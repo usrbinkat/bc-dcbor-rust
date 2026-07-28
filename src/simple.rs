@@ -70,9 +70,7 @@ pub enum Simple {
     Float(f64),
 }
 
-impl Eq for Simple {
-    fn assert_receiver_is_total_eq(&self) {}
-}
+impl Eq for Simple {}
 
 impl hash::Hash for Simple {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {

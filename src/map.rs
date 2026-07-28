@@ -211,9 +211,7 @@ impl PartialEq for Map {
     fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
 }
 
-impl Eq for Map {
-    fn assert_receiver_is_total_eq(&self) {}
-}
+impl Eq for Map {}
 
 impl hash::Hash for Map {
     fn hash<H: hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
@@ -354,9 +352,7 @@ impl PartialEq for MapKey {
     fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
 }
 
-impl Eq for MapKey {
-    fn assert_receiver_is_total_eq(&self) {}
-}
+impl Eq for MapKey {}
 
 impl hash::Hash for MapKey {
     fn hash<H: hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
