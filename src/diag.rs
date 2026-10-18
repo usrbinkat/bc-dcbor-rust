@@ -1,12 +1,9 @@
 import_stdlib!();
 
 use super::string_util::flanked;
-use crate::{
-    CBOR, CBORCase, Error, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags,
-};
+use crate::{CBOR, CBORCase, Error, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags};
 
-type SummarizerFn =
-    Arc<dyn Fn(CBOR, bool) -> Result<String, Error> + Send + Sync>;
+type SummarizerFn = Arc<dyn Fn(CBOR, bool) -> Result<String, Error> + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct DiagFormatOpts<'a> {
@@ -95,9 +92,7 @@ impl CBOR {
                 let end = "}".to_string();
                 let items = m
                     .iter()
-                    .flat_map(|(key, value)| {
-                        vec![key.diag_item(opts), value.diag_item(opts)]
-                    })
+                    .flat_map(|(key, value)| vec![key.diag_item(opts), value.diag_item(opts)])
                     .collect();
                 let is_pairs = true;
                 let comment = None;
@@ -108,20 +103,14 @@ impl CBOR {
                     let mut item_to_return: Option<DiagItem> = None;
 
                     // Attempt to get a summarizer function based on opts.tags
-                    let summarizer_fn_opt: Option<SummarizerFn> = match &opts
-                        .tags
-                    {
+                    let summarizer_fn_opt: Option<SummarizerFn> = match &opts.tags {
                         TagsStoreOpt::Custom(tags_store_trait) => {
                             tags_store_trait.summarizer(tag.value()).cloned() // Clone the Arc
                         }
                         TagsStoreOpt::Global => {
-                            with_tags!(
-                                |global_tags_store: &dyn TagsStoreTrait| {
-                                    global_tags_store
-                                        .summarizer(tag.value())
-                                        .cloned()
-                                }
-                            )
+                            with_tags!(|global_tags_store: &dyn TagsStoreTrait| {
+                                global_tags_store.summarizer(tag.value()).cloned()
+                            })
                         }
                         TagsStoreOpt::None => None,
                     };
@@ -130,14 +119,11 @@ impl CBOR {
                     if let Some(summarizer_fn) = summarizer_fn_opt {
                         match summarizer_fn(item.clone(), opts.flat) {
                             Ok(summary_text) => {
-                                item_to_return =
-                                    Some(DiagItem::Item(summary_text));
+                                item_to_return = Some(DiagItem::Item(summary_text));
                             }
                             Err(error) => {
-                                item_to_return = Some(DiagItem::Item(format!(
-                                    "<error: {}>",
-                                    error
-                                )));
+                                item_to_return =
+                                    Some(DiagItem::Item(format!("<error: {}>", error)));
                             }
                         }
                     }
@@ -190,16 +176,9 @@ impl DiagItem {
         self.format_opt(0, "", opts)
     }
 
-    fn format_opt(
-        &self,
-        level: usize,
-        separator: &str,
-        opts: &DiagFormatOpts<'_>,
-    ) -> String {
+    fn format_opt(&self, level: usize, separator: &str, opts: &DiagFormatOpts<'_>) -> String {
         match self {
-            DiagItem::Item(string) => {
-                self.format_line(level, opts, string, separator, None)
-            }
+            DiagItem::Item(string) => self.format_line(level, opts, string, separator, None),
             DiagItem::Group(_, _, _, _, _) => {
                 if !opts.flat
                     && (self.contains_group()
@@ -253,12 +232,9 @@ impl DiagItem {
                     .iter()
                     .map(|item| match item {
                         DiagItem::Item(string) => string.clone(),
-                        DiagItem::Group(_, _, _, _, _) => item
-                            .single_line_composition(
-                                level + 1,
-                                separator,
-                                opts,
-                            ),
+                        DiagItem::Group(_, _, _, _, _) => {
+                            item.single_line_composition(level + 1, separator, opts)
+                        }
                     })
                     .collect();
                 let pair_separator = if *is_pairs { ": " } else { ", " };
@@ -331,17 +307,11 @@ impl DiagItem {
     fn contains_group(&self) -> bool {
         match self {
             DiagItem::Item(_) => false,
-            DiagItem::Group(_, _, items, _, _) => {
-                items.iter().any(|x| x.is_group())
-            }
+            DiagItem::Group(_, _, items, _, _) => items.iter().any(|x| x.is_group()),
         }
     }
 
-    fn joined(
-        elements: &[String],
-        item_separator: &str,
-        pair_separator: Option<&str>,
-    ) -> String {
+    fn joined(elements: &[String], item_separator: &str, pair_separator: Option<&str>) -> String {
         let pair_separator = pair_separator.unwrap_or(item_separator);
         let mut result = String::new();
         let len = elements.len();

@@ -3,9 +3,7 @@ import_stdlib!();
 #[doc(hidden)]
 pub use paste::paste;
 
-use crate::{
-    CBORTaggedDecodable, Date, Tag, TagValue, TagsStore, TagsStoreTrait,
-};
+use crate::{CBORTaggedDecodable, Date, Tag, TagValue, TagsStore, TagsStoreTrait};
 
 pub struct LazyTagsStore {
     init: Once,
@@ -35,8 +33,10 @@ impl LazyTagsStore {
     }
 }
 
-pub static GLOBAL_TAGS: LazyTagsStore =
-    LazyTagsStore { init: Once::new(), data: Mutex::new(None) };
+pub static GLOBAL_TAGS: LazyTagsStore = LazyTagsStore {
+    init: Once::new(),
+    data: Mutex::new(None),
+};
 
 /// A macro for accessing the global tags store in a read-only manner.
 ///
@@ -182,15 +182,11 @@ pub fn register_tags_in(tags_store: &mut TagsStore) {
     tags_store.insert_all(tags);
     tags_store.set_summarizer(
         TAG_DATE,
-        Arc::new(|untagged_cbor, _| {
-            Ok(format!("{}", Date::from_untagged_cbor(untagged_cbor)?))
-        }),
+        Arc::new(|untagged_cbor, _| Ok(format!("{}", Date::from_untagged_cbor(untagged_cbor)?))),
     );
     #[cfg(feature = "num-bigint")]
     {
-        use crate::{
-            bigint_from_negative_untagged_cbor, biguint_from_untagged_cbor,
-        };
+        use crate::{bigint_from_negative_untagged_cbor, biguint_from_untagged_cbor};
 
         let biguint_tag = cbor_tag!(POSITIVE_BIGNUM);
         let bigint_tag = cbor_tag!(NEGATIVE_BIGNUM);

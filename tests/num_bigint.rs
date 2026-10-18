@@ -400,8 +400,7 @@ fn decode_tag2_with_leading_zero_fails() {
 #[test]
 fn decode_tag2_with_leading_zeros_fails() {
     // Tag 2 with h'000001' (multiple leading zeros) should fail
-    let cbor =
-        CBOR::to_tagged_value(2u64, CBOR::to_byte_string([0u8, 0u8, 1u8]));
+    let cbor = CBOR::to_tagged_value(2u64, CBOR::to_byte_string([0u8, 0u8, 1u8]));
     let result: Result<BigUint, _> = cbor.try_into();
     assert!(result.is_err());
 }

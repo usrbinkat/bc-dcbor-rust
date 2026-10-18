@@ -31,8 +31,7 @@ fn main() {
     let kv_pairs = RefCell::new(Vec::new());
     cbor.walk((), &|element, _depth, _edge, state| {
         if let Some((key, value)) = element.as_key_value()
-            && let (CBORCase::Text(k), CBORCase::Text(v)) =
-                (key.as_case(), value.as_case())
+            && let (CBORCase::Text(k), CBORCase::Text(v)) = (key.as_case(), value.as_case())
         {
             kv_pairs.borrow_mut().push(format!("{} -> {}", k, v));
         }
@@ -45,7 +44,5 @@ fn main() {
     println!("✅ Consistent: All elements visited individually");
     println!("✅ Ergonomic: Simple pattern matching on WalkElement::Single");
     println!("✅ Complete: No manual checking of key-value pairs required");
-    println!(
-        "✅ Flexible: Both individual elements AND semantic pairs available"
-    );
+    println!("✅ Flexible: Both individual elements AND semantic pairs available");
 }

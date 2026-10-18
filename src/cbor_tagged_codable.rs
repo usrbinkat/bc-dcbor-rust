@@ -62,7 +62,4 @@ use crate::{CBORTaggedDecodable, CBORTaggedEncodable};
 /// ```
 pub trait CBORTaggedCodable {}
 
-impl<T> CBORTaggedCodable for T where
-    T: CBORTaggedEncodable + CBORTaggedDecodable
-{
-}
+impl<T> CBORTaggedCodable for T where T: CBORTaggedEncodable + CBORTaggedDecodable {}

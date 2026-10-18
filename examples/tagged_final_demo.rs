@@ -65,8 +65,6 @@ fn main() {
     println!("✅ Tagged values are treated as semantic units");
     println!("✅ Tag information is still accessible via cbor.tag()");
     println!("✅ Less noise in the output");
-    println!(
-        "✅ Content is still traversed recursively if it has nested structure"
-    );
+    println!("✅ Content is still traversed recursively if it has nested structure");
     println!("✅ Consistent with map key-value pair handling");
 }

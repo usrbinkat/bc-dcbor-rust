@@ -1,0 +1,60 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "dcbor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+dcbor = { path = "..", features = ["derive", "num-bigint"] }
+num-bigint = "0.4.6"
+half = "2.4.1"
+libfuzzer-sys = "0.4"
+unicode-normalization = "=0.1.25"
+
+[[bin]]
+name = "nested"
+path = "fuzz_targets/nested.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "numeric"
+path = "fuzz_targets/numeric.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "refusals"
+path = "fuzz_targets/refusals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "representations"
+path = "fuzz_targets/representations.rs"
+test = false
+doc = false
+bench = false

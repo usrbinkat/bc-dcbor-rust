@@ -48,8 +48,7 @@ use crate::{CBOR, Result, Tag, TagValue};
 ///
 /// When this summarizer is used (for example in diagnostic output), it would
 /// convert a tagged CBOR timestamp into a more readable date format.
-pub type CBORSummarizer =
-    Arc<dyn (Fn(CBOR, bool) -> Result<String>) + Send + Sync>;
+pub type CBORSummarizer = Arc<dyn (Fn(CBOR, bool) -> Result<String>) + Send + Sync>;
 
 /// A trait for types that can map between CBOR tags and their human-readable
 /// names.
@@ -242,11 +241,7 @@ impl TagsStore {
         }
     }
 
-    pub fn set_summarizer(
-        &mut self,
-        tag: TagValue,
-        summarizer: CBORSummarizer,
-    ) {
+    pub fn set_summarizer(&mut self, tag: TagValue, summarizer: CBORSummarizer) {
         self.summarizers.insert(tag, summarizer);
     }
 
@@ -305,5 +300,7 @@ impl TagsStoreTrait for TagsStore {
 }
 
 impl Default for TagsStore {
-    fn default() -> Self { Self::new([]) }
+    fn default() -> Self {
+        Self::new([])
+    }
 }

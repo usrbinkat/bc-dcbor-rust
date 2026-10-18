@@ -109,11 +109,7 @@ fn run(
             println!("  expected:\n{:?}", expected_summary);
             println!("  actual  :\n{:?}", summary);
         }
-        assert_eq!(
-            summary, expected_summary,
-            "summary in test '{}'",
-            test_name
-        );
+        assert_eq!(summary, expected_summary, "summary in test '{}'", test_name);
     }
 
     let hex = cbor.hex();

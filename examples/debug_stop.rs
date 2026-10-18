@@ -15,13 +15,8 @@ fn main() {
     let visit_log = RefCell::new(Vec::<String>::new());
     let found_abort = RefCell::new(false);
 
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        let desc =
-            format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+        let desc = format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
         visit_log.borrow_mut().push(desc);
 
         // Check if this is our abort marker
@@ -57,9 +52,7 @@ fn main() {
     println!("\nLevel 2 visits from ArrayElement(2):");
     let level2_visits: Vec<&str> = log
         .iter()
-        .filter(|line| {
-            line.starts_with("L2:") && line.contains("ArrayElement(2)")
-        })
+        .filter(|line| line.starts_with("L2:") && line.contains("ArrayElement(2)"))
         .map(|s| s.as_str())
         .collect();
 

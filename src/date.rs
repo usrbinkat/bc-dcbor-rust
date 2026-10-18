@@ -5,13 +5,11 @@ use core::ops::{Add, Sub};
 #[cfg(feature = "std")]
 use std::ops::{Add, Sub};
 
-use chrono::{
-    DateTime, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
-};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc};
 
 use crate::{
-    CBOR, CBORTagged, CBORTaggedDecodable, CBORTaggedEncodable, Error, Result,
-    TAG_DATE, Tag, tags_for_values,
+    CBOR, CBORTagged, CBORTaggedDecodable, CBORTaggedEncodable, Error, Result, TAG_DATE, Tag,
+    tags_for_values,
 };
 
 /// A CBOR-friendly representation of a date and time.
@@ -76,7 +74,9 @@ impl Date {
     /// let datetime = Utc::now();
     /// let date = Date::from_datetime(datetime);
     /// ```
-    pub fn from_datetime(date_time: DateTime<Utc>) -> Self { Date(date_time) }
+    pub fn from_datetime(date_time: DateTime<Utc>) -> Self {
+        Date(date_time)
+    }
 
     /// Creates a new `Date` from year, month, and day components.
     ///
@@ -183,8 +183,7 @@ impl Date {
     /// let with_fraction = Date::from_timestamp(1675854714.5);
     /// ```
     pub fn from_timestamp(seconds_since_unix_epoch: f64) -> Self {
-        let whole_seconds_since_unix_epoch =
-            seconds_since_unix_epoch.trunc() as i64;
+        let whole_seconds_since_unix_epoch = seconds_since_unix_epoch.trunc() as i64;
         let nsecs = (seconds_since_unix_epoch.fract() * 1_000_000_000.0) as u32;
         Self::from_datetime(
             Utc.timestamp_opt(whole_seconds_since_unix_epoch, nsecs)
@@ -230,13 +229,10 @@ impl Date {
 
         // try parsing as just a date (with assumed zero time)
         if let Ok(d) = NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
-            let dt = NaiveDateTime::new(
-                d,
-                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            );
-            return Ok(Self::from_datetime(
-                DateTime::from_naive_utc_and_offset(dt, Utc),
-            ));
+            let dt = NaiveDateTime::new(d, chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+            return Ok(Self::from_datetime(DateTime::from_naive_utc_and_offset(
+                dt, Utc,
+            )));
         }
 
         Err(Error::InvalidDate("Invalid date string".into()))
@@ -255,7 +251,9 @@ impl Date {
     ///
     /// let now = Date::now();
     /// ```
-    pub fn now() -> Self { Self::from_datetime(Utc::now()) }
+    pub fn now() -> Self {
+        Self::from_datetime(Utc::now())
+    }
 
     /// Creates a new `Date` containing the current date and time plus the given
     /// duration.
@@ -303,7 +301,9 @@ impl Date {
     /// let datetime = date.datetime();
     /// let year = datetime.year();
     /// ```
-    pub fn datetime(&self) -> DateTime<Utc> { self.0 }
+    pub fn datetime(&self) -> DateTime<Utc> {
+        self.0
+    }
 
     /// Returns the `Date` as the number of seconds since the Unix epoch.
     ///
@@ -328,8 +328,7 @@ impl Date {
         let d = self.datetime();
         let whole_seconds_since_unix_epoch = d.timestamp();
         let nsecs = d.nanosecond();
-        (whole_seconds_since_unix_epoch as f64)
-            + (nsecs as f64) / 1_000_000_000.0
+        (whole_seconds_since_unix_epoch as f64) + (nsecs as f64) / 1_000_000_000.0
     }
 }
 
@@ -379,27 +378,37 @@ impl Sub for Date {
 }
 
 impl Default for Date {
-    fn default() -> Self { Self::now() }
+    fn default() -> Self {
+        Self::now()
+    }
 }
 
 impl TryFrom<&str> for Date {
     type Error = Error;
 
-    fn try_from(value: &str) -> Result<Self> { Self::from_string(value) }
+    fn try_from(value: &str) -> Result<Self> {
+        Self::from_string(value)
+    }
 }
 
 impl From<DateTime<Utc>> for Date {
-    fn from(value: DateTime<Utc>) -> Self { Self::from_datetime(value) }
+    fn from(value: DateTime<Utc>) -> Self {
+        Self::from_datetime(value)
+    }
 }
 
 impl From<Date> for CBOR {
-    fn from(value: Date) -> Self { value.tagged_cbor() }
+    fn from(value: Date) -> Self {
+        value.tagged_cbor()
+    }
 }
 
 impl TryFrom<CBOR> for Date {
     type Error = Error;
 
-    fn try_from(cbor: CBOR) -> Result<Self> { Self::from_tagged_cbor(cbor) }
+    fn try_from(cbor: CBOR) -> Result<Self> {
+        Self::from_tagged_cbor(cbor)
+    }
 }
 
 /// Implementation of the `CBORTagged` trait for `Date`.
@@ -416,7 +425,9 @@ impl CBORTagged for Date {
     /// # Returns
     ///
     /// A vector containing tag 1
-    fn cbor_tags() -> Vec<Tag> { tags_for_values(&[TAG_DATE]) }
+    fn cbor_tags() -> Vec<Tag> {
+        tags_for_values(&[TAG_DATE])
+    }
 }
 
 /// Implementation of the `CBORTaggedEncodable` trait for `Date`.
@@ -434,7 +445,9 @@ impl CBORTaggedEncodable for Date {
     /// # Returns
     ///
     /// A CBOR value representing the timestamp
-    fn untagged_cbor(&self) -> CBOR { self.timestamp().into() }
+    fn untagged_cbor(&self) -> CBOR {
+        self.timestamp().into()
+    }
 }
 
 /// Implementation of the `CBORTaggedDecodable` trait for `Date`.

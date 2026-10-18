@@ -153,11 +153,12 @@ use exact::ExactFrom;
 mod num_bigint;
 #[cfg(feature = "num-bigint")]
 pub use num_bigint::{
-    BigInt, BigUint, Sign, bigint_from_negative_untagged_cbor,
-    biguint_from_untagged_cbor,
+    BigInt, BigUint, Sign, bigint_from_negative_untagged_cbor, biguint_from_untagged_cbor,
 };
 
 pub mod walk;
+
+pub mod bounded;
 
 pub mod prelude;
 
@@ -165,7 +166,7 @@ mod conveniences;
 
 // Re-export derive macros when the `derive` feature is enabled
 #[cfg(feature = "derive")]
-pub use dcbor_derive::{CBORCodable, CBORDecodable, CBOREncodable};
+pub use dcbor_derive::{CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable};
 
 // Re-export standard library types used in our public API
 #[doc(hidden)]

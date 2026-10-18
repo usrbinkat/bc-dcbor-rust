@@ -26,21 +26,13 @@ fn main() {
         println!("Full diagnostic: {}", cbor.diagnostic_flat());
 
         println!("Walking elements:");
-        let visitor = |element: &WalkElement,
-                       level: usize,
-                       edge: EdgeType,
-                       _state: ()|
-         -> ((), bool) {
-            let indent = "  ".repeat(level);
-            let edge_label = edge.label().unwrap_or_else(|| "root".to_string());
-            println!(
-                "{}[{}] {}",
-                indent,
-                edge_label,
-                element.diagnostic_flat()
-            );
-            ((), false)
-        };
+        let visitor =
+            |element: &WalkElement, level: usize, edge: EdgeType, _state: ()| -> ((), bool) {
+                let indent = "  ".repeat(level);
+                let edge_label = edge.label().unwrap_or_else(|| "root".to_string());
+                println!("{}[{}] {}", indent, edge_label, element.diagnostic_flat());
+                ((), false)
+            };
 
         cbor.walk((), &visitor);
         println!();

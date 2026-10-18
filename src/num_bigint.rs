@@ -50,10 +50,7 @@ import_stdlib!();
 
 pub use num_bigint::{BigInt, BigUint, Sign};
 
-use crate::{
-    CBOR, CBORCase, Error, Result, TAG_NEGATIVE_BIGNUM, TAG_POSITIVE_BIGNUM,
-    Tag,
-};
+use crate::{CBOR, CBORCase, Error, Result, TAG_NEGATIVE_BIGNUM, TAG_POSITIVE_BIGNUM, Tag};
 
 /// Validates that a bignum magnitude byte string is in shortest canonical form.
 ///
@@ -105,7 +102,9 @@ impl From<BigUint> for CBOR {
 }
 
 impl From<&BigUint> for CBOR {
-    fn from(value: &BigUint) -> Self { value.clone().into() }
+    fn from(value: &BigUint) -> Self {
+        value.clone().into()
+    }
 }
 
 impl From<BigInt> for CBOR {
@@ -135,17 +134,16 @@ impl From<BigInt> for CBOR {
                 } else {
                     CBOR::to_byte_string(stripped)
                 };
-                CBOR::to_tagged_value(
-                    Tag::with_value(TAG_NEGATIVE_BIGNUM),
-                    content,
-                )
+                CBOR::to_tagged_value(Tag::with_value(TAG_NEGATIVE_BIGNUM), content)
             }
         }
     }
 }
 
 impl From<&BigInt> for CBOR {
-    fn from(value: &BigInt) -> Self { value.clone().into() }
+    fn from(value: &BigInt) -> Self {
+        value.clone().into()
+    }
 }
 
 /// Decodes a [`BigUint`] from an untagged CBOR byte string.

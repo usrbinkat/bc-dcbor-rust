@@ -64,18 +64,8 @@ fn test_cbor(
     assert_actual_expected!(cbor, decoded_cbor);
 }
 
-fn test_cbor_decode(data: &str, expected_debug: &str, expected_display: &str) {
-    let cbor = CBOR::try_from_hex(data).unwrap();
-    assert_actual_expected!(format!("{:?}", cbor), expected_debug);
-    assert_actual_expected!(format!("{}", cbor), expected_display);
-}
-
-fn test_cbor_codable<T>(
-    t: T,
-    expected_debug: &str,
-    expected_display: &str,
-    expected_data: &str,
-) where
+fn test_cbor_codable<T>(t: T, expected_debug: &str, expected_display: &str, expected_data: &str)
+where
     T: TryFrom<CBOR> + Into<CBOR>,
     <T as TryFrom<CBOR>>::Error: std::fmt::Debug,
 {
@@ -135,19 +125,9 @@ fn encode_unsigned() {
 
     test_cbor_codable(65536u32, "unsigned(65536)", "65536", "1a00010000");
     test_cbor_codable(65536u64, "unsigned(65536)", "65536", "1a00010000");
-    test_cbor_codable(
-        65536u64 as usize,
-        "unsigned(65536)",
-        "65536",
-        "1a00010000",
-    );
+    test_cbor_codable(65536u64 as usize, "unsigned(65536)", "65536", "1a00010000");
 
-    test_cbor_codable(
-        u32::MAX,
-        "unsigned(4294967295)",
-        "4294967295",
-        "1affffffff",
-    );
+    test_cbor_codable(u32::MAX, "unsigned(4294967295)", "4294967295", "1affffffff");
     test_cbor_codable(
         u32::MAX as u64,
         "unsigned(4294967295)",
@@ -230,12 +210,7 @@ fn encode_signed() {
         "3a7fffffff",
     );
 
-    test_cbor_codable(
-        i32::MAX,
-        "unsigned(2147483647)",
-        "2147483647",
-        "1a7fffffff",
-    );
+    test_cbor_codable(i32::MAX, "unsigned(2147483647)", "2147483647", "1a7fffffff");
     test_cbor_codable(
         i32::MAX as i64,
         "unsigned(2147483647)",
@@ -367,7 +342,8 @@ fn encode_heterogenous_array() {
         _ => panic!(),
     };
 
-    let expected_debug = r#"array([unsigned(1), text("Hello"), array([unsigned(1), unsigned(2), unsigned(3)])])"#;
+    let expected_debug =
+        r#"array([unsigned(1), text("Hello"), array([unsigned(1), unsigned(2), unsigned(3)])])"#;
     let expected_display = r#"[1, "Hello", [1, 2, 3]]"#;
     let expected_data = "83016548656c6c6f83010203";
     test_cbor(array, expected_debug, expected_display, expected_data);
@@ -466,8 +442,7 @@ fn encode_envelope() {
     let alice = CBOR::to_tagged_value(200, CBOR::to_tagged_value(201, "Alice"));
     let knows = CBOR::to_tagged_value(200, CBOR::to_tagged_value(201, "knows"));
     let bob = CBOR::to_tagged_value(200, CBOR::to_tagged_value(201, "Bob"));
-    let knows_bob =
-        CBOR::to_tagged_value(200, CBOR::to_tagged_value(221, [knows, bob]));
+    let knows_bob = CBOR::to_tagged_value(200, CBOR::to_tagged_value(221, [knows, bob]));
     let envelope = CBOR::to_tagged_value(200, [alice, knows_bob]);
     assert_eq!(
         format!("{}", envelope),
@@ -557,13 +532,12 @@ fn encode_float() {
         "3b7ffffffffffffffe",
     );
 
-    // Most negative encoded as 65-bit neg
-    // Can only be decoded as bignum
-    test_cbor_decode(
-        "3b8000000000000000",
-        "negative(-9223372036854775809)",
-        "-9223372036854775809",
-    );
+    // 65-bit negative integer value (-2^63 - 1): valid CBOR, rejected by
+    // dCBOR (draft section 7.2).
+    assert!(matches!(
+        CBOR::try_from_hex("3b8000000000000000"),
+        Err(dcbor::Error::OutOfRange)
+    ));
 
     // Largest double that can convert to uint64, almost UINT64_MAX.
     test_cbor(
@@ -582,41 +556,45 @@ fn encode_float() {
         "fa5f800000",
     );
 
-    // Least negative float not representable as Int64
+    // Least negative whole double below DCBOR_INT (-2^63 - 2048): not
+    // reduced, encoded as the double it is.
     test_cbor(
         -9223372036854777856.0,
-        "negative(-9223372036854777856)",
-        "-9223372036854777856",
-        "3b80000000000007ff",
+        "simple(-9.223372036854778e18)",
+        "-9.223372036854778e18",
+        "fbc3e0000000000001",
     );
 
-    // Next to most negative float encodable as 65-bit neg
+    // -2^64 + 2048: whole, below DCBOR_INT, stays a double.
     test_cbor(
         -18446744073709549568.0,
-        "negative(-18446744073709549568)",
-        "-18446744073709549568",
-        "3bfffffffffffff7ff",
+        "simple(-1.844674407370955e19)",
+        "-1.844674407370955e19",
+        "fbc3efffffffffffff",
     );
 
-    // 65-bit neg encoded
-    // not representable as double
-    test_cbor_decode(
-        "3bfffffffffffffffe",
-        "negative(-18446744073709551615)",
-        "-18446744073709551615",
-    );
+    // 65-bit negative integer value (-2^64 + 1): rejected by dCBOR.
+    assert!(matches!(
+        CBOR::try_from_hex("3bfffffffffffffffe"),
+        Err(dcbor::Error::OutOfRange)
+    ));
 
-    // Most negative encodable as a 65-bit neg
+    // 65-bit negative integer value (-2^64): rejected by dCBOR (draft
+    // section 7.2).
+    assert!(matches!(
+        CBOR::try_from_hex("3bffffffffffffffff"),
+        Err(dcbor::Error::OutOfRange)
+    ));
+
+    // -2^64 as a float: below DCBOR_INT, exact as a single.
     test_cbor(
         -18446744073709551616.0,
-        "negative(-18446744073709551616)",
-        "-18446744073709551616",
-        "3bffffffffffffffff",
+        "simple(-1.8446744073709552e19)",
+        "-1.8446744073709552e19",
+        "fadf800000",
     );
 
-    // Least negative whole integer that must be encoded as float in DCBOR
-    // (there are lots of non-whole-integer floats in the range of this table
-    // that must be DCBOR encoded as floats).
+    // A whole double below DCBOR_INT that is exact only as a double.
     test_cbor(
         -18446744073709555712.0,
         "simple(-1.8446744073709556e19)",
@@ -624,12 +602,13 @@ fn encode_float() {
         "fbc3f0000000000001",
     );
 
-    // Large negative that converts to negative int.
+    // Large negative that converts to float, but too large for int64
+    // (draft section 7.1).
     test_cbor(
         -18446742974197924000.0,
-        "negative(-18446742974197923840)",
-        "-18446742974197923840",
-        "3bfffffeffffffffff",
+        "simple(-1.8446742974197924e19)",
+        "-1.8446742974197924e19",
+        "fadf7fffff",
     );
 
     // Largest possible single.

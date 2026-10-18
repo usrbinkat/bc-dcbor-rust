@@ -116,7 +116,10 @@ impl Tag {
     /// );
     /// ```
     pub fn new(value: TagValue, name: impl Into<String>) -> Tag {
-        Self { value, name: Some(TagName::Dynamic(name.into())) }
+        Self {
+            value,
+            name: Some(TagName::Dynamic(name.into())),
+        }
     }
 
     /// Creates a new CBOR tag with the given value and no name.
@@ -164,7 +167,10 @@ impl Tag {
     /// assert_eq!(DATE_TAG.name(), Some("date-time-string".to_string()));
     /// ```
     pub const fn with_static_name(value: TagValue, name: &'static str) -> Tag {
-        Self { value, name: Some(TagName::Static(name)) }
+        Self {
+            value,
+            name: Some(TagName::Static(name)),
+        }
     }
 
     /// Returns the numeric value of the tag.
@@ -180,7 +186,9 @@ impl Tag {
     /// let tag = Tag::new(18, "cbor-data-item");
     /// assert_eq!(tag.value(), 18);
     /// ```
-    pub fn value(&self) -> TagValue { self.value }
+    pub fn value(&self) -> TagValue {
+        self.value
+    }
 
     /// Returns the tag's associated human-readable name, if any.
     ///
@@ -231,7 +239,9 @@ impl Tag {
 /// assert_ne!(tag1, tag4); // Different values
 /// ```
 impl PartialEq for Tag {
-    fn eq(&self, other: &Self) -> bool { self.value == other.value }
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
 }
 
 /// Confirms `Tag` implements full equality, not just partial equality.
@@ -247,7 +257,9 @@ impl Eq for Tag {}
 /// implementation. This allows tags to be used as keys in hash-based
 /// collections.
 impl hash::Hash for Tag {
-    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.value.hash(state); }
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
 }
 
 /// Formats a tag for display, preferring the name if available.
@@ -293,7 +305,9 @@ impl fmt::Display for Tag {
 /// assert_eq!(tag1, tag2);
 /// ```
 impl From<TagValue> for Tag {
-    fn from(value: TagValue) -> Self { Tag::with_value(value) }
+    fn from(value: TagValue) -> Self {
+        Tag::with_value(value)
+    }
 }
 
 /// Converts an `i32` integer to a `Tag` instance.
@@ -311,7 +325,9 @@ impl From<TagValue> for Tag {
 /// assert_eq!(tag.value(), 42);
 /// ```
 impl From<i32> for Tag {
-    fn from(value: i32) -> Self { Tag::with_value(value as TagValue) }
+    fn from(value: i32) -> Self {
+        Tag::with_value(value as TagValue)
+    }
 }
 
 /// Converts a `usize` to a `Tag` instance.
@@ -329,10 +345,14 @@ impl From<i32> for Tag {
 /// assert_eq!(tag.value(), 42);
 /// ```
 impl From<usize> for Tag {
-    fn from(value: usize) -> Self { Tag::with_value(value as TagValue) }
+    fn from(value: usize) -> Self {
+        Tag::with_value(value as TagValue)
+    }
 }
 
 /// Converts a reference to a `Tag` into an owned `Tag` instance.
 impl From<&Tag> for Tag {
-    fn from(tag: &Tag) -> Self { tag.clone() }
+    fn from(tag: &Tag) -> Self {
+        tag.clone()
+    }
 }

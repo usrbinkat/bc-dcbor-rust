@@ -18,13 +18,7 @@ fn main() {
         let indent = "  ".repeat(depth);
         match element {
             WalkElement::Single(cbor) => {
-                println!(
-                    "{}{}[{:?}] {}",
-                    indent,
-                    count,
-                    edge,
-                    cbor.diagnostic_flat()
-                );
+                println!("{}{}[{:?}] {}", indent, count, edge, cbor.diagnostic_flat());
             }
             WalkElement::KeyValue { key, value } => {
                 println!(
@@ -45,13 +39,7 @@ fn main() {
         let indent = "  ".repeat(depth);
         match element {
             WalkElement::Single(cbor) => {
-                println!(
-                    "{}{}[{:?}] {}",
-                    indent,
-                    count,
-                    edge,
-                    cbor.diagnostic_flat()
-                );
+                println!("{}{}[{:?}] {}", indent, count, edge, cbor.diagnostic_flat());
             }
             WalkElement::KeyValue { key, value } => {
                 println!(

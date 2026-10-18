@@ -26,11 +26,7 @@ fn main() {
     println!("\nWalking the CBOR tree:");
 
     // Walk the structure and print each element
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   _state: ()|
-     -> ((), bool) {
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, _state: ()| -> ((), bool) {
         let indent = "  ".repeat(level);
         let edge_label = edge.label().unwrap_or_else(|| "root".to_string());
 
@@ -75,9 +71,7 @@ fn main() {
                 CBORCase::Map(_) => state.maps += 1,
                 CBORCase::Array(_) => state.arrays += 1,
                 CBORCase::Text(_) => state.strings += 1,
-                CBORCase::Unsigned(_) | CBORCase::Negative(_) => {
-                    state.numbers += 1
-                }
+                CBORCase::Unsigned(_) | CBORCase::Negative(_) => state.numbers += 1,
                 _ => {}
             },
         }

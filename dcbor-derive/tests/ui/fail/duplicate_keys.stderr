@@ -1,0 +1,5 @@
+error: field key 1 is already the key of `first`
+ --> tests/ui/fail/duplicate_keys.rs:7:16
+  |
+7 |     #[cbor(n = 1)]
+  |                ^

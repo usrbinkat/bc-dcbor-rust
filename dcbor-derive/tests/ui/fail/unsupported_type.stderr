@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `VecDeque<bool>: BoundedEncodable` is not satisfied
+ --> tests/ui/fail/unsupported_type.rs:3:10
+  |
+3 | #[derive(CBORBoundedEncodable)]
+  |          ^^^^^^^^^^^^^^^^^^^^ the trait `BoundedEncodable` is not implemented for `VecDeque<bool>`
+  |
+  = help: the following other types implement trait `BoundedEncodable`:
+            &T
+            Arc<T>
+            BTreeMap<K, V>
+            Box<T>
+            CBOR
+            Date
+            HashMap<K, V, S>
+            Option<T>
+          and $N others
+  = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)

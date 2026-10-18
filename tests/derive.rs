@@ -202,3 +202,263 @@ fn enum_rejects_non_matching() {
     let result: dcbor::Result<Shape> = cbor.try_into();
     assert!(result.is_err());
 }
+
+// --- Bounded encoding from the same schema ---
+
+use dcbor::CBORBoundedEncodable;
+use dcbor::bounded::{Allocator, BoundedEncodable, Budget, WriteWork, prepare};
+
+#[derive(dcbor::CBORBoundedEncodable)]
+enum Collision {
+    #[cbor(n = 0)]
+    Item {
+        #[cbor(n = 0)]
+        count: u64,
+        #[cbor(n = 1)]
+        payload: String,
+        #[cbor(n = 2)]
+        plan: Option<String>,
+    },
+}
+
+#[derive(dcbor::CBORBoundedEncodable)]
+struct Generic<A, B, P> {
+    #[cbor(n = 0)]
+    first: [A; 1],
+    #[cbor(n = 1)]
+    second: B,
+    #[cbor(n = 2)]
+    third: Option<P>,
+}
+
+#[derive(dcbor::CBORBoundedEncodable)]
+enum Empty {}
+
+#[test]
+fn bounded_derive_accepts_user_names_and_generic_fields() {
+    fn bytes(value: &impl BoundedEncodable) -> Vec<u8> {
+        let prepared = prepare(value, &mut Tally::default()).unwrap();
+        let mut bytes = vec![0; prepared.len() as usize];
+        prepared
+            .encode_into(&mut bytes, &mut Tally::default())
+            .unwrap();
+        bytes
+    }
+    assert_eq!(
+        bytes(&Collision::Item {
+            count: 1,
+            payload: "x".into(),
+            plan: Some("e\u{301}".into()),
+        }),
+        [0x82, 0, 0xa3, 0, 1, 1, 0x61, b'x', 2, 0x62, 0xc3, 0xa9]
+    );
+    assert_eq!(
+        bytes(&Generic {
+            first: [true],
+            second: 1u64,
+            third: Some(2u64)
+        }),
+        [0xa3, 0, 0x81, 0xf5, 1, 1, 2, 2]
+    );
+    fn assert_bounded<T: BoundedEncodable>() {}
+    assert_bounded::<Empty>();
+}
+
+/// A budget that admits everything and records what it is told, checked.
+#[derive(Default)]
+struct Tally {
+    work: WriteWork,
+    requested: u64,
+}
+
+impl Budget for Tally {
+    type Refusal = &'static str;
+
+    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), &'static str> {
+        self.work = self
+            .work
+            .then::<()>(WriteWork::new(values, bytes))
+            .map_err(|_| "overflow")?;
+        Ok(())
+    }
+}
+
+impl Allocator for Tally {
+    type Permit = ();
+
+    fn allocate(&mut self, bytes: u64) -> Result<(), &'static str> {
+        self.requested = self.requested.checked_add(bytes).ok_or("overflow")?;
+        Ok(())
+    }
+}
+
+/// Both bounded passes of `value`: the bytes are the symbolic encoding's,
+/// both decode strictly to one value, the length is exact, and the write
+/// reports no more than predicted and allocates nothing.
+fn bounded<T: BoundedEncodable + Clone + Into<CBOR>>(value: &T) -> Vec<u8> {
+    let prepared = prepare(value, &mut Tally::default()).unwrap();
+    let mut bytes = vec![0u8; prepared.len() as usize];
+    let mut written = Tally::default();
+    prepared.encode_into(&mut bytes, &mut written).unwrap();
+    assert!(
+        prepared.write_work().covers(&written.work),
+        "{:?} beyond {:?}",
+        written.work,
+        prepared.write_work()
+    );
+    assert_eq!(written.requested, 0);
+    let symbolic = value.clone().into().to_cbor_data();
+    assert_eq!(bytes, symbolic);
+    assert_eq!(
+        CBOR::try_from_data(&bytes).unwrap(),
+        CBOR::try_from_data(&symbolic).unwrap()
+    );
+    bytes
+}
+
+/// Keys declared out of order, including keys whose encodings are two
+/// bytes wide, and optional fields both ways.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+struct Record {
+    #[cbor(n = 300)]
+    wide: u64,
+    #[cbor(n = 2)]
+    label: String,
+    #[cbor(n = 24)]
+    note: Option<String>,
+    #[cbor(n = 0)]
+    flag: bool,
+    #[cbor(n = 1)]
+    payload: ByteString,
+    #[cbor(n = 23)]
+    signed: i64,
+    #[cbor(n = 5)]
+    children: Option<Vec<Newtype>>,
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+struct Newtype(Vec<u64>);
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+struct Nothing;
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+enum Mixed {
+    #[cbor(n = 0)]
+    Point,
+    #[cbor(n = 30)]
+    Pair(u64, String),
+    #[cbor(n = 2)]
+    Frame {
+        #[cbor(n = 1)]
+        height: i64,
+        #[cbor(n = 0)]
+        width: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+enum Reason {
+    #[cbor(n = 0)]
+    First,
+    #[cbor(n = 1)]
+    Second,
+    #[cbor(n = 2)]
+    Third,
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+#[cbor(tag = 42)]
+struct Labelled {
+    #[cbor(n = 0)]
+    data: Vec<u8>,
+}
+
+fn record(note: Option<&str>, children: Option<Vec<Newtype>>) -> Record {
+    Record {
+        wide: 70_000,
+        label: "e\u{301}tiquette".to_string(),
+        note: note.map(str::to_string),
+        flag: true,
+        payload: ByteString::new([1, 2, 3]),
+        signed: -25,
+        children,
+    }
+}
+
+#[test]
+fn bounded_maps_match_the_symbolic_encoding_with_options_both_ways() {
+    bounded(&record(None, None));
+    bounded(&record(Some("present"), None));
+    bounded(&record(
+        Some("x"),
+        Some(vec![Newtype(vec![]), Newtype(vec![u64::MAX])]),
+    ));
+}
+
+#[test]
+fn bounded_newtypes_units_enums_and_tags_match_the_symbolic_encoding() {
+    bounded(&Newtype(vec![1, 1000, 1_000_000]));
+    assert_eq!(bounded(&Nothing), [0xf6]);
+    bounded(&Mixed::Point);
+    bounded(&Mixed::Pair(7, "seven".to_string()));
+    bounded(&Mixed::Frame {
+        height: -1,
+        width: None,
+    });
+    bounded(&Mixed::Frame {
+        height: 1,
+        width: Some(2),
+    });
+    for reason in [Reason::First, Reason::Second, Reason::Third] {
+        bounded(&reason);
+    }
+    let labelled = Labelled { data: vec![1, 2] };
+    assert_eq!(
+        bounded(&labelled),
+        labelled.untagged_cbor().to_cbor_data(),
+        "the conversion, bounded or not, is the untagged value"
+    );
+}
+
+/// An enum of unit variants of one head width has a fixed measure; one
+/// whose discriminants need different widths does not.
+#[test]
+fn unit_enums_of_one_width_have_a_fixed_measure() {
+    let fixed = Reason::FIXED.unwrap();
+    assert_eq!(fixed.len, 1);
+    assert_eq!(fixed.write, WriteWork::new(1, 0));
+    assert_eq!(Mixed::FIXED, None);
+    let reasons = vec![Reason::Third, Reason::First];
+    let mut measuring = Tally::default();
+    let prepared = prepare(&reasons, &mut measuring).unwrap();
+    assert_eq!(measuring.work.values, 1, "measured from the count");
+    assert_eq!(
+        prepared.write_work().values,
+        3,
+        "the array and each element are written"
+    );
+    let bytes = bounded(&reasons);
+    assert_eq!(bytes, [0x82, 0x02, 0x00]);
+}
+
+/// A float field takes the shared canonical reduction on the bounded path.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable)]
+struct Reading {
+    #[cbor(n = 0)]
+    value: f64,
+    #[cbor(n = 1)]
+    single: Option<f32>,
+}
+
+#[test]
+fn bounded_float_fields_match_the_symbolic_encoding() {
+    for (value, single) in [
+        (1.5, None),
+        (2.0, Some(4294967296.0f32)),
+        (f64::NAN, Some(f32::INFINITY)),
+        (1.1, Some(-0.0)),
+    ] {
+        bounded(&Reading { value, single });
+    }
+}

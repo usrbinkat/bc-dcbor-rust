@@ -57,12 +57,16 @@ pub trait CBOREncodable: Into<CBOR> + Clone {
     /// Converts this value to a CBOR object.
     ///
     /// This is a convenience method that avoids consuming the original value.
-    fn to_cbor(&self) -> CBOR { self.clone().into() }
+    fn to_cbor(&self) -> CBOR {
+        self.clone().into()
+    }
 
     /// Converts this value directly to binary CBOR data.
     ///
     /// This is a shorthand for `self.to_cbor().to_cbor_data()`.
-    fn to_cbor_data(&self) -> Vec<u8> { self.to_cbor().to_cbor_data() }
+    fn to_cbor_data(&self) -> Vec<u8> {
+        self.to_cbor().to_cbor_data()
+    }
 }
 
 impl<T> CBOREncodable for T where T: Into<CBOR> + Clone {}

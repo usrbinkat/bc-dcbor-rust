@@ -66,9 +66,7 @@ pub enum Error {
     /// specific UTF-8 error.
     ///
     /// All CBOR text strings (major type 3) must be valid UTF-8 per RFC 8949.
-    #[error(
-        "an invalidly-encoded UTF-8 string was encountered in the CBOR ({0:?})"
-    )]
+    #[error("an invalidly-encoded UTF-8 string was encountered in the CBOR ({0:?})")]
     InvalidString(str::Utf8Error),
 
     /// A CBOR text string was not encoded in Unicode Canonical Normalization
@@ -77,9 +75,7 @@ pub enum Error {
     /// Per Section 2.5 of the dCBOR specification, all text strings must be in
     /// NFC form, and decoders must reject any encoded text strings that are
     /// not in NFC.
-    #[error(
-        "a CBOR string was not encoded in Unicode Canonical Normalization Form C"
-    )]
+    #[error("a CBOR string was not encoded in Unicode Canonical Normalization Form C")]
     NonCanonicalString,
 
     /// The decoded CBOR item didn't consume all input data.
@@ -117,9 +113,7 @@ pub enum Error {
     /// This occurs when attempting to convert a CBOR number to a Rust numeric
     /// type that is too small to represent the value without loss of
     /// precision.
-    #[error(
-        "the CBOR numeric value could not be represented in the specified numeric type"
-    )]
+    #[error("the CBOR numeric value could not be represented in the specified numeric type")]
     OutOfRange,
 
     /// The CBOR value is not of the expected type for a conversion or
@@ -151,17 +145,23 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn msg(s: impl Into<String>) -> Self { Error::Custom(s.into()) }
+    pub fn msg(s: impl Into<String>) -> Self {
+        Error::Custom(s.into())
+    }
 }
 
 impl From<&str> for Error {
     /// Converts a string slice into a `CBORError::Custom` variant.
-    fn from(error: &str) -> Self { Error::msg(error) }
+    fn from(error: &str) -> Self {
+        Error::msg(error)
+    }
 }
 
 impl From<String> for Error {
     /// Converts a `String` into a `CBORError::Custom` variant.
-    fn from(error: String) -> Self { Error::msg(error) }
+    fn from(error: String) -> Self {
+        Error::msg(error)
+    }
 }
 
 pub type Result<T> = StdResult<T, Error>;

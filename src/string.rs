@@ -46,11 +46,15 @@ use crate::{CBOR, CBORCase, Error, Result};
 /// U+0301, NFD). dCBOR ensures these are always encoded consistently in NFC
 /// form.
 impl From<&str> for CBOR {
-    fn from(value: &str) -> Self { CBORCase::Text(value.to_string()).into() }
+    fn from(value: &str) -> Self {
+        CBORCase::Text(value.to_string()).into()
+    }
 }
 
 impl From<String> for CBOR {
-    fn from(value: String) -> Self { CBORCase::Text(value.clone()).into() }
+    fn from(value: String) -> Self {
+        CBORCase::Text(value.clone()).into()
+    }
 }
 
 impl TryFrom<CBOR> for String {

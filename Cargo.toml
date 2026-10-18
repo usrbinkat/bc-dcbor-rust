@@ -1,5 +1,7 @@
 [workspace]
 members = [".", "dcbor-derive"]
+# The fuzz crate builds with cargo-fuzz on nightly; it is its own package.
+exclude = ["fuzz"]
 
 [package]
 name = "dcbor"
@@ -32,7 +34,10 @@ hex = { version = "^0.4.3", default-features = true }
 num-bigint = { version = "0.4.6", default-features = false, optional = true }
 spin = { version = "0.10.0", optional = true }
 thiserror = { version = "^2.0", default-features = false, optional = true }
-unicode-normalization = { version = "^0.1.22", default-features = false }
+# Exact: src/bounded/text.rs restates this release's composition algorithm
+# over its character primitives; another release is adopted only after the
+# restatement is compared with that release's own iterator again.
+unicode-normalization = { version = "=0.1.25", default-features = false }
 paste = "^1.0.12"
 dcbor-derive = { version = "0.1.0", path = "dcbor-derive", optional = true }
 
@@ -48,3 +53,11 @@ no_std = ["hashbrown", "thiserror", "spin"]
 num-bigint = ["dep:num-bigint"]
 std = ["half/std", "chrono/std", "hex/std", "thiserror/std"]
 derive = ["dep:dcbor-derive"]
+
+[[example]]
+name = "bounded_record"
+required-features = ["std", "derive"]
+
+[[example]]
+name = "bounded_worker"
+required-features = ["std"]

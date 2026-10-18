@@ -9,8 +9,7 @@ pub(crate) mod with_std {
         boxed::Box,
         cmp,
         collections::{
-            BTreeMap, BTreeSet, HashMap, HashSet, VecDeque,
-            btree_map::Values as BTreeMapValues,
+            BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map::Values as BTreeMapValues,
         },
         fmt, format, hash,
         ops::Deref,
@@ -35,9 +34,7 @@ pub(crate) mod without_std {
     pub(crate) use alloc::{
         borrow::ToOwned,
         boxed::Box,
-        collections::{
-            BTreeMap, BTreeSet, VecDeque, btree_map::Values as BTreeMapValues,
-        },
+        collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Values as BTreeMapValues},
         fmt, format, str,
         string::{String, ToString},
         sync::Arc,
@@ -45,8 +42,8 @@ pub(crate) mod without_std {
         vec::Vec,
     };
     pub(crate) use core::{
-        array::TryFromSliceError, cmp, hash, ops::Deref,
-        result::Result as StdResult, time::Duration,
+        array::TryFromSliceError, cmp, hash, ops::Deref, result::Result as StdResult,
+        time::Duration,
     };
 
     pub(crate) use hashbrown::{HashMap, HashSet};

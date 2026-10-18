@@ -4,9 +4,7 @@ use super::{
     string_util::{flanked, sanitized},
     varint::{EncodeVarInt, MajorType},
 };
-use crate::{
-    CBOR, CBORCase, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags,
-};
+use crate::{CBOR, CBORCase, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags};
 
 #[derive(Default)]
 pub struct HexFormatOpts<'a> {
@@ -32,7 +30,9 @@ impl<'a> HexFormatOpts<'a> {
 /// hexadecimal.
 impl CBOR {
     /// Returns the encoded hexadecimal representation of this CBOR.
-    pub fn hex(&self) -> String { hex::encode(self.to_cbor_data()) }
+    pub fn hex(&self) -> String {
+        hex::encode(self.to_cbor_data())
+    }
 
     /// Returns the encoded hexadecimal representation of this CBOR.
     ///
@@ -49,8 +49,7 @@ impl CBOR {
         });
         // Round up to nearest multiple of 4
         let note_column = ((note_column + 4) & !3) - 1;
-        let lines: Vec<_> =
-            items.iter().map(|x| x.format(note_column)).collect();
+        let lines: Vec<_> = items.iter().map(|x| x.format(note_column)).collect();
         lines.join("\n")
     }
 
@@ -60,11 +59,7 @@ impl CBOR {
         self.hex_opt(&HexFormatOpts::default().annotate(true))
     }
 
-    fn dump_items(
-        &self,
-        level: usize,
-        opts: &HexFormatOpts<'_>,
-    ) -> Vec<DumpItem> {
+    fn dump_items(&self, level: usize, opts: &HexFormatOpts<'_>) -> Vec<DumpItem> {
         match self.as_case() {
             CBORCase::Unsigned(n) => vec![DumpItem::new(
                 level,
@@ -89,11 +84,7 @@ impl CBOR {
                     {
                         note = Some(flanked(&b, "\"", "\""));
                     }
-                    items.push(DumpItem::new(
-                        level + 1,
-                        vec![d.to_vec()],
-                        note,
-                    ));
+                    items.push(DumpItem::new(level + 1, vec![d.to_vec()], note));
                 }
                 items
             }
@@ -107,11 +98,7 @@ impl CBOR {
                         header_data,
                         Some(format!("text({})", utf8_data.len())),
                     ),
-                    DumpItem::new(
-                        level + 1,
-                        vec![utf8_data],
-                        Some(flanked(s, "\"", "\"")),
-                    ),
+                    DumpItem::new(level + 1, vec![utf8_data], Some(flanked(s, "\"", "\""))),
                 ]
             }
             CBORCase::Simple(v) => {
@@ -122,23 +109,18 @@ impl CBOR {
             CBORCase::Tagged(tag, item) => {
                 let header = tag.value().encode_varint(MajorType::Tagged);
                 let header_data = vec![vec![header[0]], header[1..].to_vec()];
-                let mut note_components: Vec<String> =
-                    vec![format!("tag({})", tag.value())];
+                let mut note_components: Vec<String> = vec![format!("tag({})", tag.value())];
                 match opts.tags {
                     TagsStoreOpt::None => {}
                     TagsStoreOpt::Global => {
                         with_tags!(|tags_store: &dyn TagsStoreTrait| {
-                            if let Some(name) =
-                                tags_store.assigned_name_for_tag(tag)
-                            {
+                            if let Some(name) = tags_store.assigned_name_for_tag(tag) {
                                 note_components.push(name);
                             }
                         })
                     }
                     TagsStoreOpt::Custom(tags_store_trait) => {
-                        if let Some(name) =
-                            tags_store_trait.assigned_name_for_tag(tag)
-                        {
+                        if let Some(name) = tags_store_trait.assigned_name_for_tag(tag) {
                             note_components.push(name);
                         }
                     }
@@ -215,9 +197,7 @@ impl DumpItem {
         let column_1 = self.format_first_column();
         let (column_2, padding) = {
             if let Some(note) = &self.note {
-                let padding_count = 1.max(
-                    39.min(note_column as i64) - (column_1.len() as i64) + 1,
-                );
+                let padding_count = 1.max(39.min(note_column as i64) - (column_1.len() as i64) + 1);
                 let padding = " ".repeat(padding_count.try_into().unwrap());
                 let column_2 = format!("# {}", note);
                 (column_2, padding)

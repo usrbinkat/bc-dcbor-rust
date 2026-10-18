@@ -7,9 +7,7 @@ use super::varint::MajorType;
 use crate::{
     CBOR, CBORCase, Map,
     error::{Error, Result},
-    float::{
-        validate_canonical_f16, validate_canonical_f32, validate_canonical_f64,
-    },
+    float::{validate_canonical_f16, validate_canonical_f32, validate_canonical_f64},
 };
 
 /// Decode CBOR binary representation to symbolic representation.
@@ -41,7 +39,7 @@ fn parse_header(header: u8) -> (MajorType, u8) {
     (major_type, header_value)
 }
 
-fn parse_header_varint(data: &[u8]) -> Result<(MajorType, u64, usize)> {
+pub(crate) fn parse_header_varint(data: &[u8]) -> Result<(MajorType, u64, usize)> {
     if data.is_empty() {
         return Err(Error::Underrun);
     }
@@ -120,10 +118,11 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
     }
     let (major_type, value, header_varint_len) = parse_header_varint(data)?;
     match major_type {
-        MajorType::Unsigned => {
-            Ok((CBORCase::Unsigned(value).into(), header_varint_len))
-        }
+        MajorType::Unsigned => Ok((CBORCase::Unsigned(value).into(), header_varint_len)),
         MajorType::Negative => {
+            if value > (-1 - crate::float::DCBOR_INT_MIN) as u64 {
+                return Err(Error::OutOfRange);
+            }
             Ok((CBORCase::Negative(value).into(), header_varint_len))
         }
         MajorType::ByteString => {
@@ -168,8 +167,7 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
             Ok((map.into(), pos))
         }
         MajorType::Tagged => {
-            let (item, item_len) =
-                decode_cbor_internal(&data[header_varint_len..])?;
+            let (item, item_len) = decode_cbor_internal(&data[header_varint_len..])?;
             let tagged = CBOR::to_tagged_value(value, item);
             Ok((tagged, header_varint_len + item_len))
         }

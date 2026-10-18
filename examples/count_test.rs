@@ -14,13 +14,8 @@ fn main() {
     let nested = CBOR::from(outer_map);
 
     let visit_log = RefCell::new(Vec::<String>::new());
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        let desc =
-            format!("L{} [{:?}] {}", level, edge, element.diagnostic_flat());
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+        let desc = format!("L{} [{:?}] {}", level, edge, element.diagnostic_flat());
         visit_log.borrow_mut().push(desc);
         (state, false)
     };

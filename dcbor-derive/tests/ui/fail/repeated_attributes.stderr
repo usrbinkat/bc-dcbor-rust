@@ -1,0 +1,23 @@
+error: repeated `n`
+ --> tests/ui/fail/repeated_attributes.rs:5:19
+  |
+5 |     #[cbor(n = 0, n = 1)]
+  |                   ^
+
+error: repeated #[cbor(tag = N)] attribute
+  --> tests/ui/fail/repeated_attributes.rs:11:1
+   |
+11 | #[cbor(tag = 2)]
+   | ^^^^^^^^^^^^^^^^
+
+error: repeated #[cbor(n = N)] attribute
+  --> tests/ui/fail/repeated_attributes.rs:17:5
+   |
+17 |     #[cbor(n = 1)]
+   |     ^^^^^^^^^^^^^^
+
+error: expected `tag = N`
+  --> tests/ui/fail/repeated_attributes.rs:22:17
+   |
+22 | #[cbor(tag = 0, n = 1)]
+   |                 ^

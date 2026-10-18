@@ -7,18 +7,26 @@ pub struct Set(Map);
 
 impl Set {
     /// Makes a new, empty CBOR `Set`.
-    pub fn new() -> Self { Self(Map::new()) }
+    pub fn new() -> Self {
+        Self(Map::new())
+    }
 
     /// Returns the number of elements in the set.
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
     /// Checks if the set is empty.
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     /// Gets an iterator over the elements in the CBOR set.
     ///
     /// Order is lexicographically by the value's binary-encoded CBOR.
-    pub fn iter(&self) -> SetIter<'_> { SetIter::new(self.0.iter()) }
+    pub fn iter(&self) -> SetIter<'_> {
+        SetIter::new(self.0.iter())
+    }
 
     /// Inserts a value into the set.
     pub fn insert<T>(&mut self, value: T)
@@ -68,11 +76,15 @@ impl Set {
         Ok(set)
     }
 
-    pub fn cbor_data(&self) -> Vec<u8> { self.as_vec().to_cbor_data() }
+    pub fn cbor_data(&self) -> Vec<u8> {
+        self.as_vec().to_cbor_data()
+    }
 }
 
 impl From<Set> for CBOR {
-    fn from(value: Set) -> Self { value.as_vec().into() }
+    fn from(value: Set) -> Self {
+        value.as_vec().into()
+    }
 }
 
 impl<T> TryFrom<Vec<T>> for Set
@@ -81,7 +93,9 @@ where
 {
     type Error = Error;
 
-    fn try_from(vec: Vec<T>) -> Result<Self> { Self::try_from_vec(vec) }
+    fn try_from(vec: Vec<T>) -> Result<Self> {
+        Self::try_from_vec(vec)
+    }
 }
 
 impl<T> TryFrom<Set> for Vec<T>
@@ -131,11 +145,15 @@ impl fmt::Debug for Set {
 pub struct SetIter<'a>(MapIter<'a>);
 
 impl<'a> SetIter<'a> {
-    pub fn new(iter: MapIter<'a>) -> Self { Self(iter) }
+    pub fn new(iter: MapIter<'a>) -> Self {
+        Self(iter)
+    }
 }
 
 impl<'a> Iterator for SetIter<'a> {
     type Item = &'a CBOR;
 
-    fn next(&mut self) -> Option<Self::Item> { self.0.next().map(|(_, v)| v) }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(_, v)| v)
+    }
 }

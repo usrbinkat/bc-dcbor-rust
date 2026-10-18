@@ -125,18 +125,26 @@ pub struct Map(BTreeMap<MapKey, MapValue>);
 
 impl Map {
     /// Makes a new, empty CBOR `Map`.
-    pub fn new() -> Self { Map(BTreeMap::new()) }
+    pub fn new() -> Self {
+        Map(BTreeMap::new())
+    }
 
     /// Returns the number of entries in the map.
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
     /// Checks if the map is empty.
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     /// Gets an iterator over the entries of the CBOR map, sorted by key.
     ///
     /// Key sorting order is lexicographic by the key's binary-encoded CBOR.
-    pub fn iter(&self) -> MapIter<'_> { MapIter::new(self.0.values()) }
+    pub fn iter(&self) -> MapIter<'_> {
+        MapIter::new(self.0.values())
+    }
 
     /// Inserts a key-value pair into the map.
     pub fn insert(&mut self, key: impl Into<CBOR>, value: impl Into<CBOR>) {
@@ -204,17 +212,23 @@ impl Map {
 }
 
 impl Default for Map {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PartialEq for Map {
-    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
 
 impl Eq for Map {}
 
 impl hash::Hash for Map {
-    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
 }
 
 impl Map {
@@ -239,11 +253,15 @@ impl Map {
 }
 
 impl From<Map> for CBOR {
-    fn from(value: Map) -> Self { CBORCase::Map(value.clone()).into() }
+    fn from(value: Map) -> Self {
+        CBORCase::Map(value.clone()).into()
+    }
 }
 
 impl From<&Map> for CBOR {
-    fn from(value: &Map) -> Self { value.clone().into() }
+    fn from(value: &Map) -> Self {
+        value.clone().into()
+    }
 }
 
 impl fmt::Debug for Map {
@@ -319,7 +337,9 @@ struct MapValue {
 }
 
 impl MapValue {
-    fn new(key: CBOR, value: CBOR) -> MapValue { MapValue { key, value } }
+    fn new(key: CBOR, value: CBOR) -> MapValue {
+        MapValue { key, value }
+    }
 }
 
 impl PartialEq for MapValue {
@@ -345,17 +365,23 @@ impl fmt::Debug for MapValue {
 struct MapKey(Vec<u8>);
 
 impl MapKey {
-    fn new(key_data: Vec<u8>) -> MapKey { MapKey(key_data) }
+    fn new(key_data: Vec<u8>) -> MapKey {
+        MapKey(key_data)
+    }
 }
 
 impl PartialEq for MapKey {
-    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
 
 impl Eq for MapKey {}
 
 impl hash::Hash for MapKey {
-    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
 }
 
 impl PartialOrd for MapKey {
@@ -365,7 +391,9 @@ impl PartialOrd for MapKey {
 }
 
 impl Ord for MapKey {
-    fn cmp(&self, other: &Self) -> cmp::Ordering { self.0.cmp(&other.0) }
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
 }
 
 impl fmt::Debug for MapKey {
@@ -413,8 +441,7 @@ where
             CBORCase::Map(map) => {
                 let mut container = <HashMap<K, V>>::new();
                 for (k, v) in map.iter() {
-                    container
-                        .insert(k.clone().try_into()?, v.clone().try_into()?);
+                    container.insert(k.clone().try_into()?, v.clone().try_into()?);
                 }
                 Ok(container)
             }

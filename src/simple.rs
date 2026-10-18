@@ -95,10 +95,14 @@ impl Simple {
     /// This method is primarily used internally. Users should generally
     /// interact with Rust's native types rather than with `Simple` values
     /// directly.
-    pub fn name(&self) -> String { format!("{:?}", self) }
+    pub fn name(&self) -> String {
+        format!("{:?}", self)
+    }
 
     /// Checks if the simple value is a floating point number.
-    pub fn is_float(&self) -> bool { matches!(self, Self::Float(_)) }
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float(_))
+    }
 
     /// Checks if the simple value is the NaN (Not a Number) representation.
     pub fn is_nan(&self) -> bool {
@@ -142,7 +146,9 @@ impl Simple {
 /// converting from Rust's native types (bool, f64) directly to CBOR instead of
 /// using the `Simple` type.
 impl From<Simple> for CBOR {
-    fn from(value: Simple) -> Self { CBORCase::Simple(value.clone()).into() }
+    fn from(value: Simple) -> Self {
+        CBORCase::Simple(value.clone()).into()
+    }
 }
 
 /// Attempts to convert a CBOR value to a `Simple` value.
@@ -177,9 +183,7 @@ impl PartialEq for Simple {
             (Self::False, Self::False) => true,
             (Self::True, Self::True) => true,
             (Self::Null, Self::Null) => true,
-            (Self::Float(v1), Self::Float(v2)) => {
-                v1 == v2 || (v1.is_nan() && v2.is_nan())
-            }
+            (Self::Float(v1), Self::Float(v2)) => v1 == v2 || (v1.is_nan() && v2.is_nan()),
             _ => false,
         }
     }

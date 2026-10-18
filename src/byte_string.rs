@@ -74,7 +74,9 @@ impl ByteString {
     /// let hex = "deadbeef";
     /// let bytes4 = ByteString::new(hex::decode(hex).unwrap());
     /// ```
-    pub fn new(data: impl AsRef<[u8]>) -> Self { Self(data.as_ref().to_vec()) }
+    pub fn new(data: impl AsRef<[u8]>) -> Self {
+        Self(data.as_ref().to_vec())
+    }
 
     /// Returns a reference to the underlying byte data.
     ///
@@ -91,7 +93,9 @@ impl ByteString {
     /// // You can use standard slice operations on the result
     /// assert_eq!(bytes.data()[1..3], [2, 3]);
     /// ```
-    pub fn data(&self) -> &[u8] { &self.0 }
+    pub fn data(&self) -> &[u8] {
+        &self.0
+    }
 
     /// Returns the length of the byte string in bytes.
     ///
@@ -106,7 +110,9 @@ impl ByteString {
     /// let bytes = ByteString::new([1, 2, 3, 4]);
     /// assert_eq!(bytes.len(), 4);
     /// ```
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
     /// Returns `true` if the byte string contains no bytes.
     ///
@@ -121,7 +127,9 @@ impl ByteString {
     /// let bytes = ByteString::new([1, 2, 3, 4]);
     /// assert!(!bytes.is_empty());
     /// ```
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     /// Extends the byte string with additional bytes.
     ///
@@ -162,7 +170,9 @@ impl ByteString {
     /// assert_eq!(vec2, vec![1, 2, 3, 4, 5]);
     /// assert_eq!(bytes.data(), &[1, 2, 3, 4]); // original unchanged
     /// ```
-    pub fn to_vec(&self) -> Vec<u8> { self.0.clone() }
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.clone()
+    }
 
     /// Returns an iterator over the bytes in the byte string.
     ///
@@ -189,7 +199,10 @@ impl ByteString {
     /// assert_eq!(sum, 6);
     /// ```
     pub fn iter(&self) -> ByteStringIterator<'_> {
-        ByteStringIterator { slice: &self.0, pos: 0 }
+        ByteStringIterator {
+            slice: &self.0,
+            pos: 0,
+        }
     }
 }
 
@@ -217,7 +230,9 @@ impl ByteString {
 /// assert_eq!(size, 4);
 /// ```
 impl From<ByteString> for Vec<u8> {
-    fn from(value: ByteString) -> Self { value.0 }
+    fn from(value: ByteString) -> Self {
+        value.0
+    }
 }
 
 /// Converts a `Vec<u8>` into a `ByteString`.
@@ -239,7 +254,9 @@ impl From<ByteString> for Vec<u8> {
 /// assert_eq!(bytes.data(), &[5, 6, 7, 8]);
 /// ```
 impl From<Vec<u8>> for ByteString {
-    fn from(value: Vec<u8>) -> Self { Self(value) }
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
 }
 
 /// Converts a reference to a `Vec<u8>` into a `ByteString`.
@@ -259,7 +276,9 @@ impl From<Vec<u8>> for ByteString {
 /// assert_eq!(vec, vec![1, 2, 3, 4]);
 /// ```
 impl From<&Vec<u8>> for ByteString {
-    fn from(value: &Vec<u8>) -> Self { Self(value.clone()) }
+    fn from(value: &Vec<u8>) -> Self {
+        Self(value.clone())
+    }
 }
 
 /// Converts a byte slice into a `ByteString`.
@@ -281,7 +300,9 @@ impl From<&Vec<u8>> for ByteString {
 /// assert_eq!(bytes.data(), &[5, 6, 7, 8]);
 /// ```
 impl From<&[u8]> for ByteString {
-    fn from(value: &[u8]) -> Self { Self(value.to_vec()) }
+    fn from(value: &[u8]) -> Self {
+        Self(value.to_vec())
+    }
 }
 
 /// Converts a string slice into a `ByteString`.
@@ -305,7 +326,9 @@ impl From<&[u8]> for ByteString {
 /// assert_eq!(bytes.data(), "こんにちは".as_bytes());
 /// ```
 impl From<&str> for ByteString {
-    fn from(value: &str) -> Self { Self(value.as_bytes().to_vec()) }
+    fn from(value: &str) -> Self {
+        Self(value.as_bytes().to_vec())
+    }
 }
 
 /// Converts a `ByteString` into a CBOR byte string value.
@@ -329,7 +352,9 @@ impl From<&str> for ByteString {
 /// //           0x44: byte string (major type 2) of length 4
 /// ```
 impl From<ByteString> for CBOR {
-    fn from(value: ByteString) -> Self { CBOR::to_byte_string(value) }
+    fn from(value: ByteString) -> Self {
+        CBOR::to_byte_string(value)
+    }
 }
 
 /// Attempts to convert a CBOR value into a `ByteString`.
@@ -377,7 +402,9 @@ impl TryFrom<CBOR> for ByteString {
 /// assert_eq!(bytes.data(), &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 /// ```
 impl<const N: usize> From<[u8; N]> for ByteString {
-    fn from(value: [u8; N]) -> Self { Self(value.to_vec()) }
+    fn from(value: [u8; N]) -> Self {
+        Self(value.to_vec())
+    }
 }
 
 /// Converts a reference to a fixed-size byte array into a `ByteString`.
@@ -398,7 +425,9 @@ impl<const N: usize> From<[u8; N]> for ByteString {
 /// assert_eq!(array, [1, 2, 3, 4]);
 /// ```
 impl<const N: usize> From<&[u8; N]> for ByteString {
-    fn from(value: &[u8; N]) -> Self { Self(value.to_vec()) }
+    fn from(value: &[u8; N]) -> Self {
+        Self(value.to_vec())
+    }
 }
 
 /// Attempts to convert a `ByteString` into a fixed-size byte array.
@@ -459,7 +488,9 @@ impl<'a> IntoIterator for &'a ByteString {
     type Item = &'a u8;
     type IntoIter = ByteStringIterator<'a>;
 
-    fn into_iter(self) -> Self::IntoIter { self.iter() }
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 /// Implements the `AsRef<[u8]>` trait for `ByteString`.
@@ -483,7 +514,9 @@ impl<'a> IntoIterator for &'a ByteString {
 /// assert_eq!(first_byte(&bytes), Some(1));
 /// ```
 impl AsRef<[u8]> for ByteString {
-    fn as_ref(&self) -> &[u8] { &self.0 }
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Implements the `Deref` trait for `ByteString`, allowing it to be treated as
@@ -510,7 +543,9 @@ impl AsRef<[u8]> for ByteString {
 impl Deref for ByteString {
     type Target = [u8];
 
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// An iterator over the bytes in a `ByteString`.

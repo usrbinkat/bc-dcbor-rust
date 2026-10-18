@@ -35,50 +35,45 @@ fn main() {
     println!("=== Demo 1: Key-Value Pattern Matching ===");
     let found_patterns = RefCell::new(Vec::new());
 
-    let pattern_matcher = |element: &WalkElement,
-                           _level: usize,
-                           _edge: EdgeType,
-                           _state: ()|
-     -> ((), bool) {
-        // The WalkElement enum makes key-value pattern matching incredibly
-        // ergonomic!
-        if let Some((key, value)) = element.as_key_value()
-            && let CBORCase::Text(key_str) = key.as_case()
-        {
-            match key_str.as_str() {
-                "email" => {
-                    if let CBORCase::Text(email) = value.as_case() {
-                        found_patterns
-                            .borrow_mut()
-                            .push(format!("📧 Email: {}", email));
+    let pattern_matcher =
+        |element: &WalkElement, _level: usize, _edge: EdgeType, _state: ()| -> ((), bool) {
+            // The WalkElement enum makes key-value pattern matching incredibly
+            // ergonomic!
+            if let Some((key, value)) = element.as_key_value()
+                && let CBORCase::Text(key_str) = key.as_case()
+            {
+                match key_str.as_str() {
+                    "email" => {
+                        if let CBORCase::Text(email) = value.as_case() {
+                            found_patterns
+                                .borrow_mut()
+                                .push(format!("📧 Email: {}", email));
+                        }
                     }
-                }
-                "name" => {
-                    if let CBORCase::Text(name) = value.as_case() {
-                        found_patterns
-                            .borrow_mut()
-                            .push(format!("👤 Name: {}", name));
+                    "name" => {
+                        if let CBORCase::Text(name) = value.as_case() {
+                            found_patterns
+                                .borrow_mut()
+                                .push(format!("👤 Name: {}", name));
+                        }
                     }
-                }
-                "city" => {
-                    if let CBORCase::Text(city) = value.as_case() {
-                        found_patterns
-                            .borrow_mut()
-                            .push(format!("🏙️  City: {}", city));
+                    "city" => {
+                        if let CBORCase::Text(city) = value.as_case() {
+                            found_patterns
+                                .borrow_mut()
+                                .push(format!("🏙️  City: {}", city));
+                        }
                     }
-                }
-                "zip" => {
-                    if let CBORCase::Unsigned(zip) = value.as_case() {
-                        found_patterns
-                            .borrow_mut()
-                            .push(format!("📮 ZIP: {}", zip));
+                    "zip" => {
+                        if let CBORCase::Unsigned(zip) = value.as_case() {
+                            found_patterns.borrow_mut().push(format!("📮 ZIP: {}", zip));
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        ((), false) // Continue traversal
-    };
+            ((), false) // Continue traversal
+        };
 
     cbor.walk((), &pattern_matcher);
 
@@ -89,35 +84,32 @@ fn main() {
 
     // Demo 2: Tree structure visualization with element types
     println!("=== Demo 2: Tree Structure Visualization ===");
-    let tree_visitor = |element: &WalkElement,
-                        level: usize,
-                        edge: EdgeType,
-                        _state: ()|
-     -> ((), bool) {
-        let indent = "  ".repeat(level);
-        let edge_label = edge.label().unwrap_or_else(|| "root".to_string());
+    let tree_visitor =
+        |element: &WalkElement, level: usize, edge: EdgeType, _state: ()| -> ((), bool) {
+            let indent = "  ".repeat(level);
+            let edge_label = edge.label().unwrap_or_else(|| "root".to_string());
 
-        let element_type = match element {
-            WalkElement::Single(cbor) => match cbor.as_case() {
-                CBORCase::Map(_) => "🗂️  Map",
-                CBORCase::Array(_) => "📚 Array",
-                CBORCase::Text(_) => "📝 Text",
-                CBORCase::Unsigned(_) => "🔢 Number",
-                CBORCase::Tagged(_, _) => "🏷️  Tagged",
-                _ => "❓ Other",
-            },
-            WalkElement::KeyValue { .. } => "🔗 Key-Value",
+            let element_type = match element {
+                WalkElement::Single(cbor) => match cbor.as_case() {
+                    CBORCase::Map(_) => "🗂️  Map",
+                    CBORCase::Array(_) => "📚 Array",
+                    CBORCase::Text(_) => "📝 Text",
+                    CBORCase::Unsigned(_) => "🔢 Number",
+                    CBORCase::Tagged(_, _) => "🏷️  Tagged",
+                    _ => "❓ Other",
+                },
+                WalkElement::KeyValue { .. } => "🔗 Key-Value",
+            };
+
+            println!(
+                "{}[{}] {} {}",
+                indent,
+                edge_label,
+                element_type,
+                element.diagnostic_flat()
+            );
+            ((), false)
         };
-
-        println!(
-            "{}[{}] {} {}",
-            indent,
-            edge_label,
-            element_type,
-            element.diagnostic_flat()
-        );
-        ((), false)
-    };
 
     cbor.walk((), &tree_visitor);
     println!();
@@ -144,33 +136,26 @@ fn main() {
         max_depth: 0,
     });
 
-    let stats_collector = |element: &WalkElement,
-                           level: usize,
-                           _edge: EdgeType,
-                           state: Stats|
-     -> (Stats, bool) {
-        let mut new_stats = state;
-        new_stats.total_elements += 1;
-        new_stats.max_depth = new_stats.max_depth.max(level);
+    let stats_collector =
+        |element: &WalkElement, level: usize, _edge: EdgeType, state: Stats| -> (Stats, bool) {
+            let mut new_stats = state;
+            new_stats.total_elements += 1;
+            new_stats.max_depth = new_stats.max_depth.max(level);
 
-        match element {
-            WalkElement::KeyValue { .. } => new_stats.key_value_pairs += 1,
-            WalkElement::Single(cbor) => match cbor.as_case() {
-                CBORCase::Text(_) => new_stats.text_values += 1,
-                CBORCase::Unsigned(_) | CBORCase::Negative(_) => {
-                    new_stats.numeric_values += 1
-                }
-                CBORCase::Map(_) | CBORCase::Array(_) => {
-                    new_stats.nested_structures += 1
-                }
-                _ => {}
-            },
-        }
+            match element {
+                WalkElement::KeyValue { .. } => new_stats.key_value_pairs += 1,
+                WalkElement::Single(cbor) => match cbor.as_case() {
+                    CBORCase::Text(_) => new_stats.text_values += 1,
+                    CBORCase::Unsigned(_) | CBORCase::Negative(_) => new_stats.numeric_values += 1,
+                    CBORCase::Map(_) | CBORCase::Array(_) => new_stats.nested_structures += 1,
+                    _ => {}
+                },
+            }
 
-        // Update the shared stats for final reporting
-        *stats.borrow_mut() = new_stats.clone();
-        (new_stats, false)
-    };
+            // Update the shared stats for final reporting
+            *stats.borrow_mut() = new_stats.clone();
+            (new_stats, false)
+        };
 
     cbor.walk(
         Stats {
@@ -197,23 +182,19 @@ fn main() {
     println!("=== Demo 4: Early Termination Search ===");
     let search_results = RefCell::new(Vec::new());
 
-    let search_for_email = |element: &WalkElement,
-                            _level: usize,
-                            _edge: EdgeType,
-                            _state: ()|
-     -> ((), bool) {
-        if let Some((key, value)) = element.as_key_value()
-            && let (CBORCase::Text(k), CBORCase::Text(v)) =
-                (key.as_case(), value.as_case())
-            && k.as_str() == "email"
-        {
-            search_results
-                .borrow_mut()
-                .push(format!("Found email: {}", v));
-            return ((), true); // Stop traversal after finding the first email
-        }
-        ((), false)
-    };
+    let search_for_email =
+        |element: &WalkElement, _level: usize, _edge: EdgeType, _state: ()| -> ((), bool) {
+            if let Some((key, value)) = element.as_key_value()
+                && let (CBORCase::Text(k), CBORCase::Text(v)) = (key.as_case(), value.as_case())
+                && k.as_str() == "email"
+            {
+                search_results
+                    .borrow_mut()
+                    .push(format!("Found email: {}", v));
+                return ((), true); // Stop traversal after finding the first email
+            }
+            ((), false)
+        };
 
     cbor.walk((), &search_for_email);
 
@@ -226,9 +207,7 @@ fn main() {
     println!("=== Demo 5: API Benefits Summary ===");
     println!("🎯 Key-Value Pattern Matching:");
     println!("  ✅ NEW: Direct access to (key, value) pairs");
-    println!(
-        "  ❌ OLD: Required external state management to correlate keys and values"
-    );
+    println!("  ❌ OLD: Required external state management to correlate keys and values");
     println!();
     println!("🔍 Element Type Detection:");
     println!("  ✅ NEW: Single enum match on WalkElement");

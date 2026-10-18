@@ -78,13 +78,14 @@ pub trait CBORTaggedEncodable: CBORTagged {
     ///
     /// In most cases, you don't need to override this method.
     fn tagged_cbor(&self) -> CBOR {
-        CBORCase::Tagged(Self::cbor_tags()[0].clone(), self.untagged_cbor())
-            .into()
+        CBORCase::Tagged(Self::cbor_tags()[0].clone(), self.untagged_cbor()).into()
     }
 
     /// Returns the tagged value in CBOR binary representation.
     ///
     /// This is a convenience method that converts the result of `tagged_cbor()`
     /// to binary format.
-    fn tagged_cbor_data(&self) -> Vec<u8> { self.tagged_cbor().to_cbor_data() }
+    fn tagged_cbor_data(&self) -> Vec<u8> {
+        self.tagged_cbor().to_cbor_data()
+    }
 }

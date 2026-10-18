@@ -1,0 +1,17 @@
+error: tuple structs with more than one field are not supported; use a named struct with #[cbor(n = N)] attributes
+ --> tests/ui/fail/unsupported_shapes.rs:4:8
+  |
+4 | struct Pair(u64, u64);
+  |        ^^^^
+
+error: tuple fields do not have CBOR keys or tags
+ --> tests/ui/fail/unsupported_shapes.rs:7:19
+  |
+7 | struct KeyedTuple(#[cbor(n = 0)] u64);
+  |                   ^^^^^^^^^^^^^^
+
+error: use #[cbor(n = N)] instead of a Rust discriminant
+  --> tests/ui/fail/unsupported_shapes.rs:12:9
+   |
+12 |     A = 1,
+   |         ^

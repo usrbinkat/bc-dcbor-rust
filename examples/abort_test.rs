@@ -15,13 +15,8 @@ fn main() {
     let visit_log = RefCell::new(Vec::<String>::new());
     let should_abort = RefCell::new(false);
 
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        let desc =
-            format!("L{} [{:?}] {}", level, edge, element.diagnostic_flat());
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+        let desc = format!("L{} [{:?}] {}", level, edge, element.diagnostic_flat());
 
         // If we're already aborting, still log but return true to stop descent
         if *should_abort.borrow() {

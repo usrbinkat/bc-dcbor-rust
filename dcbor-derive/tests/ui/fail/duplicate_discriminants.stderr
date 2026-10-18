@@ -1,0 +1,5 @@
+error: discriminant 2 is already the discriminant of `First`
+ --> tests/ui/fail/duplicate_discriminants.rs:7:16
+  |
+7 |     #[cbor(n = 2)]
+  |                ^

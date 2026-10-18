@@ -1,26 +1,18 @@
 import_stdlib!();
 
-use super::{
-    CBORCase,
-    varint::{EncodeVarInt, MajorType},
-};
+use super::CBORCase;
 use crate::{CBOR, Error, Result};
+
+/// `value` when it is within `min ..= max`, the range of the target type.
+fn in_range(value: i128, min: i128, max: i128) -> Result<i128> {
+    if value < min || value > max {
+        return Err(Error::OutOfRange);
+    }
+    Ok(value)
+}
 
 macro_rules! impl_cbor {
     ($type:ty) => {
-        impl From64 for $type {
-            fn cbor_data(&self) -> Vec<u8> {
-                #[allow(unused_comparisons)]
-                if *self < 0 {
-                    let n = (-1 - (*self as i128)) as u64;
-                    n.encode_varint(MajorType::Negative)
-                } else {
-                    let n = *self as u64;
-                    n.encode_varint(MajorType::Unsigned)
-                }
-            }
-        }
-
         impl From<$type> for CBOR {
             fn from(value: $type) -> Self {
                 #[allow(unused_comparisons)]
@@ -32,22 +24,21 @@ macro_rules! impl_cbor {
             }
         }
 
+        /// An unsigned argument `n` is the integer `n`; a negative argument
+        /// `n` is the integer `-1 - n`. Either is this type's value only
+        /// within its range: an unsigned type refuses every negative
+        /// integer.
         impl TryFrom<CBOR> for $type {
             type Error = Error;
 
             fn try_from(cbor: CBOR) -> Result<Self> {
-                match cbor.into_case() {
-                    CBORCase::Unsigned(n) => {
-                        Self::from_u64(n, <$type>::MAX as u64, |x| x as $type)
-                    }
-                    CBORCase::Negative(n) => {
-                        let a = Self::from_u64(n, <$type>::MAX as u64, |x| {
-                            x as $type
-                        })? as i128;
-                        Ok((-1 - a) as $type)
-                    }
+                let value = match cbor.into_case() {
+                    CBORCase::Unsigned(n) => n as i128,
+                    CBORCase::Negative(n) => -1 - (n as i128),
                     _ => return Err(Error::WrongType),
-                }
+                };
+                in_range(value, <$type>::MIN as i128, <$type>::MAX as i128)
+                    .map(|value| value as $type)
             }
         }
     };
@@ -63,29 +54,44 @@ impl_cbor!(i16);
 impl_cbor!(i32);
 impl_cbor!(i64);
 
-pub trait From64 {
-    fn cbor_data(&self) -> Vec<u8>;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn from_u64<F>(n: u64, max: u64, f: F) -> Result<Self>
-    where
-        F: Fn(u64) -> Self,
-        Self: Sized,
-    {
-        if n > max {
-            return Err(Error::OutOfRange);
-        }
-        Ok(f(n))
-    }
-
-    #[allow(dead_code)]
-    fn from_i64<F>(n: i64, min: i64, max: i64, f: F) -> Result<Self>
-    where
-        F: Fn(i64) -> Self,
-        Self: Sized,
-    {
-        if n > max || n > min {
-            return Err(Error::OutOfRange);
-        }
-        Ok(f(n))
+    /// Negative integers decode to their value in a signed type and are
+    /// refused by every unsigned type, never wrapped.
+    #[test]
+    fn negative_integers_decode_by_value_or_refuse() {
+        let minus_one = CBOR::from(-1i64);
+        assert!(matches!(
+            u8::try_from(minus_one.clone()),
+            Err(Error::OutOfRange)
+        ));
+        assert!(matches!(
+            u64::try_from(minus_one.clone()),
+            Err(Error::OutOfRange)
+        ));
+        assert!(matches!(
+            usize::try_from(minus_one.clone()),
+            Err(Error::OutOfRange)
+        ));
+        assert_eq!(i8::try_from(minus_one).ok(), Some(-1));
+        assert_eq!(i8::try_from(CBOR::from(-128i64)).ok(), Some(i8::MIN));
+        assert!(matches!(
+            i8::try_from(CBOR::from(-129i64)),
+            Err(Error::OutOfRange)
+        ));
+        assert_eq!(i64::try_from(CBOR::from(i64::MIN)).ok(), Some(i64::MIN));
+        let below: CBOR = CBORCase::Negative(i64::MAX as u64 + 1).into();
+        assert!(matches!(i64::try_from(below), Err(Error::OutOfRange)));
+        assert!(matches!(
+            u8::try_from(CBOR::from(256u64)),
+            Err(Error::OutOfRange)
+        ));
+        assert_eq!(u64::try_from(CBOR::from(u64::MAX)).ok(), Some(u64::MAX));
+        assert!(matches!(
+            i64::try_from(CBOR::from(u64::MAX)),
+            Err(Error::OutOfRange)
+        ));
     }
 }

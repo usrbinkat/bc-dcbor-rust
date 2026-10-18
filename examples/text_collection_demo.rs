@@ -18,12 +18,7 @@ fn main() {
         let indent = "  ".repeat(depth);
         match element {
             WalkElement::Single(cbor) => {
-                println!(
-                    "{}[{:?}] Single: {}",
-                    indent,
-                    edge,
-                    cbor.diagnostic_flat()
-                );
+                println!("{}[{:?}] Single: {}", indent, edge, cbor.diagnostic_flat());
                 if let CBORCase::Text(s) = cbor.as_case() {
                     texts.borrow_mut().push(format!("Single: {}", s));
                 }

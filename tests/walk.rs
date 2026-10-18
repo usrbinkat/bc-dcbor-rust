@@ -120,23 +120,20 @@ fn test_visitor_state_threading() {
 
     // Count only even numbers using visitor state and a RefCell
     let even_count = RefCell::new(0);
-    let visitor = |element: &WalkElement,
-                   _level: usize,
-                   _edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        match element {
-            WalkElement::Single(cbor) => {
-                if let CBORCase::Unsigned(n) = cbor.as_case()
-                    && n % 2 == 0
-                {
-                    *even_count.borrow_mut() += 1;
+    let visitor =
+        |element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+            match element {
+                WalkElement::Single(cbor) => {
+                    if let CBORCase::Unsigned(n) = cbor.as_case()
+                        && n % 2 == 0
+                    {
+                        *even_count.borrow_mut() += 1;
+                    }
                 }
+                WalkElement::KeyValue { .. } => {}
             }
-            WalkElement::KeyValue { .. } => {}
-        }
-        (state, false)
-    };
+            (state, false)
+        };
 
     array.walk((), &visitor);
     assert_eq!(*even_count.borrow(), 2); // 2 and 4 are even
@@ -159,13 +156,8 @@ fn test_early_termination() {
     let visit_log = RefCell::new(Vec::<String>::new());
     let found_abort = RefCell::new(false);
 
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        let desc =
-            format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+        let desc = format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
         visit_log.borrow_mut().push(desc);
 
         // Check if this is our abort marker
@@ -213,8 +205,7 @@ fn test_early_termination() {
 
     // Find the index of the third array visit
     let third_array_index = log_lines.iter().position(|line| {
-        line.contains("ArrayElement(2)")
-            && line.contains("[\"should\", \"not\", \"see\"]")
+        line.contains("ArrayElement(2)") && line.contains("[\"should\", \"not\", \"see\"]")
     });
 
     if let Some(index) = third_array_index {
@@ -254,16 +245,13 @@ fn test_depth_limited_traversal() {
     // Collect elements at each level
     let elements_by_level = RefCell::new(HashMap::<usize, usize>::new());
 
-    let visitor = |_element: &WalkElement,
-                   level: usize,
-                   _edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        *elements_by_level.borrow_mut().entry(level).or_insert(0) += 1;
-        // Stop descent if we're at level 2 or deeper
-        let stop = level >= 2;
-        (state, stop)
-    };
+    let visitor =
+        |_element: &WalkElement, level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+            *elements_by_level.borrow_mut().entry(level).or_insert(0) += 1;
+            // Stop descent if we're at level 2 or deeper
+            let stop = level >= 2;
+            (state, stop)
+        };
 
     root.walk((), &visitor);
 
@@ -296,28 +284,25 @@ fn test_text_extraction() {
     // Extract all text strings
     let texts = RefCell::new(Vec::<String>::new());
 
-    let visitor = |element: &WalkElement,
-                   _level: usize,
-                   _edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        match element {
-            WalkElement::Single(cbor) => {
-                if let CBORCase::Text(text) = cbor.as_case() {
-                    texts.borrow_mut().push(text.clone());
+    let visitor =
+        |element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+            match element {
+                WalkElement::Single(cbor) => {
+                    if let CBORCase::Text(text) = cbor.as_case() {
+                        texts.borrow_mut().push(text.clone());
+                    }
+                }
+                WalkElement::KeyValue { key, value } => {
+                    if let CBORCase::Text(text) = key.as_case() {
+                        texts.borrow_mut().push(text.clone());
+                    }
+                    if let CBORCase::Text(text) = value.as_case() {
+                        texts.borrow_mut().push(text.clone());
+                    }
                 }
             }
-            WalkElement::KeyValue { key, value } => {
-                if let CBORCase::Text(text) = key.as_case() {
-                    texts.borrow_mut().push(text.clone());
-                }
-                if let CBORCase::Text(text) = value.as_case() {
-                    texts.borrow_mut().push(text.clone());
-                }
-            }
-        }
-        (state, false)
-    };
+            (state, false)
+        };
 
     cbor.walk((), &visitor);
 
@@ -350,11 +335,7 @@ fn test_traversal_order_and_edge_types() {
 
     let traversal_log = RefCell::new(Vec::<(String, EdgeType)>::new());
 
-    let visitor = |element: &WalkElement,
-                   _level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
+    let visitor = |element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
         let desc = match element {
             WalkElement::Single(cbor) => {
                 format!("Single({})", cbor.diagnostic_flat())
@@ -396,14 +377,11 @@ fn test_tagged_value_traversal() {
 
     let edge_log = RefCell::new(Vec::<EdgeType>::new());
 
-    let visitor = |_element: &WalkElement,
-                   _level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        edge_log.borrow_mut().push(edge);
-        (state, false)
-    };
+    let visitor =
+        |_element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+            edge_log.borrow_mut().push(edge);
+            (state, false)
+        };
 
     outer_tagged.walk((), &visitor);
 
@@ -430,11 +408,7 @@ fn test_map_keyvalue_semantics() {
     let keyvalue_count = RefCell::new(0);
     let individual_count = RefCell::new(0);
 
-    let visitor = |element: &WalkElement,
-                   _level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
+    let visitor = |element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
         match element {
             WalkElement::KeyValue { .. } => {
                 *keyvalue_count.borrow_mut() += 1;
@@ -467,13 +441,8 @@ fn test_stop_flag_prevents_descent() {
 
     let visit_log = RefCell::new(Vec::<String>::new());
 
-    let visitor = |element: &WalkElement,
-                   level: usize,
-                   edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        let desc =
-            format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
+    let visitor = |element: &WalkElement, level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+        let desc = format!("L{}: {:?} - {}", level, edge, element.diagnostic_flat());
         visit_log.borrow_mut().push(desc);
 
         // Stop descent into the first nested array (at index 0)
@@ -511,15 +480,11 @@ fn test_stop_flag_prevents_descent() {
     // Should find level 2 visits from second and third arrays
     assert!(
         log_str.contains("L2:")
-            && (log_str.contains(" - 4")
-                || log_str.contains(" - 5")
-                || log_str.contains(" - 6"))
+            && (log_str.contains(" - 4") || log_str.contains(" - 5") || log_str.contains(" - 6"))
     );
     assert!(
         log_str.contains("L2:")
-            && (log_str.contains(" - 7")
-                || log_str.contains(" - 8")
-                || log_str.contains(" - 9"))
+            && (log_str.contains(" - 7") || log_str.contains(" - 8") || log_str.contains(" - 9"))
     );
 }
 
@@ -582,28 +547,25 @@ fn test_real_world_document() {
     // Extract all string values for search/indexing
     let strings = RefCell::new(Vec::<String>::new());
 
-    let visitor = |element: &WalkElement,
-                   _level: usize,
-                   _edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        match element {
-            WalkElement::Single(cbor) => {
-                if let CBORCase::Text(text) = cbor.as_case() {
-                    strings.borrow_mut().push(text.clone());
+    let visitor =
+        |element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+            match element {
+                WalkElement::Single(cbor) => {
+                    if let CBORCase::Text(text) = cbor.as_case() {
+                        strings.borrow_mut().push(text.clone());
+                    }
+                }
+                WalkElement::KeyValue { key, value } => {
+                    if let CBORCase::Text(text) = key.as_case() {
+                        strings.borrow_mut().push(text.clone());
+                    }
+                    if let CBORCase::Text(text) = value.as_case() {
+                        strings.borrow_mut().push(text.clone());
+                    }
                 }
             }
-            WalkElement::KeyValue { key, value } => {
-                if let CBORCase::Text(text) = key.as_case() {
-                    strings.borrow_mut().push(text.clone());
-                }
-                if let CBORCase::Text(text) = value.as_case() {
-                    strings.borrow_mut().push(text.clone());
-                }
-            }
-        }
-        (state, false)
-    };
+            (state, false)
+        };
 
     document.walk((), &visitor);
 
@@ -638,14 +600,11 @@ fn test_real_world_document() {
 // Helper function to count total visits
 fn count_visits(cbor: &CBOR) -> usize {
     let count = RefCell::new(0);
-    let visitor = |_element: &WalkElement,
-                   _level: usize,
-                   _edge: EdgeType,
-                   state: ()|
-     -> ((), bool) {
-        *count.borrow_mut() += 1;
-        (state, false)
-    };
+    let visitor =
+        |_element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+            *count.borrow_mut() += 1;
+            (state, false)
+        };
 
     cbor.walk((), &visitor);
     *count.borrow()

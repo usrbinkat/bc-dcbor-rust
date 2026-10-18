@@ -281,10 +281,7 @@ impl CBOR {
     ///
     /// Returns `Ok` if the value is a tagged value with the expected tag, `Err`
     /// otherwise.
-    pub fn try_into_expected_tagged_value(
-        self,
-        expected_tag: impl Into<Tag>,
-    ) -> Result<CBOR> {
+    pub fn try_into_expected_tagged_value(self, expected_tag: impl Into<Tag>) -> Result<CBOR> {
         let (tag, value) = self.try_into_tagged_value()?;
         let expected_tag = expected_tag.into();
         if tag == expected_tag {
@@ -326,10 +323,7 @@ impl CBOR {
     /// let result = CBOR::try_expected_tagged_value(&tagged, 43);
     /// assert!(result.is_err());
     /// ```
-    pub fn try_expected_tagged_value(
-        &self,
-        expected_tag: impl Into<Tag>,
-    ) -> Result<CBOR> {
+    pub fn try_expected_tagged_value(&self, expected_tag: impl Into<Tag>) -> Result<CBOR> {
         self.clone().try_into_expected_tagged_value(expected_tag)
     }
 }
@@ -350,9 +344,13 @@ impl CBOR {
         matches!(self.as_case(), CBORCase::Text(_))
     }
 
-    pub fn try_text(&self) -> Result<String> { self.clone().try_into_text() }
+    pub fn try_text(&self) -> Result<String> {
+        self.clone().try_into_text()
+    }
 
-    pub fn into_text(self) -> Option<String> { self.try_into_text().ok() }
+    pub fn into_text(self) -> Option<String> {
+        self.try_into_text().ok()
+    }
 
     pub fn as_text(&self) -> Option<&str> {
         match self.as_case() {
@@ -382,7 +380,9 @@ impl CBOR {
         self.clone().try_into_array()
     }
 
-    pub fn into_array(self) -> Option<Vec<CBOR>> { self.try_into_array().ok() }
+    pub fn into_array(self) -> Option<Vec<CBOR>> {
+        self.try_into_array().ok()
+    }
 
     pub fn as_array(&self) -> Option<&[CBOR]> {
         match self.as_case() {
@@ -404,11 +404,17 @@ impl CBOR {
         }
     }
 
-    pub fn is_map(&self) -> bool { matches!(self.as_case(), CBORCase::Map(_)) }
+    pub fn is_map(&self) -> bool {
+        matches!(self.as_case(), CBORCase::Map(_))
+    }
 
-    pub fn try_map(&self) -> Result<Map> { self.clone().try_into_map() }
+    pub fn try_map(&self) -> Result<Map> {
+        self.clone().try_into_map()
+    }
 
-    pub fn into_map(self) -> Option<Map> { self.try_into_map().ok() }
+    pub fn into_map(self) -> Option<Map> {
+        self.try_into_map().ok()
+    }
 
     /// Extract the CBOR value as a simple value.
     ///
@@ -431,10 +437,14 @@ impl CBOR {
 /// Conveniences for booleans.
 impl CBOR {
     /// The CBOR simple value representing `false`.
-    pub fn r#false() -> Self { CBORCase::Simple(Simple::False).into() }
+    pub fn r#false() -> Self {
+        CBORCase::Simple(Simple::False).into()
+    }
 
     /// The CBOR simple value representing `true`.
-    pub fn r#true() -> Self { CBORCase::Simple(Simple::True).into() }
+    pub fn r#true() -> Self {
+        CBORCase::Simple(Simple::True).into()
+    }
 
     pub fn as_bool(&self) -> Option<bool> {
         match self.as_case() {
@@ -458,7 +468,9 @@ impl CBOR {
         )
     }
 
-    pub fn try_bool(&self) -> Result<bool> { self.clone().try_into_bool() }
+    pub fn try_bool(&self) -> Result<bool> {
+        self.clone().try_into_bool()
+    }
 
     /// Check if the CBOR value is true.
     pub fn is_true(&self) -> bool {
@@ -490,7 +502,9 @@ impl CBOR {
     /// assert!(null_value.is_null());
     /// assert_eq!(null_value.diagnostic(), "null");
     /// ```
-    pub fn null() -> Self { CBORCase::Simple(Simple::Null).into() }
+    pub fn null() -> Self {
+        CBORCase::Simple(Simple::Null).into()
+    }
 
     /// Checks if the CBOR value is `null`.
     ///
@@ -593,5 +607,7 @@ impl CBOR {
     /// let nan_value = CBOR::nan();
     /// assert!(nan_value.is_nan());
     /// ```
-    pub fn nan() -> Self { CBORCase::Simple(Simple::Float(f64::NAN)).into() }
+    pub fn nan() -> Self {
+        CBORCase::Simple(Simple::Float(f64::NAN)).into()
+    }
 }

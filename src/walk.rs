@@ -84,11 +84,7 @@ impl WalkElement {
         match self {
             WalkElement::Single(cbor) => cbor.diagnostic_flat(),
             WalkElement::KeyValue { key, value } => {
-                format!(
-                    "{}: {}",
-                    key.diagnostic_flat(),
-                    value.diagnostic_flat()
-                )
+                format!("{}: {}", key.diagnostic_flat(), value.diagnostic_flat())
             }
         }
     }
@@ -181,8 +177,7 @@ impl EdgeType {
 /// # Type Parameters
 ///
 /// * `State` - The type of context passed between parent and child elements
-pub type Visitor<'a, State> =
-    dyn Fn(&WalkElement, usize, EdgeType, State) -> (State, bool) + 'a;
+pub type Visitor<'a, State> = dyn Fn(&WalkElement, usize, EdgeType, State) -> (State, bool) + 'a;
 
 /// Functions for traversing and manipulating the CBOR hierarchy.
 impl CBOR {
@@ -309,28 +304,13 @@ impl CBOR {
                     // Then visit key and value individually
                     // This allows consistent access to all keys and values,
                     // whether they are primitives or nested structures
-                    key._walk(
-                        next_level,
-                        EdgeType::MapKey,
-                        new_state.clone(),
-                        visit,
-                    );
-                    value._walk(
-                        next_level,
-                        EdgeType::MapValue,
-                        new_state,
-                        visit,
-                    );
+                    key._walk(next_level, EdgeType::MapKey, new_state.clone(), visit);
+                    value._walk(next_level, EdgeType::MapValue, new_state, visit);
                 }
             }
             CBORCase::Tagged(_tag, content) => {
                 // Visit the content with TaggedContent edge type
-                content._walk(
-                    next_level,
-                    EdgeType::TaggedContent,
-                    state,
-                    visit,
-                );
+                content._walk(next_level, EdgeType::TaggedContent, state, visit);
             }
             // Primitive types have no children to traverse
             CBORCase::Unsigned(_)
@@ -357,14 +337,11 @@ mod tests {
         let cbor = CBOR::from(42);
         let count = RefCell::new(0);
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       _edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
         assert_eq!(*count.borrow(), 1);
@@ -376,15 +353,12 @@ mod tests {
         let count = RefCell::new(0);
         let edges = RefCell::new(Vec::new());
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            edges.borrow_mut().push(edge);
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                edges.borrow_mut().push(edge);
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -408,15 +382,12 @@ mod tests {
         let count = RefCell::new(0);
         let edges = RefCell::new(Vec::new());
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            edges.borrow_mut().push(edge);
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                edges.borrow_mut().push(edge);
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -443,15 +414,12 @@ mod tests {
         let count = RefCell::new(0);
         let edges = RefCell::new(Vec::new());
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            edges.borrow_mut().push(edge);
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                edges.borrow_mut().push(edge);
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -471,18 +439,15 @@ mod tests {
 
         let key_value_pairs = RefCell::new(Vec::new());
 
-        let visitor = |element: &WalkElement,
-                       _level: usize,
-                       _edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            if let Some((key, value)) = element.as_key_value()
-                && let (CBORCase::Text(k), _) = (key.as_case(), value.as_case())
-            {
-                key_value_pairs.borrow_mut().push(k.clone());
-            }
-            (state, false)
-        };
+        let visitor =
+            |element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+                if let Some((key, value)) = element.as_key_value()
+                    && let (CBORCase::Text(k), _) = (key.as_case(), value.as_case())
+                {
+                    key_value_pairs.borrow_mut().push(k.clone());
+                }
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -503,15 +468,12 @@ mod tests {
         let count = RefCell::new(0);
         let edges = RefCell::new(Vec::new());
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            edges.borrow_mut().push(edge);
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                edges.borrow_mut().push(edge);
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -533,14 +495,11 @@ mod tests {
 
         let count = RefCell::new(0);
 
-        let visitor = |_element: &WalkElement,
-                       _level: usize,
-                       _edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            *count.borrow_mut() += 1;
-            (state, false)
-        };
+        let visitor =
+            |_element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+                *count.borrow_mut() += 1;
+                (state, false)
+            };
 
         cbor.walk((), &visitor);
 
@@ -560,22 +519,19 @@ mod tests {
 
         let visited = RefCell::new(Vec::new());
 
-        let visitor = |element: &WalkElement,
-                       _level: usize,
-                       _edge: EdgeType,
-                       state: ()|
-         -> ((), bool) {
-            // Record what we visited
-            visited.borrow_mut().push(element.diagnostic_flat());
+        let visitor =
+            |element: &WalkElement, _level: usize, _edge: EdgeType, state: ()| -> ((), bool) {
+                // Record what we visited
+                visited.borrow_mut().push(element.diagnostic_flat());
 
-            // Stop traversal when we encounter the "stop" text
-            let should_stop = if let Some(single) = element.as_single() {
-                matches!(single.as_case(), CBORCase::Text(s) if s == "stop")
-            } else {
-                false
+                // Stop traversal when we encounter the "stop" text
+                let should_stop = if let Some(single) = element.as_single() {
+                    matches!(single.as_case(), CBORCase::Text(s) if s == "stop")
+                } else {
+                    false
+                };
+                (state, should_stop)
             };
-            (state, should_stop)
-        };
 
         cbor.walk((), &visitor);
 
@@ -630,9 +586,6 @@ mod tests {
         );
         assert_eq!(EdgeType::MapKey.label(), Some("key".to_string()));
         assert_eq!(EdgeType::MapValue.label(), Some("val".to_string()));
-        assert_eq!(
-            EdgeType::TaggedContent.label(),
-            Some("content".to_string())
-        );
+        assert_eq!(EdgeType::TaggedContent.label(), Some("content".to_string()));
     }
 }

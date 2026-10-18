@@ -3,9 +3,7 @@ use std::cell::RefCell;
 use dcbor::{prelude::*, walk::WalkElement};
 
 fn main() {
-    println!(
-        "=== Testing CONSISTENT stop behavior: 'Prevent descent into children' ===\n"
-    );
+    println!("=== Testing CONSISTENT stop behavior: 'Prevent descent into children' ===\n");
 
     // Test case 1: Depth-limited traversal
     println!("Test 1: Depth-limited traversal (max_level = 1)");
@@ -36,10 +34,7 @@ fn main() {
 
         let should_stop = level >= max_level;
         if should_stop {
-            println!(
-                "L{} {}🛑 STOP (max level): {}",
-                level, indent, description
-            );
+            println!("L{} {}🛑 STOP (max level): {}", level, indent, description);
         } else {
             println!("L{} {}✅ Visit: {}", level, indent, description);
         }

@@ -29,6 +29,8 @@ use crate::{
 /// CBOR data item using a reference-counted wrapper around a [`CBORCase`] enum.
 /// This design allows efficient sharing of CBOR data structures in memory
 /// without excessive copying.
+/// Low-level [`CBORCase`] construction is not validated: it can create values
+/// outside the draft-12 profile, notably wide negative integer arguments.
 ///
 /// # Features
 ///
@@ -97,7 +99,9 @@ use crate::{
 pub struct CBOR(RefCounted<CBORCase>);
 
 impl CBOR {
-    pub fn as_case(&self) -> &CBORCase { &self.0 }
+    pub fn as_case(&self) -> &CBORCase {
+        &self.0
+    }
 
     pub fn into_case(self) -> CBORCase {
         match RefCounted::try_unwrap(self.0) {
@@ -108,7 +112,9 @@ impl CBOR {
 }
 
 impl From<CBORCase> for CBOR {
-    fn from(case: CBORCase) -> Self { Self(RefCounted::new(case)) }
+    fn from(case: CBORCase) -> Self {
+        Self(RefCounted::new(case))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -173,7 +179,10 @@ pub enum CBORCase {
     /// Negative integer (major type 1).
     ///
     /// Actual value is -1 - n, allowing representation of negative integers
-    /// from -1 to -2^64.
+    /// from -1 to -2^64 in general CBOR. Draft-12 dCBOR permits only arguments
+    /// `0..=i64::MAX`, representing `-1..=i64::MIN`. This public variant does
+    /// not enforce that range. Serialization emits the argument unchanged;
+    /// the strict decoder rejects an out-of-profile negative argument.
     Negative(u64),
 
     /// Byte string (major type 2).
@@ -295,6 +304,9 @@ impl CBOR {
     ///
     /// This method converts the CBOR value to a byte vector according to the
     /// dCBOR specification, ensuring deterministic encoding.
+    /// Low-level out-of-profile values such as `CBORCase::Negative(n)` with
+    /// `n > i64::MAX` are emitted unchanged, not validated or rounded. Such
+    /// bytes will be rejected by [`Self::try_from_data`].
     ///
     /// # Returns
     ///
@@ -360,9 +372,7 @@ impl PartialEq for CBOR {
             (CBORCase::Text(l0), CBORCase::Text(r0)) => l0 == r0,
             (CBORCase::Array(l0), CBORCase::Array(r0)) => l0 == r0,
             (CBORCase::Map(l0), CBORCase::Map(r0)) => l0 == r0,
-            (CBORCase::Tagged(l0, l1), CBORCase::Tagged(r0, r1)) => {
-                l0 == r0 && l1 == r1
-            }
+            (CBORCase::Tagged(l0, l1), CBORCase::Tagged(r0, r1)) => l0 == r0 && l1 == r1,
             (CBORCase::Simple(l0), CBORCase::Simple(r0)) => l0 == r0,
             _ => false,
         }
@@ -428,33 +438,24 @@ fn format_array(a: &[CBOR]) -> String {
 }
 
 fn format_map(m: &Map) -> String {
-    let s: Vec<String> =
-        m.iter().map(|x| format!("{}: {}", x.0, x.1)).collect();
+    let s: Vec<String> = m.iter().map(|x| format!("{}: {}", x.0, x.1)).collect();
     flanked(&s.join(", "), "{", "}")
 }
 
 impl fmt::Debug for CBOR {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.as_case() {
-            CBORCase::Unsigned(x) => {
-                f.debug_tuple("unsigned").field(x).finish()
-            }
+            CBORCase::Unsigned(x) => f.debug_tuple("unsigned").field(x).finish(),
             CBORCase::Negative(x) => f
                 .debug_tuple("negative")
                 .field(&(-1 - (*x as i128)))
                 .finish(),
-            CBORCase::ByteString(x) => {
-                f.write_fmt(format_args!("bytes({})", hex::encode(x)))
-            }
+            CBORCase::ByteString(x) => f.write_fmt(format_args!("bytes({})", hex::encode(x))),
             CBORCase::Text(x) => f.debug_tuple("text").field(x).finish(),
             CBORCase::Array(x) => f.debug_tuple("array").field(x).finish(),
             CBORCase::Map(x) => f.debug_tuple("map").field(x).finish(),
-            CBORCase::Tagged(tag, item) => {
-                f.write_fmt(format_args!("tagged({}, {:?})", tag, item))
-            }
-            CBORCase::Simple(x) => {
-                f.write_fmt(format_args!("simple({})", x.name()))
-            }
+            CBORCase::Tagged(tag, item) => f.write_fmt(format_args!("tagged({}, {:?})", tag, item)),
+            CBORCase::Simple(x) => f.write_fmt(format_args!("simple({})", x.name())),
         }
     }
 }
