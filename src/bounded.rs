@@ -761,26 +761,19 @@ impl<P> AsRef<[u8]> for Encoded<P> {
 }
 
 /// Prepare, admit output storage and initialization, allocate fallibly, and
-/// publish only a complete encoding. On every error all owned permits unwind.
+/// publish only a complete encoding, all under one policy. On every error all
+/// owned permits unwind. A caller that prepares under one policy and writes
+/// under another (an admitted unit) uses [`prepare`] and
+/// [`Prepared::encode_owned`] directly.
 pub fn encode<T: BoundedEncodable + ?Sized, A: Allocator>(
     value: &T,
     allocator: &mut A,
 ) -> BoundedResult<Encoded<A::Permit>, A> {
     let prepared = prepare(value, allocator)?;
-    let len = prepared.len();
-    let size = usize::try_from(len).map_err(|_| BoundedError::Overflow)?;
-    let permit = allocator.allocate(len).map_err(BoundedError::Refused)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(size)
-        .map_err(|_| BoundedError::Allocation { bytes: len })?;
-    allocator.traverse(0, len).map_err(BoundedError::Refused)?;
-    bytes.resize(size, 0);
-    prepared.encode_into(&mut bytes, allocator)?;
-    Ok(Encoded {
-        bytes,
-        _permit: permit,
-    })
+    let permit = allocator
+        .allocate(prepared.len())
+        .map_err(BoundedError::Refused)?;
+    prepared.encode_owned(permit, allocator)
 }
 
 impl<T: BoundedEncodable + ?Sized, P> Prepared<'_, T, P> {
@@ -799,6 +792,35 @@ impl<T: BoundedEncodable + ?Sized, P> Prepared<'_, T, P> {
     /// The work the write reports at most.
     pub const fn write_work(&self) -> WriteWork {
         self.measure.write
+    }
+
+    /// Write the encoding into storage this call allocates fallibly at
+    /// exactly [`Self::len`] bytes, owned with `permit`, the reservation the
+    /// caller admitted for that storage; `budget` is told of the output's
+    /// initialization (`traverse(0, len)`) before it is touched, then of the
+    /// write as [`Self::encode_into`] reports it. The bytes are published only
+    /// once the encoding is complete; on every error the storage is freed and
+    /// `permit` dropped after it. The budget may differ from the preparation's
+    /// allocator: a caller admits the output, its initialization and the
+    /// predicted write as one unit and writes on that unit.
+    pub fn encode_owned<Q, B: Budget>(
+        &self,
+        permit: Q,
+        budget: &mut B,
+    ) -> BoundedResult<Encoded<Q>, B> {
+        let len = self.measure.len;
+        let size = usize::try_from(len).map_err(|_| BoundedError::Overflow)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| BoundedError::Allocation { bytes: len })?;
+        budget.traverse(0, len).map_err(BoundedError::Refused)?;
+        bytes.resize(size, 0);
+        self.encode_into(&mut bytes, budget)?;
+        Ok(Encoded {
+            bytes,
+            _permit: permit,
+        })
     }
 
     /// Write the encoding into `bytes`, which must be exactly [`Self::len`]

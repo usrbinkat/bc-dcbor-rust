@@ -356,6 +356,36 @@ fn a_refusal_is_returned_as_the_budget_gave_it() {
     );
 }
 
+/// A value prepared under one policy is written under another into storage
+/// owned with the caller's permit: the writing budget is told of the
+/// initialization and the write, never of an allocation; a refused write
+/// publishes nothing and drops the permit.
+#[test]
+fn an_owned_encoding_is_written_under_its_own_budget() {
+    let mut preparing = Tally::unlimited();
+    let prepared = prepare(&24u64, &mut preparing).unwrap();
+    let mut storage = Tally::unlimited();
+    let permit = storage.allocate(prepared.len()).unwrap();
+    let mut writing = Tally::unlimited();
+    let encoded = prepared.encode_owned(permit, &mut writing).unwrap();
+    assert_eq!(encoded.as_ref(), [0x18, 0x18]);
+    assert_eq!(writing.bytes, 2, "the initialization of both bytes");
+    assert_eq!(writing.values, 1, "the number's one value");
+    assert_eq!(writing.requested, 0, "the writing budget allocates nothing");
+    assert_eq!(storage.live(), 2, "the permit lives with the bytes");
+    drop(encoded);
+    assert_eq!(storage.live(), 0, "and is released with them");
+
+    let permit = storage.allocate(prepared.len()).unwrap();
+    assert_eq!(
+        prepared
+            .encode_owned(permit, &mut Tally::limited(0))
+            .map(|encoded| encoded.as_ref().to_vec()),
+        Err(BoundedError::Refused("traversal refused"))
+    );
+    assert_eq!(storage.live(), 0, "a refused write drops its permit");
+}
+
 #[test]
 fn work_composition_is_checked() {
     let most = WriteWork::new(u64::MAX, 0);

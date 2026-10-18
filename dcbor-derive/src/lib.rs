@@ -224,6 +224,19 @@ pub fn derive_cbor_bounded_encodable(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Derive `dcbor::bounded::decode::BoundedDecodable` from the same schema as
+/// `TryFrom<CBOR>`: the same field keys, optional-field omission, unknown
+/// keys ignored, discriminants and tag, read from a strictly decoded
+/// document without a symbolic tree.
+#[proc_macro_derive(CBORBoundedDecodable, attributes(cbor))]
+pub fn derive_cbor_bounded_decodable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match Schema::parse(&input).map(|schema| schema.constructible()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attribute parsing
 // ---------------------------------------------------------------------------
@@ -464,6 +477,21 @@ impl<'a> Schema<'a> {
 
     fn name(&self) -> &Ident {
         &self.input.ident
+    }
+
+    /// A generic parameter name for a generated method, `prefix` extended
+    /// with `_` until it differs from every type and const parameter of the
+    /// input, at mixed-site hygiene.
+    fn fresh(&self, prefix: &str) -> Ident {
+        let mut candidate = prefix.to_string();
+        while self.input.generics.params.iter().any(|param| match param {
+            syn::GenericParam::Type(p) => p.ident == candidate,
+            syn::GenericParam::Const(p) => p.ident == candidate,
+            syn::GenericParam::Lifetime(_) => false,
+        }) {
+            candidate.push('_');
+        }
+        Ident::new(&candidate, proc_macro2::Span::mixed_site())
     }
 
     /// Bounds apply to the representation's field types, not indiscriminately
@@ -973,20 +1001,9 @@ impl Schema<'_> {
                 .predicates
                 .push(syn::parse_quote!(#ty: dcbor::bounded::BoundedEncodable));
         }
-        let fresh = |prefix: &str| {
-            let mut candidate = prefix.to_string();
-            while self.input.generics.params.iter().any(|param| match param {
-                syn::GenericParam::Type(p) => p.ident == candidate,
-                syn::GenericParam::Const(p) => p.ident == candidate,
-                syn::GenericParam::Lifetime(_) => false,
-            }) {
-                candidate.push('_');
-            }
-            Ident::new(&candidate, proc_macro2::Span::mixed_site())
-        };
-        let allocator_type = fresh("__DcborAllocator");
-        let permit_type = fresh("__DcborPermit");
-        let budget_type = fresh("__DcborBudget");
+        let allocator_type = self.fresh("__DcborAllocator");
+        let permit_type = self.fresh("__DcborPermit");
+        let budget_type = self.fresh("__DcborBudget");
         let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
         let measured_visit = visit("allocator", 1);
         let written_visit = visit("budget", 1);
@@ -1198,6 +1215,231 @@ fn bounded_enum(name: &Ident, variants: &[Variant]) -> (TokenStream2, TokenStrea
         }
     };
     (fixed, measure, write)
+}
+
+// ---------------------------------------------------------------------------
+// Bounded construction expansion
+// ---------------------------------------------------------------------------
+
+/// The construction of the map `node` (an expression of a decoded node) as
+/// `path { fields }`: one pass over its entries in canonical key order, each
+/// key a schema field's assigning its slot, every other key ignored as the
+/// symbolic extraction ignores it; a required field without its key is
+/// `MissingMapKey`, an optional one is `None`.
+fn construct_map(fields: &MapFields, path: TokenStream2, node: TokenStream2) -> TokenStream2 {
+    let visit = visit("allocator", 1);
+    let slots: Vec<Ident> = (0..fields.0.len())
+        .map(|index| {
+            Ident::new(
+                &format!("__dcbor_field_{index}"),
+                proc_macro2::Span::mixed_site(),
+            )
+        })
+        .collect();
+    let arms = fields.0.iter().zip(&slots).map(|(field, slot)| {
+        let key = field.key;
+        quote! {
+            dcbor::bounded::decode::Kind::Unsigned(#key) => {
+                #slot = Some(dcbor::bounded::decode::BoundedDecodable::construct(
+                    __dcbor_value,
+                    permits,
+                    allocator,
+                )?);
+            }
+        }
+    });
+    let values = fields.0.iter().zip(&slots).map(|(field, slot)| {
+        let ident = &field.ident;
+        if field.optional {
+            quote! { #ident: #slot }
+        } else {
+            quote! {
+                #ident: #slot.ok_or(dcbor::bounded::decode::DecodeError::Invalid(
+                    dcbor::Error::MissingMapKey,
+                ))?
+            }
+        }
+    });
+    quote! {{
+        #visit
+        let dcbor::bounded::decode::Kind::Map(_) = (#node).kind() else {
+            return Err(dcbor::bounded::decode::wrong_type());
+        };
+        #(let mut #slots = None;)*
+        let mut __dcbor_entries = (#node).children();
+        while let Some(__dcbor_key) = __dcbor_entries.next() {
+            let __dcbor_value = __dcbor_entries
+                .next()
+                .ok_or_else(dcbor::bounded::decode::wrong_type)?;
+            #visit
+            match __dcbor_key.kind() {
+                #(#arms)*
+                _ => {}
+            }
+        }
+        Ok(#path { #(#values),* })
+    }}
+}
+
+/// The construction of an enum from `node`: a unit variant from its bare
+/// discriminant, a tuple variant from `[discriminant, fields...]`, a struct
+/// variant from `[discriminant, {map}]`, accepting exactly the forms
+/// `TryFrom<CBOR>` accepts.
+fn construct_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
+    let visit = visit("allocator", 1);
+    let mut unit_arms = Vec::new();
+    let mut array_arms = Vec::new();
+    for variant in variants {
+        let disc = variant.discriminant;
+        let vname = &variant.ident;
+        match &variant.kind {
+            VariantKind::Unit => unit_arms.push(quote! { #disc => Ok(#name::#vname), }),
+            VariantKind::Tuple(count) => {
+                let expected = (*count as u64) + 1;
+                let fields = (0..*count).map(|_| {
+                    quote! {
+                        dcbor::bounded::decode::BoundedDecodable::construct(
+                            __dcbor_items
+                                .next()
+                                .ok_or_else(dcbor::bounded::decode::wrong_type)?,
+                            permits,
+                            allocator,
+                        )?
+                    }
+                });
+                array_arms.push(quote! {
+                    #disc => {
+                        if __dcbor_length != #expected {
+                            return Err(dcbor::bounded::decode::wrong_type());
+                        }
+                        Ok(#name::#vname(#(#fields),*))
+                    }
+                });
+            }
+            VariantKind::Named(fields) => {
+                let map = construct_map(fields, quote! { #name::#vname }, quote! { __dcbor_map });
+                array_arms.push(quote! {
+                    #disc => {
+                        if __dcbor_length != 2 {
+                            return Err(dcbor::bounded::decode::wrong_type());
+                        }
+                        let __dcbor_map = __dcbor_items
+                            .next()
+                            .ok_or_else(dcbor::bounded::decode::wrong_type)?;
+                        #map
+                    }
+                });
+            }
+        }
+    }
+    let unit = (!unit_arms.is_empty()).then(|| {
+        quote! {
+            dcbor::bounded::decode::Kind::Unsigned(__dcbor_disc) => match __dcbor_disc {
+                #(#unit_arms)*
+                _ => Err(dcbor::bounded::decode::wrong_type()),
+            },
+        }
+    });
+    let array = (!array_arms.is_empty()).then(|| {
+        quote! {
+            dcbor::bounded::decode::Kind::Array(__dcbor_length) => {
+                let mut __dcbor_items = node.children();
+                let __dcbor_disc = match __dcbor_items.next().map(|item| item.kind()) {
+                    Some(dcbor::bounded::decode::Kind::Unsigned(disc)) => disc,
+                    Some(dcbor::bounded::decode::Kind::Negative(_)) => {
+                        return Err(dcbor::bounded::decode::DecodeError::Invalid(
+                            dcbor::Error::OutOfRange,
+                        ));
+                    }
+                    _ => return Err(dcbor::bounded::decode::wrong_type()),
+                };
+                match __dcbor_disc {
+                    #(#array_arms)*
+                    _ => Err(dcbor::bounded::decode::wrong_type()),
+                }
+            }
+        }
+    });
+    quote! {
+        #visit
+        match node.kind() {
+            #unit
+            #array
+            _ => Err(dcbor::bounded::decode::wrong_type()),
+        }
+    }
+}
+
+impl Schema<'_> {
+    fn constructible(&self) -> TokenStream2 {
+        let name = self.name();
+        let mut generics = self.input.generics.clone();
+        for ty in self.field_types() {
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote!(#ty: dcbor::bounded::decode::BoundedDecodable));
+        }
+        let allocator_type = self.fresh("__DcborAllocator");
+        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        let visit = visit("allocator", 1);
+        let untagged = match &self.shape {
+            Shape::Map(fields) => construct_map(fields, quote! { #name }, quote! { node }),
+            Shape::Newtype(inner) => quote! {
+                Ok(#name(<#inner as dcbor::bounded::decode::BoundedDecodable>::construct(
+                    node,
+                    permits,
+                    allocator,
+                )?))
+            },
+            Shape::Unit => quote! {
+                #visit
+                match node.kind() {
+                    dcbor::bounded::decode::Kind::Null => Ok(#name),
+                    _ => Err(dcbor::bounded::decode::wrong_type()),
+                }
+            },
+            Shape::Enum(variants) => construct_enum(name, variants),
+        };
+        // A tagged type is read inside its tag, as `TryFrom<CBOR>` reads it.
+        let body = match self.tag {
+            Some(tag) => quote! {
+                #visit
+                let node = match node.kind() {
+                    dcbor::bounded::decode::Kind::Tagged(#tag) => node
+                        .children()
+                        .next()
+                        .ok_or_else(dcbor::bounded::decode::wrong_type)?,
+                    dcbor::bounded::decode::Kind::Tagged(found) => {
+                        return Err(dcbor::bounded::decode::DecodeError::Invalid(
+                            dcbor::Error::WrongTag(
+                                dcbor::Tag::with_value(#tag),
+                                dcbor::Tag::with_value(found),
+                            ),
+                        ));
+                    }
+                    _ => return Err(dcbor::bounded::decode::wrong_type()),
+                };
+                #untagged
+            },
+            None => untagged,
+        };
+        quote! {
+            impl #impl_generics dcbor::bounded::decode::BoundedDecodable for #name #ty_generics #where_clause {
+                #[allow(unused_variables, unused_mut, unreachable_code)]
+                fn construct<#allocator_type: dcbor::bounded::Allocator>(
+                    node: dcbor::bounded::decode::Node<'_, '_>,
+                    permits: &mut dcbor::bounded::Owned<
+                        #allocator_type::Permit,
+                        #allocator_type::Permit,
+                    >,
+                    allocator: &mut #allocator_type,
+                ) -> dcbor::bounded::decode::ConstructResult<Self, #allocator_type> {
+                    #body
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

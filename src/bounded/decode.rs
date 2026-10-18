@@ -20,7 +20,7 @@
 //! ```
 use super::*;
 use crate::{
-    Error,
+    Error, ExactFrom,
     float::{validate_canonical_f16, validate_canonical_f32, validate_canonical_f64},
 };
 
@@ -315,5 +315,218 @@ pub fn decode<'a, A: Allocator>(
             entries.items[completed].next = next;
             stack.items.pop();
         }
+    }
+}
+
+/// The result of constructing a typed value from a decoded document.
+pub type ConstructResult<T, A> = Result<T, DecodeError<<A as Budget>::Refusal>>;
+
+/// A typed value constructed from a decoded document ([`decode_typed`]),
+/// owned together with the permit of every heap allocation it holds. No API
+/// separates the value from its permits. Fields drop in order: the value's
+/// storage is freed before its permits are released.
+pub struct Constructed<T, P> {
+    value: T,
+    _permits: Owned<P, P>,
+}
+
+impl<T, P> Constructed<T, P> {
+    /// The constructed value, borrowed for as long as its storage is held.
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+}
+
+/// A type constructed from one node of a decoded document under the same
+/// representation its symbolic conversion (`TryFrom<CBOR>`) reads, field
+/// keys, discriminants, omission and tags included. Every unit of
+/// examination is reported to `allocator` before it is done, and every heap
+/// allocation the value holds is requested from it in its whole size before
+/// it is made, its permit pushed to `permits`, which outlive the value
+/// ([`Constructed`]). Derived types generate it from their schema
+/// (`CBORBoundedDecodable`).
+pub trait BoundedDecodable: Sized {
+    fn construct<A: Allocator>(
+        node: Node<'_, '_>,
+        permits: &mut Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> ConstructResult<Self, A>;
+}
+
+/// Request `bytes` of storage for a value under construction from
+/// `allocator`, its permit held by `permits`.
+pub fn hold<A: Allocator>(
+    bytes: u64,
+    permits: &mut Owned<A::Permit, A::Permit>,
+    allocator: &mut A,
+) -> ConstructResult<(), A> {
+    let permit = allocator.allocate(bytes).map_err(BoundedError::Refused)?;
+    permits.push(permit, allocator)?;
+    Ok(())
+}
+
+/// Report one value examined to `allocator`.
+pub fn visit<A: Allocator>(allocator: &mut A) -> ConstructResult<(), A> {
+    allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
+    Ok(())
+}
+
+/// A node of an unexpected kind: the error the symbolic conversion gives.
+pub fn wrong_type<R>() -> DecodeError<R> {
+    DecodeError::Invalid(Error::WrongType)
+}
+
+/// Decode `input` strictly ([`decode`]) and construct `T` from its root, on
+/// one allocator: the document's arena is released once the value is built,
+/// and the value is returned with the permits of what it holds.
+pub fn decode_typed<T: BoundedDecodable, A: Allocator>(
+    input: &[u8],
+    max_depth: usize,
+    allocator: &mut A,
+) -> ConstructResult<Constructed<T, A::Permit>, A> {
+    let document = decode(input, max_depth, allocator)?;
+    let mut permits = Owned::new();
+    let value = T::construct(document.root(), &mut permits, allocator)?;
+    drop(document);
+    Ok(Constructed {
+        value,
+        _permits: permits,
+    })
+}
+
+/// Integers by value, refused outside the target type's range, as
+/// `TryFrom<CBOR>` for each does (`int.rs`).
+macro_rules! impl_construct_integer {
+    ($($type:ty),*) => {$(
+        impl BoundedDecodable for $type {
+            fn construct<A: Allocator>(
+                node: Node<'_, '_>,
+                _: &mut Owned<A::Permit, A::Permit>,
+                allocator: &mut A,
+            ) -> ConstructResult<Self, A> {
+                visit(allocator)?;
+                let value = match node.kind() {
+                    Kind::Unsigned(n) => i128::from(n),
+                    Kind::Negative(n) => i128::from(n),
+                    _ => return Err(wrong_type()),
+                };
+                <$type>::try_from(value).map_err(|_| DecodeError::Invalid(Error::OutOfRange))
+            }
+        }
+    )*};
+}
+
+impl_construct_integer!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
+
+/// Floats from a float or an integer exactly representable in the target,
+/// as `TryFrom<CBOR>` for each does (`float.rs`).
+macro_rules! impl_construct_float {
+    ($($type:ty),*) => {$(
+        impl BoundedDecodable for $type {
+            fn construct<A: Allocator>(
+                node: Node<'_, '_>,
+                _: &mut Owned<A::Permit, A::Permit>,
+                allocator: &mut A,
+            ) -> ConstructResult<Self, A> {
+                visit(allocator)?;
+                let value = match node.kind() {
+                    Kind::Float(n) => <$type>::exact_from_f64(n),
+                    Kind::Unsigned(n) => <$type>::exact_from_u64(n),
+                    Kind::Negative(n) => <$type>::exact_from_i128(i128::from(n)),
+                    _ => return Err(wrong_type()),
+                };
+                value.ok_or(DecodeError::Invalid(Error::OutOfRange))
+            }
+        }
+    )*};
+}
+
+impl_construct_float!(f16, f32, f64);
+
+impl BoundedDecodable for bool {
+    fn construct<A: Allocator>(
+        node: Node<'_, '_>,
+        _: &mut Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> ConstructResult<Self, A> {
+        visit(allocator)?;
+        match node.kind() {
+            Kind::Bool(value) => Ok(value),
+            _ => Err(wrong_type()),
+        }
+    }
+}
+
+/// `bytes` copied into storage requested from `allocator` and allocated
+/// fallibly at exactly their length: the one owned copy construction makes.
+pub fn copy_bytes<A: Allocator>(
+    bytes: &[u8],
+    permits: &mut Owned<A::Permit, A::Permit>,
+    allocator: &mut A,
+) -> ConstructResult<Vec<u8>, A> {
+    let length = widen(bytes.len())?;
+    allocator
+        .traverse(0, length)
+        .map_err(BoundedError::Refused)?;
+    hold(length, permits, allocator)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| BoundedError::Allocation { bytes: length })?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+impl BoundedDecodable for String {
+    fn construct<A: Allocator>(
+        node: Node<'_, '_>,
+        permits: &mut Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> ConstructResult<Self, A> {
+        visit(allocator)?;
+        let Kind::Text(text) = node.kind() else {
+            return Err(wrong_type());
+        };
+        let bytes = copy_bytes(text.as_bytes(), permits, allocator)?;
+        // The bytes are the validated text's own.
+        String::from_utf8(bytes).map_err(|error| DecodeError::Invalid(Error::InvalidUtf8(error.utf8_error())))
+    }
+}
+
+impl BoundedDecodable for ByteString {
+    fn construct<A: Allocator>(
+        node: Node<'_, '_>,
+        permits: &mut Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> ConstructResult<Self, A> {
+        visit(allocator)?;
+        let Kind::Bytes(bytes) = node.kind() else {
+            return Err(wrong_type());
+        };
+        Ok(ByteString::from(copy_bytes(bytes, permits, allocator)?))
+    }
+}
+
+/// An array of its elements, its storage requested at its whole capacity
+/// before it is allocated.
+impl<T: BoundedDecodable> BoundedDecodable for Vec<T> {
+    fn construct<A: Allocator>(
+        node: Node<'_, '_>,
+        permits: &mut Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> ConstructResult<Self, A> {
+        visit(allocator)?;
+        let Kind::Array(count) = node.kind() else {
+            return Err(wrong_type());
+        };
+        let length = usize::try_from(count).map_err(|_| BoundedError::Overflow)?;
+        let bytes = mul(count, widen(core::mem::size_of::<T>())?)?;
+        hold(bytes, permits, allocator)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(length)
+            .map_err(|_| BoundedError::Allocation { bytes })?;
+        for child in node.children() {
+            out.push(T::construct(child, permits, allocator)?);
+        }
+        Ok(out)
     }
 }
