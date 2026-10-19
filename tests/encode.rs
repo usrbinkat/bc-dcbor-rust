@@ -450,7 +450,7 @@ fn encode_envelope() {
     );
     let bytes = CBOR::to_cbor_data(&envelope);
     assert_eq!(
-        format!("{}", hex::encode(&bytes)),
+        hex::encode(&bytes),
         "d8c882d8c8d8c965416c696365d8c8d8dd82d8c8d8c9656b6e6f7773d8c8d8c963426f62"
     );
     let decoded_cbor = CBOR::try_from_data(&bytes).unwrap();

@@ -205,8 +205,8 @@ fn enum_rejects_non_matching() {
 
 // --- Bounded encoding from the same schema ---
 
-use dcbor::bounded::{prepare, Allocator, BoundedEncodable, Budget, WriteWork};
 use dcbor::CBORBoundedEncodable;
+use dcbor::bounded::{Allocator, BoundedEncodable, Budget, WriteWork, prepare};
 
 #[derive(dcbor::CBORBoundedEncodable)]
 enum Collision {
@@ -444,9 +444,9 @@ fn unit_enums_of_one_width_have_a_fixed_measure() {
 
 // --- Bounded construction from the same schema ---
 
-use dcbor::bounded::decode::decode_typed;
-use dcbor::bounded::Limits;
 use dcbor::CBORBoundedDecodable;
+use dcbor::bounded::Limits;
+use dcbor::bounded::decode::decode_typed;
 
 #[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
 struct Constructed {

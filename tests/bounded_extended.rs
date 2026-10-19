@@ -2,11 +2,11 @@
 //! authoritative; symbolic comparisons supplement them.
 use dcbor::HashMap;
 use dcbor::{
+    CBOR, CBORCase, Date,
     bounded::{
-        decode::{decode, DecodeError, Kind},
+        decode::{DecodeError, Kind, decode},
         *,
     },
-    CBORCase, Date, CBOR,
 };
 use std::collections::BTreeMap;
 

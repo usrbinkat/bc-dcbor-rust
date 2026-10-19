@@ -1,5 +1,3 @@
-#[cfg(feature = "derive")]
-pub use crate::{CBORBoundedDecodable, CBORBoundedEncodable};
 #[cfg(feature = "num-bigint")]
 pub use crate::{BigInt, BigUint, Sign};
 pub use crate::{
@@ -10,3 +8,5 @@ pub use crate::{
     walk::{EdgeType, Visitor, WalkElement},
     with_tags, with_tags_mut,
 };
+#[cfg(feature = "derive")]
+pub use crate::{CBORBoundedDecodable, CBORBoundedEncodable};
