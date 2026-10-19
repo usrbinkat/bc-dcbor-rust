@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `input` as mutable because it is also borrowed as immutable
+ --> tests/ui/fail/decoded_input_cannot_mutate.rs:7:5
+  |
+6 |     let document = dcbor::bounded::decode::decode(&input, 8, &mut policy::Policy).unwrap();
+  |                                                   ------ immutable borrow occurs here
+7 |     input[1] = b'b';
+  |     ^^^^^ mutable borrow occurs here
+8 |     println!("{:?}", document.root().kind());
+  |                      -------- immutable borrow later used here

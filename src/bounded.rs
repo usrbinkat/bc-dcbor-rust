@@ -148,8 +148,10 @@ use crate::{
 #[cfg(feature = "num-bigint")]
 mod bigint;
 pub mod decode;
+pub mod encoding;
 mod policy;
 pub mod text;
+pub mod text_cursor;
 mod value;
 pub use policy::{LimitRefusal, Limits, Reservation};
 pub use value::Tagged;

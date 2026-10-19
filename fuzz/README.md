@@ -9,13 +9,15 @@ nix-shell fuzz/shell.nix \
   -I nixpkgs=/workspace/usrbinkat/github.com/NixOS/nixpkgs \
   --arg nixpkgsPath /workspace/usrbinkat/github.com/NixOS/nixpkgs \
   --arg rustOverlayPath /workspace/usrbinkat/github.com/oxalica/rust-overlay \
-  --run 'bash fuzz/smoke.sh'
+  --run 'env -u RUSTC -u RUSTDOC bash fuzz/smoke.sh'
 ```
 
 The `-I` option also directs nix-shell's own `<nixpkgs>` lookup for
 `bashInteractive` to the local checkout; `--arg nixpkgsPath` alone does not.
 The shell supplies nightly Rust and `cargo-fuzz`. `smoke.sh` builds all targets
-and runs the six smoke checks, stopping on the first failure. Toolchain selection
+and runs the eight smoke checks, stopping on the first failure. Clearing inherited
+`RUSTC` and `RUSTDOC` overrides ensures Cargo uses the shell's nightly compiler.
+Toolchain selection
 follows the supplied checkouts; pin their revisions in reproducible CI setups.
 
 Run with `cargo-fuzz` available on PATH and a rustup-installed nightly Rust
@@ -29,6 +31,8 @@ rustup run nightly cargo fuzz run text -- -runs=1000 -max_len=4096
 rustup run nightly cargo fuzz run nested -- -runs=1000 -max_len=32
 rustup run nightly cargo fuzz run refusals -- -runs=1000 -max_len=66
 rustup run nightly cargo fuzz run decode -- -runs=1000 -max_len=4096
+rustup run nightly cargo fuzz run decode_schedule -- -runs=1000 -max_len=4096
+rustup run nightly cargo fuzz run schema_schedule -- -runs=1000 -max_len=1024
 rustup run nightly cargo fuzz run representations -- -runs=1000 -max_len=256
 ```
 
@@ -48,6 +52,16 @@ write-allocation instrumentation lives in `tests/bounded_adversarial.rs`.
 
 `decode` covers malformed bytes, admitted parsing, and refusal cleanup. It calls
 the symbolic decoder only after bounded validation has established depth <= 32.
+`decode_schedule` exercises the retained production decoder: it selects an actual
+admission from a baseline, observes refusal, resumes the same cursor, compares
+cumulative work and outcome, and separately cancels at that admission. It also
+checks proper prefixes and a mutated input, enforcing three-value/64-byte step
+bounds and zero retained reservations after destruction.
+`schema_schedule` exercises derived schema preparation with nested arrays,
+optional fields, normalization, and multiple integer-key widths. It requires a
+positively observed admission refusal, same-cursor resumption with unchanged
+cumulative work, cancellation cleanup, bounded preparation and writer steps,
+and exact agreement with the synchronous encoder.
 `representations` exercises sorted dynamic maps, symbolic values, explicit tags,
 standalone options, and positive/negative bignums. Both cap input size inside the
 target, independently of libFuzzer arguments.

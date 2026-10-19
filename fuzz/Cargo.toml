@@ -18,6 +18,13 @@ libfuzzer-sys = "0.4"
 unicode-normalization = "=0.1.25"
 
 [[bin]]
+name = "schema_schedule"
+path = "fuzz_targets/schema_schedule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nested"
 path = "fuzz_targets/nested.rs"
 test = false
@@ -55,6 +62,13 @@ bench = false
 [[bin]]
 name = "representations"
 path = "fuzz_targets/representations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_schedule"
+path = "fuzz_targets/decode_schedule.rs"
 test = false
 doc = false
 bench = false

@@ -2,6 +2,8 @@
 //! symbolic comparison here supplements value, length and resource assertions.
 use dcbor::bounded::*;
 use std::{cell::Cell, rc::Rc};
+mod schema;
+pub use schema::exercise_schema_schedule;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -164,6 +166,103 @@ pub fn exercise_decode(input: &[u8], refusal: Option<usize>) {
         }
         Err(DecodeError::Resource(error)) => expected_failure(error, &policy),
         Err(DecodeError::Invalid(_) | DecodeError::DepthLimit { .. }) => {}
+        Err(DecodeError::UnprovenText) => panic!("normalizing policy returned QuickOnly refusal"),
     }
     assert_eq!(policy.live.get(), 0);
+}
+
+/// Arbitrary malformed inputs, every proper prefix of a bounded sample, and a
+/// selected actual refusal. The recursive oracle only sees validated depth.
+pub fn exercise_decode_schedule(data: &[u8]) {
+    let Some((&schedule, input)) = data.split_first() else {
+        return;
+    };
+    let input = &input[..input.len().min(4096)];
+    retained_schedule(input, schedule as usize);
+    for end in 0..input.len().min(64) {
+        retained_schedule(&input[..end], schedule as usize + end);
+    }
+    if !input.is_empty() {
+        let mut mutation = input.to_vec();
+        let at = schedule as usize % mutation.len();
+        mutation[at] ^= 1 << (schedule % 8);
+        retained_schedule(&mutation, schedule as usize);
+    }
+}
+
+fn retained_schedule(input: &[u8], schedule: usize) {
+    use dcbor::bounded::decode::{
+        cursor::{DecodeStep, Decoder},
+        DecodeError, Options,
+    };
+    fn run(input: &[u8], stop: Option<usize>, cancel: bool) -> (usize, WriteWork, u8) {
+        let mut policy = Policy::new(stop);
+        let mut operation = Decoder::new(input, Options::normalizing(32));
+        let mut observed = false;
+        let mut terminal = None;
+        for _ in 0..input.len() * input.len() * 512 + 4096 {
+            let before = policy.work;
+            let outcome = operation.step(&mut policy);
+            assert!(policy.work.values >= before.values && policy.work.bytes >= before.bytes);
+            assert!(policy.work.values - before.values <= 3);
+            assert!(policy.work.bytes - before.bytes <= 64);
+            match outcome {
+                Ok(DecodeStep::Progress) => assert_ne!(policy.work, before),
+                Ok(DecodeStep::Complete(document)) => {
+                    assert_eq!(document.root().encoded(), input);
+                    let expected = dcbor::CBOR::try_from_data(input).unwrap();
+                    assert_eq!(expected.to_cbor_data(), input);
+                    let held = policy.live.get();
+                    drop(operation);
+                    assert_eq!(policy.live.get(), held);
+                    drop(document);
+                    assert_eq!(policy.live.get(), 0);
+                    assert_eq!(observed, stop.is_some());
+                    return (policy.calls, policy.work, 0);
+                }
+                Err(DecodeError::Resource(BoundedError::Refused(Refusal::Scheduled))) => {
+                    assert_eq!(Some(policy.calls - 1), stop);
+                    assert!(!observed);
+                    observed = true;
+                    policy.refuse_at = None;
+                    if cancel {
+                        terminal = Some(4);
+                        break;
+                    }
+                }
+                Err(DecodeError::Invalid(_)) => {
+                    terminal = Some(1);
+                    break;
+                }
+                Err(DecodeError::DepthLimit { .. }) => {
+                    terminal = Some(2);
+                    break;
+                }
+                Err(DecodeError::Resource(BoundedError::Refused(Refusal::Limit))) => {
+                    terminal = Some(3);
+                    break;
+                }
+                _ => panic!(
+                    "unexpected retained decode outcome at {:?}",
+                    operation.position()
+                ),
+            }
+        }
+        let terminal = terminal.expect("bounded retained decode failed to terminate");
+        assert_eq!(observed, stop.is_some());
+        drop(operation);
+        assert_eq!(policy.live.get(), 0);
+        (policy.calls, policy.work, terminal)
+    }
+    let baseline = run(input, None, false);
+    assert!(baseline.0 > 0);
+    let stop = schedule % baseline.0;
+    let resumed = run(input, Some(stop), false);
+    assert_eq!(resumed.0, baseline.0 + 1);
+    assert_eq!(
+        resumed.1, baseline.1,
+        "completed work replayed after refusal"
+    );
+    assert_eq!(resumed.2, baseline.2);
+    run(input, Some(stop), true);
 }

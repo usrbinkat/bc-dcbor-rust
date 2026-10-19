@@ -19,6 +19,13 @@
 //! assert_eq!(limits.live_bytes(), 0);
 //! ```
 use super::*;
+pub mod comparison;
+pub mod construction;
+pub mod cursor;
+pub mod header;
+pub mod storage;
+pub mod string_cursor;
+mod utf8;
 use crate::{
     Error, ExactFrom,
     float::{validate_canonical_f16, validate_canonical_f32, validate_canonical_f64},

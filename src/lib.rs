@@ -168,6 +168,7 @@ mod conveniences;
 #[cfg(feature = "derive")]
 pub use dcbor_derive::{
     CBORBoundedDecodable, CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable,
+    CBORResumableEncodable,
 };
 
 // Re-export standard library types used in our public API

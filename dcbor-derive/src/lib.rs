@@ -178,6 +178,18 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Error, Fields, Ident, Result, Type, parse_macro_input};
+mod construction;
+mod encoding;
+
+/// Generate constant-work instructions for retained schema preparation.
+#[proc_macro_derive(CBORResumableEncodable, attributes(cbor))]
+pub fn derive_cbor_resumable_encodable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match Schema::parse(&input).map(|schema| encoding::expand(&schema)) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
 
 /// Derive `From<T> for dcbor::CBOR`, making the type CBOREncodable.
 #[proc_macro_derive(CBOREncodable, attributes(cbor))]
@@ -231,7 +243,11 @@ pub fn derive_cbor_bounded_encodable(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(CBORBoundedDecodable, attributes(cbor))]
 pub fn derive_cbor_bounded_decodable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    match Schema::parse(&input).map(|schema| schema.constructible()) {
+    match Schema::parse(&input).map(|schema| {
+        let synchronous = schema.constructible();
+        let retained = construction::expand(&schema);
+        quote! { #synchronous #retained }
+    }) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

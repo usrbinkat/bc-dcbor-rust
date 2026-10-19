@@ -1,0 +1,12 @@
+error[E0597]: `value` does not live long enough
+  --> tests/ui/fail/typed_value_cannot_outlive_owner.rs:13:20
+   |
+ 7 |         let value = dcbor::bounded::decode::decode_typed::<String, _>(
+   |             ----- binding `value` declared here
+...
+13 |         borrowed = value.value();
+   |                    ^^^^^ borrowed value does not live long enough
+14 |     }
+   |     - `value` dropped here while still borrowed
+15 |     println!("{borrowed}");
+   |                -------- borrow later used here

@@ -32,6 +32,32 @@ This deterministic approach ensures that semantically equivalent data items are 
 dcbor = "0.25.2"
 ```
 
+## Retained schema encoding
+
+With the `derive` feature, `CBORResumableEncodable` generates instructions for
+`bounded::encoding::Preparation`. Named structs use canonical integer-key maps;
+absent optional fields are omitted. Newtypes, unit structs, and unit, tuple, and
+named enum variants follow the symbolic schema representation. Type-level tags
+remain untagged during encoding; use `bounded::Tagged` for explicit tag emission.
+
+Preparation retains an explicit traversal stack, normalization state, byte
+relocation, and map-header positions. Call `step` on the same preparation after a
+budget refusal. `PrepareStep::Complete` returns an independently owned plan;
+`plan.writer(destination)` emits into an exactly sized destination without
+allocation. Writer steps copy at most 64 bytes and preserve the emitted prefix
+on refusal. Preparation supports nesting up to 128 traversal frames.
+
+Built-in schema instructions cover integers, floats, booleans, strings, byte
+strings, arrays, vectors, nullable options, references, boxes, and shared pointers.
+Custom `encoding::Schema` implementations must produce each instruction in
+constant work without scanning, allocating, or recursively traversing children.
+The preparation borrow must preserve the representation throughout traversal.
+
+Prepared plans retain canonical bytes with map-header gap metadata. Map fields
+are inspected once; finalizing a header does not shift the payload. Preparation
+therefore retains storage proportional to the encoded output in addition to
+normalization scratch and traversal metadata.
+
 ## Related Projects
 
 - [dCBOR Overview](https://github.com/BlockchainCommons/crypto-commons/blob/master/dcbor.md)
