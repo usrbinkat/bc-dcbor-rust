@@ -45,6 +45,12 @@ operation's storage accounting.
   symbolic input are caller operations.
 - The bounded decoder produces a flat borrowed document and validates canonical
   dCBOR structure. Semantic interpretation of arbitrary tags is application work.
+- `decode::decode_bound` and `decode_bound_with` bound what decoding any input of
+  a given length reports and holds, so a caller can admit the whole decoding as
+  one unit. A schema whose texts are always ASCII decodes under
+  `Options::quick_only`, which refuses text the NFC quick check does not prove
+  (`DecodeError::UnprovenText`) instead of normalizing it; its bound is at most
+  four values per input byte.
 
 Numeric corrections can change historical hashes/signatures. Applications must
 test their actual persisted fixtures; these examples do not establish compatibility

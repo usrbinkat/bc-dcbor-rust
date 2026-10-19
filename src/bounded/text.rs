@@ -381,6 +381,26 @@ pub fn validation_bound<R>(input: u64) -> Result<ValidationBound, BoundedError<R
     })
 }
 
+/// Whether the NFC quick check alone proves `text` normal, at one value and
+/// its bytes, allocating nothing: the validation of
+/// `decode::TextPolicy::QuickOnly`.
+pub(super) fn is_proven_normal<B: Budget>(text: &str, budget: &mut B) -> BoundedResult<bool, B> {
+    already_normal(text, widen(text.len())?, budget)
+}
+
+/// The [`ValidationBound`] of quick-check validation (`is_proven_normal`)
+/// of every text of an input of at most `input` bytes: one value per text
+/// and the payload bytes, at most `input` of each (every text has a head
+/// byte), nothing allocated.
+pub const fn quick_validation_bound(input: u64) -> ValidationBound {
+    ValidationBound {
+        values: input,
+        bytes: input,
+        allocated: 0,
+        peak: 0,
+    }
+}
+
 /// The measure of `text`'s encoding: a text head and its NFC bytes. Text
 /// not proven normal is normalized here, once, and its normal form pushed
 /// to `plan`; the write checks the text again, then copies.

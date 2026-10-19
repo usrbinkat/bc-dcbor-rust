@@ -29,7 +29,56 @@ use crate::{
 pub enum DecodeError<R> {
     Resource(BoundedError<R>),
     Invalid(Error),
-    DepthLimit { limit: usize },
+    DepthLimit {
+        limit: usize,
+    },
+    /// A text the NFC quick check does not prove normal, refused under
+    /// [`TextPolicy::QuickOnly`] before any normalization runs. The text may
+    /// be canonical; the decoding's policy admits no text whose proof needs
+    /// normalization.
+    UnprovenText,
+}
+
+/// How [`decode_with`] validates a text's Unicode normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPolicy {
+    /// Strict NFC validation: text the quick check cannot prove normal is
+    /// normalized and compared ([`text::validation_bound`]).
+    Normalize,
+    /// Only text the quick check proves normal is admitted; any other text is
+    /// refused as [`DecodeError::UnprovenText`] at one value and its bytes.
+    /// For schemas whose every text is ASCII or otherwise always proven by
+    /// the quick check: such a schema refuses nothing it accepts under
+    /// [`TextPolicy::Normalize`], and its decoding's work no longer scales
+    /// with normalization.
+    QuickOnly,
+}
+
+/// What [`decode_with`] admits: the nesting limit, counting array, map and
+/// tag ancestors, and the text policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub max_depth: usize,
+    pub text: TextPolicy,
+}
+
+impl Options {
+    /// Strict NFC validation under `max_depth`: what [`decode`] admits.
+    pub const fn normalizing(max_depth: usize) -> Self {
+        Self {
+            max_depth,
+            text: TextPolicy::Normalize,
+        }
+    }
+
+    /// Quick-check-proven text only under `max_depth`
+    /// ([`TextPolicy::QuickOnly`]).
+    pub const fn quick_only(max_depth: usize) -> Self {
+        Self {
+            max_depth,
+            text: TextPolicy::QuickOnly,
+        }
+    }
 }
 impl<R> From<BoundedError<R>> for DecodeError<R> {
     fn from(error: BoundedError<R>) -> Self {
@@ -48,6 +97,9 @@ impl<R: fmt::Display> fmt::Display for DecodeError<R> {
             Self::Resource(error) => fmt::Display::fmt(error, f),
             Self::Invalid(error) => fmt::Display::fmt(error, f),
             Self::DepthLimit { limit } => write!(f, "decoding exceeds nesting limit {limit}"),
+            Self::UnprovenText => {
+                f.write_str("text not proven NFC by the quick check is refused by this decoding")
+            }
         }
     }
 }
@@ -161,11 +213,22 @@ struct Frame {
 /// zero. Traversing the returned immutable view is a separate caller operation.
 /// Tags are structurally decoded; application-specific tag semantics, including
 /// bignum magnitude rules and date interpretation, are not validated here.
+/// Text is validated strictly ([`TextPolicy::Normalize`]).
 pub fn decode<'a, A: Allocator>(
     input: &'a [u8],
     max_depth: usize,
     allocator: &mut A,
 ) -> Result<Document<'a, A::Permit>, DecodeError<A::Refusal>> {
+    decode_with(input, Options::normalizing(max_depth), allocator)
+}
+
+/// [`decode`] under `options`: its nesting limit and its text policy.
+pub fn decode_with<'a, A: Allocator>(
+    input: &'a [u8],
+    options: Options,
+    allocator: &mut A,
+) -> Result<Document<'a, A::Permit>, DecodeError<A::Refusal>> {
+    let Options { max_depth, text } = options;
     let mut entries: Owned<Entry<'a>, A::Permit> = Owned::new();
     let mut stack: Owned<Frame, A::Permit> = Owned::new();
     let mut pos = 0usize;
@@ -200,11 +263,20 @@ pub fn decode<'a, A: Allocator>(
                     .map_err(BoundedError::Refused)?;
                 pos = end;
                 if matches!(major, MajorType::Text) {
-                    let text = core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
-                    if !text::is_normalized(text, allocator)? {
-                        return Err(Error::NonCanonicalString.into());
+                    let payload = core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
+                    match text {
+                        TextPolicy::Normalize => {
+                            if !text::is_normalized(payload, allocator)? {
+                                return Err(Error::NonCanonicalString.into());
+                            }
+                        }
+                        TextPolicy::QuickOnly => {
+                            if !text::is_proven_normal(payload, allocator)? {
+                                return Err(DecodeError::UnprovenText);
+                            }
+                        }
                     }
-                    Kind::Text(text)
+                    Kind::Text(payload)
                 } else {
                     Kind::Bytes(bytes)
                 }
@@ -361,7 +433,14 @@ pub struct DecodeBound {
 /// returns; the arena is the document's ([`DecodeBound::retained`]). Refused,
 /// never saturated, when a quantity does not fit in `u64`.
 pub fn decode_bound<R>(input: u64, max_depth: usize) -> Result<DecodeBound, BoundedError<R>> {
-    let terms = Terms::of::<R>(input, max_depth)?;
+    decode_bound_with(input, Options::normalizing(max_depth))
+}
+
+/// The [`DecodeBound`] of [`decode_with`] under `options`, by the same terms
+/// as [`decode_bound`]; under [`TextPolicy::QuickOnly`] the text term is the
+/// quick checks alone ([`text::quick_validation_bound`]).
+pub fn decode_bound_with<R>(input: u64, options: Options) -> Result<DecodeBound, BoundedError<R>> {
+    let terms = Terms::of::<R>(input, options)?;
     let values = add(
         add(terms.heads, terms.completions)?,
         add(terms.keys, terms.text.values)?,
@@ -406,8 +485,8 @@ struct Terms {
 }
 
 impl Terms {
-    fn of<R>(input: u64, max_depth: usize) -> Result<Self, BoundedError<R>> {
-        let depth = widen(max_depth)?.min(input);
+    fn of<R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
+        let depth = widen(options.max_depth)?.min(input);
         let heads = add(input, 1)?;
         Ok(Self {
             heads,
@@ -418,7 +497,10 @@ impl Terms {
             key_bytes: mul(depth, input)?,
             arena: owned_growth(input, widen(core::mem::size_of::<Entry<'static>>())?)?,
             stack: owned_growth(depth, widen(core::mem::size_of::<Frame>())?)?,
-            text: text::validation_bound(input)?,
+            text: match options.text {
+                TextPolicy::Normalize => text::validation_bound(input)?,
+                TextPolicy::QuickOnly => text::quick_validation_bound(input),
+            },
         })
     }
 }
@@ -468,7 +550,7 @@ mod terms_tests {
                 "{count} zeros"
             );
             assert_eq!(held, arena.held, "{count} zeros");
-            let terms = Terms::of::<()>(n, 1).unwrap();
+            let terms = Terms::of::<()>(n, Options::normalizing(1)).unwrap();
             assert!(terms.heads + terms.completions >= values);
             assert!(terms.arena.allocated >= arena.allocated);
             assert!(terms.arena.held >= held);
@@ -496,7 +578,8 @@ mod terms_tests {
                 deep.allocated - one.allocated
             );
             assert_eq!(nested_bytes - flat_bytes, deep.copied - one.copied);
-            let terms = Terms::of::<()>(nested.len() as u64, depth as usize).unwrap();
+            let terms =
+                Terms::of::<()>(nested.len() as u64, Options::normalizing(depth as usize)).unwrap();
             assert!(terms.stack.allocated >= deep.allocated);
             assert!(terms.stack.copied >= deep.copied);
             assert!(terms.stack.peak >= deep.peak);
@@ -523,7 +606,7 @@ mod terms_tests {
         let (array_values, array_bytes, _, _) = measured(&array, 1);
         assert_eq!(map_values - array_values, 10);
         assert_eq!(map_bytes - array_bytes, 10 * 202);
-        let terms = Terms::of::<()>(map.len() as u64, 1).unwrap();
+        let terms = Terms::of::<()>(map.len() as u64, Options::normalizing(1)).unwrap();
         assert!(terms.keys >= 10);
         assert!(terms.key_bytes >= 10 * 202);
     }
@@ -555,7 +638,12 @@ mod terms_tests {
         let compared = map_bytes - array_bytes;
         let n = map.len() as u64;
         assert!(compared > n, "{compared} key bytes over {n} input bytes");
-        assert!(Terms::of::<()>(n, depth).unwrap().key_bytes >= compared);
+        assert!(
+            Terms::of::<()>(n, Options::normalizing(depth))
+                .unwrap()
+                .key_bytes
+                >= compared
+        );
     }
 
     /// A text against a byte string of the same payload: the difference is
@@ -572,7 +660,7 @@ mod terms_tests {
             assert_eq!(as_text.len(), as_bytes.len());
             let (text_values, text_bytes, text_requested, _) = measured(&as_text, 0);
             let (bytes_values, bytes_bytes, bytes_requested, _) = measured(&as_bytes, 0);
-            let terms = Terms::of::<()>(as_text.len() as u64, 0).unwrap();
+            let terms = Terms::of::<()>(as_text.len() as u64, Options::normalizing(0)).unwrap();
             let values = text_values - bytes_values;
             assert!(values > 0);
             assert!(
@@ -582,6 +670,73 @@ mod terms_tests {
             );
             assert!(terms.text.bytes >= text_bytes - bytes_bytes);
             assert!(terms.text.allocated >= text_requested - bytes_requested);
+        }
+    }
+
+    /// What decoding `input` under `options` reported and requested, and
+    /// whether it decoded.
+    fn measured_with(input: &[u8], options: Options) -> (u64, u64, u64, bool) {
+        let mut tally = Tally::unlimited();
+        let decoded = decode_with(input, options, &mut tally).is_ok();
+        assert_eq!(tally.live(), 0);
+        (tally.values, tally.bytes, tally.requested, decoded)
+    }
+
+    /// Under the quick-only policy a text costs exactly its quick check over
+    /// a byte string of the same payload: one value, its bytes, nothing
+    /// allocated; text the quick check proves normal decodes as under strict
+    /// validation, and text it does not is refused before normalization.
+    #[test]
+    fn quick_only_text_costs_its_quick_check_alone() {
+        let proven = ["", "sha256:00ff", "ordinary text", "\u{e9}t\u{e9}"];
+        let unproven = ["e\u{301}", "q\u{301}", "\u{1100}\u{1161}"];
+        for text in proven.iter().chain(unproven.iter()) {
+            let as_text = {
+                let mut input = vec![0x60 | text.len() as u8];
+                input.extend_from_slice(text.as_bytes());
+                input
+            };
+            let as_bytes = CBOR::from(ByteString::new(text.as_bytes())).to_cbor_data();
+            assert_eq!(as_text.len(), as_bytes.len());
+            let quick = Options::quick_only(0);
+            let (text_values, text_bytes, text_requested, decoded) = measured_with(&as_text, quick);
+            let (bytes_values, bytes_bytes, bytes_requested, _) = measured_with(&as_bytes, quick);
+            assert_eq!(text_values - bytes_values, 1, "{text:?}");
+            assert_eq!(text_bytes - bytes_bytes, text.len() as u64, "{text:?}");
+            assert_eq!(decoded, proven.contains(text), "{text:?}");
+            if decoded {
+                assert_eq!(text_requested, bytes_requested, "{text:?}");
+            } else {
+                assert_eq!(text_requested, 0, "{text:?} refused before its node exists");
+            }
+            let terms = Terms::of::<()>(as_text.len() as u64, quick).unwrap();
+            assert!(terms.text.values >= 1 && terms.text.bytes >= text.len() as u64);
+            assert_eq!(
+                (terms.text.allocated, terms.text.peak),
+                (0, 0),
+                "the quick check allocates nothing"
+            );
+        }
+        let mut tally = Tally::unlimited();
+        assert!(matches!(
+            decode_with(
+                &CBOR::from("q\u{301}").to_cbor_data(),
+                Options::quick_only(0),
+                &mut tally
+            ),
+            Err(DecodeError::UnprovenText)
+        ));
+    }
+
+    /// The quick-only bound is linear with a small constant: at most four
+    /// values per input byte and one, whatever the input.
+    #[test]
+    fn the_quick_only_bound_is_four_values_per_byte() {
+        for input in [0u64, 1, 2, 100, 4096, 1 << 20] {
+            let bound = decode_bound_with::<()>(input, Options::quick_only(1)).unwrap();
+            assert!(bound.values <= 4 * input + 1, "{input}: {}", bound.values);
+            let strict = decode_bound_with::<()>(input, Options::normalizing(1)).unwrap();
+            assert!(bound.values <= strict.values && bound.bytes <= strict.bytes);
         }
     }
 }
@@ -652,7 +807,16 @@ pub fn decode_typed<T: BoundedDecodable, A: Allocator>(
     max_depth: usize,
     allocator: &mut A,
 ) -> ConstructResult<Constructed<T, A::Permit>, A> {
-    let document = decode(input, max_depth, allocator)?;
+    decode_typed_with(input, Options::normalizing(max_depth), allocator)
+}
+
+/// [`decode_typed`] under `options` ([`decode_with`]).
+pub fn decode_typed_with<T: BoundedDecodable, A: Allocator>(
+    input: &[u8],
+    options: Options,
+    allocator: &mut A,
+) -> ConstructResult<Constructed<T, A::Permit>, A> {
+    let document = decode_with(input, options, allocator)?;
     let mut permits = Owned::new();
     let value = T::construct(document.root(), &mut permits, allocator)?;
     drop(document);
