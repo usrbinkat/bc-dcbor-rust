@@ -205,8 +205,8 @@ fn enum_rejects_non_matching() {
 
 // --- Bounded encoding from the same schema ---
 
+use dcbor::bounded::{prepare, Allocator, BoundedEncodable, Budget, WriteWork};
 use dcbor::CBORBoundedEncodable;
-use dcbor::bounded::{Allocator, BoundedEncodable, Budget, WriteWork, prepare};
 
 #[derive(dcbor::CBORBoundedEncodable)]
 enum Collision {
@@ -440,6 +440,176 @@ fn unit_enums_of_one_width_have_a_fixed_measure() {
     );
     let bytes = bounded(&reasons);
     assert_eq!(bytes, [0x82, 0x02, 0x00]);
+}
+
+// --- Bounded construction from the same schema ---
+
+use dcbor::bounded::decode::decode_typed;
+use dcbor::bounded::Limits;
+use dcbor::CBORBoundedDecodable;
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+struct Constructed {
+    #[cbor(n = 300)]
+    wide: u64,
+    #[cbor(n = 2)]
+    label: String,
+    #[cbor(n = 24)]
+    note: Option<String>,
+    #[cbor(n = 0)]
+    flag: bool,
+    #[cbor(n = 1)]
+    payload: ByteString,
+    #[cbor(n = 23)]
+    signed: i64,
+    #[cbor(n = 5)]
+    children: Option<Vec<Inner>>,
+    #[cbor(n = 6)]
+    kind: Kind,
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+struct Inner(Vec<u64>);
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable,
+)]
+enum Kind {
+    #[cbor(n = 0)]
+    First,
+    #[cbor(n = 7)]
+    Second,
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+enum Variants {
+    #[cbor(n = 0)]
+    Point,
+    #[cbor(n = 30)]
+    Pair(u64, String),
+    #[cbor(n = 2)]
+    Frame {
+        #[cbor(n = 1)]
+        height: i64,
+        #[cbor(n = 0)]
+        width: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[cbor(tag = 42)]
+struct Wrapped {
+    #[cbor(n = 0)]
+    data: Vec<u8>,
+}
+
+/// Bounded and symbolic construction of the same canonical wire bytes
+/// produce equal typed values. Dropping the bounded value releases every
+/// retained permit.
+fn constructed<T>(value: &T)
+where
+    T: Clone
+        + Into<CBOR>
+        + TryFrom<CBOR, Error = dcbor::Error>
+        + dcbor::bounded::decode::BoundedDecodable
+        + PartialEq
+        + std::fmt::Debug,
+{
+    let bytes = value.clone().into().to_cbor_data();
+    let symbolic = T::try_from(CBOR::try_from_data(bytes.as_slice()).unwrap()).unwrap();
+    let mut limits = Limits::new(100_000, 1_000_000, 1_000_000);
+    let built = decode_typed::<T, _>(&bytes, 16, &mut limits).unwrap();
+    assert_eq!(
+        built.value(),
+        &symbolic,
+        "bounded and symbolic construction must interpret the same wire bytes",
+    );
+    assert_eq!(
+        symbolic.into().to_cbor_data(),
+        bytes,
+        "symbolic reconstruction must preserve the canonical wire representation",
+    );
+    drop(built);
+    assert_eq!(
+        limits.live_bytes(),
+        0,
+        "every permit is released with the value"
+    );
+}
+
+#[test]
+fn bounded_construction_reads_what_the_symbolic_conversion_reads() {
+    constructed(&Constructed {
+        wide: 70_000,
+        label: "e\u{301}tiquette".to_string(),
+        note: None,
+        flag: true,
+        payload: ByteString::new([1, 2, 3]),
+        signed: -25,
+        children: None,
+        kind: Kind::First,
+    });
+    constructed(&Constructed {
+        wide: 1,
+        label: String::new(),
+        note: Some("present".to_string()),
+        flag: false,
+        payload: ByteString::new([]),
+        signed: i64::MIN,
+        children: Some(vec![Inner(vec![]), Inner(vec![u64::MAX])]),
+        kind: Kind::Second,
+    });
+    constructed(&Variants::Point);
+    constructed(&Variants::Pair(7, "seven".to_string()));
+    constructed(&Variants::Frame {
+        height: -1,
+        width: None,
+    });
+    constructed(&Variants::Frame {
+        height: 1,
+        width: Some(2),
+    });
+}
+
+/// A tagged type is constructed from its tagged form, as `TryFrom<CBOR>`
+/// reads it, and refuses another tag and the untagged form.
+#[test]
+fn bounded_construction_of_a_tagged_type_requires_its_tag() {
+    let wrapped = Wrapped { data: vec![1, 2] };
+    let tagged = wrapped.tagged_cbor().to_cbor_data();
+    let mut limits = Limits::new(1000, 10_000, 10_000);
+    let built = decode_typed::<Wrapped, _>(&tagged, 16, &mut limits).unwrap();
+    assert_eq!(built.value(), &wrapped);
+    let untagged = wrapped.untagged_cbor().to_cbor_data();
+    assert!(decode_typed::<Wrapped, _>(&untagged, 16, &mut limits).is_err());
+    let other = CBOR::to_tagged_value(99, wrapped.untagged_cbor()).to_cbor_data();
+    assert!(decode_typed::<Wrapped, _>(&other, 16, &mut limits).is_err());
+}
+
+/// A required field absent is `MissingMapKey`; a value of another kind is
+/// `WrongType`; a discriminant no variant carries is `WrongType`.
+#[test]
+fn bounded_construction_rejects_what_the_symbolic_conversion_rejects() {
+    use dcbor::bounded::decode::DecodeError;
+    let mut limits = Limits::new(1000, 10_000, 10_000);
+    let mut missing = Map::new();
+    missing.insert(0u64, true);
+    let bytes = CBOR::from(missing).to_cbor_data();
+    assert!(matches!(
+        decode_typed::<Constructed, _>(&bytes, 16, &mut limits),
+        Err(DecodeError::Invalid(dcbor::Error::MissingMapKey))
+    ));
+    let bytes = CBOR::from(42u64).to_cbor_data();
+    assert!(matches!(
+        decode_typed::<Constructed, _>(&bytes, 16, &mut limits),
+        Err(DecodeError::Invalid(dcbor::Error::WrongType))
+    ));
+    let bytes = CBOR::from(5u64).to_cbor_data();
+    assert!(matches!(
+        decode_typed::<Kind, _>(&bytes, 16, &mut limits),
+        Err(DecodeError::Invalid(dcbor::Error::WrongType))
+    ));
+    assert_eq!(limits.live_bytes(), 0);
 }
 
 /// A float field takes the shared canonical reduction on the bounded path.

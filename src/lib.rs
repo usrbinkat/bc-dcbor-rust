@@ -166,7 +166,9 @@ mod conveniences;
 
 // Re-export derive macros when the `derive` feature is enabled
 #[cfg(feature = "derive")]
-pub use dcbor_derive::{CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable};
+pub use dcbor_derive::{
+    CBORBoundedDecodable, CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable,
+};
 
 // Re-export standard library types used in our public API
 #[doc(hidden)]

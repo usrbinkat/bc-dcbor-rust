@@ -1,5 +1,5 @@
 #[cfg(feature = "derive")]
-pub use crate::CBORBoundedEncodable;
+pub use crate::{CBORBoundedDecodable, CBORBoundedEncodable};
 #[cfg(feature = "num-bigint")]
 pub use crate::{BigInt, BigUint, Sign};
 pub use crate::{
