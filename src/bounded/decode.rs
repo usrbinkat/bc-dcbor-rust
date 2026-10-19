@@ -318,6 +318,274 @@ pub fn decode<'a, A: Allocator>(
     }
 }
 
+/// What [`decode`] reports and holds at most for one input, on success or
+/// at any failure ([`decode_bound`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeBound {
+    /// Values reported to [`Budget::traverse`].
+    pub values: u64,
+    /// Bytes reported to [`Budget::traverse`].
+    pub bytes: u64,
+    /// The sum of every allocation request.
+    pub allocated: u64,
+    /// The most bytes the decoder's permits hold at once while it runs.
+    pub peak: u64,
+    /// The most bytes the returned [`Document`]'s permits hold: what a value
+    /// constructed from it ([`decode_typed`]) is built beside.
+    pub retained: u64,
+}
+
+/// The [`DecodeBound`] of [`decode`] of any input of at most `input` bytes
+/// under `max_depth`, whatever its contents, malformed inputs included:
+/// every quantity is monotone in the input length, so the bound of the
+/// longest input admitted bounds every shorter one.
+///
+/// Every value has at least a one-byte head, so an input of `n` bytes has at
+/// most `n` nodes and at most `n + 1` header examinations (the last may
+/// fail). The terms, each charged where `decode` charges it:
+///
+/// - each header examination: one value and at most [`MAX_HEAD_LEN`] bytes;
+/// - byte and text payloads: their bytes, disjoint, at most `n` in all;
+/// - each completed child: one value, at most `n`;
+/// - each map key after the first of its map: one value, and the shorter of
+///   it and the previous key's encoded bytes. A byte lies in the encoded
+///   keys of at most one map per nesting level, so the key bytes compared
+///   are at most `min(max_depth, n) · n`;
+/// - the node arena of at most `n` entries and the stack of at most
+///   `min(max_depth, n)` frames ([`owned_growth`]);
+/// - strict NFC validation of the text payloads
+///   ([`text::validation_bound`]), whose scratch exists only while one text
+///   is validated.
+///
+/// The stack and the validation scratch are released before `decode`
+/// returns; the arena is the document's ([`DecodeBound::retained`]). Refused,
+/// never saturated, when a quantity does not fit in `u64`.
+pub fn decode_bound<R>(input: u64, max_depth: usize) -> Result<DecodeBound, BoundedError<R>> {
+    let terms = Terms::of::<R>(input, max_depth)?;
+    let values = add(
+        add(terms.heads, terms.completions)?,
+        add(terms.keys, terms.text.values)?,
+    )?;
+    let bytes = add(
+        add(add(terms.head_bytes, terms.payload)?, terms.key_bytes)?,
+        add(
+            add(terms.arena.copied, terms.stack.copied)?,
+            terms.text.bytes,
+        )?,
+    )?;
+    Ok(DecodeBound {
+        values,
+        bytes,
+        allocated: add(
+            add(terms.arena.allocated, terms.stack.allocated)?,
+            terms.text.allocated,
+        )?,
+        peak: add(add(terms.arena.peak, terms.stack.peak)?, terms.text.peak)?,
+        retained: terms.arena.held,
+    })
+}
+
+/// The terms [`decode_bound`] sums, each the bound of one place `decode`
+/// charges, kept apart so each can be checked against that place alone.
+struct Terms {
+    /// Values of the header examinations.
+    heads: u64,
+    /// Bytes of the header examinations.
+    head_bytes: u64,
+    /// Bytes of the byte and text payloads.
+    payload: u64,
+    /// Values of the completed children.
+    completions: u64,
+    /// Values of the map key comparisons.
+    keys: u64,
+    /// Bytes of the map key comparisons.
+    key_bytes: u64,
+    arena: Growth,
+    stack: Growth,
+    text: text::ValidationBound,
+}
+
+impl Terms {
+    fn of<R>(input: u64, max_depth: usize) -> Result<Self, BoundedError<R>> {
+        let depth = widen(max_depth)?.min(input);
+        let heads = add(input, 1)?;
+        Ok(Self {
+            heads,
+            head_bytes: mul(heads, widen(MAX_HEAD_LEN)?)?,
+            payload: input,
+            completions: input,
+            keys: input,
+            key_bytes: mul(depth, input)?,
+            arena: owned_growth(input, widen(core::mem::size_of::<Entry<'static>>())?)?,
+            stack: owned_growth(depth, widen(core::mem::size_of::<Frame>())?)?,
+            text: text::validation_bound(input)?,
+        })
+    }
+}
+
+/// Each term of the bound checked against the one place it bounds, that
+/// place's cost isolated by decoding two inputs of one length that differ
+/// only in it. A term removed or understated fails its test.
+#[cfg(test)]
+mod terms_tests {
+    use super::super::tests::Tally;
+    use super::*;
+    use crate::{ByteString, CBOR, Map};
+
+    /// What decoding `input` reported and requested, and what the
+    /// document held, with `max_depth` admitting it.
+    fn measured(input: &[u8], max_depth: usize) -> (u64, u64, u64, u64) {
+        let mut tally = Tally::unlimited();
+        let document = decode(input, max_depth, &mut tally).unwrap();
+        let held = tally.live();
+        drop(document);
+        assert_eq!(tally.live(), 0);
+        (tally.values, tally.bytes, tally.requested, held)
+    }
+
+    fn entry() -> u64 {
+        core::mem::size_of::<Entry<'static>>() as u64
+    }
+
+    fn frame() -> u64 {
+        core::mem::size_of::<Frame>() as u64
+    }
+
+    /// A flat array of zeros: one header per node, one completion per
+    /// child, an arena of every node and a stack of one frame, exactly.
+    #[test]
+    fn heads_completions_and_the_arena_are_exact() {
+        for count in [0u64, 1, 3, 4, 5, 22, 23, 24, 1000, 70_000] {
+            let input = CBOR::from(vec![0u64; count as usize]).to_cbor_data();
+            let n = input.len() as u64;
+            let (values, _, requested, held) = measured(&input, 1);
+            let arena = owned_growth::<()>(count + 1, entry()).unwrap();
+            let stack = owned_growth::<()>(u64::from(count > 0), frame()).unwrap();
+            assert_eq!(values, (count + 1) + count, "{count} zeros");
+            assert_eq!(
+                requested,
+                arena.allocated + stack.allocated,
+                "{count} zeros"
+            );
+            assert_eq!(held, arena.held, "{count} zeros");
+            let terms = Terms::of::<()>(n, 1).unwrap();
+            assert!(terms.heads + terms.completions >= values);
+            assert!(terms.arena.allocated >= arena.allocated);
+            assert!(terms.arena.held >= held);
+        }
+    }
+
+    /// Nested arrays against a flat array of the same length and node
+    /// count: the difference is the stack's growth, exactly.
+    #[test]
+    fn the_stack_term_covers_nesting() {
+        for depth in [1u64, 4, 5, 9, 17, 23] {
+            let mut nested = CBOR::from(0u64);
+            for _ in 0..depth {
+                nested = CBOR::from(vec![nested]);
+            }
+            let nested = nested.to_cbor_data();
+            let flat = CBOR::from(vec![0u64; depth as usize]).to_cbor_data();
+            assert_eq!(nested.len(), flat.len());
+            let (_, nested_bytes, nested_requested, _) = measured(&nested, depth as usize);
+            let (_, flat_bytes, flat_requested, _) = measured(&flat, depth as usize);
+            let deep = owned_growth::<()>(depth, frame()).unwrap();
+            let one = owned_growth::<()>(1, frame()).unwrap();
+            assert_eq!(
+                nested_requested - flat_requested,
+                deep.allocated - one.allocated
+            );
+            assert_eq!(nested_bytes - flat_bytes, deep.copied - one.copied);
+            let terms = Terms::of::<()>(nested.len() as u64, depth as usize).unwrap();
+            assert!(terms.stack.allocated >= deep.allocated);
+            assert!(terms.stack.copied >= deep.copied);
+            assert!(terms.stack.peak >= deep.peak);
+        }
+    }
+
+    /// A map against an array of the same items in the same order: the
+    /// difference is the key comparisons, exactly one value and the shorter
+    /// key's encoded bytes per key after the first.
+    #[test]
+    fn the_key_terms_cover_comparisons() {
+        let keys: Vec<ByteString> = (0..11u8).map(|i| ByteString::new(vec![i; 200])).collect();
+        let mut map = Map::new();
+        let mut items = Vec::new();
+        for key in &keys {
+            map.insert(key.clone(), 0u64);
+            items.push(CBOR::from(key.clone()));
+            items.push(CBOR::from(0u64));
+        }
+        let map = CBOR::from(map).to_cbor_data();
+        let array = CBOR::from(items).to_cbor_data();
+        assert_eq!(map.len(), array.len());
+        let (map_values, map_bytes, _, _) = measured(&map, 1);
+        let (array_values, array_bytes, _, _) = measured(&array, 1);
+        assert_eq!(map_values - array_values, 10);
+        assert_eq!(map_bytes - array_bytes, 10 * 202);
+        let terms = Terms::of::<()>(map.len() as u64, 1).unwrap();
+        assert!(terms.keys >= 10);
+        assert!(terms.key_bytes >= 10 * 202);
+    }
+
+    /// Keys holding maps whose keys hold maps: every byte of an inner key
+    /// is compared again at each level that holds it, so the comparisons
+    /// pass the input's length and need the depth factor.
+    #[test]
+    fn the_key_term_covers_nested_keys_at_every_level() {
+        let levels = 5;
+        let (mut map, mut array) = (CBOR::from(0u64), CBOR::from(0u64));
+        for _ in 0..levels {
+            let mut next = Map::new();
+            next.insert(CBOR::from(vec![CBOR::from(0u64), map.clone()]), 0u64);
+            next.insert(CBOR::from(vec![CBOR::from(1u64), map.clone()]), 0u64);
+            map = CBOR::from(next);
+            array = CBOR::from(vec![
+                CBOR::from(vec![CBOR::from(0u64), array.clone()]),
+                CBOR::from(0u64),
+                CBOR::from(vec![CBOR::from(1u64), array.clone()]),
+                CBOR::from(0u64),
+            ]);
+        }
+        let (map, array) = (map.to_cbor_data(), array.to_cbor_data());
+        assert_eq!(map.len(), array.len());
+        let depth = 2 * levels;
+        let (_, map_bytes, _, _) = measured(&map, depth);
+        let (_, array_bytes, _, _) = measured(&array, depth);
+        let compared = map_bytes - array_bytes;
+        let n = map.len() as u64;
+        assert!(compared > n, "{compared} key bytes over {n} input bytes");
+        assert!(Terms::of::<()>(n, depth).unwrap().key_bytes >= compared);
+    }
+
+    /// A text against a byte string of the same payload: the difference is
+    /// strict NFC validation, within the text term.
+    #[test]
+    fn the_text_term_covers_validation_in_place() {
+        for text in [
+            format!("\u{301}{}", "\u{e9}".repeat(2000)),
+            format!("\u{301}{}", "\u{1d5}".repeat(2000)),
+            "q\u{316}\u{301}".repeat(500),
+        ] {
+            let as_text = CBOR::from(text.as_str()).to_cbor_data();
+            let as_bytes = CBOR::from(ByteString::new(text.as_bytes())).to_cbor_data();
+            assert_eq!(as_text.len(), as_bytes.len());
+            let (text_values, text_bytes, text_requested, _) = measured(&as_text, 0);
+            let (bytes_values, bytes_bytes, bytes_requested, _) = measured(&as_bytes, 0);
+            let terms = Terms::of::<()>(as_text.len() as u64, 0).unwrap();
+            let values = text_values - bytes_values;
+            assert!(values > 0);
+            assert!(
+                terms.text.values >= values,
+                "{values} > {}",
+                terms.text.values
+            );
+            assert!(terms.text.bytes >= text_bytes - bytes_bytes);
+            assert!(terms.text.allocated >= text_requested - bytes_requested);
+        }
+    }
+}
+
 /// The result of constructing a typed value from a decoded document.
 pub type ConstructResult<T, A> = Result<T, DecodeError<<A as Budget>::Refusal>>;
 
@@ -488,7 +756,8 @@ impl BoundedDecodable for String {
         };
         let bytes = copy_bytes(text.as_bytes(), permits, allocator)?;
         // The bytes are the validated text's own.
-        String::from_utf8(bytes).map_err(|error| DecodeError::Invalid(Error::InvalidUtf8(error.utf8_error())))
+        String::from_utf8(bytes)
+            .map_err(|error| DecodeError::Invalid(Error::InvalidUtf8(error.utf8_error())))
     }
 }
 

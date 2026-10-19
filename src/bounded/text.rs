@@ -34,7 +34,7 @@ use unicode_normalization::{
 
 use super::{
     Allocator, BoundedError, BoundedResult, Budget, Cursor, MajorType, Measure, Output, Owned,
-    Plan, WriteWork, item_len, widen,
+    Plan, WriteWork, item_len, owned_growth, widen,
 };
 
 /// The normalization of one text: its buffers and the composition state.
@@ -273,6 +273,114 @@ pub(super) fn is_normalized<A: Allocator>(text: &str, allocator: &mut A) -> Boun
     Ok(normal.as_slice() == text.as_bytes())
 }
 
+/// The most decomposed parts per UTF-8 byte any scalar value has under the
+/// pinned `unicode-normalization` release (`decompose_canonical`, Hangul
+/// syllables included), as `(parts, bytes)`: a text of `L` bytes decomposes
+/// into at most `⌈L · parts / bytes⌉` parts. Every work and storage bound of
+/// normalization scales with it. Established for that release over every
+/// scalar value, and attained, by
+/// `the_parts_per_byte_maximum_is_the_releases_own`.
+pub const PARTS_PER_BYTE: (u64, u64) = (3, 2);
+
+/// What validating texts reports and holds at most ([`validation_bound`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValidationBound {
+    /// Values reported to [`Budget::traverse`] over all the texts.
+    pub values: u64,
+    /// Bytes reported to [`Budget::traverse`] over all the texts.
+    pub bytes: u64,
+    /// The sum of every allocation request over all the texts.
+    pub allocated: u64,
+    /// The most bytes one text's validation holds at once. Each text's
+    /// scratch is released before the next text is validated.
+    pub peak: u64,
+}
+
+/// The [`ValidationBound`] of strict NFC validation (`is_normalized`) of
+/// every text of an input of at most `input` bytes: each text has at least
+/// a one-byte head, so there are at most `input` texts, and their payloads
+/// together are at most `input` bytes.
+///
+/// Per text of `L` bytes, `c <= L` characters, `P <= ⌈L · 3/2⌉` decomposed
+/// parts ([`PARTS_PER_BYTE`]), `C <= P` of them combining:
+///
+/// - the quick check: one value, `L` bytes;
+/// - when it does not prove the text normal, `normalize`: `L` bytes for the
+///   source pass; one value per character and per part; per non-empty
+///   release of `m` waiting parts `3m + 512` values and `4m` pair slots and
+///   512 counters of bytes, then one value per released part, the released
+///   parts summing to `C`; one value and at most four bytes per emitted
+///   character, at most `P` of them; the growth of the two pending/ordered
+///   buffers of `(u8, char)` (they exchange storage) of at most `C` elements,
+///   the blocked buffer of at most `P` characters and the normal form of at
+///   most `4P` bytes ([`owned_growth`]);
+/// - the comparison: `L` bytes.
+///
+/// A non-empty release needs a waiting combining part, and every release
+/// but the one at the text's end is made by a starter part after it, so a
+/// text makes at most `min(starters + 1, C) <= ⌊(P + 1) / 2⌋` of them: the
+/// 512-value counting pass is paid at most once per two parts.
+///
+/// Each text has a head of at least one byte, so the `T` texts and their
+/// payloads together fill at most `input` bytes (`T + ΣL <= input`). The
+/// head bytes pay for the rounding: `ΣP <= (3·ΣL + T) / 2 <= 3·input/2` and
+/// `ΣR <= (ΣP + T) / 2 <= 3·input/4`, and one text's `P` is at most the
+/// same `3·input/2`. Each buffer's growth is bounded linearly (a capacity
+/// of at most `2M + 4` elements for `M` held, every request summing to at
+/// most twice the final capacity), so the totals are linear in `input`; the
+/// peak is one text's at its largest. Refused, never saturated, when a
+/// quantity does not fit in `u64`.
+pub fn validation_bound<R>(input: u64) -> Result<ValidationBound, BoundedError<R>> {
+    use super::{add, mul};
+    let (per, of) = PARTS_PER_BYTE;
+    // The head bytes cover the rounding of the parts (`of - 1 <= per`) and
+    // of the releases (`2·of - 1 <= per`) of every text.
+    const { assert!(PARTS_PER_BYTE.1 - 1 <= PARTS_PER_BYTE.0) };
+    const { assert!(2 * PARTS_PER_BYTE.1 - 1 <= PARTS_PER_BYTE.0) };
+    let pair = widen(core::mem::size_of::<(u8, char)>())?;
+    let scalar = widen(core::mem::size_of::<char>())?;
+    let counter = widen(core::mem::size_of::<usize>())?;
+    let texts = input;
+    let parts = mul(input, per)? / of;
+    let releases = mul(input, per)? / mul(of, 2)?;
+    // Values: the quick checks and the characters (`T + ΣL`), six per part
+    // (its visit, its release share of three, its released visit, its
+    // emission) and a counting pass of 512 per release.
+    let values = add(input, add(mul(parts, 6)?, mul(releases, 512)?)?)?;
+    // Bytes: three passes over the payloads; per part its release pair
+    // slots and its emitted bytes, per release its 512 counters; then the
+    // buffers' relocations, at most `2M + 4` capacity elements each.
+    let per_part = add(mul(pair, 4)?, 4)?;
+    let relocated_per_part = add(add(mul(pair, 4)?, mul(scalar, 2)?)?, 8)?;
+    let relocated_per_text = add(add(mul(pair, 8)?, mul(scalar, 4)?)?, 4)?;
+    let bytes = add(
+        add(
+            mul(input, 3)?,
+            mul(parts, add(per_part, relocated_per_part)?)?,
+        )?,
+        add(
+            mul(releases, mul(counter, 512)?)?,
+            mul(texts, relocated_per_text)?,
+        )?,
+    )?;
+    let allocated = add(
+        mul(parts, mul(relocated_per_part, 2)?)?,
+        mul(texts, mul(relocated_per_text, 2)?)?,
+    )?;
+    let single = parts;
+    let peak = owned_growth::<R>(single, pair)?
+        .plus(owned_growth(single, pair)?)?
+        .plus(owned_growth(single, scalar)?)?
+        .plus(owned_growth(mul(single, 4)?, 1)?)?
+        .peak;
+    Ok(ValidationBound {
+        values,
+        bytes,
+        allocated,
+        peak,
+    })
+}
+
 /// The measure of `text`'s encoding: a text head and its NFC bytes. Text
 /// not proven normal is normalized here, once, and its normal form pushed
 /// to `plan`; the write checks the text again, then copies.
@@ -494,6 +602,99 @@ mod tests {
         );
         assert!(comparisons.values <= 500);
         assert_eq!(comparisons.live(), 0);
+    }
+
+    /// The most decomposed parts per UTF-8 byte the normalization bound
+    /// uses is the pinned release's own: no scalar value decomposes into
+    /// more parts per byte of its encoding, and one attains it.
+    #[test]
+    fn the_parts_per_byte_maximum_is_the_releases_own() {
+        let (parts, bytes) = PARTS_PER_BYTE;
+        let mut attained = false;
+        for ch in (0..=0x10_ffffu32).filter_map(char::from_u32) {
+            let mut count = 0u64;
+            decompose_canonical(ch, |_| count += 1);
+            let length = ch.len_utf8() as u64;
+            assert!(
+                count * bytes <= parts * length,
+                "U+{:04X} decomposes into {count} parts in {length} bytes",
+                ch as u32
+            );
+            attained |= count * bytes == parts * length;
+        }
+        assert!(attained, "{parts}/{bytes} is not attained");
+    }
+
+    /// The validation bound covers what strict validation reports for texts
+    /// of every kind the quick check cannot prove normal, valid and not:
+    /// long combining runs, maximal decompositions, Hangul jamo, and many
+    /// short texts, each measured alone and the bound taken at its length.
+    #[test]
+    fn the_validation_bound_covers_every_text() {
+        let maximal: char = (0..=0x10_ffffu32)
+            .filter_map(char::from_u32)
+            .max_by_key(|ch| {
+                let mut parts = 0u64;
+                decompose_canonical(*ch, |_| parts += 1);
+                parts
+            })
+            .unwrap();
+        let texts = [
+            String::new(),
+            "ordinary".into(),
+            "q\u{316}\u{301}".repeat(200),
+            "a\u{301}\u{316}".repeat(200),
+            "\u{1100}\u{1161}\u{11a8}".repeat(100),
+            maximal.to_string().repeat(300),
+            "\u{301}".repeat(500),
+            "e\u{301}".into(),
+        ];
+        for text in &texts {
+            let mut tally = Tally::unlimited();
+            let normal = is_normalized(text, &mut tally);
+            assert!(normal.is_ok(), "{text:?}");
+            // The bound is over an input holding the text: its payload and
+            // at least its one-byte head.
+            let bound = validation_bound::<()>(text.len() as u64 + 1).unwrap();
+            assert!(tally.values <= bound.values, "{text:?} values");
+            assert!(tally.bytes <= bound.bytes, "{text:?} bytes");
+            assert!(tally.requested <= bound.allocated, "{text:?} allocated");
+            assert!(tally.peak() <= bound.peak, "{text:?} peak");
+            assert_eq!(tally.live(), 0, "{text:?} released");
+        }
+        assert_eq!(
+            validation_bound::<()>(u64::MAX),
+            Err(BoundedError::Overflow)
+        );
+    }
+
+    /// The bound is tight on the texts that maximize it: a counting pass
+    /// per two bytes (a precomposed letter, decomposed into a starter and a
+    /// mark, the next letter's starter releasing the mark) and three parts
+    /// per two bytes. An understated term fails the coverage above; an
+    /// overstated one fails here.
+    #[test]
+    fn the_validation_bound_is_tight_on_its_worst_texts() {
+        for letter in ['\u{e9}', '\u{1d5}'] {
+            // A leading mark keeps the quick check from proving it normal.
+            let text = format!("\u{301}{}", letter.to_string().repeat(4096));
+            let mut tally = Tally::unlimited();
+            assert_eq!(is_normalized(&text, &mut tally), Ok(true));
+            let bound = validation_bound::<()>(text.len() as u64 + 3).unwrap();
+            assert!(tally.values <= bound.values && tally.bytes <= bound.bytes);
+            assert!(
+                bound.values <= 2 * tally.values,
+                "{letter:?}: {} values bounded by {}",
+                tally.values,
+                bound.values
+            );
+            assert!(
+                bound.bytes <= 2 * tally.bytes,
+                "{letter:?}: {} bytes bounded by {}",
+                tally.bytes,
+                bound.bytes
+            );
+        }
     }
 
     /// A write against a plan that is not its preparation's is refused.

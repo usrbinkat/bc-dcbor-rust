@@ -386,6 +386,53 @@ fn an_owned_encoding_is_written_under_its_own_budget() {
     assert_eq!(storage.live(), 0, "a refused write drops its permit");
 }
 
+/// The growth bound is exactly what an `Owned` reports and holds: element
+/// by element and in one reservation, for elements of several sizes and
+/// every count across several doublings.
+#[test]
+fn owned_growth_is_exact() {
+    fn measured<T: Default>(elements: usize, one_at_a_time: bool) -> Growth {
+        let mut tally = Tally::unlimited();
+        let mut owned = Owned::<T, TallyPermit>::new();
+        if one_at_a_time {
+            for _ in 0..elements {
+                owned.push(T::default(), &mut tally).unwrap();
+            }
+        } else {
+            owned.reserve(elements, &mut tally).unwrap();
+        }
+        let growth = Growth {
+            copied: tally.bytes,
+            allocated: tally.requested,
+            held: tally.live(),
+            peak: tally.peak(),
+        };
+        drop(owned);
+        assert_eq!(tally.live(), 0);
+        growth
+    }
+    for elements in 0..=300usize {
+        let count = elements as u64;
+        let one = owned_growth::<()>(count, 1).unwrap();
+        let wide = owned_growth::<()>(count, 24).unwrap();
+        assert_eq!(measured::<u8>(elements, true), one, "{elements} bytes");
+        assert_eq!(
+            measured::<[u8; 24]>(elements, true),
+            wide,
+            "{elements} wide"
+        );
+        let reserved = measured::<[u8; 24]>(elements, false);
+        assert_eq!(
+            (reserved.allocated, reserved.held, reserved.peak),
+            (wide.allocated, wide.held, wide.peak),
+            "{elements} reserved at once"
+        );
+        assert_eq!(reserved.copied, 0, "an empty buffer relocates nothing");
+        assert!(reserved.copied <= wide.copied);
+    }
+    assert_eq!(owned_growth::<()>(u64::MAX, 2), Err(BoundedError::Overflow));
+}
+
 #[test]
 fn work_composition_is_checked() {
     let most = WriteWork::new(u64::MAX, 0);

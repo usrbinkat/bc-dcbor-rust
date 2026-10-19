@@ -415,6 +415,60 @@ impl<T, P> Default for Owned<T, P> {
     }
 }
 
+/// What one [`Owned`] reports and holds, at most, over a life in which it
+/// holds at most a given number of elements at once ([`owned_growth`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Growth {
+    /// Bytes its growths report to [`Budget::traverse`] as relocation of
+    /// initialized elements.
+    pub copied: u64,
+    /// The sum of its allocation requests.
+    pub allocated: u64,
+    /// Bytes its permit holds once it has grown to hold that many elements.
+    pub held: u64,
+    /// The most bytes its permits hold at once: the old allocation and the
+    /// new one during its last growth.
+    pub peak: u64,
+}
+
+/// The [`Growth`] of an [`Owned`] of `element_size`-byte elements that holds
+/// at most `elements` at once, by the growth policy [`Owned::reserve`]
+/// follows: capacity doubles from four elements, each growth reporting the
+/// relocation of every initialized element (at most the capacity before it)
+/// and requesting its whole new capacity while the old permit is held. One
+/// growth passing several capacities requests each of them in turn, as a
+/// sequence of single growths does, so the result bounds every order of
+/// pushes, inserts and reservations reaching `elements`. Refused, never
+/// saturated, when a quantity does not fit in `u64`.
+pub fn owned_growth<R>(elements: u64, element_size: u64) -> Result<Growth, BoundedError<R>> {
+    let mut growth = Growth::default();
+    let mut capacity = 0u64;
+    while capacity < elements {
+        let grown = if capacity == 0 { 4 } else { mul(capacity, 2)? };
+        let previous = mul(capacity, element_size)?;
+        let bytes = mul(grown, element_size)?;
+        growth.copied = add(growth.copied, previous)?;
+        growth.allocated = add(growth.allocated, bytes)?;
+        growth.peak = add(previous, bytes)?;
+        growth.held = bytes;
+        capacity = grown;
+    }
+    Ok(growth)
+}
+
+impl Growth {
+    /// This growth and `other`'s, every quantity summed: the bound of two
+    /// buffers that may exist at once.
+    pub fn plus<R>(self, other: Self) -> Result<Self, BoundedError<R>> {
+        Ok(Self {
+            copied: add(self.copied, other.copied)?,
+            allocated: add(self.allocated, other.allocated)?,
+            held: add(self.held, other.held)?,
+            peak: add(self.peak, other.peak)?,
+        })
+    }
+}
+
 /// The NFC form of one text not already in NFC, prepared for its write.
 struct Normalized<P> {
     /// The length of the text it was prepared from, checked at its write.
