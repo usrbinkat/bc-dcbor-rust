@@ -383,6 +383,14 @@ impl Default for Date {
     }
 }
 
+impl core::str::FromStr for Date {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::from_string(value)
+    }
+}
+
 impl TryFrom<&str> for Date {
     type Error = Error;
 

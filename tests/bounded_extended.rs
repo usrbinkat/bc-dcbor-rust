@@ -1,5 +1,6 @@
 //! Public wire contracts for the expanded bounded API. Literal fixtures are
 //! authoritative; symbolic comparisons supplement them.
+#[cfg(feature = "custom-std-collections")]
 use dcbor::HashMap;
 use dcbor::{
     CBOR, CBORCase, Date,
@@ -8,6 +9,8 @@ use dcbor::{
         *,
     },
 };
+#[cfg(all(feature = "hashbrown", not(feature = "custom-std-collections")))]
+use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
 fn policy() -> Limits {
@@ -64,6 +67,7 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     let map = BTreeMap::from([("aa", 1u64), ("b", 2)]);
     let expected = [0xa2, 0x61, b'b', 2, 0x62, b'a', b'a', 1];
     literal(&map, &expected);
+    #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
     literal(&HashMap::from([("b", 2u64), ("aa", 1)]), &expected);
     literal(&dcbor::Map::from(map.clone()), &expected);
     literal(&CBOR::from(map), &expected);
@@ -82,6 +86,7 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
 }
 
 #[test]
+#[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
 fn sparse_hash_map_iteration_is_admitted() {
     let map = HashMap::<u64, u64>::with_capacity(100_000);
     let mut limits = Limits::new(100, 100, 100);

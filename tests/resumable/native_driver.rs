@@ -130,6 +130,7 @@ where
             driver.meter.values,
             driver.meter.bytes,
             driver.meter.calls.len(),
+            driver.meter.pool.live(),
         );
         driver.meter.limit_values = before.0.checked_add(3).expect("work bound overflow");
         driver.meter.limit_bytes = before.1.checked_add(64).expect("work bound overflow");
@@ -141,6 +142,7 @@ where
             driver.meter.values,
             driver.meter.bytes,
             driver.meter.calls.len(),
+            driver.meter.pool.live(),
         );
         assert!(
             after.0 >= before.0 && after.1 >= before.1,
@@ -158,7 +160,7 @@ where
             Ok(Step::Progress) => {
                 assert!(driver.output.is_none());
                 assert!(
-                    after.0 > before.0 || after.1 > before.1,
+                    after.0 > before.0 || after.1 > before.1 || after.3 > before.3,
                     "reported progress without executing admitted work"
                 );
             }

@@ -1,5 +1,76 @@
 use super::*;
 
+#[cfg(feature = "custom-std-collections")]
+impl<K: Schema, V: Schema, S> Schema for std::collections::HashMap<K, V, S> {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        if index == 0 {
+            return Instruction::UnorderedMap;
+        }
+        let start = index - 1;
+        let buckets = self.num_buckets();
+        if start >= buckets {
+            return Instruction::End;
+        }
+        let end = start + (buckets - start).min(64);
+        for bucket in start..end {
+            if let Some((key, value)) = self.get_bucket(bucket) {
+                return Instruction::Entry {
+                    next: bucket + 2,
+                    entry: Some((key, value)),
+                };
+            }
+        }
+        Instruction::Entry {
+            next: end + 1,
+            entry: None,
+        }
+    }
+}
+
+#[cfg(feature = "hashbrown")]
+impl<K: Schema, V: Schema, S> Schema for hashbrown::HashMap<K, V, S> {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        if index == 0 {
+            return Instruction::UnorderedMap;
+        }
+        let start = index - 1;
+        let buckets = self.num_buckets();
+        if start >= buckets {
+            return Instruction::End;
+        }
+        let end = start + (buckets - start).min(64);
+        for bucket in start..end {
+            if let Some((key, value)) = self.get_bucket(bucket) {
+                return Instruction::Entry {
+                    next: bucket + 2,
+                    entry: Some((key, value)),
+                };
+            }
+        }
+        Instruction::Entry {
+            next: end + 1,
+            entry: None,
+        }
+    }
+}
+
+#[cfg(feature = "hashbrown")]
+impl<K: Schema, V: Schema> Schema for hashbrown::HashTable<(K, V)> {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        if index == 0 {
+            Instruction::UnorderedMap
+        } else if index <= self.num_buckets() {
+            let (next, entry) = buckets::scan(self, index - 1, 64);
+            Instruction::Entry {
+                next: next + 1,
+                entry: entry.map(|(key, value)| (key as &dyn Schema, value as &dyn Schema)),
+            }
+        } else {
+            Instruction::End
+        }
+    }
+}
+
 macro_rules! numbers {
     ($($ty:ty => $convert:expr),* $(,)?) => {$(
         impl Schema for $ty {

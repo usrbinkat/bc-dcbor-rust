@@ -2,10 +2,22 @@
 use super::*;
 use decode::storage::Storage;
 use text_cursor::{TextEncoder, TextStep};
+#[cfg(feature = "hashbrown")]
+pub mod buckets;
+mod dynamic;
+mod permutation;
+pub use permutation::{PermutationPhase, PermutationPosition};
+pub mod maps;
+pub use dynamic::{DynamicPhase, DynamicPosition};
 mod values;
+mod writer;
 
-/// One constant-work schema instruction. Implementations must not scan fields,
+/// One bounded-work schema instruction. Implementations must not scan fields,
 /// allocate, or recursively visit children while producing an instruction.
+/// Dynamic map entries may inspect at most 64 indexed bucket controls, yielding
+/// at most one entry. `Entry::next` advances by 1 through 64 instructions.
+/// The engine validates this advance; implementations remain responsible for
+/// bounding the actual work performed before returning the instruction.
 /// References and representation must remain stable for the preparation borrow.
 pub trait Schema {
     fn instruction(&self, index: usize) -> Instruction<'_>;
@@ -19,14 +31,36 @@ pub enum Instruction<'a> {
     /// Begin a map whose present fields are counted as they are visited.
     Map,
     Field(u64, Option<&'a dyn Schema>),
+    /// Begin a map whose entries are ordered by their prepared key bytes.
+    UnorderedMap,
+    /// Up to 64 inspected buckets, yielding at most one entry. `next` is the
+    /// instruction index after the last inspected bucket, including vacancies.
+    Entry {
+        next: usize,
+        entry: Option<(&'a dyn Schema, &'a dyn Schema)>,
+    },
     End,
 }
 
 struct Frame<'a> {
     source: &'a dyn Schema,
     next: usize,
-    hole: Option<usize>,
-    fields: u64,
+    map: Option<usize>,
+}
+
+enum EntryPhase<'a> {
+    Scan,
+    Key(&'a dyn Schema),
+    Value,
+    Order,
+}
+enum MapState<'a> {
+    Schema { fields: u64 },
+    Dynamic { start: usize, phase: EntryPhase<'a> },
+}
+struct MapFrame<'a> {
+    hole: usize,
+    state: MapState<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +74,7 @@ pub struct Position {
     pub relocated_headers: usize,
     pub normalized_bytes_copied: usize,
     pub normalization: Option<text_cursor::Position>,
+    pub dynamic: DynamicPosition,
 }
 
 pub enum PrepareStep<P> {
@@ -72,6 +107,9 @@ pub struct Preparation<'a, P> {
     normalized_at: usize,
     omitted: usize,
     finished: bool,
+    dynamic: dynamic::Dynamic<P>,
+    map_frames: Storage<MapFrame<'a>, P>,
+    root_payload: Option<usize>,
 }
 
 impl<'a, P> Preparation<'a, P> {
@@ -90,6 +128,9 @@ impl<'a, P> Preparation<'a, P> {
             normalized_at: 0,
             omitted: 0,
             finished: false,
+            dynamic: dynamic::Dynamic::new(),
+            map_frames: Storage::new(),
+            root_payload: None,
         }
     }
 
@@ -108,6 +149,7 @@ impl<'a, P> Preparation<'a, P> {
             relocated_headers: self.holes.relocated(),
             normalized_bytes_copied: self.normalized_at,
             normalization: self.text.as_ref().map(TextEncoder::position),
+            dynamic: self.dynamic.position(),
         }
     }
 
@@ -116,20 +158,26 @@ impl<'a, P> Preparation<'a, P> {
         self.head_at = 0;
     }
 
-    fn append<A: Allocator<Permit = P>>(&mut self, byte: u8, a: &mut A) -> BoundedResult<bool, A> {
+    fn append<A: Allocator<Permit = P>>(
+        storage: &mut Storage<u8, P>,
+        source: &[u8],
+        a: &mut A,
+    ) -> BoundedResult<usize, A> {
         // Relocation is its own turn, including the last relocated byte.
-        if self.bytes.ready().is_none() {
-            self.bytes.reserve_step(a)?;
-            return Ok(false);
+        if storage.ready().is_none() {
+            storage.reserve_step(a)?;
+            return Ok(0);
         }
-        if !self.bytes.reserve_step(a)? {
-            return Ok(false);
+        if !storage.reserve_step(a)? {
+            return Ok(0);
         }
-        a.traverse(1, 1).map_err(BoundedError::Refused)?;
-        self.bytes
-            .push_reserved(byte)
+        let count = source.len().min(64).min(storage.spare_ready());
+        a.traverse(1, widen(count)?)
+            .map_err(BoundedError::Refused)?;
+        storage
+            .extend_reserved(&source[..count])
             .map_err(|_| BoundedError::PlanMismatch)?;
-        Ok(true)
+        Ok(count)
     }
 
     pub fn step<A: Allocator<Permit = P>>(
@@ -148,22 +196,19 @@ impl<'a, P> Preparation<'a, P> {
 
     fn advance<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<PrepareStep<P>, A> {
         if self.head_at < self.head_len {
-            if self.append(self.head[self.head_at], a)? {
-                self.head_at += 1;
-            }
+            self.head_at +=
+                Self::append(&mut self.bytes, &self.head[self.head_at..self.head_len], a)?;
             return Ok(PrepareStep::Progress);
         }
-        if let Some(byte) = self.payload.first().copied() {
-            if self.append(byte, a)? {
-                self.payload = &self.payload[1..];
-            }
+        if !self.payload.is_empty() {
+            let count = Self::append(&mut self.bytes, self.payload, a)?;
+            self.payload = &self.payload[count..];
             return Ok(PrepareStep::Progress);
         }
         if let Some(encoded) = &self.normalized {
-            if let Some(byte) = encoded.as_ref().get(self.normalized_at).copied() {
-                if self.append(byte, a)? {
-                    self.normalized_at += 1;
-                }
+            if self.normalized_at < encoded.as_ref().len() {
+                self.normalized_at +=
+                    Self::append(&mut self.bytes, &encoded.as_ref()[self.normalized_at..], a)?;
             } else {
                 a.traverse(1, 0).map_err(BoundedError::Refused)?;
                 self.normalized = None;
@@ -198,11 +243,17 @@ impl<'a, P> Preparation<'a, P> {
                 .push_reserved(Frame {
                     source,
                     next: 0,
-                    hole: None,
-                    fields: 0,
+                    map: None,
                 })
                 .map_err(|_| BoundedError::PlanMismatch)?;
             self.child = None;
+            return Ok(PrepareStep::Progress);
+        }
+        if self.map_frames.ready().is_none() {
+            self.map_frames.reserve_step(a)?;
+            return Ok(PrepareStep::Progress);
+        }
+        if self.dynamic_step(a)? {
             return Ok(PrepareStep::Progress);
         }
         if self.frames.is_empty() {
@@ -218,8 +269,17 @@ impl<'a, P> Preparation<'a, P> {
             let holes = core::mem::take(&mut self.holes)
                 .into_owned()
                 .map_err(|_| BoundedError::PlanMismatch)?;
+            let entries = core::mem::take(&mut self.dynamic.entries)
+                .into_owned()
+                .map_err(|_| BoundedError::PlanMismatch)?;
             self.finished = true;
-            return Ok(PrepareStep::Complete(Prepared { bytes, holes, len }));
+            return Ok(PrepareStep::Complete(Prepared {
+                bytes,
+                holes,
+                len,
+                entries,
+                root_payload: self.root_payload,
+            }));
         }
         // Reserve metadata before inspecting an instruction so refusal never
         // causes schema inspection to replay. Only map starts consume this slot.
@@ -230,7 +290,21 @@ impl<'a, P> Preparation<'a, P> {
         if !self.holes.reserve_step(a)? {
             return Ok(PrepareStep::Progress);
         }
-        a.traverse(1, MAX_HEAD_LEN as u64)
+        if self.map_frames.ready().is_none() {
+            self.map_frames.reserve_step(a)?;
+            return Ok(PrepareStep::Progress);
+        }
+        if !self.map_frames.reserve_step(a)? {
+            return Ok(PrepareStep::Progress);
+        }
+        let dynamic = self
+            .frames
+            .ready()
+            .and_then(|s| s.last())
+            .and_then(|f| f.map)
+            .and_then(|i| self.map_frames.ready().and_then(|s| s.get(i)))
+            .is_some_and(|m| matches!(m.state, MapState::Dynamic { .. }));
+        a.traverse(1, if dynamic { 64 } else { MAX_HEAD_LEN as u64 })
             .map_err(BoundedError::Refused)?;
         let frame = self
             .frames
@@ -245,11 +319,56 @@ impl<'a, P> Preparation<'a, P> {
             Instruction::Text(text) => self.text = Some(TextEncoder::new(text)),
             Instruction::Bytes(bytes) => self.payload = bytes,
             Instruction::Child(child) => self.child = Some(child),
-            Instruction::Map => {
-                if frame.hole.is_some() {
+            Instruction::Entry { next, entry } => {
+                // frame.next already includes the one-instruction increment.
+                // Subtraction avoids overflow at the upper index boundary.
+                if next < frame.next || next - frame.next >= 64 {
                     return Err(BoundedError::PlanMismatch);
                 }
-                frame.hole = Some(self.holes.len());
+                frame.next = next;
+                let map = self
+                    .map_frames
+                    .ready_mut()
+                    .and_then(|s| frame.map.and_then(|i| s.get_mut(i)))
+                    .ok_or(BoundedError::PlanMismatch)?;
+                let MapState::Dynamic { phase, .. } = &mut map.state else {
+                    return Err(BoundedError::PlanMismatch);
+                };
+                if !matches!(phase, EntryPhase::Scan) {
+                    return Err(BoundedError::PlanMismatch);
+                }
+                if let Some((key, value)) = entry {
+                    self.dynamic
+                        .entries
+                        .push_reserved(maps::order::Entry {
+                            start: self.bytes.len(),
+                            key_end: 0,
+                            end: 0,
+                            output: 0,
+                        })
+                        .map_err(|_| BoundedError::PlanMismatch)?;
+                    *phase = EntryPhase::Key(value);
+                    self.child = Some(key);
+                }
+            }
+            Instruction::UnorderedMap | Instruction::Map => {
+                if frame.map.is_some() {
+                    return Err(BoundedError::PlanMismatch);
+                }
+                frame.map = Some(self.map_frames.len());
+                self.map_frames
+                    .push_reserved(MapFrame {
+                        hole: self.holes.len(),
+                        state: if matches!(instruction, Instruction::Map) {
+                            MapState::Schema { fields: 0 }
+                        } else {
+                            MapState::Dynamic {
+                                start: self.dynamic.entries.len(),
+                                phase: EntryPhase::Scan,
+                            }
+                        },
+                    })
+                    .map_err(|_| BoundedError::PlanMismatch)?;
                 self.holes
                     .push_reserved((self.bytes.len(), MAX_HEAD_LEN))
                     .map_err(|_| BoundedError::PlanMismatch)?;
@@ -258,22 +377,41 @@ impl<'a, P> Preparation<'a, P> {
                 self.head_len = MAX_HEAD_LEN;
             }
             Instruction::Field(key, value) => {
-                if frame.hole.is_none() {
+                let map = self
+                    .map_frames
+                    .ready_mut()
+                    .and_then(|s| frame.map.and_then(|i| s.get_mut(i)))
+                    .ok_or(BoundedError::PlanMismatch)?;
+                let MapState::Schema { fields } = &mut map.state else {
                     return Err(BoundedError::PlanMismatch);
-                }
+                };
                 if let Some(value) = value {
-                    frame.fields = add(frame.fields, 1)?;
+                    *fields = add(*fields, 1)?;
                     self.child = Some(value);
                     self.head(MajorType::Unsigned, Argument::Shortest(key));
                 }
             }
             Instruction::End => {
-                if let Some(index) = frame.hole {
+                if let Some(index) = frame.map {
+                    let map = self
+                        .map_frames
+                        .ready_mut()
+                        .and_then(|s| s.get_mut(index))
+                        .ok_or(BoundedError::PlanMismatch)?;
+                    let count = match &mut map.state {
+                        MapState::Schema { fields } => *fields,
+                        MapState::Dynamic { start, phase } => {
+                            *phase = EntryPhase::Order;
+                            widen(self.dynamic.entries.len() - *start)?
+                        }
+                    };
                     let mut head = [0; MAX_HEAD_LEN];
-                    let len =
-                        write_argument(MajorType::Map, Argument::Shortest(frame.fields), &mut head);
-                    let hole =
-                        &mut self.holes.ready_mut().ok_or(BoundedError::PlanMismatch)?[index];
+                    let len = write_argument(MajorType::Map, Argument::Shortest(count), &mut head);
+                    let hole = self
+                        .holes
+                        .ready_mut()
+                        .and_then(|s| s.get_mut(map.hole))
+                        .ok_or(BoundedError::PlanMismatch)?;
                     hole.1 = MAX_HEAD_LEN - len;
                     let start = hole.0 + hole.1;
                     self.bytes.ready_mut().ok_or(BoundedError::PlanMismatch)?[start..start + len]
@@ -282,6 +420,10 @@ impl<'a, P> Preparation<'a, P> {
                         .omitted
                         .checked_add(hole.1)
                         .ok_or(BoundedError::Overflow)?;
+                    if matches!(map.state, MapState::Dynamic { .. }) {
+                        return Ok(PrepareStep::Progress);
+                    }
+                    self.map_frames.pop_ready();
                 }
                 self.frames.pop_ready();
             }
@@ -295,6 +437,8 @@ pub struct Prepared<P> {
     bytes: Owned<u8, P>,
     holes: Owned<(usize, usize), P>,
     len: usize,
+    entries: Owned<maps::order::Entry, P>,
+    root_payload: Option<usize>,
 }
 
 impl<P> Prepared<P> {
@@ -312,6 +456,8 @@ impl<P> Prepared<P> {
             hole: 0,
             written: 0,
             finished: false,
+            entry: 0,
+            entry_offset: 0,
         }
     }
 }
@@ -340,55 +486,6 @@ pub struct Writer<'p, 'o, P> {
     hole: usize,
     written: usize,
     finished: bool,
-}
-
-impl<P> Writer<'_, '_, P> {
-    pub fn emitted_prefix(&self) -> &[u8] {
-        &self.output[..self.written]
-    }
-    pub fn step<B: Budget>(
-        &mut self,
-        b: &mut B,
-    ) -> BoundedResult<text_cursor::pipeline::EmitStep, B> {
-        use text_cursor::pipeline::EmitStep;
-        if self.finished {
-            return Ok(EmitStep::Finished);
-        }
-        if self.output.len() != self.plan.len {
-            return Err(BoundedError::OutputSize {
-                measured: widen(self.plan.len)?,
-                provided: widen(self.output.len())?,
-            });
-        }
-        if let Some(&(start, skip)) = self.plan.holes.as_slice().get(self.hole)
-            && self.source == start
-        {
-            b.traverse(1, 0).map_err(BoundedError::Refused)?;
-            self.source += skip;
-            self.hole += 1;
-            return Ok(EmitStep::Progress);
-        }
-        if self.source == self.plan.bytes.len() {
-            b.traverse(1, 0).map_err(BoundedError::Refused)?;
-            if self.written != self.plan.len {
-                return Err(BoundedError::PlanMismatch);
-            }
-            self.finished = true;
-            return Ok(EmitStep::Complete);
-        }
-        let boundary = self
-            .plan
-            .holes
-            .as_slice()
-            .get(self.hole)
-            .map_or(self.plan.bytes.len(), |h| h.0);
-        let count = (boundary - self.source).min(64);
-        b.traverse(1, widen(count)?)
-            .map_err(BoundedError::Refused)?;
-        self.output[self.written..self.written + count]
-            .copy_from_slice(&self.plan.bytes.as_slice()[self.source..self.source + count]);
-        self.source += count;
-        self.written += count;
-        Ok(EmitStep::Progress)
-    }
+    entry: usize,
+    entry_offset: usize,
 }

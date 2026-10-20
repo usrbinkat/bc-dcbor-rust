@@ -24,11 +24,21 @@ pub fn exercise_schema_schedule(data: &[u8]) {
             .fold(0u64, |n, byte| (n << 8) | u64::from(*byte)),
     };
     let expected = encode(&source, &mut Limits::new(2_000_000, 32_000_000, 4_000_000)).unwrap();
+    scheduled(&source, expected.as_ref(), seed, data.len() * 1024 + 8192);
+    super::maps::exercise(data);
+}
+
+pub(super) fn scheduled(
+    source: &dyn dcbor::bounded::encoding::Schema,
+    expected: &[u8],
+    seed: usize,
+    bound: usize,
+) {
     let run = |stop, cancel| {
         let mut policy = Policy::new(stop);
-        let mut cursor = Preparation::new(&source);
+        let mut cursor = Preparation::new(source);
         let mut observed = false;
-        for _ in 0..data.len() * 1024 + 8192 {
+        for _ in 0..bound {
             let before = policy.work;
             let result = cursor.step(&mut policy);
             assert!(policy.work.values - before.values <= 3);
@@ -52,7 +62,7 @@ pub fn exercise_schema_schedule(data: &[u8]) {
                         }
                     }
                     assert!(done);
-                    assert_eq!(bytes, expected.as_ref());
+                    assert_eq!(bytes, expected);
                     drop(plan);
                     assert_eq!(policy.live.get(), 0);
                     assert_eq!(observed, stop.is_some());

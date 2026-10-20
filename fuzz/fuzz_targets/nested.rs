@@ -1,5 +1,5 @@
 #![no_main]
-use dcbor::{CBORBoundedEncodable, CBOREncodable, CBOR};
+use dcbor::{CBOR, CBORBoundedEncodable, CBOREncodable};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Clone, CBOREncodable, CBORBoundedEncodable)]

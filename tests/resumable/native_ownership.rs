@@ -123,36 +123,53 @@ fn partial_field_reservations_are_released_when_failed_construction_is_cancelled
 #[test]
 fn completed_field_values_not_just_permits_survive_later_refusal() {
     use dcbor::bounded::Allocator;
-    use dcbor::bounded::decode::construction::{
-        BuildStep, ResumableDecodable, TypedDecoder, TypedStep,
-    };
-    use dcbor::bounded::decode::storage::Storage;
+    use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
+    use dcbor::bounded::decode::construction::reclamation::{Cursor, Reclaim, Reclaimed};
+    use dcbor::bounded::decode::construction::{DecodeOwner, TypedDecoder, TypedStep};
     use dcbor::bounded::decode::{ConstructResult, Document, Options};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        mem::MaybeUninit,
+        ptr::{NonNull, addr_of_mut},
+    };
     static CREATED: AtomicUsize = AtomicUsize::new(0);
     static DROPPED: AtomicUsize = AtomicUsize::new(0);
     struct Tracked(String);
-    impl ResumableDecodable for Tracked {
-        type State<P> = <String as ResumableDecodable>::State<P>;
-        fn start<P>() -> Self::State<P> {
-            <String as ResumableDecodable>::start::<P>()
-        }
-        fn construct_step<A: Allocator>(
+    // SAFETY: the compiler projection preserves the single String field's final
+    // address, and the same cursor is used for construction and reclamation.
+    unsafe impl<A: Allocator> InPlace<A> for Tracked {
+        unsafe fn build_step(
             document: &Document<'_, A::Permit>,
             index: usize,
-            state: &mut Self::State<A::Permit>,
-            permits: &mut Storage<A::Permit, A::Permit>,
+            place: NonNull<MaybeUninit<Self>>,
+            cursor: &mut Cursor,
             allocator: &mut A,
-        ) -> ConstructResult<BuildStep<Self>, A> {
-            Ok(
-                match String::construct_step(document, index, state, permits, allocator)? {
-                    BuildStep::Progress => BuildStep::Progress,
-                    BuildStep::Complete(text) => {
-                        CREATED.fetch_add(1, Ordering::SeqCst);
-                        BuildStep::Complete(Self(text))
-                    }
-                },
-            )
+        ) -> ConstructResult<Built, A> {
+            let child = unsafe {
+                NonNull::new_unchecked(addr_of_mut!((*place.as_ptr().cast::<Self>()).0).cast())
+            };
+            let result = unsafe { String::build_step(document, index, child, cursor, allocator)? };
+            if result == Built::Done {
+                CREATED.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(result)
+        }
+    }
+    // SAFETY: only the initialized String field is reclaimed; no Tracked Drop.
+    unsafe impl<A: Allocator> Reclaim<A> for Tracked {
+        unsafe fn reclaim_step(
+            place: NonNull<MaybeUninit<Self>>,
+            cursor: &mut Cursor,
+            a: &mut A,
+        ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
+            let child = unsafe {
+                NonNull::new_unchecked(addr_of_mut!((*place.as_ptr().cast::<Self>()).0).cast())
+            };
+            let result = unsafe { String::reclaim_step(child, cursor, a)? };
+            if result == Reclaimed::Done {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(result)
         }
     }
     impl Drop for Tracked {
@@ -165,7 +182,9 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
     let created = CREATED.load(Ordering::SeqCst);
     let dropped = DROPPED.load(Ordering::SeqCst);
     let mut m = meter();
-    let mut operation = TypedDecoder::<Vec<Tracked>, Permit>::new(&wire, Options::normalizing(8));
+    let owner = DecodeOwner::new();
+    let mut operation =
+        TypedDecoder::<Vec<Tracked>, Meter>::new(&owner, &wire, Options::normalizing(8));
     let mut reached = false;
     for _ in 0..4096 {
         assert!(matches!(
@@ -232,6 +251,8 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
     assert!(m.pool.live() > 0);
     assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
     drop(output);
+    assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
+    super::heap::drain_decode(&owner, &mut m);
     assert_eq!(m.pool.live(), 0);
     assert_eq!(
         CREATED.load(Ordering::SeqCst),

@@ -6,20 +6,33 @@ use super::utf8::Utf8;
 use super::*;
 use crate::bounded::text_cursor::{TextEncoder, TextStep};
 use core::cmp::Ordering;
+use core::mem::MaybeUninit;
 use unicode_normalization::IsNormalized;
+mod initialization;
+mod observation;
+mod publication;
+pub use observation::Resources;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Header,
     Interpret,
     Utf8,
+    InitializeNormalizer,
     Normalize,
     CheckText,
+    ReleaseText,
     Entry,
     Frame,
     Complete,
     Compare,
     Attach,
+    ReleaseStack,
+    Publish,
+    ReclaimNormalizer,
+    ReclaimNormalized,
+    ReclaimEntries,
+    ReclaimStack,
     Finished,
 }
 
@@ -58,7 +71,8 @@ pub struct Decoder<'a, P> {
     completed: usize,
     child_count: usize,
     utf8: Option<Utf8<'a>>,
-    normalizer: Option<TextEncoder<'a, P>>,
+    normalizer: MaybeUninit<TextEncoder<'a, P>>,
+    normalizer_init: usize,
     normalized: Option<Encoded<P>>,
     text_compared: usize,
     comparison: Option<KeyComparison<'a>>,
@@ -82,7 +96,8 @@ impl<'a, P> Decoder<'a, P> {
             completed: 0,
             child_count: 0,
             utf8: None,
-            normalizer: None,
+            normalizer: MaybeUninit::uninit(),
+            normalizer_init: 0,
             normalized: None,
             text_compared: 0,
             comparison: None,
@@ -113,13 +128,60 @@ impl<'a, P> Decoder<'a, P> {
         let result = self.advance(allocator);
         if matches!(&result, Err(error) if !matches!(error, DecodeError::Resource(BoundedError::Refused(_))))
         {
-            self.phase = Phase::Finished;
-            self.entries = Storage::new();
-            self.stack = Storage::new();
-            self.normalizer = None;
-            self.normalized = None;
+            self.phase = Phase::ReclaimNormalizer;
         }
         result
+    }
+
+    /// Close parser admission and reclaim one resource unit. Terminal errors
+    /// enter this same path, retaining partial relocation and normalization.
+    pub fn reclaim_step<A: Allocator<Permit = P>>(
+        &mut self,
+        allocator: &mut A,
+    ) -> BoundedResult<bool, A> {
+        match self.phase {
+            Phase::ReclaimNormalizer => {
+                if self.normalizer_init == TextEncoder::<P>::INIT_STEPS {
+                    // SAFETY: all resource-free metadata fields were initialized
+                    // before the normalizer could acquire any resources.
+                    let normalizer = unsafe { self.normalizer.assume_init_mut() };
+                    if !normalizer.reclaim_step(allocator)? {
+                        return Ok(false);
+                    }
+                }
+                allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
+                self.normalizer_init = 0;
+                self.phase = Phase::ReclaimNormalized;
+            }
+            Phase::ReclaimNormalized => {
+                allocator
+                    .traverse(1, core::mem::size_of::<Encoded<P>>() as u64)
+                    .map_err(BoundedError::Refused)?;
+                self.normalized = None;
+                self.phase = Phase::ReclaimEntries;
+            }
+            Phase::ReclaimEntries => {
+                if self.entries.drain_step(allocator)?.is_none()
+                    && self.entries.release_transition_step(allocator)?
+                {
+                    self.phase = Phase::ReclaimStack;
+                }
+            }
+            Phase::ReclaimStack => {
+                if self.stack.drain_step(allocator)?.is_none()
+                    && self.stack.release_transition_step(allocator)?
+                {
+                    self.phase = Phase::Finished;
+                    return Ok(true);
+                }
+            }
+            Phase::Finished => return Ok(true),
+            _ => {
+                allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
+                self.phase = Phase::ReclaimNormalizer;
+            }
+        }
+        Ok(false)
     }
 
     fn next_header(&mut self) {
@@ -242,19 +304,42 @@ impl<'a, P> Decoder<'a, P> {
                         (_, TextPolicy::QuickOnly) => return Err(DecodeError::UnprovenText),
                         (IsNormalized::No, _) => return Err(Error::NonCanonicalString.into()),
                         (IsNormalized::Maybe, _) => {
-                            self.normalizer = Some(TextEncoder::new(text));
-                            self.phase = Phase::Normalize;
+                            self.normalizer_init = 0;
+                            self.phase = Phase::InitializeNormalizer;
                         }
                     }
                 }
             }
+            Phase::InitializeNormalizer => {
+                let Kind::Text(source) = self.kind else {
+                    return Err(BoundedError::PlanMismatch.into());
+                };
+                // SAFETY: this final-location slot is not exposed until every
+                // initialization step has committed. Its prefix owns no resources.
+                if unsafe {
+                    TextEncoder::initialize_step(
+                        self.normalizer.as_mut_ptr(),
+                        source,
+                        &mut self.normalizer_init,
+                        allocator,
+                    )?
+                } {
+                    self.phase = Phase::Normalize;
+                }
+            }
             Phase::Normalize => {
-                let normalizer = self.normalizer.as_mut().ok_or(BoundedError::PlanMismatch)?;
+                if self.normalizer_init != TextEncoder::<P>::INIT_STEPS {
+                    return Err(BoundedError::PlanMismatch.into());
+                }
+                let normalizer = unsafe { self.normalizer.assume_init_mut() };
                 match normalizer.step(allocator)? {
                     TextStep::Progress => {}
                     TextStep::Complete(bytes) => {
                         self.normalized = Some(bytes);
-                        self.normalizer = None;
+                        // Completion has already drained the normalizer scratch
+                        // and transferred its output reservation. The old slot
+                        // may now be reused without a whole-state destructor.
+                        self.normalizer_init = 0;
                         self.text_compared = 0;
                         self.phase = Phase::CheckText;
                     }
@@ -282,9 +367,15 @@ impl<'a, P> Decoder<'a, P> {
                     if canonical.len() != original.len() {
                         return Err(Error::NonCanonicalString.into());
                     }
-                    self.normalized = None;
-                    self.phase = Phase::Entry;
+                    self.phase = Phase::ReleaseText;
                 }
+            }
+            Phase::ReleaseText => {
+                allocator
+                    .traverse(1, core::mem::size_of::<Encoded<P>>() as u64)
+                    .map_err(BoundedError::Refused)?;
+                self.normalized = None;
+                self.phase = Phase::Entry;
             }
             Phase::Entry => {
                 if !self.entries.reserve_step(allocator)? {
@@ -335,15 +426,8 @@ impl<'a, P> Decoder<'a, P> {
                     if self.position != self.input.len() {
                         return Err(Error::UnusedData(self.input.len() - self.position).into());
                     }
-                    let entries = core::mem::take(&mut self.entries)
-                        .into_owned()
-                        .map_err(|_| BoundedError::PlanMismatch)?;
-                    self.stack = Storage::new();
-                    self.phase = Phase::Finished;
-                    return Ok(DecodeStep::Complete(Document {
-                        input: self.input,
-                        entries,
-                    }));
+                    self.phase = Phase::ReleaseStack;
+                    return Ok(DecodeStep::Progress);
                 };
                 self.phase = Phase::Attach;
                 if parent.map
@@ -358,6 +442,22 @@ impl<'a, P> Decoder<'a, P> {
                     ));
                     self.phase = Phase::Compare;
                 }
+            }
+            Phase::ReleaseStack => {
+                if self.stack.release_transition_step(allocator)? {
+                    self.phase = Phase::Publish;
+                }
+            }
+            Phase::Publish => {
+                allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
+                let entries = core::mem::take(&mut self.entries)
+                    .into_owned()
+                    .map_err(|_| BoundedError::PlanMismatch)?;
+                self.phase = Phase::Finished;
+                return Ok(DecodeStep::Complete(Document {
+                    input: self.input,
+                    entries,
+                }));
             }
             Phase::Compare => {
                 match self
@@ -402,6 +502,12 @@ impl<'a, P> Decoder<'a, P> {
                 } else {
                     self.next_header();
                 }
+            }
+            Phase::ReclaimNormalizer
+            | Phase::ReclaimNormalized
+            | Phase::ReclaimEntries
+            | Phase::ReclaimStack => {
+                self.reclaim_step(allocator)?;
             }
             Phase::Finished => return Ok(DecodeStep::Finished),
         }

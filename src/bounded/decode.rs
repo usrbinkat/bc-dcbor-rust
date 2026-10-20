@@ -23,6 +23,7 @@ pub mod comparison;
 pub mod construction;
 pub mod cursor;
 pub mod header;
+pub(crate) mod initialization;
 pub mod storage;
 pub mod string_cursor;
 mod utf8;

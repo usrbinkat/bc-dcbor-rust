@@ -11,7 +11,9 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-dcbor = { path = "..", features = ["derive", "num-bigint"] }
+dcbor = { path = "..", features = ["derive", "num-bigint", "hashbrown"] }
+# Same revision as the dcbor manifest: usrbinkat/hashbrown feat/map-bucket-index.
+hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8" }
 num-bigint = "0.4.6"
 half = "2.4.1"
 libfuzzer-sys = "0.4"

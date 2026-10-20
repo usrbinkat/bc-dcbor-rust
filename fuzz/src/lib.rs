@@ -2,6 +2,7 @@
 //! symbolic comparison here supplements value, length and resource assertions.
 use dcbor::bounded::*;
 use std::{cell::Cell, rc::Rc};
+mod maps;
 mod schema;
 pub use schema::exercise_schema_schedule;
 
@@ -153,7 +154,7 @@ pub fn exercise<T: BoundedEncodable + ?Sized>(value: &T, expected: &[u8], refusa
 }
 
 pub fn exercise_decode(input: &[u8], refusal: Option<usize>) {
-    use dcbor::bounded::decode::{decode, DecodeError};
+    use dcbor::bounded::decode::{DecodeError, decode};
     let mut policy = Policy::new(refusal);
     match decode(input, 32, &mut policy) {
         Ok(document) => {
@@ -192,8 +193,8 @@ pub fn exercise_decode_schedule(data: &[u8]) {
 
 fn retained_schedule(input: &[u8], schedule: usize) {
     use dcbor::bounded::decode::{
-        cursor::{DecodeStep, Decoder},
         DecodeError, Options,
+        cursor::{DecodeStep, Decoder},
     };
     fn run(input: &[u8], stop: Option<usize>, cancel: bool) -> (usize, WriteWork, u8) {
         let mut policy = Policy::new(stop);

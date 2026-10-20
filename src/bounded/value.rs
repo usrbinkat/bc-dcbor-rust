@@ -380,20 +380,59 @@ impl<K: BoundedEncodable, V: BoundedEncodable> BoundedEncodable for BTreeMap<K, 
     }
 }
 
-impl<K: BoundedEncodable, V: BoundedEncodable, S> BoundedEncodable for HashMap<K, V, S> {
+#[cfg(feature = "custom-std-collections")]
+impl<K, V, S> BoundedEncodable for HashMap<K, V, S>
+where
+    K: BoundedEncodable + Eq + core::hash::Hash,
+    V: BoundedEncodable,
+    S: core::hash::BuildHasher,
+{
     fn measure<A: Allocator>(
         &self,
         plan: &mut Plan<A::Permit>,
         allocator: &mut A,
     ) -> BoundedResult<Measure, A> {
-        // Hash-table iteration scans empty buckets too, even for an empty map
-        // retaining a large allocation. Admit that scan before constructing it.
-        let scan = add(mul(widen(self.capacity())?, 2)?, 1)?;
+        // The storage API reports physical allocation, including control bytes.
+        // Tombstone-producing deletion cannot understate this synchronous bound.
+        let scan = add(widen(self.allocation_size())?, 1)?;
         allocator
             .traverse(scan, scan)
             .map_err(BoundedError::Refused)?;
         measure_dynamic_map(self.iter(), plan, allocator)
     }
+    fn write<P, B: Budget>(
+        &self,
+        plan: &mut Cursor<'_, P>,
+        output: &mut Output<'_>,
+        budget: &mut B,
+    ) -> BoundedResult<(), B> {
+        write_dynamic_map(plan, output, budget)
+    }
+}
+
+#[cfg(feature = "hashbrown")]
+impl<K, V, S> BoundedEncodable for hashbrown::HashMap<K, V, S>
+where
+    K: BoundedEncodable + Eq + core::hash::Hash,
+    V: BoundedEncodable,
+    S: core::hash::BuildHasher,
+{
+    fn measure<A: Allocator>(
+        &self,
+        plan: &mut Plan<A::Permit>,
+        allocator: &mut A,
+    ) -> BoundedResult<Measure, A> {
+        // The allocation includes every bucket's control byte and the extra
+        // control group. Unlike insertion capacity, it does not shrink when
+        // erasure leaves DELETED controls. This is a synchronous total bound,
+        // not a resumable iterator or a three-value/64-byte unit.
+        let scan = add(widen(self.allocation_size())?, 1)?;
+        allocator
+            .traverse(scan, scan)
+            .map_err(BoundedError::Refused)?;
+        measure_dynamic_map(self.iter(), plan, allocator)
+    }
+
     fn write<P, B: Budget>(
         &self,
         plan: &mut Cursor<'_, P>,

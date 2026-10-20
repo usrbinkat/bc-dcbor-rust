@@ -57,7 +57,46 @@ fn check(bytes: &[u8]) {
         .sum();
     assert!(allocated <= bound.allocated);
     assert!(m.pool.peak() <= bound.peak);
-    assert!(m.pool.live() <= bound.retained);
+    // A terminal parse error now retains custody for admitted cleanup. The
+    // retained bound describes the published document, not a suspended cleanup.
+    // Exercise the real cleanup boundary with independently fresh allowances.
+    if result.is_none() {
+        let mut cleanup = Meter::new(m.pool.clone());
+        let mut cleaned = false;
+        for _ in 0..bytes.len().saturating_mul(128).saturating_add(4096) {
+            cleanup.limit_values = cleanup.values + 3;
+            cleanup.limit_bytes = cleanup.bytes + 64;
+            cleanup.refused = None;
+            match decoder.reclaim_step(&mut cleanup) {
+                Ok(true) => {
+                    cleaned = true;
+                    break;
+                }
+                Ok(false) | Err(BoundedError::Refused(_)) => {}
+                other => panic!(
+                    "cleanup failed: {other:?}, wire={bytes:02x?}, parser={:?}",
+                    decoder.position()
+                ),
+            }
+        }
+        assert!(cleaned, "cleanup exceeded finite bound: wire={bytes:02x?}");
+        cleanup.assert_units(3, 64);
+        assert_eq!(
+            cleanup.pool.live(),
+            0,
+            "terminal error retained storage after cleanup"
+        );
+    }
+    assert!(
+        m.pool.live() <= bound.retained,
+        "retained capacity exceeded: wire={bytes:02x?}, accepted={}, parser={:?}, live={}, peak={}, bound={bound:?}, admissions={:?}\n{:?}",
+        result.is_some(),
+        decoder.position(),
+        m.pool.live(),
+        m.pool.peak(),
+        m.calls,
+        m.trace
+    );
     m.assert_units(3, 64);
     drop(decoder);
     drop(result);

@@ -1,0 +1,5 @@
+error: bounded in-place enum construction requires repr(C), repr(u8), or repr(C, u8)
+ --> tests/ui/fail/bounded_enum_requires_representation.rs:2:6
+  |
+2 | enum Message {
+  |      ^^^^^^^

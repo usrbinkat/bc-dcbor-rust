@@ -4,13 +4,19 @@ use dcbor::bounded::BoundedError;
 use dcbor::bounded::decode::{BoundedDecodable, decode_typed};
 use dcbor::bounded::decode::{
     DecodeError, Options,
-    construction::{ResumableDecodable, TypedDecoder, TypedStep, TypedValue},
+    construction::{DecodeOwner, TypedDecoder, TypedStep, TypedValue, in_place::InPlace},
 };
 use dcbor::bounded::{BoundedEncodable, encode};
 use dcbor::{ByteString, CBORBoundedDecodable, CBORBoundedEncodable};
 
-impl<T: ResumableDecodable> Operation<TypedValue<T, Permit>> for TypedDecoder<'_, T, Permit> {
-    fn advance(&mut self, meter: &mut Meter) -> Result<Event<TypedValue<T, Permit>>, &'static str> {
+impl<'i, 'o, T: InPlace<Meter> + 'i> Operation<TypedValue<'i, 'o, T, Meter>>
+    for TypedDecoder<'i, 'o, T, Meter>
+{
+    fn advance(
+        &mut self,
+        meter: &mut Meter,
+    ) -> Result<Event<TypedValue<'i, 'o, T, Meter>>, &'static str> {
+        meter.trace.context(self.position());
         Ok(match self.step(meter) {
             Ok(TypedStep::Progress) => Event::Progress,
             Ok(TypedStep::Complete(value)) => Event::Complete(value),
@@ -22,11 +28,15 @@ impl<T: ResumableDecodable> Operation<TypedValue<T, Permit>> for TypedDecoder<'_
     }
 }
 
-fn typed_driver<T: ResumableDecodable>(
-    wire: &[u8],
+fn typed_driver<'i, 'o, T: InPlace<Meter> + 'i>(
+    owner: &'o DecodeOwner<'i, Meter>,
+    wire: &'i [u8],
     meter: Meter,
-) -> Driver<TypedDecoder<'_, T, Permit>, TypedValue<T, Permit>> {
-    Driver::from_operation(TypedDecoder::new(wire, Options::normalizing(8)), meter)
+) -> Driver<TypedDecoder<'i, 'o, T, Meter>, TypedValue<'i, 'o, T, Meter>> {
+    Driver::from_operation(
+        TypedDecoder::new(owner, wire, Options::normalizing(8)),
+        meter,
+    )
 }
 
 #[derive(Debug, PartialEq, CBORBoundedDecodable, CBORBoundedEncodable)]
@@ -43,6 +53,7 @@ struct Record {
 struct Wrapper(String);
 
 #[derive(Debug, PartialEq, CBORBoundedDecodable, CBORBoundedEncodable)]
+#[repr(C, u8)]
 enum Choice {
     #[cbor(n = 0)]
     Empty,
@@ -145,13 +156,15 @@ fn derived_newtypes_tags_and_enum_shapes_have_literal_wire_oracles() {
     assert_eq!(writing.pool.live(), 0);
 }
 
-fn resumed_shape<T: ResumableDecodable + std::fmt::Debug + PartialEq>(wire: &[u8], expected: &T) {
-    let mut reference = typed_driver::<T>(wire, meter());
+fn resumed_shape<T: InPlace<Meter> + std::fmt::Debug + PartialEq>(wire: &[u8], expected: &T) {
+    let owner = DecodeOwner::new();
+    let mut reference = typed_driver::<T>(&owner, wire, meter());
     finish(&mut reference, 4096);
     let output = reference.output.take().unwrap();
     assert_eq!(output.value(), expected);
     drop(output);
     let baseline = reference.meter;
+    super::heap::drain_decode(&owner, &mut Meter::new(baseline.pool.clone()));
     every_case(baseline.calls.len(), |stop| {
         let mut m = meter();
         let reason = match baseline.calls[stop] {
@@ -160,22 +173,26 @@ fn resumed_shape<T: ResumableDecodable + std::fmt::Debug + PartialEq>(wire: &[u8
         };
         m.fail_at = Some((stop, reason));
         let pool = m.pool.clone();
-        let mut driver = typed_driver::<T>(wire, m);
+        let owner = DecodeOwner::new();
+        let mut driver = typed_driver::<T>(&owner, wire, m);
         resume(&mut driver, reason);
         assert_eq!(driver.output.as_ref().unwrap().value(), expected);
         let mut trace = baseline.calls.clone();
         trace.insert(stop, baseline.calls[stop]);
-        assert_eq!(driver.meter.calls, trace);
-        assert_eq!(
-            (driver.meter.values, driver.meter.bytes),
-            (baseline.values, baseline.bytes)
-        );
-        driver.meter.assert_units(3, 64);
         let output = driver.output.take().unwrap();
-        drop(driver);
+        let observed = driver.meter;
         assert_eq!(output.value(), expected);
         drop(output);
+        super::heap::drain_decode(&owner, &mut Meter::new(pool.clone()));
         assert_eq!(pool.live(), 0);
+        // Drain custody before reporting a diagnostic assertion. Otherwise the
+        // owner's deliberate shutdown assertion masks the original mismatch.
+        observed.trace.assert_calls(&observed.calls, &trace, stop);
+        assert_eq!(
+            (observed.values, observed.bytes),
+            (baseline.values, baseline.bytes)
+        );
+        observed.assert_units(3, 64);
     });
 }
 
@@ -277,17 +294,20 @@ fn derived_nested_fields_resume_at_every_admission_without_reconstruction() {
         bytes: ByteString::new(vec![0, 255]),
         optional: Some(false),
     };
-    let mut reference = typed_driver::<Record>(&wire, meter());
+    let owner = DecodeOwner::new();
+    let mut reference = typed_driver::<Record>(&owner, &wire, meter());
     finish(&mut reference, 4096);
     let result = reference.output.take().unwrap();
     assert_eq!(result.value(), &expected);
     drop(result);
     let baseline = reference.meter;
+    super::heap::drain_decode(&owner, &mut Meter::new(baseline.pool.clone()));
     every_case(baseline.calls.len(), |stop| {
         let mut m = meter();
         m.fail_at = Some((stop, Refusal::Work));
         let pool = m.pool.clone();
-        let mut driver = typed_driver::<Record>(&wire, m);
+        let owner = DecodeOwner::new();
+        let mut driver = typed_driver::<Record>(&owner, &wire, m);
         resume(&mut driver, Refusal::Work);
         assert_eq!(driver.output.as_ref().unwrap().value(), &expected);
         driver.meter.assert_units(3, 64);
@@ -296,6 +316,7 @@ fn derived_nested_fields_resume_at_every_admission_without_reconstruction() {
         assert!(pool.live() >= 4);
         assert_eq!(value.value(), &expected);
         drop(value);
+        super::heap::drain_decode(&owner, &mut Meter::new(pool.clone()));
         assert_eq!(pool.live(), 0);
     });
 }

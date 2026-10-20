@@ -1,5 +1,5 @@
 #![no_main]
-use dcbor::{bounded::Tagged, CBOR};
+use dcbor::{CBOR, bounded::Tagged};
 use libfuzzer_sys::fuzz_target;
 use num_bigint::{BigInt, BigUint, Sign};
 use std::collections::BTreeMap;

@@ -17,4 +17,5 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 
 [dev-dependencies]
 dcbor = { path = "..", features = ["derive"] }
+rustversion = "1"
 trybuild = "1"

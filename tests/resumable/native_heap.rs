@@ -3,6 +3,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 
+#[path = "heap_lifecycle.rs"]
+mod lifecycle;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub calls: usize,
@@ -203,8 +206,9 @@ fn every_real_decoder_allocation_failure_releases_physical_and_permit_ownership(
     let wire = text_wire(&"q\u{301}😀".repeat(64));
     let mut baseline = meter();
     baseline.calls.reserve(16384);
+    let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
     let observer = Observation::begin(None);
-    let value = retained_value::<String>(&wire, &mut baseline).unwrap();
+    let value = retained_value::<String>(&owner, &wire, &mut baseline).unwrap();
     observer.stop();
     let stats = observer.snapshot();
     assert!(!stats.overflow && stats.calls > 0);
@@ -212,14 +216,16 @@ fn every_real_decoder_allocation_failure_releases_physical_and_permit_ownership(
     assert!(stats.live <= baseline.pool.live() as usize);
     assert!(stats.peak <= baseline.pool.peak() as usize);
     drop(value);
+    drain_decode(&owner, &mut baseline);
     assert_eq!(observer.snapshot().live, 0);
     assert_eq!(baseline.pool.live(), 0);
     drop(observer);
     every_case(stats.calls, |index| {
         let mut m = meter();
         m.calls.reserve(16384);
+        let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
         let observer = Observation::begin(Some(index));
-        let result = retained_value::<String>(&wire, &mut m);
+        let result = retained_value::<String>(&owner, &wire, &mut m);
         observer.stop();
         let stats = observer.snapshot();
         assert!(stats.denied, "allocation {index} never intercepted");
@@ -230,6 +236,7 @@ fn every_real_decoder_allocation_failure_releases_physical_and_permit_ownership(
             Err(DecodeError::Resource(BoundedError::Allocation { .. }))
         ));
         drop(result);
+        drain_decode(&owner, &mut m);
         assert_eq!(observer.snapshot().live, 0);
         assert_eq!(m.pool.live(), 0);
     });
@@ -238,16 +245,21 @@ fn every_real_decoder_allocation_failure_releases_physical_and_permit_ownership(
 // Ownership floor: Tokio's sync_semaphore_owned.rs::try_acquire_many and
 // stress_test. Extend that floor by observing actual storage simultaneously
 // with reservations, including every physical allocation failure.
-fn retained_value<T: dcbor::bounded::decode::construction::ResumableDecodable>(
-    wire: &[u8],
+fn retained_value<
+    'i,
+    'o,
+    T: dcbor::bounded::decode::construction::in_place::InPlace<super::harness::Meter> + 'i,
+>(
+    owner: &'o dcbor::bounded::decode::construction::DecodeOwner<'i, super::harness::Meter>,
+    wire: &'i [u8],
     meter: &mut super::harness::Meter,
 ) -> Result<
-    dcbor::bounded::decode::construction::TypedValue<T, super::harness::Permit>,
+    dcbor::bounded::decode::construction::TypedValue<'i, 'o, T, super::harness::Meter>,
     dcbor::bounded::decode::DecodeError<super::harness::Refusal>,
 > {
     use dcbor::bounded::decode::Options;
     use dcbor::bounded::decode::construction::{TypedDecoder, TypedStep};
-    let mut decoder = TypedDecoder::<T, _>::new(wire, Options::normalizing(8));
+    let mut decoder = TypedDecoder::<T, _>::new(owner, wire, Options::normalizing(8));
     for _ in 0..wire.len() * 128 + 4096 {
         let before = (meter.values, meter.bytes);
         meter.limit_values = before.0.checked_add(3).unwrap();
@@ -268,6 +280,22 @@ fn retained_value<T: dcbor::bounded::decode::construction::ResumableDecodable>(
         }
     }
     panic!("retained decoder failed to terminate");
+}
+
+pub(super) fn drain_decode(
+    owner: &dcbor::bounded::decode::construction::DecodeOwner<'_, super::harness::Meter>,
+    meter: &mut super::harness::Meter,
+) {
+    use dcbor::bounded::decode::construction::reclamation::Reclaimed;
+    for _ in 0..16384 {
+        meter.limit_values = meter.values + 3;
+        meter.limit_bytes = meter.bytes + 64;
+        meter.refused = None;
+        if owner.shutdown_step(meter).unwrap() == Reclaimed::Done {
+            return;
+        }
+    }
+    panic!("decode owner exceeded cleanup bound");
 }
 
 #[test]
@@ -396,7 +424,8 @@ fn derived_nested_values_release_every_failed_physical_allocation() {
     let mut baseline = meter();
     baseline.calls.reserve(16384);
     let observer = Observation::begin(None);
-    let output = retained_value::<Record>(&wire, &mut baseline).unwrap();
+    let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
+    let output = retained_value::<Record>(&owner, &wire, &mut baseline).unwrap();
     observer.stop();
     let stats = observer.snapshot();
     assert!(stats.calls > 0 && !stats.overflow);
@@ -407,14 +436,16 @@ fn derived_nested_values_release_every_failed_physical_allocation() {
     assert_eq!(output.value().nested[0], ["b", "c"]);
     assert_eq!(output.value().nested[1], ["d"]);
     drop(output);
+    drain_decode(&owner, &mut baseline);
     assert_eq!(observer.snapshot().live, 0);
     assert_eq!(baseline.pool.live(), 0);
     drop(observer);
     every_case(stats.calls, |index| {
         let mut meter = meter();
         meter.calls.reserve(16384);
+        let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
         let observer = Observation::begin(Some(index));
-        let result = retained_value::<Record>(&wire, &mut meter);
+        let result = retained_value::<Record>(&owner, &wire, &mut meter);
         observer.stop();
         let measured = observer.snapshot();
         assert!(measured.denied && !measured.overflow);
@@ -424,6 +455,7 @@ fn derived_nested_values_release_every_failed_physical_allocation() {
             Err(DecodeError::Resource(BoundedError::Allocation { .. }))
         ));
         drop(result);
+        drain_decode(&owner, &mut meter);
         assert_eq!(observer.snapshot().live, 0);
         assert_eq!(meter.pool.live(), 0);
     });

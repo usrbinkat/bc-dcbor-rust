@@ -1,6 +1,7 @@
 #![doc(html_root_url = "https://docs.rs/dcbor/0.25.2")]
 #![warn(rust_2018_idioms)]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "custom-std-collections", feature(hashmap_bucket_access))]
 
 //! # dCBOR: Deterministic CBOR Codec
 //!
@@ -159,6 +160,11 @@ pub use num_bigint::{
 pub mod walk;
 
 pub mod bounded;
+
+/// The exact hashbrown dependency used by the bounded map implementations.
+/// Use this re-export to preserve map type identity across consumers.
+#[cfg(feature = "hashbrown")]
+pub use hashbrown;
 
 pub mod prelude;
 

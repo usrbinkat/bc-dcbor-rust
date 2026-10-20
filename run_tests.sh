@@ -31,6 +31,11 @@ test_only_features "no_std,multithreaded,num-bigint"
 test_additional_features "multithreaded"
 test_additional_features "num-bigint"
 test_additional_features "multithreaded,num-bigint"
+# Bounded map encoding over the hashbrown fork. custom-std-collections is not
+# run here: it requires the standard library built from usrbinkat/rust.
+test_additional_features "hashbrown"
+test_additional_features "derive,hashbrown"
+test_additional_features "derive,hashbrown,multithreaded,num-bigint"
 
 section "All Default Features and doctests"
 cargo test > /dev/null

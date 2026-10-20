@@ -132,11 +132,22 @@ detect deliberate violations. Fault matrices must exercise all selected cases.
 The executable acceptance target is `tests/resumable_contract.rs`; its module
 declarations identify the registered test groups.
 
+Stock toolchain: every feature except `custom-std-collections`, which enables
+`#![feature(hashmap_bucket_access)]` and is rejected on the stable channel.
+
 ```sh
-cargo test --features derive --test resumable_contract
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --features derive,hashbrown --test resumable_contract
+cargo test --workspace --features derive,hashbrown,multithreaded,num-bigint
+cargo clippy --workspace --all-targets --features derive,hashbrown,multithreaded,num-bigint -- -D warnings
 cargo fmt --all --check
+```
+
+Standard-library toolchain built from `usrbinkat/rust` branch
+`feat/bounded-collection-access`, whose std exposes `hashmap_bucket_access`:
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 The separate fuzz workspace must be built and executed with coverage

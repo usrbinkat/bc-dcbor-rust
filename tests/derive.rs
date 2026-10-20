@@ -474,6 +474,7 @@ struct Inner(Vec<u64>);
 #[derive(
     Clone, Copy, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable,
 )]
+#[repr(u8)]
 enum Kind {
     #[cbor(n = 0)]
     First,
@@ -482,6 +483,7 @@ enum Kind {
 }
 
 #[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[repr(C, u8)]
 enum Variants {
     #[cbor(n = 0)]
     Point,

@@ -1,4 +1,5 @@
 import_stdlib!();
+mod bounded;
 
 use crate::{CBOR, Error};
 

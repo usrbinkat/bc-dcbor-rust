@@ -63,28 +63,42 @@ impl<'a> KeyComparison<'a> {
         &mut self,
         budget: &mut B,
     ) -> Result<ComparisonStep, BoundedError<B::Refusal>> {
-        let Some(work) = self.next_work() else {
+        if self.finished {
             return Ok(ComparisonStep::Finished);
-        };
-        budget
-            .traverse(work.values, work.bytes)
-            .map_err(BoundedError::Refused)?;
-        let end = self.position + work.bytes as usize;
-        while self.position < end {
-            let ordering = self.left[self.position].cmp(&self.right[self.position]);
-            self.position += 1;
-            if ordering != Ordering::Equal {
-                self.finished = true;
-                return Ok(ComparisonStep::Complete(ordering));
-            }
         }
-        if self.position == self.left.len().min(self.right.len()) {
+        if let Some(ordering) = compare_step(self.left, self.right, &mut self.position, budget)? {
             self.finished = true;
-            Ok(ComparisonStep::Complete(
-                self.left.len().cmp(&self.right.len()),
-            ))
+            Ok(ComparisonStep::Complete(ordering))
         } else {
             Ok(ComparisonStep::Progress)
         }
     }
+}
+
+/// Shared comparison unit for borrowed keys and arena-indexed keys. The caller
+/// retains the offset and keeps both byte ranges unchanged until completion.
+pub(crate) fn compare_step<B: Budget>(
+    left: &[u8],
+    right: &[u8],
+    position: &mut usize,
+    budget: &mut B,
+) -> Result<Option<Ordering>, BoundedError<B::Refusal>> {
+    let remaining = left
+        .len()
+        .min(right.len())
+        .checked_sub(*position)
+        .ok_or(BoundedError::PlanMismatch)?;
+    let count = remaining.min(64);
+    budget
+        .traverse(1, count as u64)
+        .map_err(BoundedError::Refused)?;
+    let end = *position + count;
+    while *position < end {
+        let ordering = left[*position].cmp(&right[*position]);
+        *position += 1;
+        if ordering != Ordering::Equal {
+            return Ok(Some(ordering));
+        }
+    }
+    Ok((*position == left.len().min(right.len())).then(|| left.len().cmp(&right.len())))
 }

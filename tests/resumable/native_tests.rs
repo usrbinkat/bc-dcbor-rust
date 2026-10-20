@@ -199,30 +199,32 @@ fn typed_output_owns_capacity_after_parser_scratch_release() {
 
 #[test]
 fn typed_field_copies_have_bounded_units() {
-    use dcbor::bounded::decode::construction::{BuildStep, ResumableDecodable};
-    use dcbor::bounded::decode::storage::Storage;
+    use dcbor::bounded::decode::Options;
+    use dcbor::bounded::decode::construction::{DecodeOwner, TypedDecoder, TypedStep};
     let text = "😀é".repeat(1024);
     let wire = text_wire(&text);
-    let mut parsing = meter();
-    let doc = decode(&wire, 8, &mut parsing).unwrap();
     let mut m = meter();
-    let mut permits = Storage::new();
-    let mut state = <String as ResumableDecodable>::start::<Permit>();
+    let owner = DecodeOwner::new();
+    let mut decoder = TypedDecoder::<String, Meter>::new(&owner, &wire, Options::normalizing(8));
     let mut value = None;
     for _ in 0..wire.len() + 4096 {
-        match String::construct_step(&doc, 0, &mut state, &mut permits, &mut m).unwrap() {
-            BuildStep::Progress => {}
-            BuildStep::Complete(output) => {
+        m.limit_values = m.values + 3;
+        m.limit_bytes = m.bytes + 64;
+        match decoder.step(&mut m) {
+            Ok(TypedStep::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
+            Ok(TypedStep::Complete(output)) => {
                 value = Some(output);
                 break;
             }
+            _ => panic!("bounded field copy failed"),
         }
     }
     let value = value.expect("bounded field copy did not complete");
-    assert_eq!(value, text);
+    assert_eq!(value.value(), &text);
     m.assert_units(3, 64);
     drop(value);
-    drop(permits);
+    drop(decoder);
+    super::heap::drain_decode(&owner, &mut m);
     assert_eq!(m.pool.live(), 0);
 }
 

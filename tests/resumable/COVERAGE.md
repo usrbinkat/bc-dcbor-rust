@@ -1,8 +1,9 @@
 # Resumable acceptance coverage
 
 `../resumable_contract.rs` registers the runtime groups below. Paths are relative
-to this directory unless otherwise specified. Run with `--features derive` to
-exercise generated construction and its allocation-failure matrix.
+to this directory unless otherwise specified. Run with `--features derive,hashbrown`
+to exercise generated construction, bucket-indexed map preparation, and their
+allocation-failure matrices.
 
 | Requirement | Registered test source |
 | --- | --- |
@@ -17,6 +18,9 @@ exercise generated construction and its allocation-failure matrix.
 | Physical allocation failure in preparation, plan ownership, allocation-free emission | `native_preparation_heap.rs` |
 | Preparation and emission refusal/cancellation, exact prefixes, shared pool | `native_pipeline.rs` |
 | Retained schema encoding, nested generics, enum representations, optional omission, tags, map-header finalization, physical allocation failures | `native_schema_encoding.rs` |
+| Sparse bucket scans, dynamic-key ordering, canonical duplicate rejection, refusal traces, cancellation, physical allocation failures | `native_dynamic_maps.rs` |
+| Nested dynamic tables as keys and values, derived-field composition, header-gap compaction, repeated refusal, canonical collisions, physical allocation failures | `native_nested_maps.rs` |
+| Batched sparse scanning, constant-work plain-data truncation, shorter-run merge scratch, early duplicate rejection, bytes-times-depth total work | `native_map_review.rs` |
 | Literal composition, reordering, leading marks, decomposition, Hangul | `native_text_matrix.rs` |
 | Long combining runs with O(n log n) turn limits | `native_text_matrix.rs::long_combining_run_requires_retained_progress_not_whole_run_admission` |
 | Retained text positions and cancellation at progress boundaries | `native_text_progress.rs` |
@@ -62,7 +66,7 @@ The derive UI target is `dcbor-derive/tests/ui.rs`.
 `fuzz/fuzz_targets/decode_schedule.rs` drives retained decoding with an observed
 admission refusal, same-operation resumption, cancellation, truncation, mutation,
 cumulative work comparison, and ownership release. `schema_schedule.rs` exercises
-derived preparation, nested arrays, optional fields, normalization, same-cursor
+derived preparation, nested arrays and dynamic tables, optional fields, normalization, same-cursor
 refusal recovery, cancellation, and allocation-free emission. `fuzz/smoke.sh`
 includes both alongside the six other targets. Toolchain and execution commands
 are in `fuzz/README.md`.
@@ -73,5 +77,4 @@ Callback bounds, measured latency, and physical allocation observation are
 distinct measurements. None substitutes for the others. Synchronous work-bound
 tests do not establish next-unit bounds for every retained transition. Generic
 custom-constructor execution and destruction require explicit qualification.
-Dynamic-map schema encoding and downstream Kappa integration require their own
-continuation and public-boundary tests under `CONTRACT.md`.
+Downstream Kappa integration requires public-boundary tests under `CONTRACT.md`.

@@ -1,6 +1,7 @@
 //! Executable public-boundary gates against the existing dCBOR implementation.
 //! Test-owned instrumentation never parses, normalizes, or restarts a decode.
 #![cfg(feature = "std")]
+#![cfg_attr(feature = "custom-std-collections", feature(hashmap_bucket_access))]
 
 #[path = "resumable/native_bindings.rs"]
 mod bindings;
@@ -20,6 +21,19 @@ mod derive;
 mod differential;
 #[path = "resumable/native_driver.rs"]
 mod driver;
+#[cfg(feature = "hashbrown")]
+#[path = "resumable/native_dynamic_maps.rs"]
+mod dynamic_maps;
+#[cfg(feature = "hashbrown")]
+mod hash_map_schema {
+    use hashbrown::HashMap;
+    include!("resumable/native_hash_map_schema.rs");
+}
+#[cfg(feature = "custom-std-collections")]
+mod std_hash_map_schema {
+    use std::collections::HashMap;
+    include!("resumable/native_hash_map_schema.rs");
+}
 #[path = "resumable/native_harness.rs"]
 mod harness;
 #[path = "resumable/native_header_cursor.rs"]
@@ -30,8 +44,14 @@ mod heap;
 mod latency;
 #[path = "resumable/native_malformed.rs"]
 mod malformed;
+#[cfg(feature = "hashbrown")]
+#[path = "resumable/native_map_review.rs"]
+mod map_review;
 #[path = "resumable/native_matrix.rs"]
 mod matrix;
+#[cfg(all(feature = "hashbrown", feature = "derive"))]
+#[path = "resumable/native_nested_maps.rs"]
+mod nested_maps;
 #[path = "resumable/native_output_bounds.rs"]
 mod output_bounds;
 #[path = "resumable/native_ownership.rs"]

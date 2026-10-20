@@ -1,5 +1,31 @@
 # Bounded encoding fuzz targets
 
+## Recorded campaign using the project flake
+
+From the repository root:
+
+```sh
+nix develop -c bash fuzz/qualify.sh
+```
+
+This builds all eight existing targets and runs each for 600 seconds (about
+80 minutes total, plus compilation and corpus initialization). Each target uses
+seed 20261019, its own input-size ceiling, a 30-second per-input timeout, and a
+4096 MiB RSS limit. Existing corpora and crash artifacts are retained.
+
+The script prints its unique temporary log directory. It records toolchain
+versions, source hashes, campaign settings, build output, per-target output and
+final statistics, and pass/fail status in `results.txt`. It stops on the first
+failure and prints that log's tail. Set `FUZZ_LOG_DIR` to choose a persistent
+directory; an existing campaign's results are never overwritten.
+
+```sh
+FUZZ_SECONDS=60 FUZZ_SEED=42 nix develop -c bash fuzz/qualify.sh
+```
+
+This campaign covers the existing targets described below. It does not add an
+owner-backed typed-decoder lifecycle target or establish coverage of that API.
+
 For Nix-managed Rust without rustup, use local `nixpkgs` and `rust-overlay`
 checkouts. This avoids GitHub registry resolution; uncached toolchain archives
 and packages still require downloads. Substitute your checkout paths:
@@ -58,10 +84,13 @@ cumulative work and outcome, and separately cancels at that admission. It also
 checks proper prefixes and a mutated input, enforcing three-value/64-byte step
 bounds and zero retained reservations after destruction.
 `schema_schedule` exercises derived schema preparation with nested arrays,
-optional fields, normalization, and multiple integer-key widths. It requires a
+optional fields, normalization, multiple integer-key widths, and sparse dynamic
+tables nested as keys and values. Derived records inside table values exercise
+header-gap compaction. It requires a
 positively observed admission refusal, same-cursor resumption with unchanged
 cumulative work, cancellation cleanup, bounded preparation and writer steps,
-and exact agreement with the synchronous encoder.
+and exact agreement with the synchronous encoder or a separately constructed
+symbolic map oracle.
 `representations` exercises sorted dynamic maps, symbolic values, explicit tags,
 standalone options, and positive/negative bignums. Both cap input size inside the
 target, independently of libFuzzer arguments.

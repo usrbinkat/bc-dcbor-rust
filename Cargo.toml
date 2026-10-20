@@ -29,7 +29,9 @@ categories = [
 [dependencies]
 chrono = { version = "^0.4.28", default-features = true }
 half = { version = "^2.4.1", default-features = false }
-hashbrown = { version = "^0.16.1", optional = true }
+# usrbinkat/hashbrown branch feat/map-bucket-index: adds HashMap::num_buckets
+# and HashMap::get_bucket (src/map_buckets.rs) on top of upstream main.
+hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8", optional = true }
 hex = { version = "^0.4.3", default-features = true }
 num-bigint = { version = "0.4.6", default-features = false, optional = true }
 spin = { version = "0.10.0", optional = true }
@@ -52,6 +54,8 @@ multithreaded = []
 no_std = ["hashbrown", "thiserror", "spin"]
 num-bigint = ["dep:num-bigint"]
 std = ["half/std", "chrono/std", "hex/std", "thiserror/std"]
+# Requires a rebuilt standard library exposing hashmap_bucket_access.
+custom-std-collections = ["std"]
 derive = ["dep:dcbor-derive"]
 
 [[example]]

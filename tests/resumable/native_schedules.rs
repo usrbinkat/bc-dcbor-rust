@@ -1,11 +1,11 @@
 use super::harness::*;
+use dcbor::bounded::decode::{decode, DecodeError, Options};
 use dcbor::bounded::BoundedError;
-use dcbor::bounded::decode::{DecodeError, Options, decode};
 
 #[test]
 fn header_and_first_payload_admissions_are_separately_observed() {
     use super::bindings::decode_driver;
-    use super::driver::{Step, finish};
+    use super::driver::{finish, Step};
     use dcbor::bounded::decode::cursor::Phase;
     let mut wire = vec![0x78, 0x18];
     wire.extend_from_slice(b"abcdefghijklmnopqrstuvwx");
@@ -66,8 +66,8 @@ fn header_and_first_payload_admissions_are_separately_observed() {
 
 #[test]
 fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
-    use dcbor::bounded::decode::construction::{BuildStep, ResumableDecodable};
-    use dcbor::bounded::decode::storage::Storage;
+    use dcbor::bounded::decode::construction::in_place::{Construction, Step};
+    use dcbor::bounded::decode::construction::reclamation::{Reclaimed, Reclaimer};
     let wire = text_wire("q\u{301}😀");
     let mut parser = meter();
     let doc = decode(&wire, 8, &mut parser).unwrap();
@@ -75,23 +75,25 @@ fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
     let run = |stop: Option<(usize, Refusal)>, cancel: bool| {
         let mut m = meter();
         m.fail_at = stop;
-        let mut state = String::start::<Permit>();
-        let mut permits = Storage::new();
+        let owner = Reclaimer::new();
+        let mut operation = Construction::<String, Meter>::new(&owner, &doc, 0);
         let mut observed = false;
         let mut done = false;
         for _ in 0..4096 {
-            let before = (m.values, m.bytes);
+            let before = (m.values, m.bytes, m.pool.live());
             m.limit_values = before.0 + 3;
             m.limit_bytes = before.1 + 64;
             m.refused = None;
-            let result = String::construct_step(&doc, 0, &mut state, &mut permits, &mut m);
+            let result = operation.step(&mut m);
             assert!(m.values - before.0 <= 3 && m.bytes - before.1 <= 64);
             assert_eq!(parser.pool.live(), parser_live);
             match result {
-                Ok(BuildStep::Progress) => assert_ne!((m.values, m.bytes), before),
-                Ok(BuildStep::Complete(value)) => {
-                    assert_eq!(value, "q\u{301}😀");
-                    assert!(m.pool.live() >= value.len() as u64);
+                // A resumed allocation commits metadata admitted on an earlier
+                // turn. Its newly retained reservation is useful progress.
+                Ok(Step::Progress) => assert_ne!((m.values, m.bytes, m.pool.live()), before),
+                Ok(Step::Complete(value)) => {
+                    assert_eq!(value.value(), "q\u{301}😀");
+                    assert!(m.pool.live() >= value.value().len() as u64);
                     drop(value);
                     done = true;
                     break;
@@ -112,28 +114,47 @@ fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
         }
         assert!(done, "construction did not terminate");
         assert_eq!(observed, stop.is_some());
-        drop(state);
-        drop(permits);
+        let construction_calls = m.calls.clone();
+        drop(operation);
+        let mut cleaned = false;
+        for _ in 0..4096 {
+            m.limit_values = m.values + 3;
+            m.limit_bytes = m.bytes + 64;
+            m.refused = None;
+            match owner.shutdown_step(&mut m) {
+                Ok(Reclaimed::Done) => {
+                    cleaned = true;
+                    break;
+                }
+                Ok(Reclaimed::Progress) | Err(BoundedError::Refused(_)) => {}
+                _ => panic!("constructor cleanup failed"),
+            }
+        }
+        assert!(cleaned);
+        assert_eq!(parser.pool.live(), parser_live);
         assert_eq!(m.pool.live(), 0);
-        m
+        (m, construction_calls)
     };
-    let baseline = run(None, false);
-    for (index, call) in baseline.calls.iter().enumerate() {
+    let (baseline, construction_calls) = run(None, false);
+    for (index, call) in construction_calls.iter().enumerate() {
         let reason = if matches!(call, Call::Allocate(_)) {
             Refusal::Capacity
         } else {
             Refusal::Work
         };
-        let resumed = run(Some((index, reason)), false);
+        let (resumed, resumed_construction) = run(Some((index, reason)), false);
         let mut trace = baseline.calls.clone();
         trace.insert(index, *call);
         assert_eq!(resumed.calls, trace);
+        let mut construction_trace = construction_calls.clone();
+        construction_trace.insert(index, *call);
+        assert_eq!(resumed_construction, construction_trace);
         assert_eq!(
             (resumed.values, resumed.bytes),
             (baseline.values, baseline.bytes)
         );
-        let cancelled = run(Some((index, reason)), true);
-        assert_eq!(cancelled.calls, baseline.calls[..=index]);
+        let (_, cancelled) = run(Some((index, reason)), true);
+        assert_eq!(cancelled, construction_calls[..=index]);
     }
     drop(doc);
     assert_eq!(parser.pool.live(), 0);
@@ -141,7 +162,7 @@ fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
 
 #[test]
 fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
-    use unicode_normalization::{IsNormalized, is_nfc_quick};
+    use unicode_normalization::{is_nfc_quick, IsNormalized};
     fn check(text: &str) {
         let wire = text_wire(text);
         let mut m = meter();
@@ -194,7 +215,7 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
 
 #[test]
 fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
-    use super::driver::{Driver, finish, resume};
+    use super::driver::{finish, resume, Driver};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "a\u{301}";
     let expected = [0x62, 0xc3, 0xa1];
@@ -232,7 +253,7 @@ fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
 
 #[test]
 fn emission_is_bounded_independently_of_preparation() {
-    use super::driver::{Driver, finish};
+    use super::driver::{finish, Driver};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "x".repeat(65536);
     let mut preparation = Driver::from_operation(TextPreparation::new(&source), meter());
@@ -241,13 +262,11 @@ fn emission_is_bounded_independently_of_preparation() {
     let mut bytes = vec![0; prepared.len() as usize];
     let mut emission = Driver::from_operation(prepared.writer(&mut bytes), meter());
     finish(&mut emission, source.len() + 4096);
-    assert!(
-        !emission
-            .meter
-            .calls
-            .iter()
-            .any(|c| matches!(c, Call::Allocate(_)))
-    );
+    assert!(!emission
+        .meter
+        .calls
+        .iter()
+        .any(|c| matches!(c, Call::Allocate(_))));
     emission.meter.assert_units(3, 64);
     drop(emission);
     assert_eq!(bytes, text_wire(&source));

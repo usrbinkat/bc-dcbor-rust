@@ -1,6 +1,10 @@
 use dcbor::bounded::{Allocator, Budget};
 use std::sync::{Arc, Mutex};
 
+#[path = "admission_trace.rs"]
+mod trace;
+pub use trace::AdmissionTrace;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     Work,
@@ -64,6 +68,7 @@ impl Drop for Permit {
 }
 
 pub struct Meter {
+    pub trace: AdmissionTrace,
     pub pool: Pool,
     pub calls: Vec<Call>,
     pub refused: Option<(usize, Refusal)>,
@@ -80,6 +85,7 @@ pub struct Meter {
 impl Meter {
     pub fn new(pool: Pool) -> Self {
         Self {
+            trace: AdmissionTrace::new(),
             pool,
             calls: Vec::new(),
             refused: None,
@@ -128,6 +134,19 @@ impl Meter {
 impl Budget for Meter {
     type Refusal = Refusal;
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
+        let result = self.traverse_recorded(values, bytes);
+        self.trace.record(
+            self.calls.len() - 1,
+            Call::Work { values, bytes },
+            result,
+            (self.values, self.bytes),
+            (self.pool.live(), self.pool.peak()),
+        );
+        result
+    }
+}
+impl Meter {
+    fn traverse_recorded(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
         self.record(Call::Work { values, bytes })?;
         let next_values = self.values.checked_add(values).unwrap();
         let next_bytes = self.bytes.checked_add(bytes).unwrap();
@@ -143,13 +162,22 @@ impl Budget for Meter {
 impl Allocator for Meter {
     type Permit = Permit;
     fn allocate(&mut self, bytes: u64) -> Result<Permit, Refusal> {
-        self.record(Call::Allocate(bytes))?;
-        self.pool
-            .reserve(bytes)
-            .inspect(|_| super::heap::admitted(bytes))
-            .inspect_err(|reason| {
-                self.refused = Some((self.calls.len() - 1, *reason));
-            })
+        let result = self.record(Call::Allocate(bytes)).and_then(|()| {
+            self.pool
+                .reserve(bytes)
+                .inspect(|_| super::heap::admitted(bytes))
+                .inspect_err(|reason| {
+                    self.refused = Some((self.calls.len() - 1, *reason));
+                })
+        });
+        self.trace.record(
+            self.calls.len() - 1,
+            Call::Allocate(bytes),
+            result.as_ref().map(|_| ()).map_err(|reason| *reason),
+            (self.values, self.bytes),
+            (self.pool.live(), self.pool.peak()),
+        );
+        result
     }
 }
 

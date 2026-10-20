@@ -34,6 +34,24 @@ dcbor = "0.25.2"
 
 ## Retained schema encoding
 
+The default `std` build does not implement bounded encoding for
+`std::collections::HashMap`: its public API exposes neither indexed buckets nor
+an allocation-based scan bound. With `hashbrown` enabled, use the pinned
+hashbrown `HashMap` or `HashTable` directly. No conversion is performed implicitly.
+
+The `dcbor::hashbrown` re-export names the exact pinned dependency that supplies
+these implementations. Consumers can use
+`dcbor::hashbrown::HashMap<K, V, std::hash::RandomState>` for untrusted keys,
+constructing it with `HashMap::with_hasher(RandomState::new())`.
+
+The opt-in `custom-std-collections` feature enables the std `HashMap`
+implementations and requires a rebuilt standard library exposing
+`hashmap_bucket_access`. An unmodified nightly compiler is insufficient, and
+`--all-features` also requires this custom toolchain. That API exposes physical
+bucket count, indexed shared bucket access, and allocation size from the owning
+hash table. A Cargo dependency override does not replace compiled std. The
+custom standard-library toolchain has not yet been built and qualified.
+
 With the `derive` feature, `CBORResumableEncodable` generates instructions for
 `bounded::encoding::Preparation`. Named structs use canonical integer-key maps;
 absent optional fields are omitted. Newtypes, unit structs, and unit, tuple, and
@@ -50,13 +68,129 @@ on refusal. Preparation supports nesting up to 128 traversal frames.
 Built-in schema instructions cover integers, floats, booleans, strings, byte
 strings, arrays, vectors, nullable options, references, boxes, and shared pointers.
 Custom `encoding::Schema` implementations must produce each instruction in
-constant work without scanning, allocating, or recursively traversing children.
+bounded work without allocating or recursively traversing children. Dynamic-map
+entry instructions may inspect at most 64 indexed bucket controls and yield at
+most one entry. The engine rejects index advances outside 1 through 64; custom
+implementations must also bound the actual work preceding the returned instruction.
 The preparation borrow must preserve the representation throughout traversal.
 
 Prepared plans retain canonical bytes with map-header gap metadata. Map fields
-are inspected once; finalizing a header does not shift the payload. Preparation
-therefore retains storage proportional to the encoded output in addition to
-normalization scratch and traversal metadata.
+are inspected once; finalizing a schema header does not shift the payload.
+Dynamic-map children compact their header gaps incrementally before their
+canonical bytes participate in ordering. Preparation retains storage proportional
+to the encoded output in addition to normalization scratch and traversal metadata.
+
+With `hashbrown` enabled, `Preparation` accepts a borrowed
+`hashbrown::HashTable<(K, V)>` from hashbrown 0.17 whose keys and values implement
+`Schema`. `bounded::encoding::maps::MapPreparation` is an alias for that same
+engine. Each admitted scan inspects at most 64 buckets, including vacant buckets,
+and stops at the first entry.
+Keys and values are prepared through retained schema operations, then flat entry
+descriptors are merge-ordered by canonical key bytes. Key comparisons use the
+decoder's retained comparison primitive, examining at most 64 byte pairs per
+turn. Equal keys are rejected during merging. Merge scratch holds only the
+shorter run, and descriptor moves are admitted separately from comparisons.
+For a root dynamic map, the plan retains the sorted descriptors and its writer
+copies entries directly in canonical order, in chunks of at most 64 bytes.
+Root payload bytes are not permuted and no permutation bitmap is allocated.
+Descriptor storage and its reservation transfer to the independently owned
+`Prepared` plan. Emission takes `O(B / 64 + n)` steps for `B` bytes and `n` entries,
+including descriptor transitions and partial chunks, without allocation.
+
+The table interface is bucket-indexed: this path does not use `HashMap::iter`
+or estimate sparse scans from insertion capacity. Table construction is a
+separate caller operation. `HashTable<(K, V)>` also implements `Schema`, so tables
+compose as keys and values, in vectors, and in derived records and enum variants.
+Nested preparation uses one explicit frame stack and flat entry descriptors.
+Completed child maps are ordered before their parent compares their canonical
+bytes. Gap compaction, merge comparisons, descriptor removal, and reordered-byte
+assembly each retain their positions across refusal. `Preparation::position()`
+exposes these positions through its `dynamic` field. Instruction variants and
+position fields have the same shape with and without the `hashbrown` feature.
+Compaction uses chunks of at most 64 bytes. Reordered payloads use byte-position
+permutation cycles with a retained saved byte and a visited bitmap, initialized
+incrementally. No second full-payload byte buffer is allocated. Removing
+plain-data suffixes is constant work; the backing allocation stays charged.
+Nested already ordered payloads bypass reassembly. The permutation bitmap and offset
+storage are released before returning to the parent map. Descriptor merge scratch
+is retained for reuse across maps, so peak memory includes the largest shorter-run
+scratch allocation encountered during preparation, until preparation is dropped.
+
+For `B` prepared payload bytes and dynamic nesting depth `D`, compaction and
+reassembly move `O(B * D)` bytes in total. Each moved byte also requires a retained
+binary descriptor lookup. With at most `n` entries per dynamic map, permutation
+lookup work is `O(B * D * log(n + 1))`, in addition to arena growth and key
+comparison work. With `n` entries, merge ordering uses `O(n log n)` comparisons;
+each comparison examines at most the shorter key's length. These are cumulative
+work bounds, separate from the three-value/64-byte per-turn limit.
+
+## Owner-backed typed decoding
+
+`bounded::decode::construction::TypedDecoder` borrows a `DecodeOwner` and the
+complete immutable input. Its allocator type is the second type parameter.
+The controller starts without allocating or constructing schema fields. Stepping
+it allocates one stable lifecycle record and initializes parser metadata in that
+record before parsing. `TypedStep::Complete` publishes a `TypedValue` handle;
+`value()` borrows the initialized value at its construction address.
+
+```rust
+use dcbor::bounded::{Limits, decode::{Options, construction::{
+    DecodeOwner, TypedDecoder, TypedStep, reclamation::Reclaimed,
+}}};
+
+let input = [0x62, b'o', b'k'];
+let owner = DecodeOwner::<Limits>::new();
+let mut budget = Limits::new(1_000_000, 1_000_000, 1_000_000);
+let mut decoder = TypedDecoder::<String, Limits>::new(
+    &owner, &input, Options::normalizing(8),
+);
+loop {
+    match decoder.step(&mut budget).unwrap() {
+        TypedStep::Progress => {}
+        TypedStep::Complete(value) => {
+            assert_eq!(value.value(), "ok");
+            drop(value);
+            break;
+        }
+        TypedStep::Finished => panic!("missing output"),
+    }
+}
+drop(decoder);
+while owner.shutdown_step(&mut budget).unwrap() != Reclaimed::Done {}
+assert_eq!(budget.live_bytes(), 0);
+```
+
+Dropping a controller or published handle queues its existing custody record.
+The owner must be stepped to reclaim queued resources. `shutdown_step` also
+closes admission; retain the input and owner until cleanup finishes. A terminal
+decode error retains custody: further decoder steps perform cleanup before
+returning `Finished`. A budget refusal preserves the operation for resumption
+with a fresh allowance. `cancel()` selects this same explicit cleanup path.
+
+Custom bindings implement `in_place::InPlace<A>` and mandatory
+`reclamation::Reclaim<A>`. Both receive a stable destination and retained cursor;
+completion returns a status rather than moving a schema value. The former
+`ResumableDecodable::start`, schema-sized associated state, and
+`BuildStep::Complete(T)` protocol have been removed. `CBORBoundedDecodable`
+generates in-place bindings and a guard against user-defined synchronous `Drop`.
+Enum construction requires an explicit supported representation: `repr(C)`,
+`repr(u8)`, or `repr(C, u8)`.
+
+Native `Option<T>` requires `in_place::Placeholder`: a resource-free value whose
+initialization and native option representation fit 64 bytes. For larger payloads,
+`in_place::StableOption<T, A>` stores a pointer to separately allocated stable
+payload storage. It initializes the child in place and publishes that pointer
+after completion. `as_ref()` exposes the optional borrowed payload. Its child
+allocation and reservation remain in the enclosing record's incremental cleanup
+path. Neither representation guesses the layout of a native `Option<T>`.
+
+Synchronous child dispatch has a separate, pre-allocation depth limit of 64.
+`Reclaim::DISPATCH_DEPTH` describes the maximum construction or cleanup call
+chain; containers and derives compose child bounds with saturating arithmetic.
+The owner rejects an excessive bound before reserving or allocating a record.
+Custom unsafe bindings must declare their actual bound, including helper and
+child dispatch; the leaf default is valid only without child delegation. This
+limit is independent of the parser's input nesting limit.
 
 ## Related Projects
 

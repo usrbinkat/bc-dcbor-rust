@@ -2,6 +2,7 @@
 use super::decode::storage::Storage;
 use super::*;
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_canonical};
+mod initialization;
 mod ordering;
 pub use ordering::OrderingPosition;
 pub mod pipeline;
@@ -11,11 +12,18 @@ pub enum Phase {
     Read,
     Append,
     Order,
+    ReleaseOrdering,
     Compose,
     Measure,
     Allocate,
     Header,
     Emit,
+    ReleaseChars,
+    Publish,
+    ReclaimOrdering,
+    ReclaimChars,
+    ReclaimBytes,
+    ReclaimPermit,
     Finished,
 }
 
@@ -107,6 +115,49 @@ impl<'a, P> TextEncoder<'a, P> {
         &self.bytes
     }
 
+    /// Cancel and release one retained resource unit. Admission closes before
+    /// cleanup starts; subsequent calls cannot resume text production.
+    pub fn reclaim_step<A: Allocator<Permit = P>>(
+        &mut self,
+        allocator: &mut A,
+    ) -> BoundedResult<bool, A> {
+        match self.phase {
+            Phase::ReclaimOrdering => {
+                if self.ordering.reclaim_step(allocator)? {
+                    self.phase = Phase::ReclaimChars;
+                }
+            }
+            Phase::ReclaimChars => {
+                if self.chars.drain_step(allocator)?.is_none()
+                    && self.chars.release_transition_step(allocator)?
+                {
+                    self.phase = Phase::ReclaimBytes;
+                }
+            }
+            Phase::ReclaimBytes => {
+                allocator
+                    .traverse(1, core::mem::size_of::<Vec<u8>>() as u64)
+                    .map_err(BoundedError::Refused)?;
+                self.bytes = Vec::new();
+                self.phase = Phase::ReclaimPermit;
+            }
+            Phase::ReclaimPermit => {
+                allocator
+                    .traverse(1, core::mem::size_of::<P>() as u64)
+                    .map_err(BoundedError::Refused)?;
+                self.permit = None;
+                self.phase = Phase::Finished;
+                return Ok(true);
+            }
+            Phase::Finished => return Ok(true),
+            _ => {
+                allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
+                self.phase = Phase::ReclaimOrdering;
+            }
+        }
+        Ok(false)
+    }
+
     pub fn step<A: Allocator<Permit = P>>(
         &mut self,
         allocator: &mut A,
@@ -159,7 +210,11 @@ impl<'a, P> TextEncoder<'a, P> {
             Phase::Order => {
                 let chars = self.chars.ready_mut().ok_or(BoundedError::PlanMismatch)?;
                 if self.ordering.step(chars, allocator)? {
-                    self.ordering = ordering::Ordering::new();
+                    self.phase = Phase::ReleaseOrdering;
+                }
+            }
+            Phase::ReleaseOrdering => {
+                if self.ordering.reclaim_step(allocator)? {
                     self.phase = Phase::Compose;
                 }
             }
@@ -233,19 +288,38 @@ impl<'a, P> TextEncoder<'a, P> {
             Phase::Emit => {
                 allocator.traverse(1, 4).map_err(BoundedError::Refused)?;
                 if self.emit_at == self.written {
-                    let permit = self.permit.take().ok_or(BoundedError::PlanMismatch)?;
-                    self.phase = Phase::Finished;
-                    self.chars = Storage::new();
-                    return Ok(TextStep::Complete(Encoded {
-                        bytes: core::mem::take(&mut self.bytes),
-                        _permit: permit,
-                    }));
+                    self.phase = Phase::ReleaseChars;
+                    return Ok(TextStep::Progress);
                 }
                 let chars = self.chars.ready().ok_or(BoundedError::PlanMismatch)?;
                 let mut encoded = [0; 4];
                 self.bytes
                     .extend_from_slice(chars[self.emit_at].encode_utf8(&mut encoded).as_bytes());
                 self.emit_at += 1;
+            }
+            Phase::ReleaseChars => {
+                if self.chars.drain_step(allocator)?.is_none()
+                    && self.chars.release_transition_step(allocator)?
+                {
+                    self.phase = Phase::Publish;
+                }
+            }
+            Phase::Publish => {
+                allocator
+                    .traverse(1, core::mem::size_of::<Encoded<P>>() as u64)
+                    .map_err(BoundedError::Refused)?;
+                let permit = self.permit.take().ok_or(BoundedError::PlanMismatch)?;
+                self.phase = Phase::Finished;
+                return Ok(TextStep::Complete(Encoded {
+                    bytes: core::mem::take(&mut self.bytes),
+                    _permit: permit,
+                }));
+            }
+            Phase::ReclaimOrdering
+            | Phase::ReclaimChars
+            | Phase::ReclaimBytes
+            | Phase::ReclaimPermit => {
+                self.reclaim_step(allocator)?;
             }
             Phase::Finished => return Ok(TextStep::Finished),
         }
