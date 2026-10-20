@@ -2,9 +2,9 @@ use super::*;
 use crate::bounded::decode::initialization::field;
 use core::ptr::addr_of_mut;
 
-impl<'a, P> Decoder<'a, P> {
+impl<I: Copy, P> ParserContinuation<I, P> {
     pub(crate) const INIT_STEPS: usize =
-        Storage::<Entry<'a>, P>::INIT_STEPS + Storage::<Frame, P>::INIT_STEPS + 17;
+        Storage::<Entry, P>::INIT_STEPS + Storage::<Frame, P>::INIT_STEPS + 17;
 
     /// # Safety
     /// The destination is stable, unique and initially uninitialized. The cursor
@@ -12,12 +12,12 @@ impl<'a, P> Decoder<'a, P> {
     /// a Decoder. No parser operation is permitted before this returns true.
     pub(crate) unsafe fn initialize_step<A: Allocator<Permit = P>>(
         place: *mut Self,
-        input: &'a [u8],
+        input: I,
         options: Options,
         step: &mut usize,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        let entries = Storage::<Entry<'a>, P>::INIT_STEPS;
+        let entries = Storage::<Entry, P>::INIT_STEPS;
         let stack = Storage::<Frame, P>::INIT_STEPS;
         if *step < entries {
             unsafe {
@@ -38,16 +38,12 @@ impl<'a, P> Decoder<'a, P> {
                 0 => field(addr_of_mut!((*place).input), || input, a)?,
                 1 => field(addr_of_mut!((*place).options), || options, a)?,
                 2 => field(addr_of_mut!((*place).phase), || Phase::Header, a)?,
-                3 => field(
-                    addr_of_mut!((*place).header),
-                    || HeaderCursor::new(input),
-                    a,
-                )?,
+                3 => field(addr_of_mut!((*place).header), HeaderState::new, a)?,
                 4 => field(addr_of_mut!((*place).parsed), || None, a)?,
                 5 => field(addr_of_mut!((*place).start), || 0, a)?,
                 6 => field(addr_of_mut!((*place).position), || 0, a)?,
                 7 => field(addr_of_mut!((*place).payload_end), || 0, a)?,
-                8 => field(addr_of_mut!((*place).kind), || Kind::Null, a)?,
+                8 => field(addr_of_mut!((*place).kind), || StoredKind::Null, a)?,
                 9 => field(addr_of_mut!((*place).children), || 0, a)?,
                 10 => field(addr_of_mut!((*place).completed), || 0, a)?,
                 11 => field(addr_of_mut!((*place).child_count), || 0, a)?,
@@ -64,12 +60,12 @@ impl<'a, P> Decoder<'a, P> {
     }
 }
 
-impl<P> Drop for Decoder<'_, P> {
+impl<I, P> Drop for ParserContinuation<I, P> {
     fn drop(&mut self) {
         // Direct parser users retain ordinary RAII semantics. The owner-backed
         // typed path instead drains the parser and releases its record without
         // invoking this destructor. An unfinished initialization owns nothing.
-        if self.normalizer_init == TextEncoder::<P>::INIT_STEPS {
+        if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
             unsafe { self.normalizer.assume_init_drop() };
         }
     }

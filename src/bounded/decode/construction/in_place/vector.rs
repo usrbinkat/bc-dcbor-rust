@@ -4,7 +4,7 @@ use super::*;
 use alloc::alloc::{alloc, dealloc};
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::mem::{size_of, MaybeUninit};
+use core::mem::{MaybeUninit, size_of};
 use core::ptr::{self, NonNull};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -32,6 +32,12 @@ pub enum HeaderStep {
 /// ```
 pub struct HeaderCursor<'a> {
     input: &'a [u8],
+    state: HeaderState,
+}
+
+/// Borrow-free acquisition state. The enclosing operation supplies its own
+/// immutable input on each turn; this type is deliberately crate-private.
+pub(crate) struct HeaderState {
     bytes: [u8; 9],
     acquired: usize,
     needed: usize,
@@ -42,6 +48,29 @@ impl<'a> HeaderCursor<'a> {
     pub const fn new(input: &'a [u8]) -> Self {
         Self {
             input,
+            state: HeaderState::new(),
+        }
+    }
+
+    pub const fn acquired(&self) -> usize {
+        self.state.acquired()
+    }
+
+    pub fn next_work(&self) -> Option<WriteWork> {
+        self.state.next_work(self.input.len())
+    }
+
+    pub fn step<B: Budget>(
+        &mut self,
+        budget: &mut B,
+    ) -> Result<HeaderStep, DecodeError<B::Refusal>> {
+        self.state.step(self.input, budget)
+    }
+}
+
+impl HeaderState {
+    pub(crate) const fn new() -> Self {
+        Self {
             bytes: [0; 9],
             acquired: 0,
             needed: 1,
@@ -54,11 +83,11 @@ impl<'a> HeaderCursor<'a> {
         self.acquired
     }
 
-    pub fn next_work(&self) -> Option<WriteWork> {
+    pub fn next_work(&self, input_len: usize) -> Option<WriteWork> {
         if self.finished {
             return None;
         }
-        let bytes = if self.acquired == self.needed || self.acquired == self.input.len() {
+        let bytes = if self.acquired == self.needed || self.acquired == input_len {
             self.acquired as u64
         } else {
             1
@@ -68,15 +97,16 @@ impl<'a> HeaderCursor<'a> {
 
     pub fn step<B: Budget>(
         &mut self,
+        input: &[u8],
         budget: &mut B,
     ) -> Result<HeaderStep, DecodeError<B::Refusal>> {
-        let Some(work) = self.next_work() else {
+        let Some(work) = self.next_work(input.len()) else {
             return Ok(HeaderStep::Finished);
         };
         budget
             .traverse(work.values, work.bytes)
             .map_err(BoundedError::Refused)?;
-        if self.acquired == self.needed || self.acquired == self.input.len() {
+        if self.acquired == self.needed || self.acquired == input.len() {
             // Terminal invalidity is published once, just like a valid header.
             self.finished = true;
             let (major, argument, length) =
@@ -87,7 +117,7 @@ impl<'a> HeaderCursor<'a> {
                 length,
             }));
         }
-        let byte = self.input[self.acquired];
+        let byte = input[self.acquired];
         self.bytes[self.acquired] = byte;
         self.acquired += 1;
         if self.acquired == 1 {

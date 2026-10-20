@@ -49,8 +49,13 @@ pub enum TextStep<P> {
 /// Each step performs one scalar decomposition, one ordering comparison/swap,
 /// one composition, one storage relocation, or one scalar emission. All
 /// intermediate values and their reservations remain owned across refusal.
-pub struct TextEncoder<'a, P> {
-    source: &'a str,
+pub type TextEncoder<'a, P> = TextContinuation<&'a str, P>;
+
+/// Normalization progress with an explicit source attachment. Owned decoding
+/// uses `()` here and supplies a temporary source borrow to each turn.
+#[doc(hidden)]
+pub struct TextContinuation<S, P> {
+    source: S,
     chars: Storage<char, P>,
     phase: Phase,
     source_at: usize,
@@ -71,8 +76,17 @@ pub struct TextEncoder<'a, P> {
     permit: Option<P>,
 }
 
-impl<'a, P> TextEncoder<'a, P> {
-    pub const fn new(source: &'a str) -> Self {
+impl<P> TextEncoder<'_, P> {
+    pub fn step<A: Allocator<Permit = P>>(
+        &mut self,
+        allocator: &mut A,
+    ) -> BoundedResult<TextStep<P>, A> {
+        self.step_source(self.source, allocator)
+    }
+}
+
+impl<S, P> TextContinuation<S, P> {
+    pub const fn new(source: S) -> Self {
         Self {
             source,
             chars: Storage::new(),
@@ -158,14 +172,15 @@ impl<'a, P> TextEncoder<'a, P> {
         Ok(false)
     }
 
-    pub fn step<A: Allocator<Permit = P>>(
+    pub(crate) fn step_source<A: Allocator<Permit = P>>(
         &mut self,
+        source: &str,
         allocator: &mut A,
     ) -> BoundedResult<TextStep<P>, A> {
         match self.phase {
             Phase::Read => {
                 allocator.traverse(1, 4).map_err(BoundedError::Refused)?;
-                let Some(ch) = self.source[self.source_at..].chars().next() else {
+                let Some(ch) = source[self.source_at..].chars().next() else {
                     self.phase = Phase::Order;
                     return Ok(TextStep::Progress);
                 };
@@ -275,7 +290,7 @@ impl<'a, P> TextEncoder<'a, P> {
                 self.phase = Phase::Header;
                 // Continue to actual emission; a refusal retains the newly
                 // allocated output and never repeats allocation admission.
-                return self.step(allocator);
+                return self.step_source(source, allocator);
             }
             Phase::Header => {
                 allocator

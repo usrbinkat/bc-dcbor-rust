@@ -2,7 +2,7 @@ use super::*;
 use crate::bounded::decode::initialization::field;
 use core::ptr::addr_of_mut;
 
-impl<'a, P> TextEncoder<'a, P> {
+impl<S: Copy, P> TextContinuation<S, P> {
     pub(crate) const INIT_STEPS: usize =
         Storage::<char, P>::INIT_STEPS + ordering::Ordering::<P>::INIT_STEPS + 18;
 
@@ -11,7 +11,7 @@ impl<'a, P> TextEncoder<'a, P> {
     /// acquires no resources, so an incomplete prefix needs no destruction.
     pub(crate) unsafe fn initialize_step<A: Allocator<Permit = P>>(
         place: *mut Self,
-        source: &'a str,
+        source: S,
         step: &mut usize,
         a: &mut A,
     ) -> BoundedResult<bool, A> {

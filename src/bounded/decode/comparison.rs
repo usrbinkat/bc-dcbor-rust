@@ -3,6 +3,53 @@ use core::cmp::Ordering;
 
 use super::super::{BoundedError, Budget, WriteWork};
 
+/// Ranges belong to the enclosing parser's immutable input. Keeping this type
+/// private prevents callers from substituting another buffer between turns.
+pub(super) struct RangeComparison {
+    left: core::ops::Range<usize>,
+    right: core::ops::Range<usize>,
+    position: usize,
+    finished: bool,
+}
+
+impl RangeComparison {
+    pub(super) fn new(left: core::ops::Range<usize>, right: core::ops::Range<usize>) -> Self {
+        Self {
+            left,
+            right,
+            position: 0,
+            finished: false,
+        }
+    }
+
+    pub(super) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(super) fn step<B: Budget>(
+        &mut self,
+        input: &[u8],
+        budget: &mut B,
+    ) -> Result<ComparisonStep, BoundedError<B::Refusal>> {
+        if self.finished {
+            return Ok(ComparisonStep::Finished);
+        }
+        let left = input
+            .get(self.left.clone())
+            .ok_or(BoundedError::PlanMismatch)?;
+        let right = input
+            .get(self.right.clone())
+            .ok_or(BoundedError::PlanMismatch)?;
+        match compare_step(left, right, &mut self.position, budget)? {
+            Some(ordering) => {
+                self.finished = true;
+                Ok(ComparisonStep::Complete(ordering))
+            }
+            None => Ok(ComparisonStep::Progress),
+        }
+    }
+}
+
 /// One comparison turn; completion is returned exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonStep {

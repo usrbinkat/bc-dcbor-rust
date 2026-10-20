@@ -129,8 +129,68 @@ pub enum Kind<'a> {
     Float(f64),
 }
 
-struct Entry<'a> {
-    kind: Kind<'a>,
+// Payload ranges are private to the document that owns the matching input.
+// Keeping the arena borrow-free also lets owned operations retain it between
+// turns without manufacturing references into their own input storage.
+#[derive(Clone, Copy)]
+enum StoredKind {
+    Unsigned(u64),
+    Negative(i64),
+    Bytes { start: usize, end: usize },
+    Text { start: usize, end: usize },
+    Array(u64),
+    Map(u64),
+    Tagged(u64),
+    Bool(bool),
+    Null,
+    Float(f64),
+}
+
+impl StoredKind {
+    // Both parsers supply the position immediately following the payload.
+    fn retain(kind: Kind<'_>, end: usize) -> Self {
+        match kind {
+            Kind::Unsigned(n) => Self::Unsigned(n),
+            Kind::Negative(n) => Self::Negative(n),
+            Kind::Bytes(bytes) => Self::Bytes {
+                start: end - bytes.len(),
+                end,
+            },
+            Kind::Text(text) => Self::Text {
+                start: end - text.len(),
+                end,
+            },
+            Kind::Array(n) => Self::Array(n),
+            Kind::Map(n) => Self::Map(n),
+            Kind::Tagged(n) => Self::Tagged(n),
+            Kind::Bool(value) => Self::Bool(value),
+            Kind::Null => Self::Null,
+            Kind::Float(value) => Self::Float(value),
+        }
+    }
+
+    fn borrow(self, input: &[u8]) -> Kind<'_> {
+        match self {
+            Self::Unsigned(n) => Kind::Unsigned(n),
+            Self::Negative(n) => Kind::Negative(n),
+            Self::Bytes { start, end } => Kind::Bytes(&input[start..end]),
+            Self::Text { start, end } => {
+                // SAFETY: both parsers validate UTF-8 before creating a text
+                // entry. Entries and their immutable input remain paired.
+                Kind::Text(unsafe { core::str::from_utf8_unchecked(&input[start..end]) })
+            }
+            Self::Array(n) => Kind::Array(n),
+            Self::Map(n) => Kind::Map(n),
+            Self::Tagged(n) => Kind::Tagged(n),
+            Self::Bool(value) => Kind::Bool(value),
+            Self::Null => Kind::Null,
+            Self::Float(value) => Kind::Float(value),
+        }
+    }
+}
+
+struct Entry {
+    kind: StoredKind,
     start: usize,
     end: usize,
     next: usize,
@@ -139,7 +199,30 @@ struct Entry<'a> {
 /// Owns the node arena and its reservations, while borrowing the original input.
 pub struct Document<'a, P> {
     input: &'a [u8],
-    entries: Owned<Entry<'a>, P>,
+    entries: Owned<Entry, P>,
+}
+
+/// Borrow-free arena retained by an owned decoding record.
+pub(crate) struct DocumentArena<P> {
+    entries: Owned<Entry, P>,
+}
+
+impl<P> DocumentArena<P> {
+    pub(crate) fn with_document<R>(
+        &self,
+        input: &[u8],
+        f: impl FnOnce(&Document<'_, P>) -> R,
+    ) -> R {
+        // SAFETY: this read creates a temporary shared view of the ownership
+        // header, not a second owner. ManuallyDrop prevents releasing the arena
+        // or permit, including during unwinding. Only &Document escapes into f;
+        // its borrow cannot escape this call through R.
+        let view = core::mem::ManuallyDrop::new(Document {
+            input,
+            entries: unsafe { core::ptr::read(&self.entries) },
+        });
+        f(&view)
+    }
 }
 impl<'a, P> Document<'a, P> {
     /// The single validated top-level value.
@@ -160,13 +243,13 @@ impl<'a, P> Document<'a, P> {
 #[derive(Clone, Copy)]
 pub struct Node<'d, 'a> {
     input: &'a [u8],
-    entries: &'d [Entry<'a>],
+    entries: &'d [Entry],
     index: usize,
 }
 impl<'d, 'a> Node<'d, 'a> {
     /// Value kind and borrowed payload, without walking descendants.
     pub fn kind(self) -> Kind<'a> {
-        self.entries[self.index].kind
+        self.entries[self.index].kind.borrow(self.input)
     }
     /// Original canonical wire bytes for this value and all its descendants.
     pub fn encoded(self) -> &'a [u8] {
@@ -187,7 +270,7 @@ impl<'d, 'a> Node<'d, 'a> {
 /// Non-allocating iterator over immediate children in wire order.
 pub struct Children<'d, 'a> {
     input: &'a [u8],
-    entries: &'d [Entry<'a>],
+    entries: &'d [Entry],
     next: usize,
     end: usize,
 }
@@ -237,7 +320,7 @@ pub fn decode_with<'a, A: Allocator>(
     allocator: &mut A,
 ) -> Result<Document<'a, A::Permit>, DecodeError<A::Refusal>> {
     let Options { max_depth, text } = options;
-    let mut entries: Owned<Entry<'a>, A::Permit> = Owned::new();
+    let mut entries: Owned<Entry, A::Permit> = Owned::new();
     let mut stack: Owned<Frame, A::Permit> = Owned::new();
     let mut pos = 0usize;
     loop {
@@ -339,7 +422,7 @@ pub fn decode_with<'a, A: Allocator>(
         let index = entries.len();
         entries.push(
             Entry {
-                kind,
+                kind: StoredKind::retain(kind, pos),
                 start,
                 end: pos,
                 next: index + 1,
@@ -503,7 +586,7 @@ impl Terms {
             completions: input,
             keys: input,
             key_bytes: mul(depth, input)?,
-            arena: owned_growth(input, widen(core::mem::size_of::<Entry<'static>>())?)?,
+            arena: owned_growth(input, widen(core::mem::size_of::<Entry>())?)?,
             stack: owned_growth(depth, widen(core::mem::size_of::<Frame>())?)?,
             text: match options.text {
                 TextPolicy::Normalize => text::validation_bound(input)?,
@@ -534,7 +617,7 @@ mod terms_tests {
     }
 
     fn entry() -> u64 {
-        core::mem::size_of::<Entry<'static>>() as u64
+        core::mem::size_of::<Entry>() as u64
     }
 
     fn frame() -> u64 {

@@ -12,13 +12,13 @@ pub struct Resources {
     pub normalized_bytes: usize,
 }
 
-impl<P> Decoder<'_, P> {
+impl<I, P> ParserContinuation<I, P> {
     pub fn resources(&self) -> Resources {
         Resources {
             entries: self.entries.position(),
             stack: self.stack.position(),
             normalizer_initialized: self.normalizer_init,
-            normalizer_initialization_steps: TextEncoder::<P>::INIT_STEPS,
+            normalizer_initialization_steps: TextContinuation::<(), P>::INIT_STEPS,
             normalized_bytes: self
                 .normalized
                 .as_ref()

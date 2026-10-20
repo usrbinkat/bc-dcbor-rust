@@ -1,11 +1,11 @@
 use super::harness::*;
-use dcbor::bounded::decode::{decode, DecodeError, Options};
 use dcbor::bounded::BoundedError;
+use dcbor::bounded::decode::{DecodeError, Options, decode};
 
 #[test]
 fn header_and_first_payload_admissions_are_separately_observed() {
     use super::bindings::decode_driver;
-    use super::driver::{finish, Step};
+    use super::driver::{Step, finish};
     use dcbor::bounded::decode::cursor::Phase;
     let mut wire = vec![0x78, 0x18];
     wire.extend_from_slice(b"abcdefghijklmnopqrstuvwx");
@@ -162,7 +162,7 @@ fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
 
 #[test]
 fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
-    use unicode_normalization::{is_nfc_quick, IsNormalized};
+    use unicode_normalization::{IsNormalized, is_nfc_quick};
     fn check(text: &str) {
         let wire = text_wire(text);
         let mut m = meter();
@@ -215,7 +215,7 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
 
 #[test]
 fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
-    use super::driver::{finish, resume, Driver};
+    use super::driver::{Driver, finish, resume};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "a\u{301}";
     let expected = [0x62, 0xc3, 0xa1];
@@ -253,7 +253,7 @@ fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
 
 #[test]
 fn emission_is_bounded_independently_of_preparation() {
-    use super::driver::{finish, Driver};
+    use super::driver::{Driver, finish};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "x".repeat(65536);
     let mut preparation = Driver::from_operation(TextPreparation::new(&source), meter());
@@ -262,11 +262,13 @@ fn emission_is_bounded_independently_of_preparation() {
     let mut bytes = vec![0; prepared.len() as usize];
     let mut emission = Driver::from_operation(prepared.writer(&mut bytes), meter());
     finish(&mut emission, source.len() + 4096);
-    assert!(!emission
-        .meter
-        .calls
-        .iter()
-        .any(|c| matches!(c, Call::Allocate(_))));
+    assert!(
+        !emission
+            .meter
+            .calls
+            .iter()
+            .any(|c| matches!(c, Call::Allocate(_)))
+    );
     emission.meter.assert_units(3, 64);
     drop(emission);
     assert_eq!(bytes, text_wire(&source));

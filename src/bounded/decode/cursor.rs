@@ -1,10 +1,10 @@
 //! Retained iterative canonical parser over a complete immutable input.
-use super::comparison::{ComparisonStep, KeyComparison};
-use super::header::{Header, HeaderCursor, HeaderStep};
+use super::comparison::{ComparisonStep, RangeComparison};
+use super::header::{Header, HeaderState, HeaderStep};
 use super::storage::Storage;
 use super::utf8::Utf8;
 use super::*;
-use crate::bounded::text_cursor::{TextEncoder, TextStep};
+use crate::bounded::text_cursor::{TextContinuation, TextStep};
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
 use unicode_normalization::IsNormalized;
@@ -55,43 +55,55 @@ pub enum DecodeStep<'a, P> {
     Finished,
 }
 
-pub struct Decoder<'a, P> {
-    input: &'a [u8],
+pub type Decoder<'a, P> = ParserContinuation<&'a [u8], P>;
+
+#[doc(hidden)]
+pub struct ParserContinuation<I, P> {
+    input: I,
     options: Options,
-    entries: Storage<Entry<'a>, P>,
+    entries: Storage<Entry, P>,
     stack: Storage<Frame, P>,
     phase: Phase,
-    header: HeaderCursor<'a>,
+    header: HeaderState,
     parsed: Option<Header>,
     start: usize,
     position: usize,
     payload_end: usize,
-    kind: Kind<'a>,
+    kind: StoredKind,
     children: u64,
     completed: usize,
     child_count: usize,
-    utf8: Option<Utf8<'a>>,
-    normalizer: MaybeUninit<TextEncoder<'a, P>>,
+    utf8: Option<Utf8>,
+    normalizer: MaybeUninit<TextContinuation<(), P>>,
     normalizer_init: usize,
     normalized: Option<Encoded<P>>,
     text_compared: usize,
-    comparison: Option<KeyComparison<'a>>,
+    comparison: Option<RangeComparison>,
 }
 
 impl<'a, P> Decoder<'a, P> {
-    pub fn new(input: &'a [u8], options: Options) -> Self {
+    pub fn step<A: Allocator<Permit = P>>(
+        &mut self,
+        allocator: &mut A,
+    ) -> Result<DecodeStep<'a, P>, DecodeError<A::Refusal>> {
+        self.step_input(self.input, allocator)
+    }
+}
+
+impl<I, P> ParserContinuation<I, P> {
+    pub fn new(input: I, options: Options) -> Self {
         Self {
             input,
             options,
             entries: Storage::new(),
             stack: Storage::new(),
             phase: Phase::Header,
-            header: HeaderCursor::new(input),
+            header: HeaderState::new(),
             parsed: None,
             start: 0,
             position: 0,
             payload_end: 0,
-            kind: Kind::Null,
+            kind: StoredKind::Null,
             children: 0,
             completed: 0,
             child_count: 0,
@@ -113,7 +125,7 @@ impl<'a, P> Decoder<'a, P> {
             compared_bytes: self
                 .comparison
                 .as_ref()
-                .map_or(self.text_compared, KeyComparison::position),
+                .map_or(self.text_compared, RangeComparison::position),
             completed_children: self.child_count,
             nodes: self.entries.len(),
             arena_relocated: self.entries.relocated(),
@@ -121,11 +133,12 @@ impl<'a, P> Decoder<'a, P> {
         }
     }
 
-    pub fn step<A: Allocator<Permit = P>>(
+    pub(crate) fn step_input<'a, A: Allocator<Permit = P>>(
         &mut self,
+        input: &'a [u8],
         allocator: &mut A,
     ) -> Result<DecodeStep<'a, P>, DecodeError<A::Refusal>> {
-        let result = self.advance(allocator);
+        let result = self.advance(input, allocator);
         if matches!(&result, Err(error) if !matches!(error, DecodeError::Resource(BoundedError::Refused(_))))
         {
             self.phase = Phase::ReclaimNormalizer;
@@ -141,7 +154,7 @@ impl<'a, P> Decoder<'a, P> {
     ) -> BoundedResult<bool, A> {
         match self.phase {
             Phase::ReclaimNormalizer => {
-                if self.normalizer_init == TextEncoder::<P>::INIT_STEPS {
+                if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
                     // SAFETY: all resource-free metadata fields were initialized
                     // before the normalizer could acquire any resources.
                     let normalizer = unsafe { self.normalizer.assume_init_mut() };
@@ -186,7 +199,7 @@ impl<'a, P> Decoder<'a, P> {
 
     fn next_header(&mut self) {
         self.start = self.position;
-        self.header = HeaderCursor::new(&self.input[self.position..]);
+        self.header = HeaderState::new();
         self.parsed = None;
         self.children = 0;
         self.utf8 = None;
@@ -194,12 +207,13 @@ impl<'a, P> Decoder<'a, P> {
         self.phase = Phase::Header;
     }
 
-    fn advance<A: Allocator<Permit = P>>(
+    fn advance<'a, A: Allocator<Permit = P>>(
         &mut self,
+        input: &'a [u8],
         allocator: &mut A,
     ) -> Result<DecodeStep<'a, P>, DecodeError<A::Refusal>> {
         match self.phase {
-            Phase::Header => match self.header.step(allocator)? {
+            Phase::Header => match self.header.step(&input[self.position..], allocator)? {
                 HeaderStep::Progress => {}
                 HeaderStep::Complete(header) => {
                     self.position += header.length;
@@ -212,7 +226,7 @@ impl<'a, P> Decoder<'a, P> {
                 allocator.traverse(1, 9).map_err(BoundedError::Refused)?;
                 let header = self.parsed.ok_or(BoundedError::PlanMismatch)?;
                 self.phase = Phase::Entry;
-                self.kind = match header.major {
+                let kind = match header.major {
                     MajorType::Unsigned => Kind::Unsigned(header.argument),
                     MajorType::Negative => {
                         if header.argument > i64::MAX as u64 {
@@ -221,7 +235,7 @@ impl<'a, P> Decoder<'a, P> {
                         Kind::Negative(-1 - header.argument as i64)
                     }
                     MajorType::ByteString | MajorType::Text => {
-                        if header.argument > widen(self.input.len() - self.position)? {
+                        if header.argument > widen(input.len() - self.position)? {
                             return Err(Error::Underrun.into());
                         }
                         let length =
@@ -230,10 +244,10 @@ impl<'a, P> Decoder<'a, P> {
                             .position
                             .checked_add(length)
                             .ok_or(BoundedError::Overflow)?;
-                        let bytes = self.input.get(self.position..end).ok_or(Error::Underrun)?;
+                        let bytes = input.get(self.position..end).ok_or(Error::Underrun)?;
                         if header.major == MajorType::Text {
                             self.payload_end = end;
-                            self.utf8 = Some(Utf8::new(bytes));
+                            self.utf8 = Some(Utf8::new());
                             self.phase = Phase::Utf8;
                             Kind::Null
                         } else {
@@ -248,7 +262,7 @@ impl<'a, P> Decoder<'a, P> {
                         Kind::Array(header.argument)
                     }
                     MajorType::Map => {
-                        if header.argument > widen((self.input.len() - self.position) / 2)? {
+                        if header.argument > widen((input.len() - self.position) / 2)? {
                             return Err(Error::Underrun.into());
                         }
                         self.children = header
@@ -285,9 +299,10 @@ impl<'a, P> Decoder<'a, P> {
                         },
                     },
                 };
-                if self.children > widen(self.input.len() - self.position)? {
+                if self.children > widen(input.len() - self.position)? {
                     return Err(Error::Underrun.into());
                 }
+                self.kind = StoredKind::retain(kind, self.position);
                 if self.children > 0 && self.stack.len() >= self.options.max_depth {
                     return Err(DecodeError::DepthLimit {
                         limit: self.options.max_depth,
@@ -296,8 +311,10 @@ impl<'a, P> Decoder<'a, P> {
             }
             Phase::Utf8 => {
                 let validator = self.utf8.as_mut().ok_or(BoundedError::PlanMismatch)?;
-                if let Some(text) = validator.step(allocator)? {
-                    self.kind = Kind::Text(text);
+                if let Some(text) =
+                    validator.step(&input[self.position..self.payload_end], allocator)?
+                {
+                    self.kind = StoredKind::retain(Kind::Text(text), self.payload_end);
                     self.position = self.payload_end;
                     match (&validator.quick, self.options.text) {
                         (IsNormalized::Yes, _) => self.phase = Phase::Entry,
@@ -311,15 +328,15 @@ impl<'a, P> Decoder<'a, P> {
                 }
             }
             Phase::InitializeNormalizer => {
-                let Kind::Text(source) = self.kind else {
+                let StoredKind::Text { .. } = self.kind else {
                     return Err(BoundedError::PlanMismatch.into());
                 };
                 // SAFETY: this final-location slot is not exposed until every
                 // initialization step has committed. Its prefix owns no resources.
                 if unsafe {
-                    TextEncoder::initialize_step(
+                    TextContinuation::initialize_step(
                         self.normalizer.as_mut_ptr(),
-                        source,
+                        (),
                         &mut self.normalizer_init,
                         allocator,
                     )?
@@ -328,11 +345,14 @@ impl<'a, P> Decoder<'a, P> {
                 }
             }
             Phase::Normalize => {
-                if self.normalizer_init != TextEncoder::<P>::INIT_STEPS {
+                if self.normalizer_init != TextContinuation::<(), P>::INIT_STEPS {
                     return Err(BoundedError::PlanMismatch.into());
                 }
                 let normalizer = unsafe { self.normalizer.assume_init_mut() };
-                match normalizer.step(allocator)? {
+                let Kind::Text(source) = self.kind.borrow(input) else {
+                    return Err(BoundedError::PlanMismatch.into());
+                };
+                match normalizer.step_source(source, allocator)? {
                     TextStep::Progress => {}
                     TextStep::Complete(bytes) => {
                         self.normalized = Some(bytes);
@@ -352,7 +372,7 @@ impl<'a, P> Decoder<'a, P> {
                     .as_ref()
                     .ok_or(BoundedError::PlanMismatch)?
                     .as_ref();
-                let original = &self.input[self.start..self.position];
+                let original = &input[self.start..self.position];
                 let remaining = canonical.len().min(original.len()) - self.text_compared;
                 let count = remaining.min(64);
                 allocator
@@ -412,7 +432,7 @@ impl<'a, P> Decoder<'a, P> {
                     .push_reserved(Frame {
                         node: self.completed,
                         remaining: self.children,
-                        map: matches!(self.kind, Kind::Map(_)),
+                        map: matches!(self.kind, StoredKind::Map(_)),
                         key: true,
                         previous_key: None,
                     })
@@ -423,8 +443,8 @@ impl<'a, P> Decoder<'a, P> {
                 allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
                 let stack = self.stack.ready().ok_or(BoundedError::PlanMismatch)?;
                 let Some(parent) = stack.last() else {
-                    if self.position != self.input.len() {
-                        return Err(Error::UnusedData(self.input.len() - self.position).into());
+                    if self.position != input.len() {
+                        return Err(Error::UnusedData(input.len() - self.position).into());
                     }
                     self.phase = Phase::ReleaseStack;
                     return Ok(DecodeStep::Progress);
@@ -436,10 +456,8 @@ impl<'a, P> Decoder<'a, P> {
                 {
                     let entries = self.entries.ready().ok_or(BoundedError::PlanMismatch)?;
                     let entry = &entries[self.completed];
-                    self.comparison = Some(KeyComparison::new(
-                        &self.input[start..end],
-                        &self.input[entry.start..entry.end],
-                    ));
+                    self.comparison =
+                        Some(RangeComparison::new(start..end, entry.start..entry.end));
                     self.phase = Phase::Compare;
                 }
             }
@@ -454,17 +472,14 @@ impl<'a, P> Decoder<'a, P> {
                     .into_owned()
                     .map_err(|_| BoundedError::PlanMismatch)?;
                 self.phase = Phase::Finished;
-                return Ok(DecodeStep::Complete(Document {
-                    input: self.input,
-                    entries,
-                }));
+                return Ok(DecodeStep::Complete(Document { input, entries }));
             }
             Phase::Compare => {
                 match self
                     .comparison
                     .as_mut()
                     .ok_or(BoundedError::PlanMismatch)?
-                    .step(allocator)?
+                    .step(input, allocator)?
                 {
                     ComparisonStep::Progress => {}
                     ComparisonStep::Complete(Ordering::Less) => self.phase = Phase::Attach,

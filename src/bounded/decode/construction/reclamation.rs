@@ -13,6 +13,9 @@ use core::ptr::{self, NonNull};
 
 use crate::bounded::{Allocator, BoundedError, BoundedResult};
 
+mod owned;
+pub use owned::{OwnedInitialized, OwnedReclaimer, OwnedRecord};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reclaimed {
     Progress,

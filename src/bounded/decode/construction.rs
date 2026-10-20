@@ -2,8 +2,11 @@
 use super::{Document, Node, wrong_type};
 
 pub mod in_place;
+mod owned;
 pub mod reclamation;
 mod typed;
+pub use owned::{DecodeInput, OwnedDecodeStep, OwnedTypedDecoder, OwnedTypedValue};
+pub use reclamation::OwnedReclaimer as OwnedDecodeOwner;
 pub use typed::{DecodeOwner, TypedDecoder, TypedPosition, TypedStep, TypedValue};
 
 pub fn node_at<'d, 'a, P>(document: &'d Document<'a, P>, index: usize) -> Option<Node<'d, 'a>> {
