@@ -1,0 +1,196 @@
+diff --git a/library/alloc/src/collections/btree/map.rs b/library/alloc/src/collections/btree/map.rs
+--- a/library/alloc/src/collections/btree/map.rs
++++ b/library/alloc/src/collections/btree/map.rs
+@@ -22,6 +22,8 @@
+ 
+ mod entry;
+ 
++#[unstable(feature = "btree_in_place", issue = "none")]
++pub use super::node::InPlaceNode;
+ use Entry::*;
+ #[stable(feature = "rust1", since = "1.0.0")]
+ pub use entry::{Entry, OccupiedEntry, OccupiedError, VacantEntry};
+@@ -219,6 +221,47 @@
+     }
+ }
+ 
++impl<K, V> BTreeMap<K, V> {
++    /// Publish a tree built in fixed-address nodes without moving its entries.
++    ///
++    /// # Safety
++    /// The root and all descendants must form a fully initialized B-tree of
++    /// `height` and exactly `length` entries, with the standard occupancy,
++    /// parent-link, uniform leaf-depth and strict `K::Ord` ordering invariants.
++    /// Every node was allocated by `InPlaceNode::try_allocate`. Ownership of
++    /// every node, key and value transfers to the returned map. Raw handles
++    /// may be retained for later external reclamation but may not be used
++    /// until the map is detached and all references to its contents have ended.
++    /// `None` is valid only with height and length both zero.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn from_in_place(
++        root: Option<&InPlaceNode<K, V>>,
++        height: usize,
++        length: usize,
++    ) -> Self {
++        Self {
++            // SAFETY: the caller establishes the complete tree invariants.
++            root: root.map(|node| unsafe { node.root(height) }),
++            length,
++            alloc: ManuallyDrop::new(Global),
++            _marker: PhantomData,
++        }
++    }
++
++    /// Detach a tree for external, field-by-field reclamation, leaving an
++    /// ordinary empty map. No node is visited and no destructor runs.
++    ///
++    /// # Safety
++    /// The caller retains the raw handles and initialization state of every
++    /// node and entry, and assumes exclusive cleanup responsibility for them.
++    /// No references into the detached tree may remain live.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn detach_in_place(&mut self) {
++        self.root = None;
++        self.length = 0;
++    }
++}
++
+ // FIXME: This implementation is "wrong", but changing it would be a breaking change.
+ // (The bounds of the automatic `UnwindSafe` implementation have been like this since Rust 1.50.)
+ // Maybe we can fix it nonetheless with a crater run, or if the `UnwindSafe`
+diff --git a/library/alloc/src/collections/btree/node.rs b/library/alloc/src/collections/btree/node.rs
+--- a/library/alloc/src/collections/btree/node.rs
++++ b/library/alloc/src/collections/btree/node.rs
+@@ -40,6 +40,10 @@
+ use crate::alloc::{Allocator, AllocatorClone, Layout};
+ use crate::boxed::Box;
+ 
++mod in_place;
++#[unstable(feature = "btree_in_place", issue = "none")]
++pub use in_place::InPlaceNode;
++
+ const B: usize = 6;
+ pub(super) const CAPACITY: usize = 2 * B - 1;
+ pub(super) const MIN_LEN_AFTER_SPLIT: usize = B - 1;
+diff --git a/library/alloc/src/collections/btree/node/in_place.rs b/library/alloc/src/collections/btree/node/in_place.rs
+new file mode 100644
+--- /dev/null
++++ b/library/alloc/src/collections/btree/node/in_place.rs
+@@ -0,0 +1,117 @@
++//! Raw, fixed-address nodes for externally stepped construction and reclamation.
++use super::*;
++use crate::alloc::{AllocError, Global};
++
++/// A node allocation whose initialized fields are tracked by its caller.
++///
++/// This handle has no destructor. It neither moves nor drops keys or values.
++/// Allocation, individual slot construction, linking, publication and release
++/// are separate commands so a caller can admit each before executing it.
++#[unstable(feature = "btree_in_place", issue = "none")]
++pub struct InPlaceNode<K, V> {
++    node: NonNull<LeafNode<K, V>>,
++}
++
++// SAFETY: the handle transfers exclusive allocation custody. Its caller must
++// keep any initialized fields and their construction state synchronized.
++#[unstable(feature = "btree_in_place", issue = "none")]
++unsafe impl<K: Send, V: Send> Send for InPlaceNode<K, V> {}
++
++impl<K, V> InPlaceNode<K, V> {
++    /// Maximum entries per node of this representation.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub const CAPACITY: usize = CAPACITY;
++    /// Bytes written when initializing a new node's header.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub const INITIALIZE_BYTES: usize = mem::size_of::<Option<NonNull<InternalNode<K,V>>>>() + mem::size_of::<u16>();
++    /// Bytes written by linking one edge and its child's parent metadata.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub const LINK_BYTES: usize = mem::size_of::<BoxedNode<K,V>>() + Self::INITIALIZE_BYTES;
++
++    /// Allocation layout, excluding allocator bookkeeping.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    #[rustc_const_unstable(feature = "btree_in_place", issue = "none")]
++    pub const fn layout(leaf: bool) -> Layout {
++        if leaf { Layout::new::<LeafNode<K, V>>() } else { Layout::new::<InternalNode<K, V>>() }
++    }
++
++    /// Allocate one node and initialize only its parent and length fields.
++    /// No entry or edge is initialized. The returned allocation must eventually
++    /// be released with `deallocate`, or transferred into a published map.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub fn try_allocate(leaf: bool) -> Result<Self, AllocError> {
++        let node = Global.allocate(Self::layout(leaf))?.cast::<LeafNode<K, V>>();
++        // SAFETY: the allocation has the selected node's layout and no aliases.
++        unsafe { LeafNode::init(node.as_ptr()) };
++        Ok(Self { node })
++    }
++
++    /// Stable key and value destinations for one entry.
++    ///
++    /// # Safety
++    /// The allocation is live and exclusively held for construction or cleanup.
++    /// `index` is below `CAPACITY`; the caller tracks initialization of both
++    /// fields and does not create overlapping references through these pointers.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn slot(&self, index: usize) -> (NonNull<MaybeUninit<K>>, NonNull<MaybeUninit<V>>) {
++        // SAFETY: the caller provides the live allocation and valid index.
++        unsafe {
++            (
++                NonNull::new_unchecked(
++                    (&raw mut (*self.node.as_ptr()).keys).cast::<MaybeUninit<K>>().add(index),
++                ),
++                NonNull::new_unchecked(
++                    (&raw mut (*self.node.as_ptr()).vals).cast::<MaybeUninit<V>>().add(index),
++                ),
++            )
++        }
++    }
++
++    /// Install one child edge and the child's parent link. No traversal occurs.
++    ///
++    /// # Safety
++    /// `self` is an internal node, `index <= CAPACITY`, and the edge is empty.
++    /// `child` is a live, unparented node of the immediately lower height.
++    /// Both allocations are uniquely held; linking must not introduce a cycle.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn link(&self, index: usize, child: &Self) {
++        let parent = self.node.cast::<InternalNode<K, V>>();
++        // SAFETY: both nodes and the edge satisfy the caller's obligations.
++        unsafe {
++            (&raw mut (*parent.as_ptr()).edges)
++                .cast::<MaybeUninit<BoxedNode<K, V>>>()
++                .add(index)
++                .write(MaybeUninit::new(child.node));
++            (&raw mut (*child.node.as_ptr()).parent).write(Some(parent));
++            (&raw mut (*child.node.as_ptr()).parent_idx).write(MaybeUninit::new(index as u16));
++        }
++    }
++
++    /// Set the number of initialized entries in this node.
++    ///
++    /// # Safety
++    /// `len <= CAPACITY`; the first `len` keys and values are initialized.
++    /// For an internal node the first `len + 1` edges are initialized.
++    /// The allocation is live and exclusively held.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn set_len(&self, len: usize) {
++        // SAFETY: the caller establishes initialization of the entire prefix.
++        unsafe { (&raw mut (*self.node.as_ptr()).len).write(len as u16) };
++    }
++
++    /// Free this node alone, without reading entries or following edges.
++    ///
++    /// # Safety
++    /// `leaf` matches allocation. Every initialized key and value has been
++    /// reclaimed, all references have ended, and no live map owns the node.
++    /// The caller must not subsequently access this allocation through any edge.
++    #[unstable(feature = "btree_in_place", issue = "none")]
++    pub unsafe fn deallocate(self, leaf: bool) {
++        // SAFETY: layout and exclusive deallocation authority come from caller.
++        unsafe { Global.deallocate(self.node.cast(), Self::layout(leaf)) };
++    }
++
++    pub(in crate::collections::btree) unsafe fn root(&self, height: usize) -> Root<K, V> {
++        NodeRef { height, node: self.node, _marker: PhantomData }
++    }
++}

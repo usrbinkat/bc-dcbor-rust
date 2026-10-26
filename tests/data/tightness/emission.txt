@@ -1,0 +1,8 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+4099	4096	within-2	published	witness of Boundaries: Boundaries values
+8198	8198	joint	published	witness of Boundaries: total bytes
+8264	8194	joint	published	witness of Boundaries: total values
+4099	4099	within-2	published	witness of Bytes: Bytes bytes
+4164	4097	within-2	published	witness of Bytes: Bytes values
+1	1	within-1	published	witness of Completion: Completion values
+4099	4099	within-1	published	witness of Initialization: Initialization bytes

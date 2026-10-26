@@ -8,7 +8,7 @@ use dcbor::{
 struct StandaloneOption(Option<bool>);
 
 fn main() {
-    let mut limits = Limits::new(100, 100, 100);
+    let mut limits = Limits::new(10_000, 100_000, 64_000);
     assert_eq!(
         encode(&StandaloneOption(None), &mut limits)
             .unwrap()

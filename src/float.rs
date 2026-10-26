@@ -88,11 +88,6 @@ impl Numeric {
         }
     }
 
-    /// Bytes of this encoding.
-    pub(crate) const fn len(self) -> usize {
-        self.head().1.head_len()
-    }
-
     pub(crate) fn cbor_data(self) -> Vec<u8> {
         let (major_type, argument) = self.head();
         head_vec(major_type, argument)
@@ -299,25 +294,12 @@ mod tests {
         );
     }
 
-    fn bounded_bytes(value: &impl crate::bounded::BoundedEncodable) -> Vec<u8> {
+    fn bounded_bytes(value: &impl crate::bounded::Schema) -> Vec<u8> {
         use crate::bounded::*;
-        struct Admit;
-        impl Budget for Admit {
-            type Refusal = ();
-            fn traverse(&mut self, _: u64, _: u64) -> core::result::Result<(), ()> {
-                Ok(())
-            }
-        }
-        impl Allocator for Admit {
-            type Permit = ();
-            fn allocate(&mut self, _: u64) -> core::result::Result<(), ()> {
-                Ok(())
-            }
-        }
-        let prepared = prepare(value, &mut Admit).unwrap();
-        let mut bytes = vec![0; usize::try_from(prepared.len()).unwrap()];
-        prepared.encode_into(&mut bytes, &mut Admit).unwrap();
-        bytes
+        encode(value, &mut Limits::unlimited())
+            .expect("an unlimited encoding completes")
+            .as_ref()
+            .to_vec()
     }
 
     /// Supplementary consistency evidence; literal profile vectors and value
@@ -333,7 +315,10 @@ mod tests {
                 expected,
                 "{bits:#06x}"
             );
-            assert_eq!(convert_f16(value).prepared().len(), expected.len());
+            assert_eq!(
+                convert_f16(value).prepared().head().1.head_len(),
+                expected.len()
+            );
         }
     }
 

@@ -1,7 +1,12 @@
 //! Retained lexicographic comparison of immutable encoded map keys.
 use core::cmp::Ordering;
 
-use super::super::{BoundedError, Budget, WriteWork};
+use super::super::{BoundedError, Budget, Caller, Capped, Failure, Resumable, Step, WriteWork};
+
+/// One comparison turn: one value and at most a quantum of byte pairs. The
+/// caller supplies the place.
+pub(crate) const COMPARE: Capped<Caller> =
+    Capped::new(Caller, 1, super::construction::stable::QUANTUM as u64);
 
 /// Ranges belong to the enclosing parser's immutable input. Keeping this type
 /// private prevents callers from substituting another buffer between turns.
@@ -30,32 +35,21 @@ impl RangeComparison {
         &mut self,
         input: &[u8],
         budget: &mut B,
-    ) -> Result<ComparisonStep, BoundedError<B::Refusal>> {
+    ) -> Result<Step<Ordering>, BoundedError<B::Refusal>> {
         if self.finished {
-            return Ok(ComparisonStep::Finished);
+            return Ok(Step::Finished);
         }
-        let left = input
-            .get(self.left.clone())
-            .ok_or(BoundedError::PlanMismatch)?;
-        let right = input
-            .get(self.right.clone())
-            .ok_or(BoundedError::PlanMismatch)?;
-        match compare_step(left, right, &mut self.position, budget)? {
-            Some(ordering) => {
-                self.finished = true;
-                Ok(ComparisonStep::Complete(ordering))
-            }
-            None => Ok(ComparisonStep::Progress),
-        }
+        let (Some(left), Some(right)) =
+            (input.get(self.left.clone()), input.get(self.right.clone()))
+        else {
+            self.finished = true;
+            return Err(BoundedError::PlanMismatch);
+        };
+        finish(
+            &mut self.finished,
+            compare_step(left, right, &mut self.position, budget),
+        )
     }
-}
-
-/// One comparison turn; completion is returned exactly once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComparisonStep {
-    Progress,
-    Complete(Ordering),
-    Finished,
 }
 
 /// A comparison owns no storage and borrows both keys for its entire lifetime.
@@ -101,23 +95,72 @@ impl<'a> KeyComparison<'a> {
         if self.finished {
             None
         } else {
-            let remaining = self.left.len().min(self.right.len()) - self.position;
-            Some(WriteWork::new(1, remaining.min(64) as u64))
+            let remaining = (self.left.len().min(self.right.len()) - self.position) as u64;
+            Some(WriteWork::new(
+                COMPARE.values(),
+                remaining.min(COMPARE.cap()),
+            ))
         }
     }
 
     pub fn step<B: Budget>(
         &mut self,
         budget: &mut B,
-    ) -> Result<ComparisonStep, BoundedError<B::Refusal>> {
+    ) -> Result<Step<Ordering>, BoundedError<B::Refusal>> {
         if self.finished {
-            return Ok(ComparisonStep::Finished);
+            return Ok(Step::Finished);
         }
-        if let Some(ordering) = compare_step(self.left, self.right, &mut self.position, budget)? {
-            self.finished = true;
-            Ok(ComparisonStep::Complete(ordering))
-        } else {
-            Ok(ComparisonStep::Progress)
+        finish(
+            &mut self.finished,
+            compare_step(self.left, self.right, &mut self.position, budget),
+        )
+    }
+}
+
+/// The [`ResourceBound`] of comparing two keys the shorter of which has
+/// `shorter` bytes ([`KeyComparison`]): one turn per quantum of byte pairs,
+/// and one for keys of no common bytes; every pair examined once; nothing
+/// allocated.
+pub fn comparison_bound(shorter: u64) -> super::super::ResourceBound {
+    const { assert!(COMPARE.values() == 1) };
+    super::super::ResourceBound {
+        values: shorter.div_ceil(COMPARE.cap()).max(1),
+        bytes: shorter,
+        ..super::super::ResourceBound::default()
+    }
+}
+
+impl<B: Budget> Resumable<B> for KeyComparison<'_> {
+    type Output = Ordering;
+    type Error = BoundedError<B::Refusal>;
+    type Position = usize;
+
+    fn step(&mut self, budget: &mut B) -> Result<Step<Ordering>, Self::Error> {
+        KeyComparison::step(self, budget)
+    }
+
+    fn position(&mut self) -> usize {
+        KeyComparison::position(self)
+    }
+}
+
+/// One comparison turn's outcome. Completion and terminal errors finish the
+/// comparison; a refusal leaves it resumable.
+fn finish<R>(
+    finished: &mut bool,
+    turn: Result<Option<Ordering>, BoundedError<R>>,
+) -> Result<Step<Ordering>, BoundedError<R>> {
+    match turn {
+        Ok(Some(ordering)) => {
+            *finished = true;
+            Ok(Step::Complete(ordering))
+        }
+        Ok(None) => Ok(Step::Progress),
+        Err(error) => {
+            if !error.refused() {
+                *finished = true;
+            }
+            Err(error)
         }
     }
 }
@@ -135,10 +178,8 @@ pub(crate) fn compare_step<B: Budget>(
         .min(right.len())
         .checked_sub(*position)
         .ok_or(BoundedError::PlanMismatch)?;
-    let count = remaining.min(64);
-    budget
-        .traverse(1, count as u64)
-        .map_err(BoundedError::Refused)?;
+    let count = remaining.min(super::construction::stable::QUANTUM);
+    COMPARE.admit(budget, count as u64)?;
     let end = *position + count;
     while *position < end {
         let ordering = left[*position].cmp(&right[*position]);

@@ -50,52 +50,91 @@ implementations and requires a rebuilt standard library exposing
 `--all-features` also requires this custom toolchain. That API exposes physical
 bucket count, indexed shared bucket access, and allocation size from the owning
 hash table. A Cargo dependency override does not replace compiled std. The
-custom standard-library toolchain has not yet been built and qualified.
+custom standard-library development shell supplies that library; qualification
+results must identify the fork revision and patch used.
 
-With the `derive` feature, `CBORResumableEncodable` generates instructions for
-`bounded::encoding::Preparation`. Named structs use canonical integer-key maps;
-absent optional fields are omitted. Newtypes, unit structs, and unit, tuple, and
-named enum variants follow the symbolic schema representation. Type-level tags
-remain untagged during encoding; use `bounded::Tagged` for explicit tag emission.
+Every bounded encoding runs on one engine, `bounded::encoding::Preparation`,
+over a value's `bounded::Schema`. `bounded::encode` walks the value's shape
+(`encoding::Shape::of`), prepares its plan in an arena capped at the walked
+extent and a widest head per map, and publishes that arena in place as the
+encoding (`Prepared::publish`): nothing is allocated or copied for the output.
+`bounded::prepare` stops at the plan; `Prepared::encode_into` writes it into a
+caller's exactly sized slice and `Prepared::encode_owned` into storage the
+caller admits separately. `bounded::encode_bound` bounds the whole of `encode`
+from the walked shape.
+
+With the `derive` feature, `CBORBoundedEncodable` generates the `Schema`. Named
+structs use canonical integer-key maps; absent optional fields are omitted. A
+derived map's head carries its count at once: the presence checks of its
+optional fields are announced and admitted first (`Instruction::Inspect`), then
+the counted head is written (`Instruction::CountedMap`), and the engine refuses
+a source that visits another number of fields. Newtypes, unit structs, and unit,
+tuple, and named enum variants follow the symbolic schema representation.
+Type-level tags remain untagged during encoding; use `bounded::Tagged` for
+explicit tag emission.
 
 Preparation retains an explicit traversal stack, normalization state, byte
 relocation, and map-header positions. Call `step` on the same preparation after a
-budget refusal. `PrepareStep::Complete` returns an independently owned plan;
+budget refusal. `Step::Complete` returns an independently owned plan;
 `plan.writer(destination)` emits into an exactly sized destination without
 allocation. Writer steps copy at most 64 bytes and preserve the emitted prefix
 on refusal. Preparation supports nesting up to 128 traversal frames.
 
 Built-in schema instructions cover integers, floats, booleans, strings, byte
-strings, arrays, vectors, nullable options, references, boxes, and shared pointers.
+strings, arrays, vectors, nullable options, references, boxes, shared pointers,
+`BTreeMap`, `dcbor::Map`, symbolic `CBOR`, `Date`, and, with `num-bigint`,
+`BigInt` and `BigUint`. Text the NFC quick check proves normal is copied as it
+is; any other text is normalized by the retained normalizer. Bignum magnitudes
+are read a quantum of digits at a time, scanned once for their length and once
+for their bytes.
 Custom `encoding::Schema` implementations must produce each instruction in
 bounded work without allocating or recursively traversing children. Dynamic-map
 entry instructions may inspect at most 64 indexed bucket controls and yield at
 most one entry. The engine rejects index advances outside 1 through 64; custom
 implementations must also bound the actual work preceding the returned instruction.
-The preparation borrow must preserve the representation throughout traversal.
+The preparation borrow must preserve the representation throughout traversal:
+a source answering differently when prepared than when its shape was walked is
+refused at the arena's cap. A counted unordered map
+(`Instruction::CountedUnorderedMap`) must declare the number of entries its
+source holds: the map ends once that many are yielded, and one ending before
+its count is refused.
 
-Prepared plans retain canonical bytes with map-header gap metadata. Map fields
-are inspected once; finalizing a schema header does not shift the payload.
-Dynamic-map children compact their header gaps incrementally before their
-canonical bytes participate in ordering. Preparation retains storage proportional
-to the encoded output in addition to normalization scratch and traversal metadata.
+Prepared plans retain canonical bytes with map-header gap metadata; only a map
+whose count is unknown at its start holds a gap. Finalizing a gap's header does
+not shift the payload. Dynamic-map children compact their header gaps
+incrementally before their canonical bytes participate in ordering.
+Preparation retains storage proportional to the encoded output in addition to
+normalization scratch and traversal metadata.
+
+Trees are walked without searching or comparing keys. On a stable toolchain a
+`BTreeMap` or `dcbor::Map` is read through its standard iterator over its whole
+range, each step's node moves (at most twice the tree's height) admitted before
+it in units of at most a turn's three values. Under `custom-std-collections` it
+is read through the forked standard
+library's stepped cursor, one admitted transition per step. A `dcbor::Map` is
+keyed by its keys' encodings and yields them in canonical order, so its entries
+are checked in one pass over adjacent keys instead of sorted; a `BTreeMap`'s
+entries are ordered by their prepared key bytes.
 
 With `hashbrown` enabled, `Preparation` accepts a borrowed
 `hashbrown::HashTable<(K, V)>` from hashbrown 0.17 whose keys and values implement
 `Schema`. `bounded::encoding::maps::MapPreparation` is an alias for that same
 engine. Each admitted scan inspects at most 64 buckets, including vacant buckets,
-and stops at the first entry.
+and stops at the first entry, found a control group at a time
+(`next_full_bucket` in the pinned hashbrown and the forked standard library);
+the charge is the 64-control window on every target. A map ends once its
+declared entries are yielded, so no bucket after its last entry is scanned.
 Keys and values are prepared through retained schema operations, then flat entry
 descriptors are merge-ordered by canonical key bytes. Key comparisons use the
 decoder's retained comparison primitive, examining at most 64 byte pairs per
 turn. Equal keys are rejected during merging. Merge scratch holds only the
 shorter run, and descriptor moves are admitted separately from comparisons.
-For a root dynamic map, the plan retains the sorted descriptors and its writer
-copies entries directly in canonical order, in chunks of at most 64 bytes.
-Root payload bytes are not permuted and no permutation bitmap is allocated.
-Descriptor storage and its reservation transfer to the independently owned
-`Prepared` plan. Emission takes `O(B / 64 + n)` steps for `B` bytes and `n` entries,
-including descriptor transitions and partial chunks, without allocation.
+Every dynamic map, the root's included, is permuted into canonical order in the
+plan's own bytes, so the plan is the encoding but for its header gaps.
+Descriptors stay with the preparation; the `Prepared` plan holds only its
+bytes and gap records. Emission takes `O(B / 64 + g)` steps for `B` bytes and
+`g` header gaps, including partial chunks, without allocation; publication in
+place takes the same steps and releases the gap records.
 
 The table interface is bucket-indexed: this path does not use `HashMap::iter`
 or estimate sparse scans from insertion capacity. Table construction is a
@@ -126,33 +165,42 @@ work bounds, separate from the three-value/64-byte per-turn limit.
 
 ## Owner-backed typed decoding
 
-`bounded::decode::construction::TypedDecoder` borrows a `DecodeOwner` and the
-complete immutable input. Its allocator type is the second type parameter.
+`bounded::decode::construction::TypedDecoder` consumes an initialized input
+handle acquired through `DecodeOwner`. Its type parameters are the input,
+decoded value and allocator.
 The controller starts without allocating or constructing schema fields. Stepping
 it allocates one stable lifecycle record and initializes parser metadata in that
-record before parsing. `TypedStep::Complete` publishes a `TypedValue` handle;
+record before parsing. `Step::Complete` publishes a `TypedValue` handle;
 `value()` borrows the initialized value at its construction address.
 
 ```rust
-use dcbor::bounded::{Limits, decode::{Options, construction::{
-    DecodeOwner, TypedDecoder, TypedStep, reclamation::Reclaimed,
+use dcbor::bounded::{Limits, Resumable, Step, decode::{Options, construction::{
+    DecodeOwner, TypedDecoder, reclamation::Reclaimed,
 }}};
 
 let input = [0x62, b'o', b'k'];
-let owner = DecodeOwner::<Limits>::new();
+let mut owner = DecodeOwner::<Limits>::new();
 let mut budget = Limits::new(1_000_000, 1_000_000, 1_000_000);
-let mut decoder = TypedDecoder::<String, Limits>::new(
-    &owner, &input, Options::normalizing(8),
-);
+owner.initialize_step(&mut budget).unwrap();
+let mut acquisition = owner.borrow_input(&input);
+let input = loop {
+    match acquisition.step(&mut budget).unwrap() {
+        Step::Progress => {}
+        Step::Complete(input) => break input,
+        Step::Finished => panic!("missing input"),
+    }
+};
+drop(acquisition);
+let mut decoder = TypedDecoder::<_, String, Limits>::new(input, Options::normalizing(8));
 loop {
     match decoder.step(&mut budget).unwrap() {
-        TypedStep::Progress => {}
-        TypedStep::Complete(value) => {
+        Step::Progress => {}
+        Step::Complete(value) => {
             assert_eq!(value.value(), "ok");
             drop(value);
             break;
         }
-        TypedStep::Finished => panic!("missing output"),
+        Step::Finished => panic!("missing output"),
     }
 }
 drop(decoder);
@@ -168,7 +216,11 @@ returning `Finished`. A budget refusal preserves the operation for resumption
 with a fresh allowance. `cancel()` selects this same explicit cleanup path.
 
 Custom bindings implement `in_place::InPlace<A>` and mandatory
-`reclamation::Reclaim<A>`. Both receive a stable destination and retained cursor;
+`reclamation::Reclaim<A>`. Their retained state implements `Custody`, projecting
+its initialized parts, held allocations, admissions and active child obligations
+under exclusive access. Observation admits and allocates nothing. `Reduction`
+is optional and requires a documented cleanup simulation; containers without
+one retain every stop schedule. Both construction and cleanup receive a stable destination and retained cursor;
 completion returns a status rather than moving a schema value. The former
 `ResumableDecodable::start`, schema-sized associated state, and
 `BuildStep::Complete(T)` protocol have been removed. `CBORBoundedDecodable`
@@ -191,6 +243,36 @@ The owner rejects an excessive bound before reserving or allocating a record.
 Custom unsafe bindings must declare their actual bound, including helper and
 child dispatch; the leaf default is valid only without child delegation. This
 limit is independent of the parser's input nesting limit.
+
+Every binding also declares `Reclaim::remaining`: the most successful cleanup
+calls its state can still take, the one returning `Done` included, read like
+an observation. The scope holds each queued record to the count it declared
+when its cleanup began and refuses a call beyond it as a defect, so every
+drain, stepped or terminal, is finite. Overstating is sound; understating
+violates the unsafe contract.
+
+## Verification layers
+
+In the fork-enabled development shell:
+
+```sh
+cargo test --workspace --all-features
+DCBOR_RIGOR=exhaustive cargo test --workspace --all-features
+bash tests/miri-owned.sh
+```
+
+Fast rigor is the default: every admission is refused once and resumed,
+every physical request is failed, and stops are reduced only by certified
+cleanup classes. Exhaustive additionally replays each refusal and each stop
+independently and checks the reductions. Both use the same oracles.
+The Miri gate runs both aliasing models with strict provenance and compares
+its reached class inventory with native execution of the same selections.
+
+`run_tests.sh` runs the stable feature matrix; its exhaustive mode also
+checks the fast feature-selection assumptions. [tests/BOUNDED.md](tests/BOUNDED.md)
+documents the selection and mutation-effectiveness gate.
+[tests/data/README.md](tests/data/README.md) documents checked recording,
+configuration identities, complete variant inventories and matrix cost ratchets.
 
 ## Related Projects
 

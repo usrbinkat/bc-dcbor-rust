@@ -1,0 +1,44 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+16	16	measured	published	borrow: Initialization bytes
+1	1	measured	published	borrow: Initialization values
+72	72	joint	published	borrow: total allocated
+88	88	joint	published	borrow: total bytes
+72	72	joint	published	borrow: total peak
+72	72	joint	published	borrow: total retained
+6	4	joint	published	borrow: total values
+88	88	measured	published	copy: Record allocated
+80	80	measured	published	copy: Record bytes
+88	88	measured	published	copy: Record peak
+88	88	measured	published	copy: Record retained
+2	2	measured	published	copy: Record values
+205	205	measured	published	copy: Task allocated
+285	261	measured	published	copy: Task bytes
+205	205	measured	published	copy: Task peak
+205	205	measured	published	copy: Task retained
+13	8	measured	published	copy: Task values
+293	293	joint	published	copy: total allocated
+389	341	joint	published	copy: total bytes
+293	293	joint	published	copy: total peak
+293	293	joint	published	copy: total retained
+16	10	joint	published	copy: total values
+1790567	1740573	joint	published	owned preparation of 16 texts of 400 pairs: public bytes
+429266	427176	joint	published	owned preparation of 16 texts of 400 pairs: public values
+138467	127093	joint	published	owned preparation of 4 texts of 100 pairs: public bytes
+27741	27188	joint	published	owned preparation of 4 texts of 100 pairs: public values
+15780	11396	joint	published	owned preparation of 4000 empty strings: public allocated
+8713	8456	joint	published	owned preparation of 4000 empty strings: public peak
+8713	6344	joint	published	owned preparation of 4000 empty strings: public retained
+4920	4036	joint	published	owned preparation of 500 empty strings: public allocated
+3337	3080	joint	published	owned preparation of 500 empty strings: public peak
+3337	2760	joint	published	owned preparation of 500 empty strings: public retained
+1	1	measured	exact	retired copy: Release values
+35421217	1797135	joint	published	typed decode chain of 16 texts of 400 pairs: public bytes
+2379268	408006	joint	published	typed decode chain of 16 texts of 400 pairs: public values
+2243161	128079	joint	published	typed decode chain of 4 texts of 100 pairs: public bytes
+150077	25986	joint	published	typed decode chain of 4 texts of 100 pairs: public values
+1635692	879259	joint	published	typed decode chain of 4000 empty strings: public allocated
+690249	681883	joint	published	typed decode chain of 4000 empty strings: public peak
+690249	681883	joint	published	typed decode chain of 4000 empty strings: public retained
+207912	111503	joint	published	typed decode chain of 500 empty strings: public allocated
+87717	86351	joint	published	typed decode chain of 500 empty strings: public peak
+87717	86351	joint	published	typed decode chain of 500 empty strings: public retained

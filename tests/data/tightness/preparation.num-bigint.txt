@@ -1,0 +1,140 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+4096	4096	measured	published	bignums (Digits): Digits bytes
+72	64	measured	published	bignums (Digits): Digits values
+17779	14619	total	published	bignums (Digits): run bytes
+4407	4312	total	published	bignums (Digits): run values
+1112	232	measured	cancelled	cancelled map (Cleanup): Cleanup bytes
+41	11	measured	cancelled	cancelled map (Cleanup): Cleanup values
+231154	21574	total	cancelled	cancelled map (Cleanup): run bytes
+13366	2028	total	cancelled	cancelled map (Cleanup): run values
+1984	1984	measured	published	deep cursors (Cursors): Cursors allocated
+1920	1616	measured	published	deep cursors (Cursors): Cursors bytes
+1600	1600	measured	published	deep cursors (Cursors): Cursors peak
+30	29	measured	published	deep cursors (Cursors): Cursors values
+36466	12918	total	published	deep cursors (Cursors): run bytes
+1284	510	total	published	deep cursors (Cursors): run values
+48879	14127	total	published	deep frames: run bytes
+1612	838	total	published	deep frames: run values
+12367	6615	total	published	deep maps: run bytes
+451	309	total	published	deep maps: run values
+312070	285996	total	published	disordered text: run bytes
+78304	74038	total	published	disordered text: run values
+15586	12567	total	published	field map: run bytes
+3490	2640	total	published	field map: run values
+28589958	14556193	total	published	gapped values: run bytes
+1354961	988213	total	published	gapped values: run values
+16832	16832	measured	published	gaps (Gaps): Gaps allocated
+11200	10496	measured	published	gaps (Gaps): Gaps bytes
+12352	12352	measured	published	gaps (Gaps): Gaps peak
+8192	8192	measured	published	gaps (Gaps): Gaps retained
+556	555	measured	published	gaps (Gaps): Gaps values
+38229	29409	total	published	gaps (Gaps): run bytes
+8151	6242	total	published	gaps (Gaps): run values
+320	320	measured	published	gaps (OpenMaps): OpenMaps allocated
+384	240	measured	published	gaps (OpenMaps): OpenMaps bytes
+320	320	measured	published	gaps (OpenMaps): OpenMaps peak
+6	5	measured	published	gaps (OpenMaps): OpenMaps values
+38229	29409	total	published	gaps (OpenMaps): run bytes
+8151	6242	total	published	gaps (OpenMaps): run values
+38229	29409	total	published	gaps: run bytes
+8151	6242	total	published	gaps: run values
+1	1	measured	published	integers (Completion): Completion values
+41233	38073	total	published	integers (Completion): run bytes
+13018	9187	total	published	integers (Completion): run values
+288	288	measured	published	integers (Frames): Frames allocated
+384	240	measured	published	integers (Frames): Frames bytes
+288	288	measured	published	integers (Frames): Frames peak
+6	5	measured	published	integers (Frames): Frames values
+41233	38073	total	published	integers (Frames): run bytes
+13018	9187	total	published	integers (Frames): run values
+27018	27018	measured	published	integers (Instructions): Instructions bytes
+3002	3002	measured	published	integers (Instructions): Instructions values
+41233	38073	total	published	integers (Instructions): run bytes
+13018	9187	total	published	integers (Instructions): run values
+8892	8892	measured	published	integers (PlanBytes): PlanBytes allocated
+8316	7372	measured	published	integers (PlanBytes): PlanBytes bytes
+6208	6208	measured	published	integers (PlanBytes): PlanBytes peak
+4096	4096	measured	published	integers (PlanBytes): PlanBytes retained
+4158	4157	measured	published	integers (PlanBytes): PlanBytes values
+41233	38073	total	published	integers (PlanBytes): run bytes
+13018	9187	total	published	integers (PlanBytes): run values
+3003	1001	measured	published	integers (Pushes): Pushes values
+41233	38073	total	published	integers (Pushes): run bytes
+13018	9187	total	published	integers (Pushes): run values
+41233	38073	total	published	integers: run bytes
+13018	9187	total	published	integers: run values
+2893379	1829411	total	published	large permuted map: run bytes
+156007	103274	total	published	large permuted map: run values
+155090	103337	joint	published	large permuted map: total allocated
+2893379	1829411	joint	published	large permuted map: total bytes
+91712	58208	joint	published	large permuted map: total peak
+8256	8256	joint	published	large permuted map: total retained
+156007	103274	joint	published	large permuted map: total values
+2039306	769417	total	published	long keys: run bytes
+151737	45549	total	published	long keys: run values
+127374	44940	total	published	map keys: run bytes
+6538	2600	total	published	map keys: run values
+65	65	measured	published	ordered map (Check): Check values
+231154	47326	total	published	ordered map (Check): run bytes
+13366	4332	total	published	ordered map (Check): run values
+231154	47326	total	published	ordered map: run bytes
+13366	4332	total	published	ordered map: run values
+8792	8192	measured	published	permuted map (Compaction): Compaction bytes
+652	256	measured	published	permuted map (Compaction): Compaction values
+231154	131878	total	published	permuted map (Compaction): run bytes
+13366	8476	total	published	permuted map (Compaction): run values
+728	292	measured	published	permuted map (Comparisons): Comparisons bytes
+467	192	measured	published	permuted map (Comparisons): Comparisons values
+231154	131878	total	published	permuted map (Comparisons): run bytes
+13366	8476	total	published	permuted map (Comparisons): run values
+8448	8448	measured	published	permuted map (EntryArena): EntryArena allocated
+6272	5728	measured	published	permuted map (EntryArena): EntryArena bytes
+6208	6208	measured	published	permuted map (EntryArena): EntryArena peak
+160	159	measured	published	permuted map (EntryArena): EntryArena values
+231154	131878	total	published	permuted map (EntryArena): run bytes
+13366	8476	total	published	permuted map (EntryArena): run values
+43008	18432	measured	published	permuted map (Merging): Merging bytes
+2277	1028	measured	published	permuted map (Merging): Merging values
+231154	131878	total	published	permuted map (Merging): run bytes
+13366	8476	total	published	permuted map (Merging): run values
+139722	76524	measured	published	permuted map (Permutation): Permutation bytes
+5348	3662	measured	published	permuted map (Permutation): Permutation values
+231154	131878	total	published	permuted map (Permutation): run bytes
+13366	8476	total	published	permuted map (Permutation): run values
+22970	14881	joint	published	permuted map (Permutation): total allocated
+231154	131878	joint	published	permuted map (Permutation): total bytes
+12864	8032	joint	published	permuted map (Permutation): total peak
+1088	1088	joint	published	permuted map (Permutation): total retained
+13366	8476	joint	published	permuted map (Permutation): total values
+8448	2176	measured	published	permuted map (Scratch): Scratch allocated
+6272	2048	measured	published	permuted map (Scratch): Scratch bytes
+6208	1600	measured	published	permuted map (Scratch): Scratch peak
+160	51	measured	published	permuted map (Scratch): Scratch values
+231154	131878	total	published	permuted map (Scratch): run bytes
+13366	8476	total	published	permuted map (Scratch): run values
+734	581	measured	published	permuted map (Visited): Visited allocated
+3220	1884	measured	published	permuted map (Visited): Visited bytes
+256	201	measured	published	permuted map (Visited): Visited peak
+196	159	measured	published	permuted map (Visited): Visited values
+231154	131878	total	published	permuted map (Visited): run bytes
+13366	8476	total	published	permuted map (Visited): run values
+231154	131878	total	published	permuted map: run bytes
+13366	8476	total	published	permuted map: run values
+435325	295460	total	published	root map: run bytes
+24618	15413	total	published	root map: run values
+4701876	276851	total	published	text: run bytes
+1235876	133380	total	published	text: run values
+10496	10432	measured	published	texts (Texts): Texts allocated
+94464	66251	measured	published	texts (Texts): Texts bytes
+96	96	measured	published	texts (Texts): Texts peak
+4803	4263	measured	published	texts (Texts): Texts values
+103368	71467	total	published	texts (Texts): run bytes
+6039	4904	total	published	texts (Texts): run values
+103368	71467	total	published	texts: run bytes
+6039	4904	total	published	texts: run values
+72157	43832	total	published	wide cursor: run bytes
+3926	2280	total	published	wide cursor: run values
+1003	1003	measured	published	zeros (Appends): Appends bytes
+1030	1001	measured	published	zeros (Appends): Appends values
+35673	32673	total	published	zeros (Appends): run bytes
+8185	6098	total	published	zeros (Appends): run values

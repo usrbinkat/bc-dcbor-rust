@@ -1,7 +1,10 @@
 #![doc(html_root_url = "https://docs.rs/dcbor/0.25.2")]
 #![warn(rust_2018_idioms)]
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(feature = "custom-std-collections", feature(hashmap_bucket_access))]
+#![cfg_attr(
+    feature = "custom-std-collections",
+    feature(hashmap_bucket_access, btree_stepped_cursor, btree_in_place)
+)]
 
 //! # dCBOR: Deterministic CBOR Codec
 //!
@@ -174,7 +177,6 @@ mod conveniences;
 #[cfg(feature = "derive")]
 pub use dcbor_derive::{
     CBORBoundedDecodable, CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable,
-    CBORResumableEncodable,
 };
 
 // Re-export standard library types used in our public API

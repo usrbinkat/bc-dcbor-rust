@@ -1,6 +1,19 @@
 use super::*;
 use decode::comparison::compare_step;
 
+/// One step of a merge: a run begun or passed, a phase changed, the merge
+/// finished.
+pub(in crate::bounded::encoding) const MERGE_STEP: Unit<PreparationPlace> =
+    Unit::new(PreparationPlace::Merging, 1, 0);
+
+/// One entry moved: copied into the scratch, or written back.
+pub(in crate::bounded::encoding) const MERGE_MOVE: Unit<PreparationPlace> =
+    Unit::of::<Entry>(PreparationPlace::Merging);
+
+/// Resetting the ordering for the next map: its position rewritten.
+pub(in crate::bounded::encoding) const RESET: Unit<PreparationPlace> =
+    Unit::of::<OrderPosition>(PreparationPlace::Completion);
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::bounded::encoding) struct Entry {
     pub start: usize,
@@ -34,14 +47,58 @@ pub struct OrderPosition {
 }
 
 pub(in crate::bounded::encoding) struct Order<P> {
-    scratch: Storage<Entry, P>,
+    pub(in crate::bounded::encoding) scratch: Storage<Entry, P>,
     position: OrderPosition,
-    middle: usize,
-    end: usize,
-    forward: bool,
+    pub(in crate::bounded::encoding) middle: usize,
+    pub(in crate::bounded::encoding) end: usize,
+    pub(in crate::bounded::encoding) forward: bool,
 }
 
 impl<P> Order<P> {
+    /// Every unit of [`Self::initialize_step`]: the scratch arena and four
+    /// scalar fields.
+    pub const INIT_STEPS: usize = Storage::<Entry, P>::INIT_STEPS + 4;
+
+    /// Initialize one unit of the empty ordering [`Self::new`] builds.
+    ///
+    /// # Safety
+    /// The destination is unique, stable and uninitialized; `step` starts at
+    /// zero and is retained. An incomplete prefix owns nothing.
+    pub unsafe fn initialize_step<A: Allocator<Permit = P>>(
+        place: *mut Self,
+        step: &mut usize,
+        a: &mut A,
+    ) -> BoundedResult<bool, A> {
+        let storage = Storage::<Entry, P>::INIT_STEPS;
+        // SAFETY: each unit writes one uninitialized field of the destination.
+        unsafe {
+            if *step < storage {
+                Storage::initialize_step(addr_of_mut!((*place).scratch), step, a)?;
+                return Ok(false);
+            }
+            match *step - storage {
+                0 => field(addr_of_mut!((*place).position), OrderPosition::default, a)?,
+                1 => field(addr_of_mut!((*place).middle), || 0, a)?,
+                2 => field(addr_of_mut!((*place).end), || 0, a)?,
+                3 => field(addr_of_mut!((*place).forward), || true, a)?,
+                _ => return Err(BoundedError::PlanMismatch),
+            }
+        }
+        *step += 1;
+        Ok(*step == Self::INIT_STEPS)
+    }
+
+    /// Whether the merge scratch holds nothing.
+    pub fn is_released(&self) -> bool {
+        self.scratch.is_released()
+    }
+
+    /// One admitted unit releasing the merge scratch; true once released.
+    /// The caller supplies the place.
+    pub fn reclaim_step<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<bool, A> {
+        self.scratch.reclaim_copy_step(a)
+    }
+
     pub fn new() -> Self {
         Self {
             scratch: Storage::new(),
@@ -60,10 +117,18 @@ impl<P> Order<P> {
     }
 
     pub fn reset<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
-        a.traverse(1, widen(core::mem::size_of::<OrderPosition>())?)
-            .map_err(BoundedError::Refused)?;
+        RESET.admit(a)?;
         self.position = OrderPosition::default();
         Ok(())
+    }
+
+    /// The merge scratch, settled; or, while it relocates, one unit of its
+    /// relocation as the step's work and `None`.
+    fn settled<'s, A: Allocator<Permit = P>>(
+        scratch: &'s mut Storage<Entry, P>,
+        a: &mut A,
+    ) -> BoundedResult<Option<&'s mut Owned<Entry, P>>, A> {
+        at(PreparationPlace::Scratch, || scratch.settle_step(a))
     }
 
     pub fn step<A: Allocator<Permit = P>>(
@@ -75,7 +140,7 @@ impl<P> Order<P> {
         let p = &mut self.position;
         match p.phase {
             OrderPhase::Run => {
-                a.traverse(1, 0).map_err(BoundedError::Refused)?;
+                MERGE_STEP.admit(a)?;
                 p.width = p.width.max(1);
                 if p.width >= entries.len() {
                     p.phase = OrderPhase::Complete;
@@ -100,20 +165,22 @@ impl<P> Order<P> {
                     (self.middle, self.end - self.middle)
                 };
                 if self.scratch.len() < count {
-                    if self.scratch.ready().is_none() {
-                        self.scratch.reserve_capped_step(count, a)?;
+                    // Scratch is retained across runs and maps. Grow
+                    // geometrically rather than capping at this run's length:
+                    // successive short caps would introduce extra growths
+                    // beyond the retained arena's doubling bound.
+                    let scratch = &mut self.scratch;
+                    let Some(spare) = at(PreparationPlace::Scratch, || {
+                        scratch.reserve_step(usize::MAX, a)
+                    })?
+                    else {
                         return Ok(false);
-                    }
-                    if !self.scratch.reserve_capped_step(count, a)? {
-                        return Ok(false);
-                    }
-                    a.traverse(1, widen(core::mem::size_of::<Entry>())?)
-                        .map_err(BoundedError::Refused)?;
-                    self.scratch
-                        .push_reserved(entries[start + self.scratch.len()])
-                        .map_err(|_| BoundedError::PlanMismatch)?;
+                    };
+                    MERGE_MOVE.admit(a)?;
+                    let copied = spare.len();
+                    spare.push(entries[start + copied]);
                 } else {
-                    a.traverse(1, 0).map_err(BoundedError::Refused)?;
+                    MERGE_STEP.admit(a)?;
                     (p.left, p.right, p.output) = if self.forward {
                         (0, self.middle, p.run)
                     } else {
@@ -135,7 +202,7 @@ impl<P> Order<P> {
                     p.left == p.run
                 };
                 if scratch_done || other_done {
-                    a.traverse(1, 0).map_err(BoundedError::Refused)?;
+                    MERGE_STEP.admit(a)?;
                     p.phase = if scratch_done {
                         OrderPhase::Clear
                     } else if self.forward {
@@ -144,18 +211,23 @@ impl<P> Order<P> {
                         OrderPhase::WriteRight
                     };
                 } else {
-                    let scratch = self.scratch.ready().ok_or(BoundedError::PlanMismatch)?;
+                    let Some(scratch) = Self::settled(&mut self.scratch, a)? else {
+                        return Ok(false);
+                    };
+                    let scratch = scratch.as_slice();
                     let (left, right) = if self.forward {
                         (&scratch[p.left], &entries[p.right])
                     } else {
                         (&entries[p.left - 1], &scratch[p.right - 1])
                     };
-                    if let Some(ordering) = compare_step(
-                        &bytes[left.start..left.key_end],
-                        &bytes[right.start..right.key_end],
-                        &mut p.compared,
-                        a,
-                    )? {
+                    if let Some(ordering) = at(PreparationPlace::Comparisons, || {
+                        compare_step(
+                            &bytes[left.start..left.key_end],
+                            &bytes[right.start..right.key_end],
+                            &mut p.compared,
+                            a,
+                        )
+                    })? {
                         if ordering == cmp::Ordering::Equal {
                             return Err(BoundedError::DuplicateKey);
                         }
@@ -173,10 +245,12 @@ impl<P> Order<P> {
                 }
             }
             OrderPhase::WriteLeft | OrderPhase::WriteRight => {
-                a.traverse(1, widen(core::mem::size_of::<Entry>())?)
-                    .map_err(BoundedError::Refused)?;
+                let Some(scratch) = Self::settled(&mut self.scratch, a)? else {
+                    return Ok(false);
+                };
+                let scratch = scratch.as_slice();
+                MERGE_MOVE.admit(a)?;
                 let left = p.phase == OrderPhase::WriteLeft;
-                let scratch = self.scratch.ready().ok_or(BoundedError::PlanMismatch)?;
                 if self.forward {
                     entries[p.output] = if left {
                         scratch[p.left]
@@ -203,12 +277,16 @@ impl<P> Order<P> {
                 p.phase = OrderPhase::Compare;
             }
             OrderPhase::Clear => {
-                self.scratch.truncate_copy_step(0, a)?;
-                p.run = self.end;
-                p.phase = OrderPhase::Run;
+                let scratch = &mut self.scratch;
+                if at(PreparationPlace::Merging, || {
+                    scratch.truncate_copy_step(0, a)
+                })? {
+                    p.run = self.end;
+                    p.phase = OrderPhase::Run;
+                }
             }
             OrderPhase::Complete => {
-                a.traverse(1, 0).map_err(BoundedError::Refused)?;
+                MERGE_STEP.admit(a)?;
                 return Ok(true);
             }
         }

@@ -1,11 +1,13 @@
 //! Public wire contracts for the expanded bounded API. Literal fixtures are
 //! authoritative; symbolic comparisons supplement them.
+#![cfg_attr(feature = "custom-std-collections", feature(hashmap_bucket_access))]
 #[cfg(feature = "custom-std-collections")]
 use dcbor::HashMap;
 use dcbor::{
     CBOR, CBORCase, Date,
     bounded::{
         decode::{DecodeError, Kind, decode},
+        encoding::Shape,
         *,
     },
 };
@@ -17,15 +19,28 @@ fn policy() -> Limits {
     Limits::new(10_000_000, 100_000_000, 10_000_000)
 }
 
-fn literal<T: BoundedEncodable + ?Sized>(value: &T, expected: &[u8]) {
+/// `value` encodes to `expected`, its published arena holding at least those
+/// bytes and at most what [`encode_bound`] retains, and decodes back to them;
+/// the decode releases all it held, and the encoding's release the rest.
+fn literal<T: Schema + ?Sized>(value: &T, expected: &[u8]) {
+    let source: &dyn Schema = &value;
+    let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
+    let retained = encode_bound::<Reservation, ()>(shape)
+        .expect("the bound fits in u64")
+        .retained;
     let mut limits = policy();
     let encoded = encode(value, &mut limits).unwrap();
     assert_eq!(encoded.as_ref(), expected);
-    assert_eq!(limits.live_bytes(), expected.len() as u64);
+    let held = limits.live_bytes();
+    assert!(
+        expected.len() as u64 <= held && held <= retained,
+        "{} encoded bytes held in {held}, bounded by {retained}",
+        expected.len()
+    );
     let document = decode(encoded.as_ref(), 128, &mut limits).unwrap();
     assert_eq!(document.root().encoded(), expected);
     drop(document);
-    assert_eq!(limits.live_bytes(), expected.len() as u64);
+    assert_eq!(limits.live_bytes(), held);
     drop(encoded);
     assert_eq!(limits.live_bytes(), 0);
 }
@@ -61,6 +76,35 @@ fn new_representations_have_literal_wire_contracts() {
     assert_eq!(limits.live_bytes(), 0);
 }
 
+/// Byte strings and texts at each head width the published vectors use:
+/// a one-byte head, a two-byte head of a 32-byte payload, and a three-byte
+/// head of a 445-byte text.
+#[test]
+fn byte_strings_and_texts_have_literal_wire_contracts() {
+    use hex_literal::hex;
+    literal(
+        &dcbor::ByteString::from(hex!("00112233")),
+        &hex!("4400112233"),
+    );
+    literal(
+        &dcbor::ByteString::from(hex!(
+            "c0a7da14e5847c526244f7e083d26fe33f86d2313ad2b77164233444423a50a7"
+        )),
+        &hex!("5820c0a7da14e5847c526244f7e083d26fe33f86d2313ad2b77164233444423a50a7"),
+    );
+    literal("Hello", &hex!("6548656c6c6f"));
+    let lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+                 tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
+                 quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo \
+                 consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse \
+                 cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non \
+                 proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
+    assert_eq!(lorem.len(), 0x1bd);
+    let mut expected = vec![0x79, 0x01, 0xbd];
+    expected.extend_from_slice(lorem.as_bytes());
+    literal(lorem, &expected);
+}
+
 #[test]
 fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     // Rust string order differs from bytewise CBOR order (length head first).
@@ -71,7 +115,7 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     literal(&HashMap::from([("b", 2u64), ("aa", 1)]), &expected);
     literal(&dcbor::Map::from(map.clone()), &expected);
     literal(&CBOR::from(map), &expected);
-    let collision = BTreeMap::from([("é", 1u8), ("e\u{301}", 2)]);
+    let collision = BTreeMap::from([("\u{e9}", 1u8), ("e\u{301}", 2)]);
     let mut limits = policy();
     assert!(matches!(
         encode(&collision, &mut limits),
@@ -85,15 +129,52 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     }
 }
 
+/// Every key hashes to all ones: its home bucket is a table's last.
+#[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+#[derive(Default)]
+struct Last;
+#[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+impl std::hash::Hasher for Last {
+    fn finish(&self) -> u64 {
+        u64::MAX
+    }
+    fn write(&mut self, _: &[u8]) {}
+}
+
+/// The vacant buckets before a hash map's last entry are scanned, each
+/// window admitted before it is inspected: a large table whose one entry lies
+/// in its last bucket is refused under a budget short of that scan, holding
+/// nothing. A table of no entries ends at its head, whatever its size: its
+/// walk asks for no window, only the map's end.
 #[test]
 #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
 fn sparse_hash_map_iteration_is_admitted() {
-    let map = HashMap::<u64, u64>::with_capacity(100_000);
+    type Hashed = std::hash::BuildHasherDefault<Last>;
+    let mut map = HashMap::<u64, u64, Hashed>::with_capacity_and_hasher(100_000, Hashed::default());
+    map.insert(7, 7);
+    assert_eq!(
+        map.get_bucket(map.num_buckets() - 1),
+        Some((&7, &7)),
+        "the entry lies in the last bucket"
+    );
     let mut limits = Limits::new(100, 100, 100);
     assert!(matches!(
         encode(&map, &mut limits),
         Err(BoundedError::Refused(LimitRefusal::Work))
     ));
+    assert_eq!(limits.live_bytes(), 0);
+
+    let empty = HashMap::<u64, u64, Hashed>::with_capacity_and_hasher(100_000, Hashed::default());
+    let source: &dyn Schema = &empty;
+    let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
+    assert_eq!(
+        shape.dynamic, 1,
+        "an empty map's walk asks only for its end"
+    );
+    let mut limits = policy();
+    let encoded = encode(&empty, &mut limits).unwrap();
+    assert_eq!(encoded.as_ref(), &[0xa0]);
+    drop(encoded);
     assert_eq!(limits.live_bytes(), 0);
 }
 

@@ -1,17 +1,11 @@
-use super::bindings::{decode_driver, string_driver, text_driver};
-use super::driver::{Step, finish, resume};
+use super::bindings::{decoder, string_decoder, text_encoder};
 use super::harness::*;
+use super::support::{
+    Fault, TurnSchedule, allowed, drive_faulted, drive_within, exhausted, refusal_matrix, refuse,
+    rigor::rigor, suspend_within,
+};
+use dcbor::bounded::Allocator;
 use dcbor::bounded::decode::Kind;
-
-fn assert_no_replay(actual: &Meter, baseline: &Meter, stop: usize) {
-    let mut expected = baseline.calls.clone();
-    expected.insert(stop, baseline.calls[stop]);
-    assert_eq!(actual.calls, expected, "completed work was replayed");
-    assert_eq!(
-        (actual.values, actual.bytes),
-        (baseline.values, baseline.bytes)
-    );
-}
 
 #[test]
 fn decoder_resumes_same_operation_before_and_after_header_without_replay() {
@@ -19,132 +13,130 @@ fn decoder_resumes_same_operation_before_and_after_header_without_replay() {
         0x58, 0x18, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', b'i', b'j', b'k', b'l', b'm',
         b'n', b'o', b'p', b'q', b'r', b's', b't', b'u', b'v', b'w', b'x',
     ];
-    let mut reference = decode_driver(&wire, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
+    refusal_matrix("decoder over a byte string", rigor(), |fault: Fault| {
         let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let pool = m.pool.clone();
-        let mut operation = decode_driver(&wire, m);
-        resume(&mut operation, Refusal::Work);
-        assert_no_replay(&operation.meter, &baseline, stop);
-        assert_eq!(
-            operation.output.as_ref().unwrap().root().kind(),
-            Kind::Bytes(&wire[2..])
-        );
-        assert_eq!(operation.output.as_ref().unwrap().root().encoded(), wire);
-        operation.meter.assert_units(3, 64);
-        assert_eq!(operation.step().unwrap(), Step::Finished);
+        refuse(&mut m, fault.refusal);
+        let pool = m.share();
+        let mut operation = decoder(&wire);
+        let turns = allowed(&m, decode_turns(wire.len()));
+        let document = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+            .expect("a canonical byte string decodes");
+        if let Some(document) = &document {
+            assert_eq!(document.root().kind(), Kind::Bytes(&wire[2..]));
+            assert_eq!(document.root().encoded(), wire);
+            m.assert_units(TURN);
+        }
         drop(operation);
-        assert_eq!(pool.live(), 0);
+        drop(document);
+        assert_eq!(pool.live_bytes(), 0);
+        super::support::RefusalRun::of(&m)
     });
 }
 
 #[test]
 fn text_normalization_resumes_each_real_refusal_and_preserves_literal_result() {
     let source = "a\u{301}";
-    let mut reference = text_driver(source, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
-        let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let pool = m.pool.clone();
-        let mut operation = text_driver(source, m);
-        resume(&mut operation, Refusal::Work);
-        assert_no_replay(&operation.meter, &baseline, stop);
-        assert_eq!(
-            operation.output.as_ref().unwrap().as_ref(),
-            &[0x62, 0xc3, 0xa1]
-        );
-        operation.meter.assert_units(3, 64);
-        let value = operation.output.take().unwrap();
-        drop(operation);
-        assert!(pool.live() >= 3);
-        drop(value);
-        assert_eq!(pool.live(), 0);
-    });
+    refusal_matrix(
+        "text encoder of a composing pair",
+        rigor(),
+        |fault: Fault| {
+            let mut m = meter();
+            refuse(&mut m, fault.refusal);
+            let pool = m.share();
+            let mut operation = text_encoder(source);
+            let turns = allowed(&m, normalize_turns(source));
+            let value = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+                .expect("a composing pair normalizes");
+            drop(operation);
+            if let Some(value) = &value {
+                assert_eq!(value.as_ref(), &[0x62, 0xc3, 0xa1]);
+                m.assert_units(TURN);
+                assert!(pool.live_bytes() >= 3);
+            }
+            drop(value);
+            assert_eq!(pool.live_bytes(), 0);
+            super::support::RefusalRun::of(&m)
+        },
+    );
 }
 
 #[test]
 fn typed_construction_resumes_and_transfers_output_ownership() {
     let wire = [0x62, 0xc3, 0xa9];
-    let mut reference = string_driver(&wire, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
-        let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let pool = m.pool.clone();
-        let mut operation = string_driver(&wire, m);
-        resume(&mut operation, Refusal::Work);
-        assert_no_replay(&operation.meter, &baseline, stop);
-        assert_eq!(operation.output.as_ref().unwrap().value(), "é");
-        operation.meter.assert_units(3, 64);
-        let value = operation.output.take().unwrap();
-        drop(operation);
-        assert!(pool.live() >= 2);
-        assert_eq!(value.value(), "é");
-        drop(value);
-        assert_eq!(pool.live(), 0);
-    });
+    refusal_matrix(
+        "string decoder of composed text",
+        rigor(),
+        |fault: Fault| {
+            let mut m = meter();
+            refuse(&mut m, fault.refusal);
+            let pool = m.share();
+            let mut operation = string_decoder(&wire);
+            let turns = allowed(&m, string_turns(wire.len()));
+            let value = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+                .expect("canonical text decodes");
+            drop(operation);
+            if let Some(value) = &value {
+                assert_eq!(value.value(), "\u{e9}");
+                m.assert_units(TURN);
+                assert!(pool.live_bytes() >= 2);
+                assert_eq!(value.value(), "\u{e9}");
+            }
+            drop(value);
+            assert_eq!(pool.live_bytes(), 0);
+            super::support::RefusalRun::of(&m)
+        },
+    );
 }
 
 #[test]
 fn externally_released_capacity_resumes_same_decode_not_a_second_attempt() {
-    let pool = Pool::new(4096);
-    let blocked = pool.reserve(4096).unwrap();
+    let mut pool = meter_with(4096);
+    let blocked = pool.allocate(4096).unwrap();
     let wire = [0x81, 0x01];
-    let mut operation = decode_driver(&wire, Meter::new(pool.clone()));
-    let mut suspended = false;
-    for _ in 0..4096 {
-        match operation.step().unwrap() {
-            Step::Progress => assert!(operation.output.is_none()),
-            Step::Refused(Refusal::Capacity) => {
-                suspended = true;
-                break;
-            }
-            other => panic!("expected capacity suspension, got {other:?}"),
-        }
-    }
-    assert!(suspended, "capacity boundary was never reached");
-    let (stop, reason) = operation
-        .meter
-        .refused
-        .expect("capacity refusal was not observed");
-    assert_eq!(reason, Refusal::Capacity);
-    let paid = (operation.meter.values, operation.meter.bytes);
-    assert!(operation.output.is_none());
-    assert_eq!(pool.live(), 4096);
+    let mut m = pool.share();
+    let mut operation = decoder(&wire);
+    let turns = decode_turns(wire.len());
+    let stop = suspend_within(
+        &mut m,
+        &mut operation,
+        LimitRefusal::Storage,
+        turns,
+        TurnSchedule::Retained,
+    );
+    assert_eq!(m.first_refusal(), Some((stop, LimitRefusal::Storage)));
+    let paid = m.used();
+    assert_eq!(pool.live_bytes(), 4096);
     std::thread::spawn(move || drop(blocked)).join().unwrap();
-    assert_eq!(pool.live(), 0);
-    finish(&mut operation, 4096);
-    assert_eq!(operation.invocations, 1);
-    assert!(operation.meter.values >= paid.0 && operation.meter.bytes >= paid.1);
-    let mut reference = decode_driver(&wire, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    assert_no_replay(&operation.meter, &baseline, stop);
-    assert_eq!(operation.output.as_ref().unwrap().root().encoded(), wire);
-    operation.meter.assert_units(3, 64);
+    assert_eq!(pool.live_bytes(), 0);
+    let document =
+        drive_within(&mut m, &mut operation, turns).expect("released capacity did not resume");
+    let after = m.used();
+    assert!(after.values >= paid.values && after.bytes >= paid.bytes);
+    let mut baseline = meter();
+    drop(drive_within(&mut baseline, &mut decoder(&wire), turns).unwrap());
+    assert_eq!(
+        m.admitted(),
+        baseline.admitted(),
+        "completed work was replayed"
+    );
+    assert_eq!(m.used(), baseline.used());
+    assert_eq!(document.root().encoded(), wire);
+    m.assert_units(TURN);
     drop(operation);
-    assert_eq!(pool.live(), 0);
-    let all = pool.reserve(4096).unwrap();
-    assert!(pool.reserve(1).is_err());
+    drop(document);
+    assert_eq!(pool.live_bytes(), 0);
+    let all = pool.allocate(4096).unwrap();
+    assert!(pool.allocate(1).is_err());
     drop(all);
 }
 
 #[test]
-fn driver_control_executes_real_decode_once_and_never_republishes() {
+fn decode_publishes_once_and_then_only_reports_finished() {
     let wire = [0x81, 0x01];
-    let mut operation = decode_driver(&wire, meter());
-    finish(&mut operation, 4096);
-    assert_eq!(operation.output.as_ref().unwrap().root().encoded(), wire);
-    assert_eq!(operation.step().unwrap(), Step::Finished);
-    assert_eq!(operation.invocations, 1);
+    let mut m = meter();
+    let mut operation = decoder(&wire);
+    let document = drive_within(&mut m, &mut operation, decode_turns(wire.len())).unwrap();
+    assert_eq!(document.root().encoded(), wire);
+    exhausted(&mut m, &mut operation);
+    exhausted(&mut m, &mut operation);
 }

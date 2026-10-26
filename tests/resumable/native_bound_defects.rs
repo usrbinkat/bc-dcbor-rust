@@ -1,98 +1,97 @@
 use super::harness::*;
-use dcbor::bounded::{
-    Allocator, BoundedEncodable, BoundedError, BoundedResult, Budget, Cursor, Measure, Output,
-    Plan, WriteWork, prepare,
-};
+use super::support::{contracted, exhausted, pipeline::Refusal, prepare_turns, refuse, shape};
+use dcbor::ByteString;
+use dcbor::bounded::encoding::{Instruction, Preparation, Schema};
+use dcbor::bounded::{BoundedError, Class, Failure, Step, WriteWork, prepare};
 
-struct Underreported {
-    predicted: WriteWork,
-    second: WriteWork,
-}
+/// A counted map whose head declares `self.0` fields and whose source
+/// visits one: miscounted unless it declares exactly one.
+struct Counted(u64);
 
-impl BoundedEncodable for Underreported {
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Measure {
-            len: 2,
-            write: self.predicted,
-        })
-    }
-
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        budget: &mut B,
-    ) -> BoundedResult<(), B> {
-        budget.traverse(1, 1).map_err(BoundedError::Refused)?;
-        output.byte(0x81)?;
-        budget
-            .traverse(self.second.values, self.second.bytes)
-            .map_err(BoundedError::Refused)?;
-        output.byte(0x01)
+impl Schema for Counted {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::CountedMap(self.0),
+            1 => Instruction::Field(0, Some(&true)),
+            _ => Instruction::End,
+        }
     }
 }
 
+/// A source breaking its schema contract is a defect: terminal, never a
+/// refusal the caller could resume, and the preparation is finished after it,
+/// admitting nothing further. Its storage is released with it.
 #[test]
-fn underestimated_work_is_a_bound_defect_before_the_offending_write() {
-    for second in [WriteWork::new(1, 0), WriteWork::new(0, 1)] {
-        let value = Underreported {
-            predicted: WriteWork::new(1, 1),
-            second,
-        };
-        let mut allocator = meter();
-        let prepared = prepare(&value, &mut allocator).unwrap();
-        let mut output = [0xee; 2];
-        let mut budget = meter();
-        let error = prepared.encode_into(&mut output, &mut budget).unwrap_err();
-        assert!(
-            matches!(error, BoundedError::WorkExceeded { predicted, attempted }
-            if predicted == value.predicted && attempted == WriteWork::new(1 + second.values, 1 + second.bytes))
-        );
-        assert_eq!(output, [0x81, 0xee]);
-        assert_eq!(
-            budget.calls,
-            [Call::Work {
-                values: 1,
-                bytes: 1
-            }]
-        );
-        assert!(
-            budget.refused.is_none(),
-            "bound defect was misclassified as caller refusal"
-        );
-        assert_eq!((budget.values, budget.bytes), (1, 1));
-        drop(prepared);
-        assert_eq!(allocator.pool.live(), 0);
+fn a_source_contract_defect_is_terminal_and_never_a_refusal() {
+    // The miscounted source has no shape: its walk rejects it. The same map
+    // declaring its one field answers the same instructions up to its end,
+    // where the miscount is found, so its production bound covers every
+    // step before the rejection.
+    let bound = prepare_turns(shape(&Counted(1)));
+    let mut m = meter();
+    let source = Counted(2);
+    let mut operation = Preparation::new(&source);
+    let mut defect = None;
+    for _ in 0..bound {
+        match contracted(&mut m, &mut operation) {
+            Ok(Step::Progress) => {}
+            Err(error) => {
+                defect = Some(error);
+                break;
+            }
+            Ok(Step::Complete(_)) => panic!("a miscounted map was published"),
+            Ok(Step::Finished) => panic!("finished without an outcome"),
+        }
     }
+    let error = defect.unwrap_or_else(|| {
+        panic!("the miscount was not found within the valid map's {bound} turns")
+    });
+    assert_eq!(error, BoundedError::PlanMismatch);
+    assert_eq!(error.class(), Class::Defect);
+    assert!(
+        m.first_refusal().is_none(),
+        "a defect was classified as a caller refusal"
+    );
+    exhausted(&mut m, &mut operation);
+    drop(operation);
+    assert_eq!(m.live_bytes(), 0);
 }
 
+/// A caller's refusal of a write's second segment keeps its own class, the
+/// first segment's payment and its bytes, and nothing past them; the same
+/// plan then writes in full.
 #[test]
-fn caller_refusal_within_valid_bound_keeps_its_class_and_paid_prefix() {
-    let value = Underreported {
-        predicted: WriteWork::new(2, 2),
-        second: WriteWork::new(1, 1),
-    };
+fn caller_refusal_within_a_write_keeps_its_class_and_paid_prefix() {
+    // A head of two bytes and a hundred payload bytes: segments of 64 and
+    // 38 bytes, then the completion.
+    let value = ByteString::new(vec![0x5a; 100]);
     let mut allocator = meter();
     let prepared = prepare(&value, &mut allocator).unwrap();
-    for reason in [Refusal::Work, Refusal::Capacity, Refusal::Deadline] {
-        let mut output = [0xee; 2];
+    assert_eq!(prepared.len(), 102);
+    for reason in [
+        LimitRefusal::Work,
+        LimitRefusal::Storage,
+        LimitRefusal::Deadline,
+    ] {
+        let mut output = [0xee; 102];
         let mut budget = meter();
-        budget.fail_at = Some((1, reason));
-        assert!(matches!(prepared.encode_into(&mut output, &mut budget),
-            Err(BoundedError::Refused(actual)) if actual == reason));
-        assert_eq!(budget.refused, Some((1, reason)));
-        assert_eq!((budget.values, budget.bytes), (1, 1));
-        assert_eq!(output, [0x81, 0xee]);
+        refuse(&mut budget, Refusal::For(1, reason));
+        assert_eq!(
+            prepared.encode_into(&mut output, &mut budget),
+            Err(BoundedError::Refused(reason))
+        );
+        assert_eq!(budget.first_refusal(), Some((1, reason)));
+        assert_eq!(budget.used(), WriteWork::new(1, 64));
+        assert_eq!(output[..2], [0x58, 100]);
+        assert!(output[2..64].iter().all(|b| *b == 0x5a));
+        assert!(output[64..].iter().all(|b| *b == 0xee));
     }
-    let mut output = [0; 2];
+    let mut output = [0; 102];
     let mut budget = meter();
     prepared.encode_into(&mut output, &mut budget).unwrap();
-    assert_eq!(output, [0x81, 0x01]);
-    assert_eq!((budget.values, budget.bytes), (2, 2));
+    assert_eq!(output[..2], [0x58, 100]);
+    assert!(output[2..].iter().all(|b| *b == 0x5a));
+    assert_eq!(budget.used(), WriteWork::new(3, 102));
     drop(prepared);
-    assert_eq!(allocator.pool.live(), 0);
+    assert_eq!(allocator.live_bytes(), 0);
 }

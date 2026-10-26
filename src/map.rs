@@ -270,6 +270,86 @@ impl fmt::Debug for Map {
     }
 }
 
+/// Bounded encoding: the map's entries, keyed by their encoded keys, come in
+/// canonical key order, so the engine checks each key against the one
+/// before it instead of sorting. The tree is walked by its stepped cursor
+/// on the bounded-collection standard library, one admitted transition per
+/// instruction, and by its standard iterator elsewhere.
+impl crate::bounded::encoding::Schema for Map {
+    fn instruction(&self, index: usize) -> crate::bounded::encoding::Instruction<'_> {
+        use crate::bounded::encoding::Instruction;
+        match index {
+            0 => Instruction::CountedUnorderedMap(self.0.len() as u64),
+            1 => Instruction::Entries(self),
+            _ => Instruction::End,
+        }
+    }
+}
+
+// SAFETY: the cursor is the map's stepped cursor, which borrows the tree,
+// owns nothing, and never refers to itself.
+#[cfg(feature = "custom-std-collections")]
+unsafe impl crate::bounded::encoding::Entries for Map {
+    fn start(&self, slot: &mut crate::bounded::encoding::Slot) {
+        slot.put(self.0.stepped_cursor());
+    }
+
+    /// One transition per call.
+    fn moves(&self) -> u64 {
+        0
+    }
+
+    /// Keyed by the entries' encoded keys, compared bytewise.
+    fn ordered(&self) -> bool {
+        true
+    }
+
+    unsafe fn next<'a>(
+        &'a self,
+        slot: &mut crate::bounded::encoding::Slot,
+    ) -> crate::bounded::encoding::EntryStep<'a> {
+        use crate::bounded::encoding::Schema;
+        // SAFETY: `start` stored this map's stepped cursor.
+        let cursor = unsafe {
+            slot.get::<std::collections::btree_map::SteppedCursor<'a, MapKey, MapValue>>()
+        };
+        crate::bounded::encoding::stepped(cursor, |_, entry| {
+            (&entry.key as &dyn Schema, &entry.value as &dyn Schema)
+        })
+    }
+}
+
+// SAFETY: the cursor is the tree's whole range, which borrows the tree, owns
+// nothing, has no destructor, and never refers to itself; creating it over
+// the unbounded range and stepping it compare no keys.
+#[cfg(not(feature = "custom-std-collections"))]
+unsafe impl crate::bounded::encoding::Entries for Map {
+    fn start(&self, slot: &mut crate::bounded::encoding::Slot) {
+        slot.put(self.0.range::<MapKey, _>(..));
+    }
+
+    fn moves(&self) -> u64 {
+        crate::bounded::encoding::tree_moves(self.0.len())
+    }
+
+    /// Keyed by the entries' encoded keys, compared bytewise.
+    fn ordered(&self) -> bool {
+        true
+    }
+
+    unsafe fn next<'a>(
+        &'a self,
+        slot: &mut crate::bounded::encoding::Slot,
+    ) -> crate::bounded::encoding::EntryStep<'a> {
+        use crate::bounded::encoding::Schema;
+        // SAFETY: `start` stored this map's range.
+        let range = unsafe { slot.get::<BTreeMapRange<'a, MapKey, MapValue>>() };
+        crate::bounded::encoding::ranged(range, |_, entry| {
+            (&entry.key as &dyn Schema, &entry.value as &dyn Schema)
+        })
+    }
+}
+
 /// An iterator over the entries of a CBOR map.
 ///
 /// This iterator provides a way to traverse the key-value pairs in a CBOR map.

@@ -1,195 +1,50 @@
-use dcbor::bounded::{Allocator, Budget};
-use std::sync::{Arc, Mutex};
+//! The suite's policy, its fixture runner, and its preparation drivers. The
+//! preparation and physical matrices are the support crate's single-operation
+//! matrices ([`super::support::refusal_matrix`],
+//! [`super::support::physical_matrix`]) over a preparation run; they are
+//! compiled exactly where a registered group calls them: the map and schema
+//! groups, under `derive`, `hashbrown` or the standard library's collections.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+use super::heap::Observation;
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+use super::support::{
+    Fault, allowed, drive_faulted, drive_faulted_observed, exhausted, physical_matrix,
+    refusal_matrix, refuse, rigor::rigor,
+};
+use super::support::{drive_within, prepare_turns, shape};
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+use dcbor::bounded::BoundedError;
+use dcbor::bounded::encoding::{Preparation, Prepared, Schema};
+pub use dcbor::bounded::{Call, LimitRefusal, Limits, Reservation, TURN};
 
-#[path = "admission_trace.rs"]
-mod trace;
-pub use trace::AdmissionTrace;
+#[cfg(any(
+    feature = "derive",
+    feature = "hashbrown",
+    feature = "custom-std-collections"
+))]
+pub use super::support::emit_turns;
+pub use super::support::{
+    decode_turns, normalize_turns, string_turns, text_emit_turns, typed_turns,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Work,
-    Capacity,
-    Deadline,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Call {
-    Work { values: u64, bytes: u64 },
-    Allocate(u64),
-}
-
-#[derive(Default, Debug)]
-struct Capacity {
-    live: u64,
-    peak: u64,
-    limit: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Pool(Arc<Mutex<Capacity>>);
-impl Pool {
-    pub fn new(limit: u64) -> Self {
-        Self(Arc::new(Mutex::new(Capacity {
-            limit,
-            ..Capacity::default()
-        })))
-    }
-    pub fn live(&self) -> u64 {
-        self.0.lock().unwrap().live
-    }
-    pub fn peak(&self) -> u64 {
-        self.0.lock().unwrap().peak
-    }
-    pub fn reserve(&self, bytes: u64) -> Result<Permit, Refusal> {
-        let mut state = self.0.lock().unwrap();
-        let live = state.live.checked_add(bytes).ok_or(Refusal::Capacity)?;
-        if live > state.limit {
-            return Err(Refusal::Capacity);
-        }
-        state.live = live;
-        state.peak = state.peak.max(live);
-        Ok(Permit {
-            pool: self.clone(),
-            bytes,
-        })
-    }
+/// The resumable suite's policy: a 32 MiB pool, logged and strict calls, and
+/// admitted allocations reported to the heap observer.
+pub fn meter() -> Limits {
+    meter_with(32 * 1024 * 1024)
 }
 
-#[derive(Debug)]
-pub struct Permit {
-    pool: Pool,
-    bytes: u64,
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        let mut state = self.pool.0.lock().unwrap();
-        state.live = state.live.checked_sub(self.bytes).expect("double release");
-    }
+/// The suite policy over `capacity` live bytes.
+pub fn meter_with(capacity: u64) -> Limits {
+    super::support::observed_with_capacity(capacity)
 }
 
-pub struct Meter {
-    pub trace: AdmissionTrace,
-    pub pool: Pool,
-    pub calls: Vec<Call>,
-    pub refused: Option<(usize, Refusal)>,
-    pub fail_at: Option<(usize, Refusal)>,
-    pub values: u64,
-    pub bytes: u64,
-    pub limit_values: u64,
-    pub limit_bytes: u64,
-    /// Deterministic scheduler clock, advanced at each admission boundary.
-    /// This tests deadline policy, not CPU duration or internal parser offsets.
-    pub clock: u64,
-    pub deadline: Option<u64>,
-}
-impl Meter {
-    pub fn new(pool: Pool) -> Self {
-        Self {
-            trace: AdmissionTrace::new(),
-            pool,
-            calls: Vec::new(),
-            refused: None,
-            fail_at: None,
-            values: 0,
-            bytes: 0,
-            limit_values: u64::MAX,
-            limit_bytes: u64::MAX,
-            clock: 0,
-            deadline: None,
-        }
-    }
-    fn record(&mut self, call: Call) -> Result<(), Refusal> {
-        assert!(self.refused.is_none(), "execution continued after refusal");
-        let index = self.calls.len();
-        self.calls.push(call);
-        let now = self.clock;
-        self.clock = self.clock.checked_add(1).expect("test clock overflow");
-        if self.deadline.is_some_and(|deadline| now >= deadline) {
-            self.refused = Some((index, Refusal::Deadline));
-            return Err(Refusal::Deadline);
-        }
-        if let Some((at, reason)) = self.fail_at
-            && at == index
-        {
-            self.refused = Some((index, reason));
-            return Err(reason);
-        }
-        Ok(())
-    }
-    pub fn assert_units(&self, values: u64, bytes: u64) {
-        for (index, call) in self.calls.iter().enumerate() {
-            if let Call::Work {
-                values: v,
-                bytes: b,
-            } = call
-            {
-                assert!(
-                    *v <= values && *b <= bytes,
-                    "indivisible operation {index}: {call:?} exceeds quantum ({values}, {bytes})"
-                );
-            }
-        }
-    }
-}
-impl Budget for Meter {
-    type Refusal = Refusal;
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
-        let result = self.traverse_recorded(values, bytes);
-        self.trace.record(
-            self.calls.len() - 1,
-            Call::Work { values, bytes },
-            result,
-            (self.values, self.bytes),
-            (self.pool.live(), self.pool.peak()),
-        );
-        result
-    }
-}
-impl Meter {
-    fn traverse_recorded(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
-        self.record(Call::Work { values, bytes })?;
-        let next_values = self.values.checked_add(values).unwrap();
-        let next_bytes = self.bytes.checked_add(bytes).unwrap();
-        if next_values > self.limit_values || next_bytes > self.limit_bytes {
-            self.refused = Some((self.calls.len() - 1, Refusal::Work));
-            return Err(Refusal::Work);
-        }
-        self.values = next_values;
-        self.bytes = next_bytes;
-        Ok(())
-    }
-}
-impl Allocator for Meter {
-    type Permit = Permit;
-    fn allocate(&mut self, bytes: u64) -> Result<Permit, Refusal> {
-        let result = self.record(Call::Allocate(bytes)).and_then(|()| {
-            self.pool
-                .reserve(bytes)
-                .inspect(|_| super::heap::admitted(bytes))
-                .inspect_err(|reason| {
-                    self.refused = Some((self.calls.len() - 1, *reason));
-                })
-        });
-        self.trace.record(
-            self.calls.len() - 1,
-            Call::Allocate(bytes),
-            result.as_ref().map(|_| ()).map_err(|reason| *reason),
-            (self.values, self.bytes),
-            (self.pool.live(), self.pool.peak()),
-        );
-        result
-    }
-}
-
-pub fn meter() -> Meter {
-    Meter::new(Pool::new(32 * 1024 * 1024))
-}
-
-/// Execute every independent fault schedule even while the capability is red.
-/// Catching an assertion does not pass the test: all failures are reported at
-/// the end, so the first missing continuation cannot hide later boundaries.
-pub fn every_case(count: usize, mut case: impl FnMut(usize)) {
-    assert!(count > 0, "empty fault matrix");
+/// Run every one of `count` fixtures or stress repetitions, never a
+/// selection of them, even while some fail: catching an assertion does not
+/// pass the test, and all failures are reported at the end, so the first
+/// failing fixture cannot hide later ones. Fault schedules are not fixtures:
+/// they run through the support crate's matrices.
+pub fn every_fixture(count: usize, mut case: impl FnMut(usize)) {
+    assert!(count > 0, "no fixture");
     let mut failures = Vec::new();
     for index in 0..count {
         if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(index))) {
@@ -203,9 +58,175 @@ pub fn every_case(count: usize, mut case: impl FnMut(usize)) {
     }
     assert!(
         failures.is_empty(),
-        "{} of {count} schedules failed: {failures:#?}",
+        "{} of {count} fixtures failed: {failures:#?}",
         failures.len()
     );
+}
+
+/// Emit `plan` into a guarded destination of `expected`'s length within an
+/// input-derived bound of turns. Requires the literal bytes, no write outside
+/// the destination, no allocation request, and a finished writer that admits
+/// nothing further.
+#[cfg(any(
+    feature = "derive",
+    feature = "hashbrown",
+    feature = "custom-std-collections"
+))]
+pub fn emit(plan: &Prepared<Reservation>, expected: &[u8], m: &mut Limits) {
+    assert_eq!(plan.len(), expected.len());
+    let mut bytes = vec![0xee; expected.len() + 2];
+    let requests = m.requests();
+    {
+        let mut writer = plan.writer(&mut bytes[1..=expected.len()]);
+        drive_within(m, &mut writer, emit_turns(expected.len())).expect("emission failed");
+        assert_eq!(writer.emitted_prefix(), expected);
+    }
+    assert_eq!(
+        (bytes[0], bytes[expected.len() + 1]),
+        (0xee, 0xee),
+        "emission wrote outside its destination"
+    );
+    assert_eq!(m.requests(), requests, "emission requested allocation");
+}
+
+/// `source` prepared under fresh checked turns within its shape's bound,
+/// with the policy holding its reservations.
+pub fn prepared(source: &dyn Schema) -> (Prepared<Reservation>, Limits) {
+    let mut m = meter();
+    let plan = drive_within(
+        &mut m,
+        &mut Preparation::new(source),
+        prepare_turns(shape(source)),
+    )
+    .expect("preparation failed");
+    (plan, m)
+}
+
+/// What preparing a source must reach: its literal encoding, or the terminal
+/// rejection of an invalid source.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub type Expected<'e> = Result<&'e [u8], BoundedError<LimitRefusal>>;
+
+/// Prepare `source` under fresh checked turns within its shape's bound,
+/// injecting `fault`: a refused step is resumed in the next turn, or, when
+/// the fault cancels, the preparation is dropped at its refusal. An expected
+/// encoding is emitted under its own policy; an expected rejection ends the
+/// preparation, which then admits nothing. Every reservation is released.
+/// Returns the calls the preparation attempted.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_run(
+    source: &dyn Schema,
+    expected: &Expected<'_>,
+    fault: Fault,
+    bound: dcbor::bounded::encoding::Shape,
+) -> super::support::RefusalRun {
+    let mut m = meter();
+    refuse(&mut m, fault.refusal);
+    let mut operation = Preparation::new(source);
+    let turns = allowed(&m, prepare_turns(bound));
+    let output = match drive_faulted(&mut m, &mut operation, turns, fault.cancel) {
+        Ok(output) => {
+            assert!(
+                output.is_none() || expected.is_ok(),
+                "a rejected source was published"
+            );
+            output
+        }
+        Err(error) => {
+            assert_eq!(
+                expected.as_ref().err(),
+                Some(&error),
+                "unexpected rejection at {:?}",
+                operation.position()
+            );
+            exhausted(&mut m, &mut operation);
+            None
+        }
+    };
+    drop(operation);
+    if let Some(plan) = output {
+        assert!(m.live_bytes() > 0);
+        let bytes = expected
+            .as_ref()
+            .copied()
+            .expect("a published plan's source was expected to publish");
+        emit(&plan, bytes, &mut meter());
+        drop(plan);
+    }
+    assert_eq!(m.live_bytes(), 0);
+    super::support::RefusalRun::of(&m)
+}
+
+/// The fault matrix of preparing `source` ([`refusal_matrix`]): every
+/// refusal resumed without replay, and a cancellation at every call, which
+/// ends the trace there. Named by the source shape and declared outcome;
+/// libtest supplies the surrounding semantic test identity.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_matrix(source: &dyn Schema, expected: Expected<'_>) {
+    prepare_matrix_bounded(source, expected, shape(source));
+}
+
+/// A fixture-supplied structural upper bound for sources rejected by the
+/// shape walk itself. The actual preparation must still reach the exact
+/// declared error under every shared refusal and cancellation schedule.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_matrix_bounded(
+    source: &dyn Schema,
+    expected: Expected<'_>,
+    bound: dcbor::bounded::encoding::Shape,
+) {
+    let name = format!("prepare {bound:?}, expected {expected:?}");
+    refusal_matrix(&name, rigor(), |fault| {
+        prepare_run(source, &expected, fault, bound)
+    });
+}
+
+/// Prepare `source` under the heap observer, failing physical request
+/// `failure`. Observed storage stays within reservations, every request was
+/// admitted, and failure or completion releases every byte and reservation.
+/// Returns the physical requests made.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_physically(source: &dyn Schema, failure: Option<usize>) -> usize {
+    let turns = prepare_turns(shape(source));
+    let mut m = meter();
+    let observation = Observation::begin(failure);
+    let mut operation = Preparation::new(source);
+    let result = drive_faulted_observed(&mut m, &mut operation, turns, false, |m, _, _| {
+        assert!(observation.snapshot().live <= m.live_bytes() as usize)
+    });
+    let (output, failed) = match result {
+        Ok(Some(plan)) => (Some(plan), false),
+        Err(BoundedError::Allocation { .. }) => {
+            exhausted(&mut m, &mut operation);
+            (None, true)
+        }
+        Ok(None) => unreachable!("physical failures never request cancellation"),
+        Err(error) => panic!("unexpected allocation matrix outcome {error:?}"),
+    };
+    observation.stop();
+    assert!(failed || output.is_some());
+    assert_eq!(failed, failure.is_some());
+    let stats = observation.snapshot();
+    assert_eq!(stats.denied, usize::from(failure.is_some()));
+    assert_eq!(stats.unadmitted, 0);
+    assert!(!stats.overflow);
+    assert!(stats.peak <= m.peak_bytes() as usize);
+    drop(operation);
+    if output.is_some() {
+        assert!(m.live_bytes() > 0);
+    }
+    drop(output);
+    assert_eq!(m.live_bytes(), 0);
+    assert_eq!(observation.snapshot().live, 0);
+    stats.calls
+}
+
+/// Every physical allocation of preparing `source`, failed in a run of its
+/// own ([`physical_matrix`]). Named by the source shape within its test.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_physical_matrix(source: &dyn Schema) {
+    let name = format!("prepare {:?}", shape(source));
+    physical_matrix(&name, |failure| prepare_physically(source, failure));
 }
 
 pub fn text_wire(text: &str) -> Vec<u8> {

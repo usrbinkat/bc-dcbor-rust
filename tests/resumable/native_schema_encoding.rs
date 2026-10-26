@@ -1,83 +1,21 @@
 use super::harness::*;
-use dcbor::bounded::{
-    BoundedError,
-    encoding::{Preparation, PrepareStep, Schema},
-    text_cursor::pipeline::EmitStep,
+use super::support::{
+    Fault, allowed, drive_faulted_observed, refusal_matrix, refuse, rigor::rigor,
 };
-use dcbor_derive::CBORResumableEncodable;
+use dcbor::bounded::{
+    BoundedError, Failure,
+    encoding::{Instruction, Schema},
+};
+use dcbor_derive::CBORBoundedEncodable;
 
-#[derive(CBORResumableEncodable)]
-struct Record {
+#[derive(CBORBoundedEncodable)]
+pub(super) struct Record {
     #[cbor(n = 24)]
-    omitted: Option<String>,
+    pub(super) omitted: Option<String>,
     #[cbor(n = 1)]
-    nested: Vec<Vec<String>>,
+    pub(super) nested: Vec<Vec<String>>,
     #[cbor(n = 0)]
-    enabled: bool,
-}
-
-fn prepare(source: &dyn Schema, stop: Option<usize>, cancel: bool) -> Meter {
-    let expected = [0xa2, 0, 0xf5, 1, 0x81, 0x81, 0x62, 0xc3, 0xa9];
-    let mut m = meter();
-    m.fail_at = stop.map(|i| (i, Refusal::Work));
-    let pool = m.pool.clone();
-    let mut cursor = Preparation::new(source);
-    let mut observed = false;
-    let mut completed = false;
-    let mut plan = None;
-    for _ in 0..8192 {
-        let before = (m.values, m.bytes);
-        m.limit_values = before.0 + 3;
-        m.limit_bytes = before.1 + 64;
-        m.refused = None;
-        let result = cursor.step(&mut m);
-        assert!(m.values - before.0 <= 3 && m.bytes - before.1 <= 64);
-        match result {
-            Ok(PrepareStep::Progress) => {}
-            Ok(PrepareStep::Complete(value)) => {
-                plan = Some(value);
-                completed = true;
-                break;
-            }
-            Err(BoundedError::Refused(Refusal::Work)) => {
-                assert_eq!(m.refused, stop.map(|i| (i, Refusal::Work)));
-                assert!(!observed);
-                observed = true;
-                m.fail_at = None;
-                if cancel {
-                    completed = true;
-                    break;
-                }
-            }
-            _ => panic!("unexpected outcome at {:?}", cursor.position()),
-        }
-    }
-    assert!(completed);
-    assert_eq!(observed, stop.is_some());
-    drop(cursor);
-    if let Some(plan) = plan {
-        assert!(pool.live() > 0);
-        assert_eq!(plan.len(), expected.len());
-        let mut bytes = [0xee; 11];
-        let mut writer = plan.writer(&mut bytes[1..10]);
-        let mut b = meter();
-        let mut done = false;
-        for _ in 0..32 {
-            if writer.step(&mut b).unwrap() == EmitStep::Complete {
-                done = true;
-                break;
-            }
-        }
-        assert!(done);
-        assert_eq!(writer.emitted_prefix(), expected);
-        assert!(b.calls.iter().all(|c| !matches!(c, Call::Allocate(_))));
-        assert_eq!(writer.step(&mut b).unwrap(), EmitStep::Finished);
-        assert_eq!(bytes[0], 0xee);
-        assert_eq!(bytes[10], 0xee);
-        drop(plan);
-    }
-    assert_eq!(pool.live(), 0);
-    m
+    pub(super) enabled: bool,
 }
 
 #[test]
@@ -87,22 +25,13 @@ fn derived_schema_every_admission_resumes_without_replay_and_cancels() {
         enabled: true,
         nested: vec![vec!["e\u{301}".into()]],
     };
-    let baseline = prepare(&source, None, false);
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = prepare(&source, Some(stop), false);
-        let mut expected = baseline.calls.clone();
-        expected.insert(stop, expected[stop]);
-        assert_eq!(resumed.calls, expected);
-        assert_eq!(
-            (resumed.values, resumed.bytes),
-            (baseline.values, baseline.bytes)
-        );
-        let cancelled = prepare(&source, Some(stop), true);
-        assert_eq!(cancelled.calls, baseline.calls[..=stop]);
-    });
+    prepare_matrix(
+        &source,
+        Ok(&[0xa2, 0, 0xf5, 1, 0x81, 0x81, 0x62, 0xc3, 0xa9]),
+    );
 }
 
-#[derive(CBORResumableEncodable)]
+#[derive(CBORBoundedEncodable)]
 enum Shape<T> {
     #[cbor(n = 7)]
     Unit,
@@ -119,83 +48,66 @@ enum Shape<T> {
     },
 }
 
-fn plan(source: &dyn Schema) -> (dcbor::bounded::encoding::Prepared<Permit>, Pool) {
-    let mut m = meter();
-    let mut preparation = Preparation::new(source);
-    for _ in 0..65536 {
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        if let PrepareStep::Complete(plan) = preparation.step(&mut m).unwrap() {
-            drop(preparation);
-            return (plan, m.pool);
-        }
-    }
-    panic!(
-        "preparation exceeded finite bound at {:?}",
-        preparation.position()
-    );
-}
-
+/// The fault matrix of emitting `source`'s plan into a guarded destination
+/// ([`refusal_matrix`]): every refusal resumed without replay, a refused
+/// step leaving the emitted prefix unchanged, and a cancellation at every
+/// call ending the trace there. Emission never allocates, never writes
+/// outside its destination, and never releases the plan's storage. Named by
+/// its call site.
+#[track_caller]
 fn emission_matrix(source: &dyn Schema, expected: &[u8]) {
-    let (plan, pool) = plan(source);
+    let name = format!("emit at {}", std::panic::Location::caller());
+    let (plan, pool) = prepared(source);
     assert_eq!(plan.len(), expected.len());
-    let live = pool.live();
-    let run = |stop: Option<usize>, cancel: bool| {
+    let live = pool.live_bytes();
+    refusal_matrix(&name, rigor(), |fault: Fault| {
         let mut bytes = vec![0xee; expected.len() + 2];
         let mut writer = plan.writer(&mut bytes[1..expected.len() + 1]);
         let mut m = meter();
-        m.fail_at = stop.map(|i| (i, Refusal::Work));
-        let mut observed = false;
-        let mut done = false;
-        for _ in 0..expected.len() * 2 + 64 {
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            let prefix = writer.emitted_prefix().to_vec();
-            match writer.step(&mut m) {
-                Ok(EmitStep::Progress) => {}
-                Ok(EmitStep::Complete) => {
-                    assert_eq!(writer.emitted_prefix(), expected);
-                    done = true;
-                    break;
+        refuse(&mut m, fault.refusal);
+        let turns = allowed(&m, emit_turns(expected.len()));
+        let mut prefix = Vec::new();
+        let output = drive_faulted_observed(
+            &mut m,
+            &mut writer,
+            turns,
+            fault.cancel,
+            |_, writer, result| {
+                if matches!(result, Err(error) if error.refused()) {
+                    assert_eq!(
+                        writer.emitted_prefix(),
+                        prefix,
+                        "a refused step changed the emitted prefix"
+                    );
                 }
-                Err(BoundedError::Refused(Refusal::Work)) => {
-                    assert_eq!(m.refused, stop.map(|i| (i, Refusal::Work)));
-                    assert_eq!(writer.emitted_prefix(), prefix);
-                    assert!(!observed);
-                    observed = true;
-                    m.fail_at = None;
-                    m.refused = None;
-                    if cancel {
-                        done = true;
-                        break;
-                    }
-                }
-                other => panic!("unexpected emission {other:?}"),
-            }
-            assert_eq!(pool.live(), live);
+                assert_eq!(
+                    writer.emitted_prefix(),
+                    &expected[..writer.emitted_prefix().len()]
+                );
+                prefix.clear();
+                prefix.extend_from_slice(writer.emitted_prefix());
+                assert_eq!(
+                    pool.live_bytes(),
+                    live,
+                    "emission changed the plan's storage"
+                );
+            },
+        )
+        .expect("emission failed");
+        if output.is_some() {
+            assert_eq!(writer.emitted_prefix(), expected);
         }
-        assert!(done);
-        assert_eq!(observed, stop.is_some());
-        assert!(
-            m.calls
-                .iter()
-                .all(|call| !matches!(call, Call::Allocate(_)))
+        assert_eq!(m.requests(), 0, "emission requested allocation");
+        // The writer's borrow of `bytes` ends here; it has no destructor.
+        assert_eq!(
+            (bytes[0], bytes[expected.len() + 1]),
+            (0xee, 0xee),
+            "emission wrote outside its destination"
         );
-        assert_eq!(bytes[0], 0xee);
-        assert_eq!(*bytes.last().unwrap(), 0xee);
-        m
-    };
-    let baseline = run(None, false);
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = run(Some(stop), false);
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(resumed.calls, trace);
-        let cancelled = run(Some(stop), true);
-        assert_eq!(cancelled.calls, baseline.calls[..=stop]);
+        super::support::RefusalRun::of(&m)
     });
     drop(plan);
-    assert_eq!(pool.live(), 0);
+    assert_eq!(pool.live_bytes(), 0);
 }
 
 #[test]
@@ -223,15 +135,235 @@ fn enum_generic_optional_tagged_and_numeric_literals_survive_emission_refusals()
         &[0x83, 1, 0xf9, 0x3e, 0, 0xf9, 0x7e, 0],
     );
     emission_matrix(&vec![-1i64, -25], &[0x82, 0x20, 0x38, 24]);
+    emission_matrix(&[Some(1u64), None, Some(24)], &[0x83, 1, 0xf6, 0x18, 24]);
+}
+
+/// Ordered collections walked without searching: by the tree's own iterator
+/// on stable, its node moves admitted with each step, and by the forked
+/// std's stepped cursor, one admitted transition per step. A `BTreeMap`'s
+/// entries are placed by their prepared key bytes, whatever the tree's own
+/// order; a `dcbor::Map`'s come in canonical order and are checked in one
+/// pass. The symbolic encoder is the independent oracle for every literal.
+mod ordered {
+    use super::*;
+    use dcbor::{CBOR, CBORCase, Map};
+    use std::collections::BTreeMap;
+
+    /// The symbolic encoder's bytes for `value`.
+    fn symbolic(value: impl Into<CBOR>) -> Vec<u8> {
+        value.into().to_cbor_data()
+    }
+
+    /// The canonical encoding of a map of `count` entries `n => n`.
+    fn identity_map(count: u64) -> Vec<u8> {
+        let mut expected = match count {
+            0..24 => vec![0xa0 | count as u8],
+            24..256 => vec![0xb8, count as u8],
+            _ => panic!("identity map literal covers fewer than 256 entries"),
+        };
+        for n in 0..count {
+            for _ in 0..2 {
+                if n < 24 {
+                    expected.push(n as u8);
+                } else {
+                    expected.extend([0x18, n as u8]);
+                }
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn btree_map_entries_take_canonical_key_order_not_tree_order() {
+        let source = BTreeMap::from([
+            ("aa".to_string(), 1u64),
+            ("b".to_string(), 2),
+            ("e\u{301}".to_string(), 4),
+            ("z".to_string(), 3),
+        ]);
+        // Tree order is aa, b, e+U+0301, z; canonical order sorts the
+        // shorter encoded keys first and compares the normalized bytes.
+        let expected = [
+            0xa4, 0x61, b'b', 2, 0x61, b'z', 3, 0x62, b'a', b'a', 1, 0x62, 0xc3, 0xa9, 4,
+        ];
+        assert_eq!(symbolic(source.clone()), expected);
+        prepare_matrix(&source, Ok(&expected));
+        emission_matrix(&source, &expected);
+    }
+
+    #[test]
+    fn btree_map_keys_distinct_in_the_tree_but_canonically_equal_are_rejected() {
+        let source = BTreeMap::from([("e\u{301}".to_string(), 1u64), ("\u{e9}".to_string(), 2)]);
+        prepare_matrix(&source, Err(BoundedError::DuplicateKey));
+    }
+
+    #[test]
+    fn empty_and_nested_trees_stack_their_cursors_as_keys_and_values() {
+        prepare_matrix(&BTreeMap::<u64, u64>::new(), Ok(&[0xa0]));
+        let values = BTreeMap::from([
+            (1u64, BTreeMap::from([(2u64, vec![3u64])])),
+            (0, BTreeMap::new()),
+        ]);
+        let expected = [0xa2, 0, 0xa0, 1, 0xa1, 2, 0x81, 3];
+        assert_eq!(symbolic(values.clone()), expected);
+        prepare_matrix(&values, Ok(&expected));
+        // A key's cursor is started and finished while the outer cursor is
+        // suspended between two of its entries.
+        let keys = BTreeMap::from([(BTreeMap::from([(1u64, 0u64)]), 7u64), (BTreeMap::new(), 8)]);
+        let expected = [0xa2, 0xa0, 8, 0xa1, 1, 0, 7];
+        assert_eq!(symbolic(keys.clone()), expected);
+        prepare_matrix(&keys, Ok(&expected));
+    }
+
+    #[test]
+    fn multi_level_tree_is_walked_through_every_internal_node_transition() {
+        // More entries than one leaf holds: the cursor descends, ascends and
+        // yields from internal nodes, one admitted transition per instruction.
+        let source: BTreeMap<u64, u64> = (0..40).map(|n| (n, n)).collect();
+        let expected = identity_map(40);
+        assert_eq!(symbolic(source.clone()), expected);
+        prepare_matrix(&source, Ok(&expected));
+        emission_matrix(&source, &expected);
+    }
+
+    #[test]
+    fn every_tree_preparation_allocation_failure_preserves_physical_ownership() {
+        let source: BTreeMap<String, String> = (0..64)
+            .map(|n| (format!("{n:02}e\u{301}"), "e\u{301}".repeat(n % 8)))
+            .collect();
+        prepare_physical_matrix(&source);
+    }
+
+    #[test]
+    fn dcbor_map_matches_the_symbolic_encoder_across_every_refusal() {
+        let mut map = Map::new();
+        map.insert("k", 1.5f64);
+        map.insert(-1i64, true);
+        map.insert(10u64, "a");
+        let expected = [
+            0xa3, 0x0a, 0x61, b'a', 0x20, 0xf5, 0x61, b'k', 0xf9, 0x3e, 0x00,
+        ];
+        assert_eq!(map.cbor_data(), expected);
+        prepare_matrix(&map, Ok(&expected));
+        emission_matrix(&map, &expected);
+        prepare_physical_matrix(&map);
+        prepare_matrix(&Map::new(), Ok(&[0xa0]));
+    }
+
+    #[test]
+    fn symbolic_values_of_every_major_type_match_the_symbolic_encoder() {
+        let mut inner = Map::new();
+        inner.insert("b", 2u64);
+        inner.insert("a", 1u64);
+        let value = CBOR::from(vec![
+            CBOR::from(0u64),
+            CBOR::from(-25i64),
+            CBOR::to_byte_string([1u8, 2]),
+            CBOR::from(CBORCase::Text("e\u{301}".to_string())),
+            CBOR::to_tagged_value(42u64, 7u64),
+            CBOR::null(),
+            CBOR::from(1.5f64),
+            CBOR::from(inner),
+        ]);
+        let expected = [
+            0x88, 0, 0x38, 24, 0x42, 1, 2, 0x62, 0xc3, 0xa9, 0xd8, 42, 7, 0xf6, 0xf9, 0x3e, 0,
+            0xa2, 0x61, b'a', 1, 0x61, b'b', 2,
+        ];
+        assert_eq!(value.to_cbor_data(), expected);
+        prepare_matrix(&value, Ok(&expected));
+        emission_matrix(&value, &expected);
+        prepare_physical_matrix(&value);
+    }
+
+    #[test]
+    fn out_of_profile_negative_integers_are_rejected_wherever_they_occur() {
+        let boundary = CBOR::from(CBORCase::Negative(i64::MAX as u64));
+        let expected = [0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(boundary.to_cbor_data(), expected);
+        prepare_matrix(&boundary, Ok(&expected));
+        let wide = CBOR::from(CBORCase::Negative(i64::MAX as u64 + 1));
+        // Replacing the rejected scalar by the largest valid negative
+        // preserves structure and bounds all work before rejection.
+        prepare_matrix_bounded(
+            &wide,
+            Err(BoundedError::OutOfRange),
+            super::super::support::shape(&boundary),
+        );
+        let element = CBOR::from(vec![CBOR::from(1u64), wide.clone()]);
+        let valid_element = CBOR::from(vec![CBOR::from(1u64), boundary.clone()]);
+        prepare_matrix_bounded(
+            &element,
+            Err(BoundedError::OutOfRange),
+            super::super::support::shape(&valid_element),
+        );
+        let mut entry = Map::new();
+        entry.insert(0u64, wide.clone());
+        let mut valid_entry = Map::new();
+        valid_entry.insert(0u64, boundary.clone());
+        prepare_matrix_bounded(
+            &CBOR::from(entry),
+            Err(BoundedError::OutOfRange),
+            super::super::support::shape(&CBOR::from(valid_entry)),
+        );
+        prepare_matrix_bounded(
+            &CBOR::to_tagged_value(1u64, wide),
+            Err(BoundedError::OutOfRange),
+            super::super::support::shape(&CBOR::to_tagged_value(1u64, boundary)),
+        );
+    }
+
+    /// `depth` arrays nested around zero.
+    fn nested(depth: usize) -> CBOR {
+        let mut value = CBOR::from(0u64);
+        for _ in 0..depth {
+            value = CBOR::from(vec![value]);
+        }
+        value
+    }
+
+    #[test]
+    fn symbolic_nesting_is_bounded_by_the_engine_frame_limit() {
+        // The root and every nested value hold one frame each; 128 frames
+        // are the limit.
+        let deepest = nested(127);
+        let mut expected = vec![0x81; 127];
+        expected.push(0);
+        assert_eq!(deepest.to_cbor_data(), expected);
+        prepare_matrix(&deepest, Ok(&expected));
+        // One additional array contributes its head and child/end
+        // instructions. No 129th frame is acquired before rejection.
+        let mut bound = super::super::support::shape(&deepest);
+        bound.instructions += 3;
+        bound.extent += 1;
+        prepare_matrix_bounded(&nested(128), Err(BoundedError::DepthLimit), bound);
+    }
+}
+
+/// A field map of the first `n` integer keys, each holding zero, whose head
+/// waits in a gap for the count its fields reach.
+struct GapFields(u64);
+
+impl Schema for GapFields {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::Map,
+            index if (index as u64) <= self.0 => Instruction::Field(index as u64 - 1, Some(&0u64)),
+            _ => Instruction::End,
+        }
+    }
 }
 
 #[test]
 fn many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes() {
-    #[derive(CBORResumableEncodable)]
-    struct Empty {}
-    let source: Vec<_> = (0..32).map(|_| Empty {}).collect();
+    // Every head waits in its own gap: thirty-two gaps passed in order.
+    let source: Vec<_> = (0..32).map(|_| GapFields(0)).collect();
     let mut expected = vec![0x98, 32];
     expected.extend([0xa0; 32]);
+    emission_matrix(&source, &expected);
+    // A derived map's count is known at its start: its head has no gap.
+    #[derive(CBORBoundedEncodable)]
+    struct Empty {}
+    let source: Vec<_> = (0..32).map(|_| Empty {}).collect();
     emission_matrix(&source, &expected);
     let source = dcbor::ByteString::from(vec![0xaa; 256]);
     let mut expected = vec![0x59, 1, 0];
@@ -241,64 +373,21 @@ fn many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes() {
 
 #[test]
 fn every_schema_preparation_allocation_failure_preserves_physical_ownership() {
-    use super::heap::Observation;
-    let source = Record {
+    prepare_physical_matrix(&Record {
         omitted: None,
         enabled: true,
         nested: vec![vec!["e\u{301}".repeat(32)]; 8],
-    };
-    let run = |failure| {
-        let mut m = meter();
-        m.calls.reserve(65536);
-        let observation = Observation::begin(failure);
-        let mut preparation = Preparation::new(&source);
-        let mut result = None;
-        let mut failed = false;
-        for _ in 0..65536 {
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            match preparation.step(&mut m) {
-                Ok(PrepareStep::Progress) => {}
-                Ok(PrepareStep::Complete(plan)) => {
-                    result = Some(plan);
-                    break;
-                }
-                Err(BoundedError::Allocation { .. }) => {
-                    failed = true;
-                    break;
-                }
-                _ => panic!("unexpected preparation outcome"),
-            }
-            assert!(observation.snapshot().live <= m.pool.live() as usize);
-        }
-        observation.stop();
-        assert!(failed || result.is_some());
-        let stats = observation.snapshot();
-        assert_eq!(stats.denied, failure.is_some());
-        assert_eq!(failed, failure.is_some());
-        assert!(!stats.overflow);
-        assert_eq!(stats.unadmitted, 0);
-        assert!(stats.peak <= m.pool.peak() as usize);
-        drop(preparation);
-        if result.is_some() {
-            assert!(m.pool.live() > 0);
-        }
-        drop(result);
-        assert_eq!(observation.snapshot().live, 0);
-        assert_eq!(m.pool.live(), 0);
-        stats.calls
-    };
-    let calls = run(None);
-    every_case(calls, |index| {
-        run(Some(index));
     });
 }
 
+/// Thirty-two fields need a two-byte map head: a gap-headed map finalizes it
+/// in its gap without relocating the payload, and a derived map, its count
+/// known at its start, writes it at once.
 #[test]
 fn wide_schema_finalizes_multibyte_map_head_without_payload_relocation() {
     macro_rules! wide {
         ($($name:ident = $key:literal),* $(,)?) => {{
-            #[derive(CBORResumableEncodable)]
+            #[derive(CBORBoundedEncodable)]
             struct Wide { $(#[cbor(n = $key)] $name: u64,)* }
             Wide { $($name: 0,)* }
         }};
@@ -343,4 +432,5 @@ fn wide_schema_finalizes_multibyte_map_head_without_payload_relocation() {
         0x18, 25, 0, 0x18, 26, 0, 0x18, 27, 0, 0x18, 28, 0, 0x18, 29, 0, 0x18, 30, 0, 0x18, 31, 0,
     ];
     emission_matrix(&source, &expected);
+    emission_matrix(&GapFields(32), &expected);
 }

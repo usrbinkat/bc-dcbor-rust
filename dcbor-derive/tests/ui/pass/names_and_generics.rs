@@ -1,5 +1,5 @@
 #![deny(warnings)]
-use dcbor::{bounded::BoundedEncodable, CBORBoundedEncodable};
+use dcbor::{bounded::Schema, CBORBoundedEncodable};
 
 #[derive(CBORBoundedEncodable)]
 struct Generic<A, B, P, const N: usize> {
@@ -51,13 +51,13 @@ enum Empty {}
 #[derive(CBORBoundedEncodable)]
 struct Borrowed<'a, T: ?Sized>
 where
-    T: BoundedEncodable,
+    T: Schema,
 {
     #[cbor(n = 0)]
     value: &'a T,
 }
 
-fn assert_bounded<T: BoundedEncodable>() {}
+fn assert_bounded<T: Schema>() {}
 fn main() {
     assert_bounded::<Generic<bool, u64, String, 3>>();
     assert_bounded::<Newtype<bool, u64, String>>();

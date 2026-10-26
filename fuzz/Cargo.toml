@@ -10,10 +10,18 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[[bin]]
+name = "owned_lifecycle"
+path = "fuzz_targets/owned_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
 dcbor = { path = "..", features = ["derive", "num-bigint", "hashbrown"] }
+dcbor-test-support = { path = "../tests/support" }
 # Same revision as the dcbor manifest: usrbinkat/hashbrown feat/map-bucket-index.
-hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8" }
+hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "0fbe75be38372034b884d347419994d5fec0bc7d" }
 num-bigint = "0.4.6"
 half = "2.4.1"
 libfuzzer-sys = "0.4"

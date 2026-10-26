@@ -1,0 +1,44 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+3353332	837592	total	published	disordered: run bytes
+396839	105813	total	published	disordered: run values
+3018084	3882	total	published	hangul: run bytes
+357157	709	total	published	hangul: run values
+3353332	30380	total	published	leading marks: run bytes
+396839	4038	total	published	leading marks: run values
+27479196	16962292	total	published	long letters: run bytes
+3251913	2130455	total	published	long letters: run values
+27479196	16962292	joint	published	long letters: total bytes
+3251913	2130455	joint	published	long letters: total values
+27479196	17093364	total	published	long three-part letters: run bytes
+3251913	2150935	total	published	long three-part letters: run values
+27479196	17093364	joint	published	long three-part letters: total bytes
+3251913	2150935	joint	published	long three-part letters: total values
+13328	4283	total	published	not NFC: run bytes
+1586	525	total	published	not NFC: run values
+26996	8	total	published	quick: run bytes
+3183	1	total	published	quick: run values
+61652	24492	measured	published	witness of Buffers: Buffers allocated
+116636	9763	measured	published	witness of Buffers: Buffers bytes
+26624	13312	measured	published	witness of Buffers: Buffers peak
+1453	34	measured	published	witness of Buffers: Buffers values
+1721352	32807	total	published	witness of Buffers: run bytes
+203713	3878	total	published	witness of Buffers: run values
+61652	24492	joint	published	witness of Buffers: total allocated
+26624	13312	joint	published	witness of Buffers: total peak
+196	129	measured	published	witness of Decomposing: Decomposing values
+437916	269524	total	published	witness of Decomposing: run bytes
+51849	33809	total	published	witness of Decomposing: run values
+437916	269524	joint	published	witness of Decomposing: total bytes
+51849	33809	joint	published	witness of Decomposing: total values
+195	192	measured	published	witness of Emitting: Emitting bytes
+97	48	measured	published	witness of Emitting: Emitting values
+214612	67676	total	published	witness of Emitting: run bytes
+25403	8443	total	published	witness of Emitting: run values
+407680	268320	measured	published	witness of Ordering: Ordering bytes
+50960	33540	measured	published	witness of Ordering: Ordering values
+437916	269524	total	published	witness of Ordering: run bytes
+51849	33809	total	published	witness of Ordering: run values
+201	198	measured	published	witness of Reading: Reading bytes
+67	66	measured	published	witness of Reading: Reading values
+223388	4900	total	published	witness of Reading: run bytes
+26453	720	total	published	witness of Reading: run values

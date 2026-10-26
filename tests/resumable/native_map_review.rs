@@ -1,78 +1,137 @@
 use super::harness::*;
+use super::support::{
+    checked, contracted, exhausted, label, pipeline::Refusal, prepare_turns, refuse, shape,
+};
 use dcbor::bounded::{
-    BoundedError,
+    BoundedError, Step,
     decode::storage::Storage,
     encoding::{
-        Instruction, Preparation, PrepareStep, Schema,
+        Instruction, Preparation, Schema,
         buckets::{BucketCursor, BucketStep},
     },
 };
 use hashbrown::HashTable;
 
+/// A large table whose one entry lies in its last bucket: every window of
+/// vacant buckets before it is admitted, refused and resumed at its exact
+/// position; the last window yields the entry; the enumeration then
+/// completes, every control byte charged once.
 #[test]
 fn vacant_bucket_batches_retain_exact_positions_and_bound_total_steps() {
-    let table = HashTable::<u64>::with_capacity(1_000_000);
+    let mut table = HashTable::<u64>::with_capacity(1_000_000);
+    let buckets = table.num_buckets();
+    let last = buckets as u64 - 1;
+    // Hashed to itself: its home bucket is the last, free as it is inserted.
+    table.insert_unique(last, last, |value| *value);
+    assert_eq!(table.get_bucket(buckets - 1), Some(&last));
     let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
-    for start in (0..table.num_buckets()).step_by(64) {
-        let call = m.calls.len();
-        m.fail_at = Some((call, Refusal::Work));
+    for start in (0..buckets).step_by(64) {
+        let call = m.attempts();
+        refuse(&mut m, Refusal::For(call, LimitRefusal::Work));
         assert!(matches!(
             cursor.step_batch(&mut m),
-            Err(BoundedError::Refused(Refusal::Work))
+            Err(BoundedError::Refused(LimitRefusal::Work))
         ));
-        assert_eq!(m.refused, Some((call, Refusal::Work)));
+        assert_eq!(m.first_refusal(), Some((call, LimitRefusal::Work)));
         assert_eq!(cursor.position(), start);
-        m.fail_at = None;
-        m.refused = None;
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        assert_eq!(
-            cursor.step_batch(&mut m).unwrap(),
+        m.fail_call(None);
+        m.turn();
+        let expected = if start + 64 >= buckets {
+            BucketStep::Entry {
+                index: buckets - 1,
+                value: &last,
+            }
+        } else {
             BucketStep::Vacant { index: start }
-        );
-        assert_eq!(cursor.position(), (start + 64).min(table.num_buckets()));
+        };
+        assert_eq!(cursor.step_batch(&mut m).unwrap(), expected);
+        assert_eq!(cursor.position(), (start + 64).min(buckets));
     }
-    assert_eq!(m.bytes, table.num_buckets() as u64);
-    assert_eq!(m.values, table.num_buckets().div_ceil(64) as u64);
+    assert_eq!(m.used().bytes, buckets as u64);
+    assert_eq!(m.used().values, buckets.div_ceil(64) as u64);
     assert_eq!(cursor.step_batch(&mut m).unwrap(), BucketStep::Complete);
 }
 
 #[test]
 fn plain_data_truncation_is_constant_work_and_retains_the_allocation() {
-    let mut storage = Storage::new();
+    let mut storage: Storage<u64, Reservation> = Storage::new();
     let mut m = meter();
+    // A push into an arena of `len` elements takes at most a growth's units
+    // (`Storage::grow_step`): staging, the grown allocation, publication, one
+    // relocation per element, the settlement and the vacated block's
+    // release; then the grant.
     for value in 0..1024u64 {
-        while !storage.reserve_step(&mut m).unwrap() {}
-        storage.push_reserved(value).unwrap();
+        let units = storage.len() + 6;
+        let mut pushed = false;
+        for _ in 0..units {
+            if let Some(spare) = storage.reserve_step(usize::MAX, &mut m).unwrap() {
+                spare.push(value);
+                pushed = true;
+                break;
+            }
+        }
+        assert!(pushed, "push {value} exceeded its {units} growth units");
     }
-    let held = m.pool.live();
-    let before = (m.values, m.bytes, m.calls.len());
-    m.fail_at = Some((before.2, Refusal::Work));
+    let held = m.live_bytes();
+    let before = m.used();
+    let call = m.attempts();
+    refuse(&mut m, Refusal::For(call, LimitRefusal::Work));
     assert!(matches!(
         storage.truncate_copy_step(1, &mut m),
-        Err(BoundedError::Refused(Refusal::Work))
+        Err(BoundedError::Refused(LimitRefusal::Work))
     ));
     assert_eq!(storage.len(), 1024);
-    assert_eq!(m.pool.live(), held);
-    m.fail_at = None;
-    m.refused = None;
-    storage.truncate_copy_step(1, &mut m).unwrap();
-    assert_eq!(storage.ready(), Some([0u64].as_slice()));
-    assert_eq!(m.values, before.0 + 1);
-    assert_eq!(m.bytes, before.1);
-    assert_eq!(m.pool.live(), held);
-    storage.truncate_copy_step(0, &mut m).unwrap();
-    assert!(storage.release_step(&mut m).unwrap());
-    assert_eq!(m.pool.live(), 0);
+    assert_eq!(m.live_bytes(), held);
+    m.fail_call(None);
+    m.clear_refusal();
+    assert!(storage.truncate_copy_step(1, &mut m).unwrap());
+    assert_eq!(
+        storage.settled().map(|arena| arena.as_slice()),
+        Some([0u64].as_slice())
+    );
+    assert_eq!(m.used().values, before.values + 1);
+    assert_eq!(m.used().bytes, before.bytes);
+    assert_eq!(m.live_bytes(), held);
+    assert!(storage.truncate_copy_step(0, &mut m).unwrap());
+    // The allocation's release was paid for by its growth: cleanup frees
+    // it, then admits the transition that reports the arena released. An
+    // arena of `len` elements cleans up in at most `len + 3` units
+    // (`Storage::reclaim_step`): a staged growth's release, one drain per
+    // element, the allocation's release, then the completing transition.
+    let units = storage.len() + 3;
+    let mut released = false;
+    for _ in 0..units {
+        if storage.reclaim_step(&mut m).unwrap() {
+            released = true;
+            break;
+        }
+    }
+    assert!(released, "cleanup exceeded its {units} units");
+    assert_eq!(m.live_bytes(), 0);
 }
 
 struct Entries(Vec<(u64, u64)>);
 
+/// A root unordered map whose source yields its entries in reverse canonical
+/// order, each value a byte string longer than a quantum. Its contract, not
+/// its mechanism:
+///
+/// - canonical bytes: the emitted plan is the symbolic encoding;
+/// - the permutation and compaction are admitted: every turn is checked
+///   (admission before progress, at most a quantum, nothing refunded) within
+///   the bound of the source's own shape, the root's keys and values are
+///   compacted, and its payload is permuted in place, each byte moved at
+///   most once, the visited bitmap a bit per payload byte;
+/// - progress is kept across refusals: before every preparation and
+///   emission step, three immediate refusals leave the position, the paid
+///   work and the live storage unchanged;
+/// - nothing is published until the permutation finishes: completion comes
+///   only after the moves, with the permutation reset and its bitmap
+///   released.
 #[test]
-fn root_map_emits_descriptors_without_permuting_payload_and_retains_refusals() {
-    use dcbor::bounded::encoding::PermutationPhase;
-    use dcbor::bounded::text_cursor::pipeline::EmitStep;
+fn root_map_is_permuted_in_place_and_published_only_once_canonical() {
+    use dcbor::bounded::encoding::{DynamicPhase, PermutationPhase, prepare_bound};
     struct Payloads(Vec<(u64, dcbor::ByteString)>);
     impl Schema for Payloads {
         fn instruction(&self, index: usize) -> Instruction<'_> {
@@ -98,70 +157,99 @@ fn root_map_emits_descriptors_without_permuting_payload_and_retains_refusals() {
             })
             .collect(),
     );
-    let mut expected = vec![0xb4];
-    for key in 0..20u8 {
-        expected.extend([key, 0x58, 65 + key]);
-        expected.extend(vec![key; 65 + key as usize]);
+    // The symbolic encoding, and the literal it must be: twenty entries in
+    // key order, each key a one-byte integer and each value a byte string
+    // of 65 + key bytes behind its two-byte head.
+    let mut symbolic = dcbor::Map::new();
+    for (key, value) in &source.0 {
+        symbolic.insert(*key, value.clone());
     }
+    let expected = dcbor::CBOR::from(symbolic).to_cbor_data();
+    let mut literal = vec![0xb4];
+    for key in 0..20u8 {
+        literal.extend([key, 0x58, 65 + key]);
+        literal.extend(vec![key; 65 + key as usize]);
+    }
+    assert_eq!(expected, literal);
+    // Every byte after the map's one-byte head is its payload.
+    let payload = expected.len() - 1;
+
+    let walked = shape(&source);
     let mut m = meter();
     let mut operation = Preparation::new(&source);
+    let (mut compacted, mut moves, mut bitmap) = (false, 0usize, 0usize);
     let mut output = None;
-    for _ in 0..32768 {
-        let position = operation.position().dynamic;
-        assert_ne!(position.permutation.phase, PermutationPhase::Move);
-        assert_eq!(position.permutation.bitmap_bytes, 0);
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        if let PrepareStep::Complete(plan) = operation.step(&mut m).unwrap() {
-            output = Some(plan);
-            break;
+    for _ in 0..prepare_turns(walked) {
+        let before = operation.position().dynamic;
+        // An open compaction records where it reads; none reads at zero,
+        // the root's gap lying before every key.
+        compacted |= before.compact_source != 0;
+        if before.permutation.phase == PermutationPhase::Move {
+            moves += 1;
+        }
+        bitmap = bitmap.max(before.permutation.bitmap_bytes);
+        match super::support::repeated_turn(&mut m, &mut operation, 3) {
+            Ok(Step::Progress) => {}
+            Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
+            Ok(Step::Complete(plan)) => {
+                let after = operation.position().dynamic;
+                assert!(moves > 0, "published before the payload was permuted");
+                assert_eq!(after.permutation.phase, PermutationPhase::Offsets);
+                assert_eq!(after.permutation.bitmap_bytes, 0, "the bitmap outlived it");
+                assert_eq!(after.phase, DynamicPhase::Order);
+                exhausted(&mut m, &mut operation);
+                output = Some(plan);
+                break;
+            }
+            other => panic!(
+                "preparation stepped to {} at {:?}",
+                label(&other),
+                operation.position()
+            ),
         }
     }
-    let plan = output.expect("preparation completion bound");
+    let plan = output.expect("preparation exceeded the bound of its shape");
+    assert!(compacted, "the root's keys and values were never compacted");
+    assert!(
+        moves <= payload,
+        "{moves} moves over a payload of {payload} bytes"
+    );
+    assert_eq!(
+        bitmap,
+        payload.div_ceil(8),
+        "the bitmap is a bit per payload byte"
+    );
+    let bound = prepare_bound::<Reservation, LimitRefusal>(walked).unwrap();
+    assert!(
+        bound.work().covers(&m.used()),
+        "{:?} beyond the preparation bound {bound:?}",
+        m.used()
+    );
+    m.assert_units(TURN);
     drop(operation);
-    assert!(m.pool.live() > 0);
+    assert!(m.live_bytes() > 0, "the plan holds its arena");
+
+    let requests = m.requests();
     let mut bytes = vec![0xee; expected.len()];
     let mut writer = plan.writer(&mut bytes);
     let mut complete = false;
-    // Two payload chunks and one descriptor transition per entry, plus
-    // root header, header-gap transition, and completion.
-    for _ in 0..20 * 3 + 4 {
-        let prefix = writer.emitted_prefix().to_vec();
-        let consumed = (m.values, m.bytes);
-        let live = m.pool.live();
-        for _ in 0..3 {
-            let call = m.calls.len();
-            m.fail_at = Some((call, Refusal::Work));
-            assert!(matches!(
-                writer.step(&mut m),
-                Err(BoundedError::Refused(Refusal::Work))
-            ));
-            assert_eq!(m.refused, Some((call, Refusal::Work)));
-            assert_eq!(writer.emitted_prefix(), prefix);
-            assert_eq!((m.values, m.bytes), consumed);
-            assert_eq!(m.pool.live(), live);
-            m.fail_at = None;
-            m.refused = None;
-        }
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        let calls = m.calls.len();
-        let result = writer.step(&mut m).unwrap();
-        assert_eq!(m.calls.len(), calls + 1);
-        assert!(!matches!(m.calls[calls], Call::Allocate(_)));
+    for _ in 0..emit_turns(expected.len()) {
+        let result = super::support::repeated_turn(&mut m, &mut writer, 3).unwrap();
         assert_eq!(
             writer.emitted_prefix(),
             &expected[..writer.emitted_prefix().len()]
         );
-        if result == EmitStep::Complete {
+        if result == Step::Complete(()) {
             complete = true;
             break;
         }
     }
-    assert!(complete);
+    assert!(complete, "emission exceeded the bound of its length");
+    exhausted(&mut m, &mut writer);
     assert_eq!(writer.emitted_prefix(), expected);
+    assert_eq!(m.requests(), requests, "emission requested storage");
     drop(plan);
-    assert_eq!(m.pool.live(), 0);
+    assert_eq!(m.live_bytes(), 0);
 }
 
 impl Schema for Entries {
@@ -186,14 +274,15 @@ fn duplicate_is_rejected_during_the_first_merge_not_after_sorting() {
     let mut operation = Preparation::new(&source);
     let mut m = meter();
     let mut rejected = false;
-    for _ in 0..32768 {
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        match operation.step(&mut m) {
-            Ok(PrepareStep::Progress) => {}
+    // The walk accepts the source: duplicates are found by preparation.
+    for _ in 0..prepare_turns(shape(&source)) {
+        match checked(&mut m, |m| contracted(m, &mut operation)) {
+            Ok(Step::Progress) => {}
+            Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
             Err(BoundedError::DuplicateKey) => {
                 assert_eq!(operation.position().dynamic.ordering.width, 1);
                 assert_eq!(operation.position().dynamic.ordering.run, 0);
+                exhausted(&mut m, &mut operation);
                 rejected = true;
                 break;
             }
@@ -202,7 +291,7 @@ fn duplicate_is_rejected_during_the_first_merge_not_after_sorting() {
     }
     assert!(rejected);
     drop(operation);
-    assert_eq!(m.pool.live(), 0);
+    assert_eq!(m.live_bytes(), 0);
 }
 
 #[test]
@@ -212,24 +301,27 @@ fn merge_scratch_never_contains_more_than_the_shorter_run() {
         let mut operation = Preparation::new(&source);
         let mut m = meter();
         let mut complete = false;
-        for _ in 0..32768 {
+        for _ in 0..prepare_turns(shape(&source)) {
             let p = operation.position().dynamic.ordering;
             if p.width > 0 && p.run < count {
                 let left = p.width.min(count - p.run);
                 let right = p.width.min(count - p.run - left);
                 assert!(p.scratch <= left.min(right));
             }
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            if let PrepareStep::Complete(plan) = operation.step(&mut m).unwrap() {
-                drop(plan);
-                complete = true;
-                break;
+            match checked(&mut m, |m| contracted(m, &mut operation)) {
+                Ok(Step::Complete(plan)) => {
+                    drop(plan);
+                    complete = true;
+                    break;
+                }
+                Ok(Step::Progress) => {}
+                Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
+                other => panic!("unexpected merge outcome: {}", label(&other)),
             }
         }
         assert!(complete);
         drop(operation);
-        assert_eq!(m.pool.live(), 0);
+        assert_eq!(m.live_bytes(), 0);
     }
 }
 
@@ -253,7 +345,6 @@ impl Schema for Nested {
 
 #[test]
 fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
-    use dcbor::bounded::text_cursor::pipeline::EmitStep;
     for reordered in [false, true] {
         for depth in [1usize, 8, 32] {
             for length in [64usize, 256, 4096] {
@@ -263,23 +354,23 @@ fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
                     source = Box::new(Nested(source, reordered));
                 }
                 let wire_length = length + 3 + if reordered { 4 * depth } else { 2 * depth };
-                // At most two 24-byte descriptor inspections, one four-byte
-                // cycle move, and one visited-bit inspection per payload byte
-                // for these two-entry maps; include bitmap/arena growth too.
+                // Per payload byte and dynamic ancestor, the in-place
+                // permutation of these two-entry maps: at most two 24-byte
+                // lookup probes, one four-byte move and its share of the
+                // bitmap scan; and the bitmap's and arenas' growth.
                 let byte_bound = 64 * wire_length * (depth + 1) + 512 * (depth + 1);
+                let turns = prepare_turns(shape(source.as_ref()));
                 let mut operation = Preparation::new(source.as_ref());
                 let mut m = meter();
                 let mut output = None;
                 let mut moves = 0;
-                for _ in 0..byte_bound {
-                    m.limit_values = m.values + 3;
-                    m.limit_bytes = m.bytes + 64;
+                for _ in 0..turns {
                     if operation.position().dynamic.permutation.phase
                         == dcbor::bounded::encoding::PermutationPhase::Move
                     {
                         moves += 1;
                     }
-                    let step = operation.step(&mut m).unwrap();
+                    let step = checked(&mut m, |m| contracted(m, &mut operation));
                     assert!(operation.position().dynamic.scratch <= wire_length.div_ceil(8));
                     if !reordered {
                         assert_eq!(
@@ -288,20 +379,29 @@ fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
                             "already ordered single-entry maps must not allocate payload scratch"
                         );
                     }
-                    if let PrepareStep::Complete(plan) = step {
-                        output = Some(plan);
-                        break;
+                    match step {
+                        Ok(Step::Complete(plan)) => {
+                            output = Some(plan);
+                            break;
+                        }
+                        Ok(Step::Progress) => {}
+                        Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
+                        other => panic!(
+                            "depth {depth}, length {length}, reordered {reordered}: {} at {:?}",
+                            label(&other),
+                            operation.position(),
+                        ),
                     }
                 }
-                let plan = output.expect("input-derived step bound exceeded");
+                let plan = output.expect("preparation exceeded its production turn bound");
                 assert!(
                     moves <= wire_length * depth,
                     "a byte moved more than once per dynamic ancestor"
                 );
                 assert!(
-                    m.bytes <= byte_bound as u64,
+                    m.used().bytes <= byte_bound as u64,
                     "depth {depth}, length {length}: {}",
-                    m.bytes
+                    m.used().bytes
                 );
                 let mut expected = Vec::new();
                 for _ in 0..depth {
@@ -317,22 +417,10 @@ fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
                     expected.extend([0x59, (length >> 8) as u8, length as u8]);
                 }
                 expected.extend(vec![0xaa; length]);
-                let mut bytes = vec![0; plan.len()];
-                let mut writer = plan.writer(&mut bytes);
-                let mut done = false;
-                for _ in 0..expected.len() + 16 {
-                    m.limit_values = m.values + 3;
-                    m.limit_bytes = m.bytes + 64;
-                    if writer.step(&mut m).unwrap() == EmitStep::Complete {
-                        done = true;
-                        break;
-                    }
-                }
-                assert!(done);
-                assert_eq!(writer.emitted_prefix(), expected);
+                emit(&plan, &expected, &mut m);
                 drop(operation);
                 drop(plan);
-                assert_eq!(m.pool.live(), 0);
+                assert_eq!(m.live_bytes(), 0);
             }
         }
     }

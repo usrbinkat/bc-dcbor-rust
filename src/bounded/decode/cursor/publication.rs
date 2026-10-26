@@ -1,18 +1,13 @@
 use super::*;
 use core::ptr::addr_of_mut;
 
-impl<'a, P> Decoder<'a, P> {
-    pub(crate) unsafe fn publish_step<A: Allocator<Permit = P>>(
-        &mut self,
-        place: *mut Document<'a, P>,
-        initialized: &mut usize,
-        a: &mut A,
-    ) -> BoundedResult<bool, A> {
-        unsafe { self.publish_input_step(self.input, place, initialized, a) }
-    }
-}
-
 impl<I, P> ParserContinuation<I, P> {
+    /// Transfer the validated arena into its retained destination one
+    /// ownership field per admitted unit. `initialized` counts the parts.
+    ///
+    /// # Safety
+    /// The destination is stable uninitialized arena storage, `initialized`
+    /// starts at zero, and the parser is ready to publish.
     pub(crate) unsafe fn publish_arena_step<A: Allocator<Permit = P>>(
         &mut self,
         place: *mut DocumentArena<P>,
@@ -31,48 +26,37 @@ impl<I, P> ParserContinuation<I, P> {
         }
         Ok(done)
     }
+
     pub(crate) fn ready_to_publish(&self) -> bool {
         self.phase == Phase::Publish
-    }
-
-    /// Transfer a validated document header one field at a time. The input and
-    /// arena never move; their ownership metadata moves in separately admitted
-    /// units. The caller retains initialized fields for cancellation cleanup.
-    ///
-    /// # Safety
-    /// The destination is stable uninitialized document storage and initialized
-    /// starts at zero. This is called only after ready_to_publish returns true.
-    pub(crate) unsafe fn publish_input_step<'a, A: Allocator<Permit = P>>(
-        &mut self,
-        input: &'a [u8],
-        place: *mut Document<'a, P>,
-        initialized: &mut usize,
-        a: &mut A,
-    ) -> BoundedResult<bool, A> {
-        if !self.ready_to_publish() {
-            return Err(BoundedError::PlanMismatch);
-        }
-        if *initialized == 0 {
-            unsafe {
-                super::super::initialization::field(addr_of_mut!((*place).input), || input, a)?;
-            }
-            *initialized = 1;
-            return Ok(false);
-        }
-        let mut part = *initialized - 1;
-        let done = unsafe {
-            self.entries
-                .transfer_step(addr_of_mut!((*place).entries), &mut part, a)?
-        };
-        *initialized = part + 1;
-        if done {
-            self.phase = Phase::Finished;
-        }
-        Ok(done)
     }
 }
 
 impl<P> DocumentArena<P> {
+    /// Releasing the arena's items: one value and the vector's bytes.
+    const ITEMS: Unit<Caller> = Unit::of::<Vec<Entry>>(Caller);
+
+    /// Releasing the arena's permit: one value and the slot's bytes.
+    const PERMIT: Unit<Caller> = Unit::of::<Option<P>>(Caller);
+
+    /// The work of transferring the arena from its parser
+    /// ([`ParserContinuation::publish_arena_step`]): its storage's transfer.
+    pub(crate) fn transfer_work<R>() -> Result<WriteWork, BoundedError<R>> {
+        Storage::<Entry, P>::transfer_work()
+    }
+
+    /// The work of releasing every part ([`Self::release_parts_step`]),
+    /// transferred or not: one unit per part.
+    pub(crate) fn release_work<R>() -> Result<WriteWork, BoundedError<R>> {
+        Self::ITEMS.times(1)?.then(Self::PERMIT.times(1)?)
+    }
+
+    /// Release one transferred part per admitted unit.
+    ///
+    /// # Safety
+    /// `place` and `initialized` describe the destination of
+    /// `publish_arena_step`; `released` starts at zero and is retained. No
+    /// document views may remain live.
     pub(crate) unsafe fn release_parts_step<A: Allocator<Permit = P>>(
         place: *mut Self,
         initialized: usize,
@@ -81,15 +65,13 @@ impl<P> DocumentArena<P> {
     ) -> BoundedResult<bool, A> {
         match *released {
             0 => {
-                a.traverse(1, core::mem::size_of::<Vec<Entry>>() as u64)
-                    .map_err(BoundedError::Refused)?;
+                Self::ITEMS.admit(a)?;
                 if initialized >= 1 {
                     unsafe { core::ptr::drop_in_place(addr_of_mut!((*place).entries.items)) };
                 }
             }
             1 => {
-                a.traverse(1, core::mem::size_of::<Option<P>>() as u64)
-                    .map_err(BoundedError::Refused)?;
+                Self::PERMIT.admit(a)?;
                 if initialized == 3 {
                     unsafe { core::ptr::drop_in_place(addr_of_mut!((*place).entries.permit)) };
                 }
@@ -100,43 +82,11 @@ impl<P> DocumentArena<P> {
         *released += 1;
         Ok(*released == 2)
     }
-}
 
-impl<P> Document<'_, P> {
-    /// # Safety
-    /// place and initialized describe the destination of publish_step. released
-    /// starts at zero and is retained. No document views may remain live.
-    pub(crate) unsafe fn release_parts_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        initialized: usize,
-        released: &mut usize,
-        a: &mut A,
-    ) -> BoundedResult<bool, A> {
-        match *released {
-            0 => {
-                a.traverse(1, core::mem::size_of::<Vec<Entry>>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                if initialized >= 2 {
-                    // Entries contain only scalar data and borrowed slices;
-                    // Vec destruction releases one allocation without children.
-                    unsafe {
-                        core::ptr::drop_in_place(addr_of_mut!((*place).entries.items));
-                    }
-                }
-            }
-            1 => {
-                a.traverse(1, core::mem::size_of::<Option<P>>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                if initialized == 4 {
-                    unsafe {
-                        core::ptr::drop_in_place(addr_of_mut!((*place).entries.permit));
-                    }
-                }
-            }
-            2 => return Ok(true),
-            _ => return Err(BoundedError::PlanMismatch),
-        }
-        *released += 1;
-        Ok(*released == 2)
+    /// The most calls [`Self::release_parts_step`] still takes after
+    /// `released` parts, the one returning true included: one per part not
+    /// yet released, or one once both are.
+    pub(crate) fn release_remaining(released: usize) -> u64 {
+        (2u64.saturating_sub(released as u64)).max(1)
     }
 }

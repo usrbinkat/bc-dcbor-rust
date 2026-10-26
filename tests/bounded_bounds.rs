@@ -6,96 +6,52 @@
 //! fails part way). The bound is taken at each input's own length.
 use dcbor::{
     ByteString, CBOR, Map,
-    bounded::{Allocator, BoundedError, Budget, decode::*},
+    bounded::{BoundedError, Limits, decode::*},
 };
-use std::{cell::Cell, rc::Rc};
-
-/// Records every report and request, admits everything, and tracks live
-/// and peak requested bytes through its permits.
-#[derive(Default)]
-struct Recorder {
-    values: u64,
-    bytes: u64,
-    requested: u64,
-    live: Rc<Cell<u64>>,
-    peak: u64,
-}
-
-struct Permit {
-    bytes: u64,
-    live: Rc<Cell<u64>>,
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.live.set(self.live.get() - self.bytes);
-    }
-}
-
-impl Budget for Recorder {
-    type Refusal = ();
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), ()> {
-        self.values = self.values.checked_add(values).ok_or(())?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or(())?;
-        Ok(())
-    }
-}
-
-impl Allocator for Recorder {
-    type Permit = Permit;
-    fn allocate(&mut self, bytes: u64) -> Result<Permit, ()> {
-        self.requested = self.requested.checked_add(bytes).ok_or(())?;
-        let live = self.live.get().checked_add(bytes).ok_or(())?;
-        self.live.set(live);
-        self.peak = self.peak.max(live);
-        Ok(Permit {
-            bytes,
-            live: Rc::clone(&self.live),
-        })
-    }
-}
 
 /// Decode `input` under `max_depth`, and check every reported quantity
 /// against the bound at its length, whatever the outcome.
 fn covered(input: &[u8], max_depth: usize) -> bool {
     let bound = decode_bound::<()>(input.len() as u64, max_depth).unwrap();
-    let mut recorder = Recorder::default();
-    let result = decode(input, max_depth, &mut recorder);
+    let mut limits = Limits::unlimited();
+    let result = decode(input, max_depth, &mut limits);
     let decoded = result.is_ok();
     if let Ok(document) = &result {
         assert!(
-            recorder.live.get() <= bound.retained,
+            limits.live_bytes() <= bound.retained,
             "retained {} > {} for {} bytes",
-            recorder.live.get(),
+            limits.live_bytes(),
             bound.retained,
             input.len()
         );
         assert!(document.node_count() as u64 <= input.len() as u64);
     }
     drop(result);
-    assert_eq!(recorder.live.get(), 0, "every permit is released");
+    assert_eq!(limits.live_bytes(), 0, "every permit is released");
+    assert_eq!(limits.refusals(), 0, "an unlimited policy refused");
+    let used = limits.used();
     assert!(
-        recorder.values <= bound.values,
+        used.values <= bound.values,
         "values {} > {}",
-        recorder.values,
+        used.values,
         bound.values
     );
     assert!(
-        recorder.bytes <= bound.bytes,
+        used.bytes <= bound.bytes,
         "bytes {} > {}",
-        recorder.bytes,
+        used.bytes,
         bound.bytes
     );
     assert!(
-        recorder.requested <= bound.allocated,
+        limits.requested_bytes() <= bound.allocated,
         "allocated {} > {}",
-        recorder.requested,
+        limits.requested_bytes(),
         bound.allocated
     );
     assert!(
-        recorder.peak <= bound.peak,
+        limits.peak_bytes() <= bound.peak,
         "peak {} > {}",
-        recorder.peak,
+        limits.peak_bytes(),
         bound.peak
     );
     decoded

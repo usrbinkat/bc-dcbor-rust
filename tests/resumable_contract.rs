@@ -19,8 +19,6 @@ mod deadlines;
 mod derive;
 #[path = "resumable/native_differential.rs"]
 mod differential;
-#[path = "resumable/native_driver.rs"]
-mod driver;
 #[cfg(feature = "hashbrown")]
 #[path = "resumable/native_dynamic_maps.rs"]
 mod dynamic_maps;
@@ -38,8 +36,11 @@ mod std_hash_map_schema {
 mod harness;
 #[path = "resumable/native_header_cursor.rs"]
 mod header_cursor;
+use dcbor_test_support::{self as support, heap};
+#[global_allocator]
+static HEAP: heap::Heap = heap::Heap;
 #[path = "resumable/native_heap.rs"]
-mod heap;
+mod heap_tests;
 #[path = "resumable/native_latency.rs"]
 mod latency;
 #[path = "resumable/native_malformed.rs"]
@@ -77,3 +78,7 @@ mod tests;
 mod text_matrix;
 #[path = "resumable/native_text_progress.rs"]
 mod text_progress;
+// Recorded amounts include `size_of` values of 64-bit targets.
+#[cfg(target_pointer_width = "64")]
+#[path = "resumable/native_traces.rs"]
+mod traces;

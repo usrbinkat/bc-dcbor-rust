@@ -6,37 +6,46 @@ macro_rules! scalar {
     ($ty:ty, $zero:expr, $node:ident, $value:expr) => {
         // SAFETY: the scalar owns no child resources and needs no destructor.
         unsafe impl<A: Allocator> Reclaim<A> for $ty {
+            type State = Written;
+            const INITIAL: Written = Written::Empty;
+
             unsafe fn reclaim_step(
                 _: NonNull<MaybeUninit<Self>>,
-                cursor: &mut Cursor,
+                state: &mut Written,
                 a: &mut A,
             ) -> BoundedResult<Reclaimed, A> {
-                a.traverse(1, 0).map_err(BoundedError::Refused)?;
-                *cursor = Cursor::default();
+                STEP.admit(a)?;
+                *state = Written::Empty;
                 Ok(Reclaimed::Done)
+            }
+
+            /// One call, which is `Done`.
+            unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+                1
             }
         }
         // SAFETY: admission precedes the only scalar write; errors leave the
-        // destination uninitialized and the zero cursor safe to reclaim.
+        // destination uninitialized and the empty state safe to reclaim.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
+            const COST: ConstructionCost = scalar_cost::<$ty>();
+
             unsafe fn build_step(
                 document: &Document<'_, A::Permit>,
                 index: usize,
                 place: NonNull<MaybeUninit<Self>>,
-                cursor: &mut Cursor,
+                state: &mut Written,
                 a: &mut A,
             ) -> ConstructResult<Built, A> {
-                if cursor.state != 0 {
+                if *state != Written::Empty {
                     return Err(BoundedError::PlanMismatch.into());
                 }
-                a.traverse(1, core::mem::size_of::<Self>() as u64)
-                    .map_err(BoundedError::Refused)?;
+                sized::<Self>().admit(a)?;
                 let $node = node_at(document, index).ok_or_else(wrong_type)?.kind();
                 let value: Self = $value;
                 unsafe {
                     place.as_ptr().write(MaybeUninit::new(value));
                 }
-                cursor.state = 1;
+                *state = Written::Initialized;
                 Ok(Built::Done)
             }
         }

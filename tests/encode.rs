@@ -18,7 +18,6 @@ pub mod without_std {
 }
 
 use dcbor::prelude::*;
-use half::f16;
 use hex_literal::hex;
 #[cfg(feature = "std")]
 use with_std::*;
@@ -272,38 +271,6 @@ fn encode_string() {
 }
 
 #[test]
-fn test_normalized_string() {
-    let composed_e_acute = "\u{00E9}"; // é in NFC
-    let decomposed_e_acute = "\u{0065}\u{0301}"; // e followed by ́ (combining acute accent) in NFD
-
-    // Unlike in Swift, where string comparison is aware of compositional
-    // differences, in Rust string comparison is not.
-    assert_ne!(composed_e_acute, decomposed_e_acute);
-
-    // And of course they serialize differently, which is not what we
-    // want for determinism.
-    let utf8_1 = composed_e_acute.as_bytes();
-    let utf8_2 = decomposed_e_acute.as_bytes();
-    assert_ne!(utf8_1, utf8_2);
-
-    // But serializing them as dCBOR yields the same data.
-    let cbor1 = CBOR::from(composed_e_acute).to_cbor_data();
-    let cbor2 = CBOR::from(decomposed_e_acute).to_cbor_data();
-    assert_eq!(cbor1, cbor2);
-
-    let cbor_data = hex!("6365cc81");
-    let cbor = CBOR::try_from_data(cbor_data);
-    if let Err(e) = cbor {
-        assert_actual_expected!(
-            format!("{}", e),
-            "a CBOR string was not encoded in Unicode Canonical Normalization Form C"
-        );
-    } else {
-        panic!("Expected NonCanonicalString error");
-    }
-}
-
-#[test]
 fn encode_array() {
     test_cbor(Vec::<CBOR>::new(), "array([])", "[]", "80");
     test_cbor(
@@ -349,6 +316,9 @@ fn encode_heterogenous_array() {
     test_cbor(array, expected_debug, expected_display, expected_data);
 }
 
+/// The empty map's renderings, and a populated map's decode round trip and
+/// typed accessors. The populated map's renderings and canonical key order
+/// are `format::format_key_order`'s, over the same eight entries.
 #[test]
 fn encode_map() {
     let mut m = Map::new();
@@ -362,12 +332,8 @@ fn encode_map() {
     m.insert(100, 2);
     m.insert("aa", 5);
     m.insert(vec![100], 6);
-    test_cbor(
-        &m,
-        r#"map({0x0a: (unsigned(10), unsigned(1)), 0x1864: (unsigned(100), unsigned(2)), 0x20: (negative(-1), unsigned(3)), 0x617a: (text("z"), unsigned(4)), 0x626161: (text("aa"), unsigned(5)), 0x811864: (array([unsigned(100)]), unsigned(6)), 0x8120: (array([negative(-1)]), unsigned(7)), 0xf4: (simple(false), unsigned(8))})"#,
-        r#"{10: 1, 100: 2, -1: 3, "z": 4, "aa": 5, [100]: 6, [-1]: 7, false: 8}"#,
-        "a80a011864022003617a046261610581186406812007f408",
-    );
+    let cbor: CBOR = (&m).into();
+    assert_eq!(CBOR::try_from_data(cbor.to_cbor_data()).unwrap(), cbor);
 
     assert_eq!(m.get::<bool, i32>(false), Some(8));
     assert_eq!(m.get::<bool, i32>(true), None);
@@ -532,13 +498,6 @@ fn encode_float() {
         "3b7ffffffffffffffe",
     );
 
-    // 65-bit negative integer value (-2^63 - 1): valid CBOR, rejected by
-    // dCBOR (draft section 7.2).
-    assert!(matches!(
-        CBOR::try_from_hex("3b8000000000000000"),
-        Err(dcbor::Error::OutOfRange)
-    ));
-
     // Largest double that can convert to uint64, almost UINT64_MAX.
     test_cbor(
         18446744073709550000.0,
@@ -572,19 +531,6 @@ fn encode_float() {
         "-1.844674407370955e19",
         "fbc3efffffffffffff",
     );
-
-    // 65-bit negative integer value (-2^64 + 1): rejected by dCBOR.
-    assert!(matches!(
-        CBOR::try_from_hex("3bfffffffffffffffe"),
-        Err(dcbor::Error::OutOfRange)
-    ));
-
-    // 65-bit negative integer value (-2^64): rejected by dCBOR (draft
-    // section 7.2).
-    assert!(matches!(
-        CBOR::try_from_hex("3bffffffffffffffff"),
-        Err(dcbor::Error::OutOfRange)
-    ));
 
     // -2^64 as a float: below DCBOR_INT, exact as a single.
     test_cbor(
@@ -634,57 +580,6 @@ fn encode_float() {
         "1.7976931348623157e308",
         "fb7fefffffffffffff",
     );
-}
-
-#[test]
-fn int_coerced_to_float() {
-    let n = 42;
-    let c: CBOR = n.into();
-    let f: f64 = f64::try_from_cbor(&c).unwrap();
-    assert_eq!(f, n as f64);
-    let c2: CBOR = f.into();
-    assert_eq!(c2, c);
-    let i: i32 = c.try_into().unwrap();
-    assert_eq!(i, n);
-}
-
-#[test]
-fn fail_float_coerced_to_int() {
-    // Floating point values cannot be coerced to integer types.
-    let n = 42.5;
-    let c: CBOR = n.into();
-    let f: f64 = f64::try_from_cbor(&c).unwrap();
-    assert_eq!(f, n);
-    let a = i32::try_from(c);
-    assert!(a.is_err());
-}
-
-#[test]
-fn non_canonical_float_1() {
-    // Non-canonical representation of 1.5 that could be represented at a
-    // smaller width.
-    if let Err(e) = CBOR::try_from_hex("FB3FF8000000000000") {
-        assert_eq!(
-            format!("{}", e),
-            "a CBOR numeric value was encoded in non-canonical form"
-        );
-    } else {
-        panic!("Expected NonCanonicalNumeric error");
-    }
-}
-
-#[test]
-fn non_canonical_float_2() {
-    // Non-canonical representation of a floating point value that could be
-    // represented as an integer.
-    if let Err(e) = CBOR::try_from_hex("F94A00") {
-        assert_eq!(
-            format!("{}", e),
-            "a CBOR numeric value was encoded in non-canonical form"
-        );
-    } else {
-        panic!("Expected NonCanonicalNumeric error");
-    }
 }
 
 #[test]
@@ -815,106 +710,4 @@ fn usage_test_2() {
     assert_eq!(cbor.diagnostic(), "[1000, 2000, 3000]");
     let array: Vec<u32> = cbor.try_into().unwrap();
     assert_eq!(format!("{:?}", array), "[1000, 2000, 3000]");
-}
-
-#[test]
-fn encode_nan() {
-    let canonical_nan_data = hex!("f97e00");
-
-    let nonstandard_f64_nan = f64::from_bits(0x7ff9100000000001);
-    assert!(nonstandard_f64_nan.is_nan());
-    assert_eq!(
-        Into::<CBOR>::into(nonstandard_f64_nan).to_cbor_data(),
-        canonical_nan_data
-    );
-
-    let nonstandard_f32_nan = f32::from_bits(0xffc00001);
-    assert!(nonstandard_f32_nan.is_nan());
-    assert_eq!(
-        Into::<CBOR>::into(nonstandard_f32_nan).to_cbor_data(),
-        canonical_nan_data
-    );
-
-    let nonstandard_f16_nan = f16::from_bits(0x7e01);
-    assert!(nonstandard_f16_nan.is_nan());
-    assert_eq!(
-        Into::<CBOR>::into(nonstandard_f16_nan).to_cbor_data(),
-        canonical_nan_data
-    );
-}
-
-#[test]
-fn decode_nan() {
-    // Canonical NaN decodes
-    let canonical_nan_data = hex!("f97e00");
-    let d: f64 = CBOR::try_from_data(canonical_nan_data)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    assert!(d.is_nan());
-
-    // Non-canonical NaNs of any size return an error
-    CBOR::try_from_data(hex!("f97e01")).unwrap_err();
-    CBOR::try_from_data(hex!("faffc00001")).unwrap_err();
-    CBOR::try_from_data(hex!("fb7ff9100000000001")).unwrap_err();
-}
-
-#[test]
-fn encode_infinit() {
-    let canonical_infinity_data = hex!("f97c00");
-    let canonical_neg_infinity_data = hex!("f9fc00");
-    assert_eq!(
-        Into::<CBOR>::into(f64::INFINITY).to_cbor_data(),
-        canonical_infinity_data
-    );
-    assert_eq!(
-        Into::<CBOR>::into(f32::INFINITY).to_cbor_data(),
-        canonical_infinity_data
-    );
-    assert_eq!(
-        Into::<CBOR>::into(f16::INFINITY).to_cbor_data(),
-        canonical_infinity_data
-    );
-    assert_eq!(
-        Into::<CBOR>::into(f64::NEG_INFINITY).to_cbor_data(),
-        canonical_neg_infinity_data
-    );
-    assert_eq!(
-        Into::<CBOR>::into(f32::NEG_INFINITY).to_cbor_data(),
-        canonical_neg_infinity_data
-    );
-    assert_eq!(
-        Into::<CBOR>::into(f16::NEG_INFINITY).to_cbor_data(),
-        canonical_neg_infinity_data
-    );
-}
-
-#[test]
-fn decode_infinity() {
-    let canonical_infinity_data = hex!("f97c00");
-    let canonical_neg_infinity_data = hex!("f9fc00");
-
-    // Canonical infinity decodes
-    let a: f64 = CBOR::try_from_data(canonical_infinity_data)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    assert_eq!(a, f64::INFINITY);
-    let a: f64 = CBOR::try_from_data(canonical_neg_infinity_data)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    assert_eq!(a, f64::NEG_INFINITY);
-
-    // Non-canonical +infinities return error
-    CBOR::try_from_data(hex!("fa7f800000")).err().unwrap();
-    CBOR::try_from_data(hex!("fb7ff0000000000000"))
-        .err()
-        .unwrap();
-
-    // Non-canonical -infinities return error
-    CBOR::try_from_data(hex!("faff800000")).err().unwrap();
-    CBOR::try_from_data(hex!("fbfff0000000000000"))
-        .err()
-        .unwrap();
 }

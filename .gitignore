@@ -90,3 +90,18 @@ dkms.conf
 
 target/
 cargo-docs/
+
+# Matrix cost records and inventories (tests/record-evidence.sh record-costs).
+# Pinned to one toolchain and fork configuration and regenerated whole on any
+# change to it; kept local, never tracked.
+tests/data/costs/
+
+# Working ledger of the verification overhaul; not a maintained document.
+test_overhaul.md
+
+# Python bytecode from the recorder and mutation-evidence controls.
+__pycache__/
+
+# cargo-mutants output.
+mutants.out/
+mutants.out.old/

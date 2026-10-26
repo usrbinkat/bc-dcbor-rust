@@ -1,0 +1,26 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+4099	4096	measured	published	bytes (Payload): Payload bytes
+98112	98112	measured	published	flat array (Arena): Arena allocated
+49536	49392	measured	published	flat array (Arena): Arena bytes
+73728	73728	measured	published	flat array (Arena): Arena peak
+49152	49152	measured	published	flat array (Arena): Arena retained
+9	9	measured	published	flat array (Arena): Arena values
+218636	98304	joint	published	flat array (Arena): total allocated
+73920	73920	joint	published	flat array (Arena): total peak
+49152	49152	joint	published	flat array (Arena): total retained
+1003	1000	measured	published	flat array (Completions): Completions values
+9036	8973	measured	published	flat array (Heads): Heads bytes
+1004	1001	measured	published	flat array (Heads): Heads values
+1278284	786432	joint	published	large flat array: total allocated
+590016	590016	joint	published	large flat array: total peak
+393216	393216	joint	published	large flat array: total retained
+56692063	33936223	joint	published	long letters: total bytes
+6544300	4260378	joint	published	long letters: total values
+3723	2717	measured	published	many keys (Keys): Keys bytes
+1861	999	measured	published	many keys (Keys): Keys values
+2880	2880	measured	published	nested arrays (Stack): Stack allocated
+1600	1536	measured	published	nested arrays (Stack): Stack bytes
+2304	2304	measured	published	nested arrays (Stack): Stack peak
+4	4	measured	published	nested arrays (Stack): Stack values
+13664095	8284911	joint	published	normalized text (Text): total bytes
+1598953	1040535	joint	published	normalized text (Text): total values

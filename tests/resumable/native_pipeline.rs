@@ -1,175 +1,156 @@
-use super::bindings::{string_driver, text_driver};
-use super::driver::{Driver, Event, Operation, Step, finish, resume};
+use super::bindings::{string_decoder, text_encoder};
 use super::harness::*;
-use dcbor::bounded::BoundedError;
-use dcbor::bounded::text_cursor::pipeline::{
-    EmitStep, PrepareStep, PreparedText, TextPreparation, TextWriter,
+use super::support::{
+    Fault, allowed, drive_faulted, drive_within, pipeline::Refusal, refusal_matrix, refuse,
+    rigor::rigor,
 };
-
-impl Operation<PreparedText<Permit>> for TextPreparation<'_, Permit> {
-    fn advance(&mut self, meter: &mut Meter) -> Result<Event<PreparedText<Permit>>, &'static str> {
-        Ok(match self.step(meter) {
-            Ok(PrepareStep::Progress) => Event::Progress,
-            Ok(PrepareStep::Complete(plan)) => Event::Complete(plan),
-            Ok(PrepareStep::Finished) => Event::Finished,
-            Err(BoundedError::Refused(reason)) => Event::Refused(reason),
-            Err(_) => return Err("text preparation failed"),
-        })
-    }
-}
-
-impl Operation<()> for TextWriter<'_, '_, Permit> {
-    fn advance(&mut self, meter: &mut Meter) -> Result<Event<()>, &'static str> {
-        Ok(match self.step(meter) {
-            Ok(EmitStep::Progress) => Event::Progress,
-            Ok(EmitStep::Complete) => Event::Complete(()),
-            Ok(EmitStep::Finished) => Event::Finished,
-            Err(BoundedError::Refused(reason)) => Event::Refused(reason),
-            Err(_) => return Err("text emission failed"),
-        })
-    }
-}
-
-fn preparation(meter: Meter) -> Driver<TextPreparation<'static, Permit>, PreparedText<Permit>> {
-    Driver::from_operation(TextPreparation::new(SOURCE), meter)
-}
-
-fn prepared() -> (PreparedText<Permit>, Meter) {
-    let mut operation = preparation(meter());
-    finish(&mut operation, 4096);
-    (operation.output.take().unwrap(), operation.meter)
-}
-
-fn suspend<O: Operation<T>, T>(operation: &mut Driver<O, T>, reason: Refusal) {
-    let target = operation.meter.fail_at.expect("injection configured");
-    let mut observed = false;
-    for _ in 0..4096 {
-        match operation.step().unwrap() {
-            Step::Progress => assert!(operation.output.is_none()),
-            Step::Refused(actual) => {
-                assert_eq!(actual, reason);
-                observed = true;
-                break;
-            }
-            other => panic!("missing pipeline refusal {target:?}: {other:?}"),
-        }
-    }
-    assert!(observed);
-    assert_eq!(operation.meter.refused, Some(target));
-}
+use dcbor::bounded::Allocator;
+use dcbor::bounded::text_cursor::pipeline::{PreparedText, TextPreparation};
 
 const SOURCE: &str = "a\u{301}";
 const EXPECTED: &[u8] = &[0x62, 0xc3, 0xa1];
 
+/// The prepared text of [`SOURCE`] and the policy holding its storage.
+fn text_plan() -> (PreparedText<Reservation>, Limits) {
+    let mut m = meter();
+    let plan = drive_within(
+        &mut m,
+        &mut TextPreparation::new(SOURCE),
+        normalize_turns(SOURCE),
+    )
+    .expect("text preparation failed");
+    (plan, m)
+}
+
+/// Every refusal of preparing [`SOURCE`] resumed to a plan that owns its
+/// storage beyond the preparation and emits the literal encoding, and a
+/// cancellation at every call releasing the preparation's scratch.
 #[test]
-fn preparation_cancellation_at_every_admission_releases_scratch() {
-    let (plan, baseline) = prepared();
+fn preparation_refusal_and_cancellation_preserve_literal_result_and_plan_ownership() {
+    let (plan, baseline) = text_plan();
     assert_eq!(plan.len(), EXPECTED.len() as u64);
     drop(plan);
-    assert_eq!(baseline.pool.live(), 0);
-    every_case(baseline.calls.len(), |stop| {
-        let reason = match baseline.calls[stop] {
-            Call::Allocate(_) => Refusal::Capacity,
-            Call::Work { .. } => Refusal::Work,
-        };
+    assert_eq!(baseline.live_bytes(), 0);
+    refusal_matrix("text preparation", rigor(), |fault: Fault| {
         let mut m = meter();
-        m.fail_at = Some((stop, reason));
-        let pool = m.pool.clone();
-        let mut operation = preparation(m);
-        suspend(&mut operation, reason);
-        assert_eq!(operation.meter.refused, Some((stop, reason)));
-        assert_eq!(operation.meter.calls, baseline.calls[..=stop]);
-        assert!(operation.output.is_none());
-        drop(operation);
-        assert_eq!(pool.live(), 0);
+        refuse(&mut m, fault.refusal);
+        let pool = m.share();
+        let mut operation = TextPreparation::new(SOURCE);
+        let turns = allowed(&m, normalize_turns(SOURCE));
+        let plan = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+            .expect("a composing pair prepares");
+        match plan {
+            None => {
+                drop(operation);
+                assert_eq!(pool.live_bytes(), 0, "cancellation kept scratch");
+            }
+            Some(plan) => {
+                m.assert_units(TURN);
+                let retained = pool.live_bytes();
+                assert!(retained > 0);
+                drop(operation);
+                assert_eq!(pool.live_bytes(), retained);
+                let mut bytes = [0xee; 3];
+                let mut emission = meter();
+                drive_within(
+                    &mut emission,
+                    &mut plan.writer(&mut bytes),
+                    text_emit_turns(EXPECTED.len()),
+                )
+                .expect("emission failed");
+                emission.assert_units(TURN);
+                assert_eq!(bytes, EXPECTED);
+                assert_eq!(pool.live_bytes(), retained);
+                drop(plan);
+                assert_eq!(pool.live_bytes(), 0);
+            }
+        }
+        super::support::RefusalRun::of(&m)
     });
 }
 
+/// Every refusal of emitting the plan resumed into the same guarded
+/// destination without replaying its prefix, and a cancellation at every
+/// call leaving exactly the literal prefix emitted so far, the guards intact
+/// and the plan's storage held.
 #[test]
-fn preparation_resumption_preserves_literal_result_and_plan_ownership() {
-    let (plan, baseline) = prepared();
-    drop(plan);
-    every_case(baseline.calls.len(), |stop| {
-        let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let pool = m.pool.clone();
-        let mut operation = preparation(m);
-        resume(&mut operation, Refusal::Work);
-        operation.meter.assert_units(3, 64);
-        let mut expected_trace = baseline.calls.clone();
-        expected_trace.insert(stop, baseline.calls[stop]);
-        assert_eq!(operation.meter.calls, expected_trace);
-        let plan = operation.output.take().unwrap();
-        let retained = pool.live();
-        assert!(retained > 0);
-        drop(operation);
-        assert_eq!(pool.live(), retained);
-        let mut bytes = [0xee; 3];
-        let mut writer = Driver::from_operation(plan.writer(&mut bytes), meter());
-        finish(&mut writer, 4096);
-        writer.meter.assert_units(3, 64);
-        drop(writer);
-        assert_eq!(bytes, EXPECTED);
-        assert_eq!(pool.live(), retained);
-        drop(plan);
-        assert_eq!(pool.live(), 0);
-    });
-}
-
-#[test]
-fn emission_resumes_same_destination_without_prefix_replay() {
-    let (plan, allocator) = prepared();
-    let retained = allocator.pool.live();
-    let mut destination = [0; 3];
-    let mut reference = Driver::from_operation(plan.writer(&mut destination), meter());
-    finish(&mut reference, 4096);
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
+fn emission_refusal_and_cancellation_preserve_destination_prefix_and_plan() {
+    let (plan, allocator) = text_plan();
+    let retained = allocator.live_bytes();
+    refusal_matrix("text emission", rigor(), |fault: Fault| {
         let mut guarded = [0xee; 5];
         let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let mut operation = Driver::from_operation(plan.writer(&mut guarded[1..4]), m);
-        resume(&mut operation, Refusal::Work);
-        operation.meter.assert_units(3, 64);
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, baseline.calls[stop]);
-        assert_eq!(operation.meter.calls, trace, "emitted prefix replayed");
-        assert_eq!(operation.step().unwrap(), Step::Finished);
-        assert_eq!(allocator.pool.live(), retained);
-        drop(operation);
-        assert_eq!(guarded, [0xee, 0x62, 0xc3, 0xa1, 0xee]);
+        refuse(&mut m, fault.refusal);
+        let mut operation = plan.writer(&mut guarded[1..4]);
+        let turns = allowed(&m, text_emit_turns(EXPECTED.len()));
+        let emitted = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+            .expect("a prepared plan emits");
+        let calls = super::support::RefusalRun::of(&m);
+        if emitted.is_some() {
+            m.assert_units(TURN);
+        }
+        assert_eq!(
+            allocator.live_bytes(),
+            retained,
+            "emission changed the plan"
+        );
+        // The writer's borrow of `guarded` ends here; it has no destructor.
+        assert_eq!(
+            (guarded[0], guarded[4]),
+            (0xee, 0xee),
+            "a guard was written"
+        );
+        let written = guarded[1..4]
+            .iter()
+            .take_while(|byte| **byte != 0xee)
+            .count();
+        assert_eq!(&guarded[1..1 + written], &EXPECTED[..written]);
+        assert!(guarded[1 + written..4].iter().all(|byte| *byte == 0xee));
+        if emitted.is_some() {
+            assert_eq!(written, EXPECTED.len(), "a completed emission is partial");
+        }
+        calls
     });
     drop(plan);
-    assert_eq!(allocator.pool.live(), 0);
+    assert_eq!(allocator.live_bytes(), 0);
 }
 
+/// Every refusal of encoding [`SOURCE`], resumed or cancelled, beside an
+/// independent output of the same pool: the output's storage is untouched
+/// by the second encoding's suspension, resumption or cancellation.
 #[test]
-fn every_encoding_refusal_cancels_without_releasing_an_independent_output() {
-    let mut reference = text_driver(SOURCE, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
-        let pool = Pool::new(32 * 1024 * 1024);
-        let mut first = text_driver(SOURCE, Meter::new(pool.clone()));
-        finish(&mut first, 4096);
-        let output = first.output.take().unwrap();
-        let retained = pool.live();
+fn every_encoding_refusal_leaves_an_independent_output_untouched() {
+    refusal_matrix("text encoding beside an output", rigor(), |fault: Fault| {
+        let pool = meter();
+        let output = drive_within(
+            &mut pool.share(),
+            &mut text_encoder(SOURCE),
+            normalize_turns(SOURCE),
+        )
+        .unwrap();
+        let retained = pool.live_bytes();
         assert!(retained >= EXPECTED.len() as u64);
-        let mut m = Meter::new(pool.clone());
-        m.fail_at = Some((stop, Refusal::Work));
-        let mut operation = text_driver(SOURCE, m);
-        suspend(&mut operation, Refusal::Work);
-        assert_eq!(operation.meter.refused, Some((stop, Refusal::Work)));
-        assert!(operation.output.is_none());
-        assert!(pool.live() >= retained);
+        let mut m = pool.share();
+        refuse(&mut m, fault.refusal);
+        let mut operation = text_encoder(SOURCE);
+        let turns = allowed(&m, normalize_turns(SOURCE));
+        let second = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
+            .expect("a composing pair encodes");
+        assert!(pool.live_bytes() >= retained);
         drop(operation);
-        assert_eq!(pool.live(), retained);
+        if let Some(second) = second {
+            assert_eq!(second.as_ref(), EXPECTED);
+            drop(second);
+        }
+        assert_eq!(
+            pool.live_bytes(),
+            retained,
+            "the independent output changed"
+        );
         assert_eq!(output.as_ref(), EXPECTED);
-        drop(first);
-        assert_eq!(pool.live(), retained);
         drop(output);
-        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.live_bytes(), 0);
+        super::support::RefusalRun::of(&m)
     });
 }
 
@@ -179,37 +160,53 @@ fn every_encoding_refusal_cancels_without_releasing_an_independent_output() {
 #[test]
 fn concurrent_suspended_constructors_recover_exact_shared_capacity() {
     let capacity = 32 * 1024 * 1024;
-    let pool = Pool::new(capacity);
-    let mut reference = string_driver(EXPECTED, meter());
-    finish(&mut reference, 4096);
-    drop(reference.output.take());
-    let baseline = reference.meter;
-    let boundaries = baseline.calls.len();
+    let mut pool = meter_with(capacity);
+    let mut baseline = meter();
+    drop(
+        drive_within(
+            &mut baseline,
+            &mut string_decoder(EXPECTED),
+            string_turns(EXPECTED.len()),
+        )
+        .unwrap(),
+    );
+    let boundaries = baseline.calls().len();
+    // Every refused call is suspended and resumed the same number of times,
+    // in rounds over all of them, about a thousand continuations in all; the
+    // cases are dealt to the workers in turn.
+    const WORKERS: usize = 8;
+    const CONTINUATIONS: usize = 1000;
+    let rounds = CONTINUATIONS.div_ceil(boundaries);
+    let cases: Vec<usize> = (0..rounds).flat_map(|_| 0..boundaries).collect();
     let outcomes = std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for worker in 0..8 {
-            let pool = pool.clone();
+        for worker in 0..WORKERS {
+            let shared = pool.share();
             let baseline = &baseline;
+            let mine: Vec<usize> = cases
+                .iter()
+                .copied()
+                .skip(worker)
+                .step_by(WORKERS)
+                .collect();
             handles.push(scope.spawn(move || {
-                every_case(125, |iteration| {
-                    let stop = (worker * 125 + iteration) % boundaries;
-                    let mut m = Meter::new(pool.clone());
-                    m.fail_at = Some((stop, Refusal::Work));
-                    let mut operation = string_driver(EXPECTED, m);
-                    resume(&mut operation, Refusal::Work);
-                    let mut expected_trace = baseline.calls.clone();
-                    expected_trace.insert(stop, baseline.calls[stop]);
-                    assert_eq!(operation.meter.calls, expected_trace);
-                    assert_eq!(
-                        (operation.meter.values, operation.meter.bytes),
-                        (baseline.values, baseline.bytes),
+                every_fixture(mine.len(), |case| {
+                    let stop = mine[case];
+                    let mut m = shared.share();
+                    refuse(&mut m, Refusal::For(stop, LimitRefusal::Work));
+                    let mut operation = string_decoder(EXPECTED);
+                    let output = drive_within(&mut m, &mut operation, string_turns(EXPECTED.len()))
+                        .expect("suspended construction failed");
+                    super::support::RefusalRun::of(&m).resumed(
+                        &super::support::RefusalRun::of(baseline),
+                        stop,
+                        LimitRefusal::Work,
                     );
-                    operation.meter.assert_units(3, 64);
-                    assert_eq!(operation.output.as_ref().unwrap().value(), "á");
-                    let output = operation.output.take().unwrap();
-                    assert_eq!(operation.step().unwrap(), Step::Finished);
+                    assert_eq!(m.used(), baseline.used());
+                    m.assert_units(TURN);
+                    assert_eq!(output.value(), "\u{e1}");
                     drop(operation);
-                    assert_eq!(output.value(), "á");
+                    assert_eq!(output.value(), "\u{e1}");
                     drop(output);
                 });
             }));
@@ -219,45 +216,13 @@ fn concurrent_suspended_constructors_recover_exact_shared_capacity() {
             .map(|handle| handle.join())
             .collect::<Vec<_>>()
     });
-    assert_eq!(pool.live(), 0);
-    let all = pool.reserve(capacity).unwrap();
-    assert!(pool.reserve(1).is_err());
+    assert_eq!(pool.live_bytes(), 0);
+    let all = pool.allocate(capacity).unwrap();
+    assert!(pool.allocate(1).is_err());
     drop(all);
-    assert_eq!(pool.live(), 0);
+    assert_eq!(pool.live_bytes(), 0);
     assert!(
         outcomes.iter().all(Result::is_ok),
         "one or more continuation workers failed"
     );
-}
-
-#[test]
-fn cancelled_emission_preserves_plan_and_exact_literal_prefix() {
-    let (plan, allocator) = prepared();
-    let retained = allocator.pool.live();
-    let mut destination = [0; 3];
-    let mut reference = Driver::from_operation(plan.writer(&mut destination), meter());
-    finish(&mut reference, 4096);
-    let baseline = reference.meter;
-    every_case(baseline.calls.len(), |stop| {
-        let mut guarded = [0xee; 5];
-        let mut m = meter();
-        m.fail_at = Some((stop, Refusal::Work));
-        let mut operation = Driver::from_operation(plan.writer(&mut guarded[1..4]), m);
-        suspend(&mut operation, Refusal::Work);
-        assert_eq!(operation.meter.refused, Some((stop, Refusal::Work)));
-        assert_eq!(operation.meter.calls, baseline.calls[..=stop]);
-        assert!(operation.output.is_none());
-        assert_eq!(allocator.pool.live(), retained);
-        drop(operation);
-        assert_eq!(allocator.pool.live(), retained);
-        assert_eq!((guarded[0], guarded[4]), (0xee, 0xee));
-        let written = guarded[1..4]
-            .iter()
-            .take_while(|byte| **byte != 0xee)
-            .count();
-        assert_eq!(&guarded[1..1 + written], &EXPECTED[..written]);
-        assert!(guarded[1 + written..4].iter().all(|byte| *byte == 0xee));
-    });
-    drop(plan);
-    assert_eq!(allocator.pool.live(), 0);
 }

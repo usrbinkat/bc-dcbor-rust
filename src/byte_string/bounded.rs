@@ -3,18 +3,17 @@ extern crate alloc;
 use super::ByteString;
 use crate::bounded::decode::construction::{
     in_place::{
-        Built, InPlace, Placeholder,
-        text::{Meta, Phase, allocate_meta},
+        Built, ConstructionCost, InPlace, Placeholder, rejected,
+        text::{BufferState, buffer_cost, copy_buffer, reclaim_buffer},
     },
     node_at,
-    reclamation::{Cursor, Reclaim, Reclaimed},
+    reclamation::{Reclaim, Reclaimed},
 };
-use crate::bounded::decode::{ConstructResult, Document, Kind, wrong_type};
-use crate::bounded::{Allocator, BoundedError, BoundedResult};
-use alloc::{alloc::dealloc, vec::Vec};
+use crate::bounded::decode::{ConstructResult, Document, Kind};
+use crate::bounded::{Allocator, BoundedResult};
+use alloc::vec::Vec;
 use core::{
-    alloc::Layout,
-    mem::{MaybeUninit, size_of},
+    mem::MaybeUninit,
     ptr::{self, NonNull},
 };
 
@@ -25,126 +24,74 @@ unsafe impl Placeholder for ByteString {
     }
 }
 
-// SAFETY: each phase records buffer initialization and its individual permits.
+// SAFETY: the shared byte-buffer phases record initialization and permits.
 unsafe impl<A: Allocator> InPlace<A> for ByteString {
+    const COST: ConstructionCost = buffer_cost::<Self, A::Permit>();
+
     unsafe fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
         place: NonNull<MaybeUninit<Self>>,
-        cursor: &mut Cursor,
+        state: &mut Self::State,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
-        if cursor.state == 0 {
-            allocate_meta(cursor, a)?;
-            return Ok(Built::Progress);
+        let Some(Kind::Bytes(source)) = node_at(document, index).map(|n| n.kind()) else {
+            return rejected(a);
+        };
+        unsafe { Self::copy_step(source, place, state, a) }.map_err(Into::into)
+    }
+}
+
+impl ByteString {
+    /// Initialize a byte buffer in stable storage using the same custody phases
+    /// as typed construction. The caller retains the immutable source and state.
+    ///
+    /// # Safety
+    /// The destination and state are an original stable construction pair.
+    pub(crate) unsafe fn copy_step<A: Allocator>(
+        source: &[u8],
+        place: NonNull<MaybeUninit<Self>>,
+        state: &mut BufferState<A::Permit>,
+        a: &mut A,
+    ) -> BoundedResult<Built, A> {
+        let place = place.as_ptr().cast::<Self>();
+        // SAFETY: forwarded from the caller; the vector is reached only after
+        // the empty ByteString is written.
+        unsafe {
+            copy_buffer::<Self, A>(
+                source,
+                false,
+                || place.write(Self(Vec::new())),
+                || &mut (*place).0,
+                state,
+                a,
+            )
         }
-        let meta = unsafe { &mut *(cursor.state as *mut Meta<A::Permit>) };
-        match meta.phase {
-            Phase::Empty => {
-                a.traverse(1, size_of::<Self>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                if !matches!(
-                    node_at(document, index).map(|n| n.kind()),
-                    Some(Kind::Bytes(_))
-                ) {
-                    return Err(wrong_type());
-                }
-                unsafe {
-                    place.as_ptr().write(MaybeUninit::new(Self(Vec::new())));
-                }
-                meta.phase = Phase::Initialized;
-            }
-            Phase::Initialized | Phase::AllocatePayload => {
-                let Some(Kind::Bytes(source)) = node_at(document, index).map(|n| n.kind()) else {
-                    return Err(wrong_type());
-                };
-                let bytes = u64::try_from(source.len()).map_err(|_| BoundedError::Overflow)?;
-                if meta.phase == Phase::Initialized {
-                    a.traverse(1, 0).map_err(BoundedError::Refused)?;
-                    meta.phase = Phase::AllocatePayload;
-                }
-                meta.payload = Some(a.allocate(bytes).map_err(BoundedError::Refused)?);
-                let value = unsafe { &mut *place.as_ptr().cast::<Self>() };
-                value
-                    .0
-                    .try_reserve_exact(source.len())
-                    .map_err(|_| BoundedError::Allocation { bytes })?;
-                meta.phase = Phase::Copy;
-            }
-            Phase::Copy => {
-                let Some(Kind::Bytes(source)) = node_at(document, index).map(|n| n.kind()) else {
-                    return Err(wrong_type());
-                };
-                let start = cursor.position;
-                let end = start
-                    + source
-                        .len()
-                        .checked_sub(start)
-                        .ok_or(BoundedError::PlanMismatch)?
-                        .min(64);
-                a.traverse(1, (end - start) as u64)
-                    .map_err(BoundedError::Refused)?;
-                unsafe { &mut *place.as_ptr().cast::<Self>() }
-                    .0
-                    .extend_from_slice(&source[start..end]);
-                cursor.position = end;
-                if end == source.len() {
-                    meta.phase = Phase::Complete;
-                    return Ok(Built::Done);
-                }
-            }
-            _ => return Err(BoundedError::PlanMismatch.into()),
-        }
-        Ok(Built::Progress)
     }
 }
 
 // SAFETY: the native buffer contains bytes only. Its allocation is released
 // before either permit, and no arbitrary element destructor is invoked.
 unsafe impl<A: Allocator> Reclaim<A> for ByteString {
+    type State = BufferState<A::Permit>;
+    const INITIAL: Self::State = BufferState::INITIAL;
+
     unsafe fn reclaim_step(
         place: NonNull<MaybeUninit<Self>>,
-        cursor: &mut Cursor,
+        state: &mut Self::State,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
-        if cursor.state == 0 {
-            a.traverse(1, 0).map_err(BoundedError::Refused)?;
-            return Ok(Reclaimed::Done);
+        // SAFETY: the buffer phases prove initialization of this ByteString.
+        unsafe {
+            reclaim_buffer::<Self, A>(
+                state,
+                || ptr::drop_in_place(place.as_ptr().cast::<Self>()),
+                a,
+            )
         }
-        let raw = cursor.state as *mut Meta<A::Permit>;
-        let meta = unsafe { &mut *raw };
-        match meta.phase {
-            Phase::Empty => {
-                a.traverse(1, 0).map_err(BoundedError::Refused)?;
-                meta.phase = Phase::BufferFreed;
-            }
-            Phase::Initialized | Phase::AllocatePayload | Phase::Copy | Phase::Complete => {
-                a.traverse(1, size_of::<Self>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                unsafe {
-                    ptr::drop_in_place(place.as_ptr().cast::<Self>());
-                }
-                meta.phase = Phase::BufferFreed;
-            }
-            Phase::BufferFreed => {
-                a.traverse(1, size_of::<A::Permit>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                let permit = meta.payload.take();
-                meta.phase = Phase::PermitReleased;
-                drop(permit);
-            }
-            Phase::PermitReleased => {
-                a.traverse(1, size_of::<A::Permit>() as u64)
-                    .map_err(BoundedError::Refused)?;
-                unsafe {
-                    let permit = ptr::addr_of!((*raw).allocation).read();
-                    dealloc(raw.cast(), Layout::new::<Meta<A::Permit>>());
-                    *cursor = Cursor::default();
-                    drop(permit);
-                }
-                return Ok(Reclaimed::Done);
-            }
-        }
-        Ok(Reclaimed::Progress)
+    }
+
+    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
+        crate::bounded::decode::construction::in_place::text::buffer_remaining(state)
     }
 }

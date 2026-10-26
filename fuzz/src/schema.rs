@@ -1,8 +1,7 @@
 use super::*;
-use dcbor::bounded::encoding::{Preparation, PrepareStep};
-use dcbor::bounded::text_cursor::pipeline::EmitStep;
+use dcbor::bounded::encoding::Preparation;
 
-#[derive(dcbor::CBORBoundedEncodable, dcbor::CBORResumableEncodable)]
+#[derive(dcbor::CBORBoundedEncodable)]
 struct Record {
     #[cbor(n = 24)]
     text: Option<String>,
@@ -23,11 +22,16 @@ pub fn exercise_schema_schedule(data: &[u8]) {
             .take(8)
             .fold(0u64, |n, byte| (n << 8) | u64::from(*byte)),
     };
-    let expected = encode(&source, &mut Limits::new(2_000_000, 32_000_000, 4_000_000)).unwrap();
-    scheduled(&source, expected.as_ref(), seed, data.len() * 1024 + 8192);
+    let expected = encode(&source, &mut policy(None)).unwrap();
+    let bound = support::prepare_turns(support::shape(&source));
+    scheduled(&source, expected.as_ref(), seed, bound);
     super::maps::exercise(data);
 }
 
+/// Prepare `source` within `bound` turns, unrefused, refused at one call
+/// selected by `seed` and resumed, and refused there and cancelled; emit each
+/// published plan within its own bound. Resumption repeats only the refused
+/// call.
 pub(super) fn scheduled(
     source: &dyn dcbor::bounded::encoding::Schema,
     expected: &[u8],
@@ -35,28 +39,28 @@ pub(super) fn scheduled(
     bound: usize,
 ) {
     let run = |stop, cancel| {
-        let mut policy = Policy::new(stop);
+        let mut policy = policy(stop);
         let mut cursor = Preparation::new(source);
         let mut observed = false;
         for _ in 0..bound {
-            let before = policy.work;
-            let result = cursor.step(&mut policy);
-            assert!(policy.work.values - before.values <= 3);
-            assert!(policy.work.bytes - before.bytes <= 64);
+            let before = policy.used();
+            let result = support::contracted(&mut policy, &mut cursor);
+            within_turn(before, policy.used());
             match result {
-                Ok(PrepareStep::Progress) => {}
-                Ok(PrepareStep::Complete(plan)) => {
+                Ok(Step::Progress) => {}
+                Ok(Step::Complete(plan)) => {
+                    support::exhausted(&mut policy, &mut cursor);
                     drop(cursor);
                     let mut bytes = vec![0xee; plan.len()];
                     let mut writer = plan.writer(&mut bytes);
-                    let mut budget = Policy::new(None);
+                    let mut budget = super::policy(None);
                     let mut done = false;
-                    for _ in 0..plan.len() * 2 + 64 {
-                        let before = budget.work;
-                        let step = writer.step(&mut budget).unwrap();
-                        assert!(budget.work.values - before.values <= 3);
-                        assert!(budget.work.bytes - before.bytes <= 64);
-                        if step == EmitStep::Complete {
+                    for _ in 0..support::emit_turns(plan.len()) {
+                        let before = budget.used();
+                        let step = support::contracted(&mut budget, &mut writer).unwrap();
+                        within_turn(before, budget.used());
+                        if step == Step::Complete(()) {
+                            support::exhausted(&mut budget, &mut writer);
                             done = true;
                             break;
                         }
@@ -64,19 +68,20 @@ pub(super) fn scheduled(
                     assert!(done);
                     assert_eq!(bytes, expected);
                     drop(plan);
-                    assert_eq!(policy.live.get(), 0);
+                    assert_eq!(policy.live_bytes(), 0);
                     assert_eq!(observed, stop.is_some());
-                    return (policy.calls, policy.work);
+                    return (policy.attempts(), policy.used());
                 }
-                Err(BoundedError::Refused(Refusal::Scheduled)) => {
-                    assert_eq!(Some(policy.calls - 1), stop);
+                Err(BoundedError::Refused(LimitRefusal::Scheduled(at))) => {
+                    assert_eq!(Some(at), stop);
+                    assert_eq!(at, policy.attempts() - 1);
                     assert!(!observed);
                     observed = true;
-                    policy.refuse_at = None;
+                    policy.fail_call(None);
                     if cancel {
                         drop(cursor);
-                        assert_eq!(policy.live.get(), 0);
-                        return (policy.calls, policy.work);
+                        assert_eq!(policy.live_bytes(), 0);
+                        return (policy.attempts(), policy.used());
                     }
                 }
                 _ => panic!("unexpected schema outcome at {:?}", cursor.position()),

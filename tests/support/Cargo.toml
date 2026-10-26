@@ -1,0 +1,17 @@
+[package]
+name = "dcbor-test-support"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The contract-checking lifecycle driver and physical heap observer shared by dcbor's integration tests and fuzz targets."
+license = "BSD-2-Clause-Patent"
+
+# The driver is the crate root; the heap observer is its `heap` module.
+[lib]
+path = "lifecycle.rs"
+
+[dependencies]
+# The root test leg selects std or no_std. Enabling dcbor's defaults here
+# would silently turn every --no-default-features no_std test into a std test
+# through Cargo feature unification.
+dcbor = { path = "../..", default-features = false }

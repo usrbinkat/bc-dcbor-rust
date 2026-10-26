@@ -1,10 +1,10 @@
-error[E0277]: the trait bound `VecDeque<bool>: BoundedEncodable` is not satisfied
+error[E0277]: the trait bound `VecDeque<bool>: Schema` is not satisfied
  --> tests/ui/fail/unsupported_type.rs:3:10
   |
 3 | #[derive(CBORBoundedEncodable)]
-  |          ^^^^^^^^^^^^^^^^^^^^ the trait `BoundedEncodable` is not implemented for `VecDeque<bool>`
+  |          ^^^^^^^^^^^^^^^^^^^^ the trait `Schema` is not implemented for `VecDeque<bool>`
   |
-  = help: the following other types implement trait `BoundedEncodable`:
+  = help: the following other types implement trait `Schema`:
             &T
             Arc<T>
             BTreeMap<K, V>

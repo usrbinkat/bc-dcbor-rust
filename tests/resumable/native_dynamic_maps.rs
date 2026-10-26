@@ -1,12 +1,11 @@
 use super::harness::*;
+use super::support::{checked, contracted, prepare_turns, repeated_refusal, shape};
 use dcbor::bounded::{
-    BoundedError,
+    BoundedError, Step, WriteWork,
     encoding::{
-        PrepareStep, Schema,
         buckets::{BucketCursor, BucketStep},
         maps::MapPreparation,
     },
-    text_cursor::pipeline::EmitStep,
 };
 use hashbrown::HashTable;
 
@@ -14,45 +13,33 @@ use hashbrown::HashTable;
 fn hash_map_normalized_duplicates_reject_across_every_refusal() {
     let mut map = hashbrown::HashMap::new();
     map.insert("e\u{301}".to_string(), 1u64);
-    map.insert("é".to_string(), 2u64);
-    let baseline = run(&map, None, false, None);
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = run(&map, Some(stop), false, None);
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(resumed.calls, trace);
-        let cancelled = run(&map, Some(stop), true, None);
-        assert_eq!(cancelled.calls, baseline.calls[..=stop]);
-    });
+    map.insert("\u{e9}".to_string(), 2u64);
+    prepare_matrix(&map, Err(BoundedError::DuplicateKey));
 }
 
+/// One bucket per step, every control byte up to the last entry accounted
+/// for, repeated refusals leaving the position unchanged; the cursor
+/// completes after the last entry, scanning no bucket after it.
 #[test]
 fn sparse_bucket_steps_account_for_every_control_byte_and_repeated_refusal() {
     let mut table = HashTable::with_capacity(8192);
     for n in [0u64, 2000, 6000] {
         table.insert_unique(n, n, |n| *n);
     }
+    assert!(
+        table.num_buckets() > 6001,
+        "buckets lie after the last entry"
+    );
     let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
     let mut found = Vec::new();
-    for index in 0..table.num_buckets() {
+    for index in 0..=6000 {
         assert_eq!(cursor.position(), index);
-        if index % 1024 == 0 {
-            for _ in 0..3 {
-                let stop = m.calls.len();
-                m.fail_at = Some((stop, Refusal::Work));
-                assert!(matches!(
-                    cursor.step(&mut m),
-                    Err(BoundedError::Refused(Refusal::Work))
-                ));
-                assert_eq!(m.refused, Some((stop, Refusal::Work)));
-                assert_eq!(cursor.position(), index);
-                m.fail_at = None;
-                m.refused = None;
-            }
-        }
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
+        repeated_refusal("sparse bucket scan", &mut m, index, 3, |m| {
+            let result = cursor.step(m).map(|_| ());
+            (cursor.position(), result)
+        });
+        m.fresh();
         match cursor.step(&mut m).unwrap() {
             BucketStep::Entry {
                 index: actual,
@@ -67,79 +54,12 @@ fn sparse_bucket_steps_account_for_every_control_byte_and_repeated_refusal() {
     }
     found.sort();
     assert_eq!(found, [0, 2000, 6000]);
-    assert_eq!(m.bytes, table.num_buckets() as u64);
+    assert_eq!(m.used().bytes, 6001);
     assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Complete);
+    assert_eq!(cursor.position(), 6001, "no bucket after the last entry");
     assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Finished);
-    assert_eq!(m.values, table.num_buckets() as u64 + 1);
-    assert!(m.calls.iter().all(|c| !matches!(c, Call::Allocate(_))));
-}
-
-fn run(table: &dyn Schema, stop: Option<usize>, cancel: bool, expected: Option<&[u8]>) -> Meter {
-    let mut m = meter();
-    m.fail_at = stop.map(|i| (i, Refusal::Work));
-    let mut operation = MapPreparation::new(table);
-    let mut output = None;
-    let mut observed = false;
-    let mut done = false;
-    for _ in 0..65536 {
-        let before = (m.values, m.bytes);
-        m.limit_values = before.0 + 3;
-        m.limit_bytes = before.1 + 64;
-        let result = operation.step(&mut m);
-        assert!(m.values - before.0 <= 3 && m.bytes - before.1 <= 64);
-        match result {
-            Ok(PrepareStep::Progress) => {}
-            Ok(PrepareStep::Complete(plan)) => {
-                assert!(expected.is_some());
-                output = Some(plan);
-                done = true;
-                break;
-            }
-            Err(BoundedError::Refused(Refusal::Work)) => {
-                assert_eq!(m.refused, stop.map(|i| (i, Refusal::Work)));
-                assert!(!observed);
-                observed = true;
-                m.fail_at = None;
-                m.refused = None;
-                if cancel {
-                    done = true;
-                    break;
-                }
-            }
-            Err(BoundedError::DuplicateKey) => {
-                assert!(expected.is_none());
-                done = true;
-                break;
-            }
-            _ => panic!("unexpected outcome at {:?}", operation.position()),
-        }
-    }
-    assert!(done);
-    assert_eq!(observed, stop.is_some());
-    drop(operation);
-    if let Some(plan) = output {
-        assert!(m.pool.live() > 0);
-        let expected = expected.unwrap();
-        assert_eq!(plan.len(), expected.len());
-        let mut bytes = vec![0xee; expected.len()];
-        let mut writer = plan.writer(&mut bytes);
-        let mut b = meter();
-        let mut complete = false;
-        for _ in 0..expected.len() + 16 {
-            b.limit_values = b.values + 3;
-            b.limit_bytes = b.bytes + 64;
-            if writer.step(&mut b).unwrap() == EmitStep::Complete {
-                complete = true;
-                break;
-            }
-        }
-        assert!(complete);
-        assert_eq!(writer.emitted_prefix(), expected);
-        assert!(b.calls.iter().all(|c| !matches!(c, Call::Allocate(_))));
-        drop(plan);
-    }
-    assert_eq!(m.pool.live(), 0);
-    m
+    assert_eq!(m.used().values, 6001 + 1);
+    assert!(m.calls().iter().all(|c| !matches!(c, Call::Allocate(_))));
 }
 
 #[test]
@@ -151,87 +71,24 @@ fn dynamic_keys_sort_canonically_across_every_refusal_without_replay() {
     let expected = [
         0xa4, 0x61, b'a', 3, 0x61, b'z', 1, 0x62, b'a', b'a', 2, 0x62, 0xc3, 0xa9, 4,
     ];
-    let baseline = run(&table, None, false, Some(&expected));
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = run(&table, Some(stop), false, Some(&expected));
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(resumed.calls, trace);
-        assert_eq!(
-            (resumed.values, resumed.bytes),
-            (baseline.values, baseline.bytes)
-        );
-        let cancelled = run(&table, Some(stop), true, Some(&expected));
-        assert_eq!(cancelled.calls, baseline.calls[..=stop]);
-    });
+    prepare_matrix(&table, Ok(&expected));
 }
 
 #[test]
 fn normalized_duplicate_keys_reject_after_observed_suspension() {
     let mut table = HashTable::new();
     table.insert_unique(0, ("e\u{301}".to_string(), 1), |(_, v)| *v);
-    table.insert_unique(1, ("é".to_string(), 2), |(_, v)| *v);
-    let baseline = run(&table, None, false, None);
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = run(&table, Some(stop), false, None);
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(resumed.calls, trace);
-    });
+    table.insert_unique(1, ("\u{e9}".to_string(), 2), |(_, v)| *v);
+    prepare_matrix(&table, Err(BoundedError::DuplicateKey));
 }
 
 #[test]
 fn physical_map_preparation_failures_release_flat_arenas_and_reservations() {
-    use super::heap::Observation;
     let mut table = HashTable::with_capacity(32);
     for i in 0..16u64 {
         table.insert_unique(i, (format!("{i:02}e\u{301}"), i), |(_, v)| *v);
     }
-    let run = |failure| {
-        let mut m = meter();
-        m.calls.reserve(65536);
-        let observation = Observation::begin(failure);
-        let mut operation = MapPreparation::new(&table);
-        let mut output = None;
-        let mut failed = false;
-        for _ in 0..65536 {
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            match operation.step(&mut m) {
-                Ok(PrepareStep::Progress) => {}
-                Ok(PrepareStep::Complete(plan)) => {
-                    output = Some(plan);
-                    break;
-                }
-                Err(BoundedError::Allocation { .. }) => {
-                    failed = true;
-                    break;
-                }
-                _ => panic!("unexpected allocation-failure outcome"),
-            }
-            assert!(observation.snapshot().live <= m.pool.live() as usize);
-        }
-        observation.stop();
-        assert!(failed || output.is_some());
-        assert_eq!(failed, failure.is_some());
-        let stats = observation.snapshot();
-        assert_eq!(stats.denied, failure.is_some());
-        assert!(!stats.overflow);
-        assert_eq!(stats.unadmitted, 0);
-        assert!(stats.peak <= m.pool.peak() as usize);
-        drop(operation);
-        if output.is_some() {
-            assert!(m.pool.live() > 0);
-        }
-        drop(output);
-        assert_eq!(m.pool.live(), 0);
-        assert_eq!(observation.snapshot().live, 0);
-        stats.calls
-    };
-    let count = run(None);
-    every_case(count, |index| {
-        run(Some(index));
-    });
+    prepare_physical_matrix(&table);
 }
 
 #[test]
@@ -244,32 +101,30 @@ fn long_key_comparison_retains_exact_offset_across_repeated_refusal() {
             |(_, v)| *v,
         );
     }
+    // Within the preparation bound of the table's own shape; the repeated
+    // refusals below fall inside one turn and take none of their own.
+    let turns = prepare_turns(shape(&table));
     let mut operation = MapPreparation::new(&table);
     let mut m = meter();
     let mut interrupted = false;
     let mut output = None;
-    for _ in 0..65536 {
+    for _ in 0..turns {
         let position = operation.position();
         if !interrupted && position.dynamic.ordering.compared == 64 {
-            for _ in 0..3 {
-                let stop = m.calls.len();
-                m.fail_at = Some((stop, Refusal::Work));
-                assert!(matches!(
-                    operation.step(&mut m),
-                    Err(BoundedError::Refused(Refusal::Work))
-                ));
-                assert_eq!(m.refused, Some((stop, Refusal::Work)));
-                assert_eq!(operation.position(), position);
-                m.fail_at = None;
-                m.refused = None;
-            }
+            repeated_refusal("long key at comparison byte 64", &mut m, position, 3, |m| {
+                let result = contracted(m, &mut operation).map(|_| ());
+                (operation.position(), result)
+            });
             interrupted = true;
         }
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        if let PrepareStep::Complete(plan) = operation.step(&mut m).unwrap() {
-            output = Some(plan);
-            break;
+        match checked(&mut m, |m| contracted(m, &mut operation)) {
+            Ok(Step::Complete(plan)) => {
+                output = Some(plan);
+                break;
+            }
+            Ok(Step::Progress) => {}
+            Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
+            other => panic!("comparison failed: {}", super::support::label(&other)),
         }
     }
     assert!(interrupted);
@@ -281,27 +136,15 @@ fn long_key_comparison_retains_exact_offset_across_repeated_refusal() {
         expected.extend([b'a'; 256]);
         expected.extend([last, value]);
     }
-    let mut bytes = vec![0; plan.len()];
-    let mut writer = plan.writer(&mut bytes);
-    let mut done = false;
-    for _ in 0..expected.len() + 16 {
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
-        if writer.step(&mut m).unwrap() == EmitStep::Complete {
-            done = true;
-            break;
-        }
-    }
-    assert!(done);
-    assert_eq!(writer.emitted_prefix(), expected);
+    emit(&plan, &expected, &mut m);
     drop(plan);
-    assert_eq!(m.pool.live(), 0);
+    assert_eq!(m.live_bytes(), 0);
 }
 
 #[test]
 fn empty_dynamic_map_has_one_canonical_header() {
     let table = HashTable::<(String, u64)>::new();
-    run(&table, None, false, Some(&[0xa0]));
+    prepare_matrix(&table, Ok(&[0xa0]));
 }
 
 #[test]
@@ -320,26 +163,20 @@ fn deletion_sparse_cursor_refuses_at_every_bucket_and_terminal_transition() {
     }
     assert_eq!(table.num_buckets(), buckets);
     assert_eq!(table.len(), 3);
+    // The last entry, 255, lies in bucket 255: the cursor completes at the
+    // next step, before the buckets after it.
+    let last = 255;
+    assert_eq!(table.get_bucket(last), Some(&255));
+    assert!(buckets > last + 1, "buckets lie after the last entry");
     let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
     let mut found = Vec::new();
-    for index in 0..=buckets {
-        for _ in 0..3 {
-            let call = m.calls.len();
-            let consumed = (m.values, m.bytes);
-            m.fail_at = Some((call, Refusal::Work));
-            assert!(matches!(
-                cursor.step(&mut m),
-                Err(BoundedError::Refused(Refusal::Work))
-            ));
-            assert_eq!(m.refused, Some((call, Refusal::Work)));
-            assert_eq!(cursor.position(), index);
-            assert_eq!((m.values, m.bytes), consumed);
-            m.fail_at = None;
-            m.refused = None;
-        }
-        m.limit_values = m.values + 3;
-        m.limit_bytes = m.bytes + 64;
+    for index in 0..=last + 1 {
+        repeated_refusal("deletion-sparse bucket scan", &mut m, index, 3, |m| {
+            let result = cursor.step(m).map(|_| ());
+            (cursor.position(), result)
+        });
+        m.fresh();
         match cursor.step(&mut m).unwrap() {
             BucketStep::Entry {
                 index: actual,
@@ -349,28 +186,30 @@ fn deletion_sparse_cursor_refuses_at_every_bucket_and_terminal_transition() {
                 found.push(*value);
             }
             BucketStep::Vacant { index: actual } => assert_eq!(actual, index),
-            BucketStep::Complete => assert_eq!(index, buckets),
+            BucketStep::Complete => assert_eq!(index, last + 1),
             BucketStep::Finished => panic!("early terminal state"),
         }
-        assert_eq!(cursor.position(), (index + 1).min(buckets));
+        assert_eq!(cursor.position(), (index + 1).min(last + 1));
     }
     found.sort();
     assert_eq!(found, [0, 127, 255]);
-    assert_eq!((m.values, m.bytes), (buckets as u64 + 1, buckets as u64));
-    let calls = m.calls.len();
+    let scanned = last as u64 + 1;
+    assert_eq!(m.used(), WriteWork::new(scanned + 1, scanned));
+    let calls = m.calls().len();
     assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Finished);
-    assert_eq!(m.calls.len(), calls);
+    assert_eq!(m.calls().len(), calls);
 }
 
 #[test]
 fn all_ready_bucket_step_never_scans_past_one_control_byte() {
     let mut table = HashTable::with_capacity(8192);
     table.insert_unique(4096, 7u64, |value| *value);
+    assert_eq!(table.get_bucket(4096), Some(&7));
     let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
     let mut entries = 0;
-    for index in 0..table.num_buckets() {
-        let before = (m.values, m.bytes, m.calls.len());
+    for index in 0..=4096 {
+        let before = (m.used(), m.calls().len());
         match cursor.step(&mut m).unwrap() {
             BucketStep::Entry {
                 index: actual,
@@ -384,12 +223,16 @@ fn all_ready_bucket_step_never_scans_past_one_control_byte() {
         }
         assert_eq!(cursor.position(), index + 1);
         assert_eq!(
-            (m.values, m.bytes, m.calls.len()),
-            (before.0 + 1, before.1 + 1, before.2 + 1)
+            (m.used(), m.calls().len()),
+            (
+                WriteWork::new(before.0.values + 1, before.0.bytes + 1),
+                before.1 + 1
+            )
         );
     }
     assert_eq!(entries, 1);
     assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Complete);
+    assert_eq!(cursor.position(), 4097, "no bucket after the entry");
 }
 
 #[test]
@@ -406,17 +249,7 @@ fn structured_keys_and_nested_schema_values_have_literal_canonical_order() {
     let expected = [
         0xa3, 0x81, 1, 0x81, 0x82, 1, 2, 0x81, 0x18, 24, 0x81, 0x81, 3, 0x82, 1, 2, 0x81, 0x80,
     ];
-    let baseline = run(&table, None, false, Some(&expected));
-    every_case(baseline.calls.len(), |stop| {
-        let resumed = run(&table, Some(stop), false, Some(&expected));
-        let mut trace = baseline.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(resumed.calls, trace);
-        assert_eq!(
-            (resumed.values, resumed.bytes),
-            (baseline.values, baseline.bytes)
-        );
-    });
+    prepare_matrix(&table, Ok(&expected));
 }
 
 #[test]
@@ -443,14 +276,14 @@ fn long_prefix_map_ordering_has_input_derived_n_log_n_work_bound() {
             {
                 ordering_steps += 1;
             }
-            let before = (m.values, m.bytes);
-            m.limit_values = before.0 + 3;
-            m.limit_bytes = before.1 + 64;
-            let step = operation.step(&mut m).unwrap();
-            assert!(m.values - before.0 <= 3 && m.bytes - before.1 <= 64);
-            if let PrepareStep::Complete(plan) = step {
-                output = Some(plan);
-                break;
+            match checked(&mut m, |m| contracted(m, &mut operation)) {
+                Ok(Step::Complete(plan)) => {
+                    output = Some(plan);
+                    break;
+                }
+                Ok(Step::Progress) => {}
+                Err(error) if super::support::ordinary_exhaustion(&m, &error) => {}
+                other => panic!("ordering failed: {}", super::support::label(&other)),
             }
         }
         assert!(
@@ -469,21 +302,9 @@ fn long_prefix_map_ordering_has_input_derived_n_log_n_work_bound() {
             expected.extend(format!("{suffix:03}").bytes());
             expected.push(0);
         }
-        let mut bytes = vec![0; plan.len()];
-        let mut writer = plan.writer(&mut bytes);
-        let mut complete = false;
-        for _ in 0..expected.len() + 1 {
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            if writer.step(&mut m).unwrap() == EmitStep::Complete {
-                complete = true;
-                break;
-            }
-        }
-        assert!(complete);
-        assert_eq!(writer.emitted_prefix(), expected);
+        emit(&plan, &expected, &mut m);
         drop(operation);
         drop(plan);
-        assert_eq!(m.pool.live(), 0);
+        assert_eq!(m.live_bytes(), 0);
     }
 }

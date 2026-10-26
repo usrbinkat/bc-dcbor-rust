@@ -1,25 +1,34 @@
 use dcbor::CBOR;
+use dcbor::CBORDecodable;
 use dcbor::bounded::*;
 use half::f16;
 
-struct Admit;
-impl Budget for Admit {
-    type Refusal = ();
-    fn traverse(&mut self, _: u64, _: u64) -> Result<(), ()> {
-        Ok(())
-    }
+#[test]
+fn int_coerced_to_float() {
+    let n = 42;
+    let c: CBOR = n.into();
+    let f = f64::try_from_cbor(&c).unwrap();
+    assert_eq!(f, n as f64);
+    let c2: CBOR = f.into();
+    assert_eq!(c2, c);
+    let i: i32 = c.try_into().unwrap();
+    assert_eq!(i, n);
 }
-impl Allocator for Admit {
-    type Permit = ();
-    fn allocate(&mut self, _: u64) -> Result<(), ()> {
-        Ok(())
-    }
+
+#[test]
+fn fail_float_coerced_to_int() {
+    let n = 42.5;
+    let c: CBOR = n.into();
+    let f = f64::try_from_cbor(&c).unwrap();
+    assert_eq!(f, n);
+    assert!(i32::try_from(c).is_err());
 }
-fn encoded(value: &(impl BoundedEncodable + ?Sized)) -> Vec<u8> {
-    let prepared = prepare(value, &mut Admit).unwrap();
-    let mut bytes = vec![0; prepared.len() as usize];
-    prepared.encode_into(&mut bytes, &mut Admit).unwrap();
-    bytes
+
+fn encoded(value: &(impl Schema + ?Sized)) -> Vec<u8> {
+    encode(value, &mut Limits::unlimited())
+        .expect("an unlimited encoding completes")
+        .as_ref()
+        .to_vec()
 }
 
 /// Draft-12 section 7.1: literals are the authority, not another serializer.
@@ -69,6 +78,11 @@ fn published_numeric_vectors_in_every_exact_source_precision() {
         (f64::NAN, "f97e00"),
         (-33554432.0, "3a01ffffff"),
         (-18446744073709551616.0, "fadf800000"),
+        // Whole doubles below the dCBOR integer range are not reduced: each
+        // stays at the narrowest float that holds it exactly.
+        (-9223372036854777856.0, "fbc3e0000000000001"),
+        (-18446744073709549568.0, "fbc3efffffffffffff"),
+        (-18446744073709555712.0, "fbc3f0000000000001"),
     ];
     for &(value, expected) in fixtures {
         let expected = hex::decode(expected).unwrap();
@@ -96,24 +110,73 @@ fn published_numeric_vectors_in_every_exact_source_precision() {
         hex::decode("1bffffffffffffffff").unwrap()
     );
     assert_eq!(CBOR::from(u64::MAX).to_cbor_data(), encoded(&u64::MAX));
+    // An integer with more precision than any float holds stays an integer.
+    let precise = -9223372036854775807i64;
+    let expected = hex::decode("3b7ffffffffffffffe").unwrap();
+    assert_eq!(encoded(&precise), expected);
+    assert_eq!(CBOR::from(precise).to_cbor_data(), expected);
+    assert_eq!(
+        i64::try_from(CBOR::try_from_data(&expected).unwrap()).unwrap(),
+        precise
+    );
 }
 
+/// Noncanonical NaN payload examples at each source precision encode as the
+/// canonical half-precision NaN on both paths.
+#[test]
+fn noncanonical_nan_payloads_encode_as_the_canonical_nan() {
+    let canonical = hex::decode("f97e00").unwrap();
+    let double = f64::from_bits(0x7ff9_1000_0000_0001);
+    let single = f32::from_bits(0xffc0_0001);
+    let half = f16::from_bits(0x7e01);
+    assert!(double.is_nan() && single.is_nan() && half.is_nan());
+    assert_eq!(encoded(&double), canonical, "bounded f64 NaN payload");
+    assert_eq!(encoded(&single), canonical, "bounded f32 NaN payload");
+    assert_eq!(encoded(&half), canonical, "bounded f16 NaN payload");
+    assert_eq!(CBOR::from(double).to_cbor_data(), canonical);
+    assert_eq!(CBOR::from(single).to_cbor_data(), canonical);
+    assert_eq!(CBOR::from(half).to_cbor_data(), canonical);
+}
+
+/// Each invalid vector is rejected with its exact class: a float or head
+/// not in its narrowest canonical form is `NonCanonicalNumeric`
+/// (`decode::parse_header_varint`, `float::validate_canonical_*`); a negative
+/// integer below the dCBOR range is `OutOfRange` (`decode_cbor_internal`).
 #[test]
 fn published_invalid_numeric_vectors_are_rejected() {
-    for hex in [
-        "f94a00",
-        "fb3ff8000000000000",
-        "3b8000000000000000",
-        "3bffffffffffffffff",
-        "fb7ff0000000000000",
-        "fa7f800000",
-        "fbfff0000000000000",
-        "faff800000",
-        "fb7ff9100000000001",
-        "faffc00001",
-        "f97e01",
+    use dcbor::Error;
+    use std::mem::discriminant;
+    let noncanonical = Error::NonCanonicalNumeric;
+    let range = Error::OutOfRange;
+    for (hex, expected) in [
+        // 10.0 at half precision: must be the integer 10.
+        ("f94a00", &noncanonical),
+        // 1.5 at double precision: fits a half.
+        ("fb3ff8000000000000", &noncanonical),
+        // 2^32 at single precision: must be an integer.
+        ("fa4f800000", &noncanonical),
+        // -2^63 - 1, -2^64 + 1 and -2^64: 65-bit negatives (draft 7.2).
+        ("3b8000000000000000", &range),
+        ("3bfffffffffffffffe", &range),
+        ("3bffffffffffffffff", &range),
+        // Infinities wider than a half.
+        ("fb7ff0000000000000", &noncanonical),
+        ("fa7f800000", &noncanonical),
+        ("fbfff0000000000000", &noncanonical),
+        ("faff800000", &noncanonical),
+        // NaNs other than the canonical f97e00.
+        ("fb7ff9100000000001", &noncanonical),
+        ("faffc00001", &noncanonical),
+        ("f97e01", &noncanonical),
     ] {
-        assert!(CBOR::try_from_hex(hex).is_err(), "accepted {hex}");
+        match CBOR::try_from_hex(hex) {
+            Ok(value) => panic!("accepted {hex} as {value:?}"),
+            Err(error) => assert_eq!(
+                discriminant(&error),
+                discriminant(expected),
+                "{hex}: rejected as {error:?}, expected {expected:?}"
+            ),
+        }
     }
 }
 
@@ -229,18 +292,4 @@ fn equal_source_values_have_identical_encodings() {
         CBOR::from(-33554432.0f32).to_cbor_data(),
         [0x3a, 0x01, 0xff, 0xff, 0xff]
     );
-}
-
-#[test]
-fn profile_rejects_unreduced_floats_and_wide_negative_integers() {
-    for bytes in [
-        &[0xfa, 0x4f, 0x80, 0, 0][..],      // 2^32 must be an integer
-        &[0x3b, 0x80, 0, 0, 0, 0, 0, 0, 0], // -2^63 - 1
-        &[0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], // -2^64
-    ] {
-        assert!(CBOR::try_from_data(bytes).is_err(), "{bytes:02x?}");
-    }
-    let bytes = [0xfa, 0xdf, 0x7f, 0xff, 0xff];
-    let value = CBOR::try_from_data(bytes).unwrap();
-    assert_eq!(value.to_cbor_data(), bytes);
 }

@@ -1,172 +1,21 @@
 #![cfg(all(feature = "std", feature = "derive"))]
 //! Black-box resource and failure tests. No normalization or encoder internals
 //! are used; the allocator observes real heap requests on the test thread.
-use dcbor::{ByteString, CBOR, CBORBoundedEncodable, CBOREncodable, bounded::*};
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-    rc::Rc,
-};
-
-#[derive(Clone, Copy, Default, Debug)]
-struct Heap {
-    active: bool,
-    calls: usize,
-    fail_at: Option<usize>,
-    denied: bool,
-    admitted_bytes: u64,
-    unadmitted: usize,
-}
-thread_local! { static HEAP: Cell<Heap> = const { Cell::new(Heap {
-    active: false, calls: 0, fail_at: None, denied: false,
-    admitted_bytes: 0, unadmitted: 0,
-}) }; }
-struct Observed;
-fn deny_allocation(bytes: usize) -> bool {
-    HEAP.try_with(|state| {
-        let mut s = state.get();
-        if !s.active {
-            return false;
-        }
-        let deny = s.fail_at == Some(s.calls);
-        if bytes as u64 > s.admitted_bytes {
-            s.unadmitted += 1;
-        }
-        s.admitted_bytes = 0;
-        s.calls += 1;
-        s.denied |= deny;
-        state.set(s);
-        deny
-    })
-    .unwrap_or(false)
-}
-// The wrapper preserves System's layout/pointer contract. Only a configured
-// allocation request returns null; deallocations are always forwarded.
-unsafe impl GlobalAlloc for Observed {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if deny_allocation(layout.size()) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { System.alloc(layout) }
-        }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if deny_allocation(layout.size()) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { System.alloc_zeroed(layout) }
-        }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if deny_allocation(size) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { System.realloc(ptr, layout, size) }
-        }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
 #[global_allocator]
-static ALLOCATOR: Observed = Observed;
+static HEAP: heap::Heap = heap::Heap;
+use core::cell::Cell;
+use dcbor::bounded::encoding::{BUCKET_WINDOW, Instruction, Shape};
+use dcbor::{ByteString, CBOR, CBORBoundedEncodable, CBOREncodable, bounded::*};
+use dcbor_test_support::heap::{self, Observation};
+use dcbor_test_support::{physical_matrix, synchronous_matrix};
+use std::rc::Rc;
 
-fn observe<T>(fail_at: Option<usize>, f: impl FnOnce() -> T) -> (T, Heap) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            HEAP.with(|s| {
-                let mut h = s.get();
-                h.active = false;
-                s.set(h);
-            });
-        }
-    }
-    HEAP.with(|s| {
-        s.set(Heap {
-            active: true,
-            fail_at,
-            ..Heap::default()
-        })
-    });
-    let reset = Reset;
-    let result = f();
-    let heap = HEAP.with(Cell::get);
-    drop(reset);
-    (result, heap)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Refusal(usize);
-struct Permit {
-    bytes: u64,
-    live: Rc<Cell<u64>>,
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.live
-            .set(self.live.get().checked_sub(self.bytes).unwrap());
-    }
-}
-struct Policy {
-    calls: usize,
-    refuse_at: Option<usize>,
-    live: Rc<Cell<u64>>,
-    peak: u64,
-    limit: u64,
-    work: WriteWork,
-}
-impl Policy {
-    fn new(refuse_at: Option<usize>) -> Self {
-        Self {
-            calls: 0,
-            refuse_at,
-            live: Rc::new(Cell::new(0)),
-            peak: 0,
-            limit: u64::MAX,
-            work: WriteWork::default(),
-        }
-    }
-    fn admit(&mut self) -> Result<(), Refusal> {
-        let index = self.calls;
-        self.calls += 1;
-        if self.refuse_at == Some(index) {
-            Err(Refusal(index))
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Budget for Policy {
-    type Refusal = Refusal;
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
-        self.admit()?;
-        self.work = self.work.then::<()>(WriteWork::new(values, bytes)).unwrap();
-        Ok(())
-    }
-}
-impl Allocator for Policy {
-    type Permit = Permit;
-    fn allocate(&mut self, bytes: u64) -> Result<Permit, Refusal> {
-        self.admit()?;
-        let live = self.live.get().checked_add(bytes).unwrap();
-        if live > self.limit {
-            return Err(Refusal(self.calls - 1));
-        }
-        self.live.set(live);
-        self.peak = self.peak.max(live);
-        HEAP.with(|state| {
-            let mut heap = state.get();
-            if heap.active {
-                heap.admitted_bytes = bytes;
-            }
-            state.set(heap);
-        });
-        Ok(Permit {
-            bytes,
-            live: self.live.clone(),
-        })
-    }
+/// An unlimited policy refusing call `refuse_at`, reporting each admitted
+/// allocation to the heap observer.
+fn policy(refuse_at: Option<usize>) -> Limits {
+    Limits::unlimited()
+        .refusing(refuse_at)
+        .observe(heap::admitted)
 }
 
 #[derive(Clone, CBOREncodable, CBORBoundedEncodable)]
@@ -198,16 +47,31 @@ fn record() -> Record {
     }
 }
 
+/// Require that preparing `value` fails with exactly `expected`, every heap
+/// request admitted first and nothing held after.
+#[track_caller]
+fn refused_as(value: &dyn Schema, expected: BoundedError<LimitRefusal>) -> Limits {
+    let mut policy = policy(None);
+    let (result, heap) = Observation::run(None, || prepare(value, &mut policy));
+    match result {
+        Err(error) => assert_eq!(error, expected),
+        Ok(prepared) => panic!("prepared {} bytes, expected {expected:?}", prepared.len()),
+    }
+    assert_eq!(heap.unadmitted, 0, "heap request preceded admission");
+    assert_eq!(policy.live_bytes(), 0, "storage held after {expected:?}");
+    policy
+}
+
 #[test]
 fn every_preparation_admission_can_refuse_without_leaking() {
     let value = record();
-    let mut baseline = Policy::new(None);
+    let mut baseline = policy(None);
     drop(prepare(&value, &mut baseline).unwrap());
-    assert_eq!(baseline.live.get(), 0);
-    assert!(baseline.calls > 100);
-    for at in 0..baseline.calls {
-        let mut policy = Policy::new(Some(at));
-        let (result, heap) = observe(None, || prepare(&value, &mut policy));
+    assert_eq!(baseline.live_bytes(), 0);
+    assert!(baseline.attempts() > 100);
+    synchronous_matrix("preparing a record", baseline.attempts(), |at| {
+        let mut policy = policy(Some(at));
+        let (result, heap) = Observation::run(None, || prepare(&value, &mut policy));
         assert_eq!(
             heap.unadmitted, 0,
             "heap request preceded admission at step {at}"
@@ -216,54 +80,58 @@ fn every_preparation_admission_can_refuse_without_leaking() {
             assert_eq!(heap.calls, 0);
         }
         let error = result.err().expect("refusal must propagate");
-        assert_eq!(error, BoundedError::Refused(Refusal(at)));
-        assert_eq!(policy.calls, at + 1, "no further admission after refusal");
-        assert_eq!(policy.live.get(), 0, "leak at admission {at}");
-    }
+        assert_eq!(error, BoundedError::Refused(LimitRefusal::Scheduled(at)));
+        assert_eq!(
+            policy.attempts(),
+            at + 1,
+            "no further admission after refusal"
+        );
+        assert_eq!(policy.live_bytes(), 0, "leak at admission {at}");
+    });
 }
 
 #[test]
 fn every_real_scratch_allocation_can_fail_after_admission() {
     let value = record();
-    let mut baseline = Policy::new(None);
-    let (prepared, heap) = observe(None, || prepare(&value, &mut baseline));
-    drop(prepared.unwrap());
-    assert!(heap.calls > 0);
-    assert_eq!(heap.unadmitted, 0);
-    for at in 0..heap.calls {
-        let mut policy = Policy::new(None);
-        let (result, heap) = observe(Some(at), || prepare(&value, &mut policy));
-        assert!(heap.denied);
-        assert_eq!(heap.unadmitted, 0);
-        assert!(
-            matches!(result, Err(BoundedError::Allocation { .. })),
-            "failure {at}"
-        );
-        drop(result);
+    physical_matrix("preparing a record physically", |failure| {
+        let mut policy = policy(None);
+        let (result, heap) = Observation::run(failure, || prepare(&value, &mut policy));
+        assert_eq!(heap.unadmitted, 0, "heap request preceded admission");
+        match failure {
+            None => drop(result.expect("the unobstructed preparation")),
+            Some(at) => {
+                assert_eq!(heap.denied, 1, "failure {at} was not exercised");
+                assert!(
+                    matches!(result, Err(BoundedError::Allocation { .. })),
+                    "failure {at}"
+                );
+                drop(result);
+            }
+        }
         assert_eq!(
-            policy.live.get(),
+            policy.live_bytes(),
             0,
-            "permits survive allocation failure {at}"
+            "permits survive allocation failure {failure:?}"
         );
-    }
+        heap.calls
+    });
 }
 
 #[test]
 fn peak_live_limit_counts_old_and_new_reservations() {
     let value = record();
-    let mut baseline = Policy::new(None);
+    let mut baseline = policy(None);
     let prepared = prepare(&value, &mut baseline).unwrap();
-    let peak = baseline.peak;
+    let peak = baseline.peak_bytes();
     assert!(peak > 0);
     drop(prepared);
     for limit in [0, peak / 2, peak - 1, peak] {
-        let mut policy = Policy::new(None);
-        policy.limit = limit;
+        let mut policy = Limits::new(u64::MAX, u64::MAX, limit);
         let result = prepare(&value, &mut policy);
         assert_eq!(result.is_ok(), limit == peak);
-        assert!(policy.peak <= limit);
+        assert!(policy.peak_bytes() <= limit);
         drop(result);
-        assert_eq!(policy.live.get(), 0);
+        assert_eq!(policy.live_bytes(), 0);
     }
 }
 
@@ -271,146 +139,168 @@ fn peak_live_limit_counts_old_and_new_reservations() {
 fn every_write_refusal_preserves_guards_and_allows_retry_without_allocating() {
     let value = record();
     let symbolic = CBOR::from(value.clone()).to_cbor_data();
-    let mut allocator = Policy::new(None);
+    let mut allocator = policy(None);
     let prepared = prepare(&value, &mut allocator).unwrap();
-    let len = prepared.len() as usize;
+    let len = prepared.len();
     let mut guarded = vec![0xee; len + 2];
-    let mut baseline = Policy::new(None);
-    let (result, heap) = observe(None, || {
+    let mut baseline = policy(None);
+    let (result, heap) = Observation::run(None, || {
         prepared.encode_into(&mut guarded[1..=len], &mut baseline)
     });
     result.unwrap();
     assert_eq!(heap.calls, 0, "writing requested real heap storage");
     assert_eq!(&guarded[1..=len], symbolic);
-    assert!(prepared.write_work().covers(&baseline.work));
-    for at in 0..baseline.calls {
+    let write = prepared
+        .write_work::<()>()
+        .expect("the write bound of a plan held in memory fits in u64");
+    assert!(
+        write.covers(&baseline.used()),
+        "{:?} beyond {write:?}",
+        baseline.used()
+    );
+    synchronous_matrix("writing a record's plan", baseline.attempts(), |at| {
         guarded.fill(0xee);
-        let mut policy = Policy::new(Some(at));
-        let (result, heap) = observe(None, || {
-            prepared.encode_into(&mut guarded[1..=len], &mut policy)
+        let mut refusing = policy(Some(at));
+        let (result, heap) = Observation::run(None, || {
+            prepared.encode_into(&mut guarded[1..=len], &mut refusing)
         });
-        assert_eq!(result, Err(BoundedError::Refused(Refusal(at))));
+        assert_eq!(
+            result,
+            Err(BoundedError::Refused(LimitRefusal::Scheduled(at)))
+        );
         assert_eq!(heap.calls, 0);
-        assert_eq!(policy.calls, at + 1);
+        assert_eq!(refusing.attempts(), at + 1);
         assert_eq!((guarded[0], guarded[len + 1]), (0xee, 0xee));
         if at == 0 {
             assert!(guarded.iter().all(|b| *b == 0xee));
         }
-        // A cursor is per attempt, not consumed permanently by a failed write.
+        // A writer is per attempt, not consumed permanently by a failed write.
         prepared
-            .encode_into(&mut guarded[1..=len], &mut Policy::new(None))
+            .encode_into(&mut guarded[1..=len], &mut policy(None))
             .unwrap();
         assert_eq!(&guarded[1..=len], symbolic);
-    }
+    });
     drop(prepared);
-    assert_eq!(allocator.live.get(), 0);
+    assert_eq!(allocator.live_bytes(), 0);
 }
 
 #[test]
 fn wrong_output_size_is_rejected_before_budget_or_output_changes() {
     let value = record();
-    let mut allocator = Policy::new(None);
+    let mut allocator = policy(None);
     let prepared = prepare(&value, &mut allocator).unwrap();
-    for size in [0, prepared.len() as usize - 1, prepared.len() as usize + 1] {
+    let len = prepared.len();
+    for size in [0, len - 1, len + 1] {
         let mut output = vec![0xee; size];
-        let mut policy = Policy::new(Some(0));
-        let result = prepared.encode_into(&mut output, &mut policy);
-        assert!(matches!(result, Err(BoundedError::OutputSize { .. })));
-        assert_eq!(policy.calls, 0);
+        let mut policy = policy(Some(0));
+        assert_eq!(
+            prepared.encode_into(&mut output, &mut policy),
+            Err(BoundedError::OutputSize {
+                measured: len as u64,
+                provided: size as u64,
+            })
+        );
+        assert_eq!(policy.attempts(), 0);
         assert!(output.iter().all(|b| *b == 0xee));
     }
 }
 
-struct Underreported(WriteWork);
-impl BoundedEncodable for Underreported {
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Measure {
-            len: 1,
-            write: WriteWork::default(),
-        })
-    }
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        budget: &mut B,
-    ) -> BoundedResult<(), B> {
-        budget
-            .traverse(self.0.values, self.0.bytes)
-            .map_err(BoundedError::Refused)?;
-        output.byte(0)
+/// A source answering differently on each pass: a byte string of one byte
+/// while its shape is walked, of every byte it holds once it is prepared.
+struct Unstable {
+    passes: Cell<usize>,
+    bytes: [u8; 200],
+}
+
+impl Schema for Unstable {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        if index == 0 {
+            self.passes.set(self.passes.get() + 1);
+        }
+        let len = if self.passes.get() == 1 {
+            1
+        } else {
+            self.bytes.len()
+        };
+        match index {
+            0 => Instruction::Head(MajorType::ByteString, Argument::Shortest(len as u64)),
+            1 => Instruction::Bytes(&self.bytes[..len]),
+            _ => Instruction::End,
+        }
     }
 }
+
+/// A source longer when prepared than when walked cannot grow the plan's
+/// arena past the walked extent: the growth that would pass it is refused.
 #[test]
-fn understated_work_is_an_invariant_error_before_the_caller_is_charged() {
-    for work in [WriteWork::new(1, 0), WriteWork::new(0, 1)] {
-        let value = Underreported(work);
-        let mut allocator = Policy::new(None);
-        let prepared = prepare(&value, &mut allocator).unwrap();
-        let mut output = [0xee];
-        let mut budget = Policy::new(None);
-        assert_eq!(
-            prepared.encode_into(&mut output, &mut budget),
-            Err(BoundedError::WorkExceeded {
-                predicted: WriteWork::default(),
-                attempted: work,
-            })
-        );
-        assert_eq!(budget.calls, 0);
-        assert_eq!(output, [0xee]);
-    }
+fn a_source_longer_than_its_walk_is_refused_at_the_arena_cap() {
+    let value = Unstable {
+        passes: Cell::new(0),
+        bytes: [0x5a; 200],
+    };
+    refused_as(&value, BoundedError::PlanMismatch);
+    assert_eq!(value.passes.get(), 2, "walked once, prepared once");
 }
 
-struct BadLength {
-    measured: u64,
-    written: usize,
-}
+/// A counted map whose source visits another number of fields than its head
+/// carries.
+struct Miscounted;
 
-struct CumulativeOverflow(bool);
-impl BoundedEncodable for CumulativeOverflow {
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Measure {
-            len: 1,
-            write: WriteWork::new(u64::MAX, u64::MAX),
-        })
-    }
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        budget: &mut B,
-    ) -> BoundedResult<(), B> {
-        let (values, bytes) = if self.0 { (u64::MAX, 0) } else { (0, u64::MAX) };
-        budget
-            .traverse(values, bytes)
-            .map_err(BoundedError::Refused)?;
-        budget
-            .traverse(u64::from(self.0), u64::from(!self.0))
-            .map_err(BoundedError::Refused)?;
-        output.byte(0)
+impl Schema for Miscounted {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::CountedMap(2),
+            1 => Instruction::Field(0, Some(&true)),
+            _ => Instruction::End,
+        }
     }
 }
 
 #[test]
-fn cumulative_write_work_overflow_is_not_forwarded() {
-    for value in [CumulativeOverflow(false), CumulativeOverflow(true)] {
-        let prepared = prepare(&value, &mut Policy::new(None)).unwrap();
-        let mut policy = Policy::new(None);
-        let mut bytes = [0xee];
-        let (result, heap) = observe(None, || prepared.encode_into(&mut bytes, &mut policy));
-        assert_eq!(result, Err(BoundedError::Overflow));
-        assert_eq!(policy.calls, 1);
-        assert_eq!(bytes, [0xee]);
-        assert_eq!(heap.calls, 0);
+fn a_counted_map_visiting_another_count_is_refused_at_its_end() {
+    refused_as(&Miscounted, BoundedError::PlanMismatch);
+}
+
+/// An unordered map whose entry claims to inspect a whole window past the
+/// most one instruction may.
+struct Leaping;
+
+impl Schema for Leaping {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::UnorderedMap,
+            1 => Instruction::Entry {
+                next: 2 + BUCKET_WINDOW,
+                entry: None,
+            },
+            _ => Instruction::End,
+        }
     }
+}
+
+#[test]
+fn an_entry_past_its_window_is_refused() {
+    refused_as(&Leaping, BoundedError::PlanMismatch);
+}
+
+/// A source that is its own child, without end.
+struct Endless;
+
+impl Schema for Endless {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::Child(self),
+            _ => Instruction::End,
+        }
+    }
+}
+
+/// Unbounded nesting is refused by the shape walk, before anything is
+/// requested.
+#[test]
+fn an_endless_source_is_refused_before_any_allocation() {
+    let policy = refused_as(&Endless, BoundedError::DepthLimit);
+    assert_eq!(policy.requests(), 0, "the walk requested storage");
 }
 
 #[derive(CBORBoundedEncodable)]
@@ -421,205 +311,103 @@ struct AbsentFields {
     b: Option<bool>,
 }
 
+/// Absent fields are inspected, for the map's counted head, when the value is
+/// walked and when it is prepared; writing the encoding inspects nothing.
 #[test]
-fn absent_fields_are_admitted_even_when_nothing_is_encoded() {
+fn absent_fields_are_inspected_in_preparation_and_not_when_written() {
     let value = AbsentFields { a: None, b: None };
-    let mut allocator = Policy::new(None);
+    let mut allocator = policy(None);
     let prepared = prepare(&value, &mut allocator).unwrap();
+    // Walked, then prepared: each pass its five instructions (the
+    // inspection, the counted map, two fields, the end) and two presences.
     assert!(
-        allocator.work.values >= 3,
-        "map plus both field inspections"
+        allocator.used().values >= 2 * (5 + 2),
+        "{:?}: the inspections were not admitted",
+        allocator.used()
     );
-    let mut policy = Policy::new(Some(0));
+    let mut refusing = policy(Some(0));
     let mut bytes = [0xee];
     assert_eq!(
-        prepared.encode_into(&mut bytes, &mut policy),
-        Err(BoundedError::Refused(Refusal(0)))
+        prepared.encode_into(&mut bytes, &mut refusing),
+        Err(BoundedError::Refused(LimitRefusal::Scheduled(0)))
     );
     assert_eq!(bytes, [0xee]);
-    let mut policy = Policy::new(None);
-    prepared.encode_into(&mut bytes, &mut policy).unwrap();
+    let mut admitting = policy(None);
+    prepared.encode_into(&mut bytes, &mut admitting).unwrap();
     assert_eq!(bytes, [0xa0]);
-    assert!(policy.work.values >= 3);
-    assert!(prepared.write_work().covers(&policy.work));
-}
-impl BoundedEncodable for BadLength {
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Measure::leaf(self.measured, 0))
-    }
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        _: &mut B,
-    ) -> BoundedResult<(), B> {
-        output.slice(&[0; 3][..self.written])
-    }
-}
-#[test]
-fn incorrect_lengths_fail_at_the_sink() {
-    for (measured, written) in [(1, 2), (2, 1)] {
-        let value = BadLength { measured, written };
-        let prepared = prepare(&value, &mut Policy::new(None)).unwrap();
-        let mut output = [0xee; 4];
-        let result = prepared.encode_into(
-            &mut output[1..1 + measured as usize],
-            &mut Policy::new(None),
-        );
-        assert!(if written as u64 > measured {
-            matches!(result, Err(BoundedError::Capacity { .. }))
-        } else {
-            matches!(result, Err(BoundedError::Length { .. }))
-        });
-        assert_eq!((output[0], output[3]), (0xee, 0xee));
-    }
-}
-
-struct BadPlan(bool);
-impl BoundedEncodable for BadPlan {
-    fn measure<A: Allocator>(
-        &self,
-        plan: &mut Plan<A::Permit>,
-        allocator: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        if self.0 {
-            text::measure_text("e\u{301}", plan, allocator)
-        } else {
-            Ok(Measure::leaf(3, 100))
-        }
-    }
-    fn write<P, B: Budget>(
-        &self,
-        plan: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        budget: &mut B,
-    ) -> BoundedResult<(), B> {
-        if self.0 {
-            output.slice(&[0x62, 0xc3, 0xa9])
-        } else {
-            text::write_text("e\u{301}", plan, output, budget)
-        }
-    }
-}
-#[test]
-fn missing_and_unconsumed_plan_entries_are_rejected() {
-    for value in [BadPlan(false), BadPlan(true)] {
-        let mut allocator = Policy::new(None);
-        let prepared = prepare(&value, &mut allocator).unwrap();
-        assert_eq!(
-            prepared.encode_into(&mut [0; 3], &mut Policy::new(None)),
-            Err(BoundedError::PlanMismatch)
-        );
-        drop(prepared);
-        assert_eq!(allocator.live.get(), 0);
-    }
-}
-
-struct Huge;
-impl BoundedEncodable for Huge {
-    const FIXED: Option<Measure> = Some(Measure {
-        len: u64::MAX,
-        write: WriteWork::new(u64::MAX, 0),
-    });
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Self::FIXED.unwrap())
-    }
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        _: &mut Output<'_>,
-        _: &mut B,
-    ) -> BoundedResult<(), B> {
-        panic!("overflow must stop preparation")
-    }
-}
-#[test]
-fn fixed_measure_overflow_never_reaches_writing_or_allocation() {
-    let mut policy = Policy::new(None);
-    assert!(matches!(
-        prepare(&[Huge, Huge], &mut policy),
-        Err(BoundedError::Overflow)
-    ));
-    assert_eq!(policy.live.get(), 0);
-}
-
-struct FalseFixed;
-impl BoundedEncodable for FalseFixed {
-    const FIXED: Option<Measure> = Some(Measure {
-        len: 1,
-        write: WriteWork::new(0, 0),
-    });
-    fn measure<A: Allocator>(
-        &self,
-        _: &mut Plan<A::Permit>,
-        _: &mut A,
-    ) -> BoundedResult<Measure, A> {
-        Ok(Measure::leaf(1, 0))
-    }
-    fn write<P, B: Budget>(
-        &self,
-        _: &mut Cursor<'_, P>,
-        output: &mut Output<'_>,
-        budget: &mut B,
-    ) -> BoundedResult<(), B> {
-        budget.traverse(1, 0).map_err(BoundedError::Refused)?;
-        output.byte(0)
-    }
-}
-
-#[test]
-fn false_fixed_prediction_is_enforced_when_composed() {
-    let value = [FalseFixed];
-    let prepared = prepare(&value, &mut Policy::new(None)).unwrap();
-    let mut budget = Policy::new(None);
-    let mut output = [0xee; 2];
-    assert!(matches!(
-        prepared.encode_into(&mut output, &mut budget),
-        Err(BoundedError::WorkExceeded { .. })
-    ));
-    assert_eq!(
-        budget.calls, 1,
-        "only the admitted array visit reaches the caller"
-    );
-    assert_eq!(output, [0x81, 0xee]);
+    // One segment of the head's byte, then the completion.
+    assert_eq!(admitting.used(), WriteWork::new(2, 1));
+    let write = prepared
+        .write_work::<()>()
+        .expect("the write bound of a plan held in memory fits in u64");
+    assert!(write.covers(&admitting.used()));
 }
 
 #[test]
 fn heap_observer_detects_unreported_allocations() {
     // Positive control: if instrumentation is accidentally disabled, the
     // allocation-free tests must not silently become vacuous.
-    let (bytes, heap) = observe(None, || std::hint::black_box(vec![7u8; 1024]));
+    let (bytes, heap) = Observation::run(None, || std::hint::black_box(vec![7u8; 1024]));
     assert!(heap.calls > 0);
     assert!(heap.unadmitted > 0);
     assert_eq!(bytes.len(), 1024);
 }
 
+/// The heap requests of preparing `value`, all admitted.
+fn requests(value: &dyn Schema) -> (usize, usize) {
+    let mut policy = policy(None);
+    let (result, heap) = Observation::run(None, || prepare(value, &mut policy));
+    drop(result.unwrap());
+    assert_eq!(heap.unadmitted, 0);
+    assert_eq!(policy.live_bytes(), 0);
+    (heap.calls, policy.requests())
+}
+
+/// Text the quick check proves normal is copied as it is, and numbers are
+/// appended head by head: each prepares with exactly the requests of a byte
+/// string of the same encoded length, the plan's own arenas, nothing per
+/// text or per number.
 #[test]
-fn already_normal_text_and_numeric_arrays_prepare_without_heap_storage() {
+fn already_normal_text_and_numeric_arrays_request_only_the_plan() {
     let text = "ordinary NFC text".repeat(4096);
     let numbers = vec![1.5f64; 4096];
-    let mut policy = Policy::new(None);
-    let (result, heap) = observe(None, || prepare(&text, &mut policy));
-    drop(result.unwrap());
-    assert_eq!(heap.calls, 0);
-    let (result, heap) = observe(None, || prepare(&numbers, &mut policy));
-    drop(result.unwrap());
+    let numbers_len = CBOR::from(numbers.clone()).to_cbor_data().len();
+    // The array's head and the byte string's are both three bytes.
+    let numbers_peer = ByteString::new(vec![0; numbers_len - 3]);
+    let text_peer = ByteString::new(text.as_bytes());
+    assert_eq!(requests(&text), requests(&text_peer), "the text allocated");
     assert_eq!(
-        heap.calls, 0,
-        "preparing numbers must not allocate per-number plans"
+        requests(&numbers),
+        requests(&numbers_peer),
+        "preparing numbers allocated per number"
     );
 }
 
+/// A head alone, as a source.
+struct HeadOnly(MajorType, Argument);
+
+impl Schema for HeadOnly {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        match index {
+            0 => Instruction::Head(self.0, self.1),
+            _ => Instruction::End,
+        }
+    }
+}
+
+const MAJORS: [(MajorType, u8); 8] = [
+    (MajorType::Unsigned, 0x00),
+    (MajorType::Negative, 0x20),
+    (MajorType::ByteString, 0x40),
+    (MajorType::Text, 0x60),
+    (MajorType::Array, 0x80),
+    (MajorType::Map, 0xa0),
+    (MajorType::Tagged, 0xc0),
+    (MajorType::Simple, 0xe0),
+];
+
 #[test]
-fn every_head_width_refuses_short_outputs_atomically() {
+fn every_head_width_refuses_wrong_outputs_atomically() {
     for argument in [
         Argument::Shortest(0),
         Argument::Shortest(24),
@@ -631,24 +419,22 @@ fn every_head_width_refuses_short_outputs_atomically() {
         Argument::Fixed32(0),
         Argument::Fixed64(0),
     ] {
-        for major in [
-            MajorType::Unsigned,
-            MajorType::Negative,
-            MajorType::ByteString,
-            MajorType::Text,
-            MajorType::Array,
-            MajorType::Map,
-            MajorType::Tagged,
-            MajorType::Simple,
-        ] {
-            for size in 0..argument.head_len() {
-                let mut guarded = [0xee; MAX_HEAD_LEN + 2];
-                let mut output = Output::new(&mut guarded[1..1 + size]);
-                assert!(matches!(
-                    output.argument::<()>(major, argument),
-                    Err(BoundedError::Capacity { .. })
-                ));
-                assert_eq!(output.written(), 0);
+        for (major, _) in MAJORS {
+            let prepared = prepare(&HeadOnly(major, argument), &mut policy(None)).unwrap();
+            let len = argument.head_len();
+            assert_eq!(prepared.len(), len, "{major:?} {argument:?}");
+            for size in (0..len).chain([len + 1]) {
+                let mut guarded = [0xee; MAX_HEAD_LEN + 3];
+                let mut budget = policy(None);
+                assert_eq!(
+                    prepared.encode_into(&mut guarded[1..1 + size], &mut budget),
+                    Err(BoundedError::OutputSize {
+                        measured: len as u64,
+                        provided: size as u64,
+                    }),
+                    "{major:?} {argument:?} into {size} bytes"
+                );
+                assert_eq!(budget.attempts(), 0);
                 assert!(guarded.iter().all(|b| *b == 0xee));
             }
         }
@@ -657,12 +443,13 @@ fn every_head_width_refuses_short_outputs_atomically() {
 
 #[test]
 fn pointer_forwarding_writes_without_cloning_or_allocating() {
-    fn check<T: BoundedEncodable>(value: &T) {
-        let mut allocator = Policy::new(None);
+    fn check<T: Schema>(value: &T) {
+        let mut allocator = policy(None);
         let prepared = prepare(value, &mut allocator).unwrap();
-        let mut bytes = vec![0; prepared.len() as usize];
-        let mut budget = Policy::new(None);
-        let (result, heap) = observe(None, || prepared.encode_into(&mut bytes, &mut budget));
+        let mut bytes = vec![0; prepared.len()];
+        let mut budget = policy(None);
+        let (result, heap) =
+            Observation::run(None, || prepared.encode_into(&mut bytes, &mut budget));
         result.unwrap();
         assert_eq!(heap.calls, 0);
         assert_eq!(bytes, [0x62, 0xc3, 0xa9]);
@@ -676,28 +463,32 @@ fn pointer_forwarding_writes_without_cloning_or_allocating() {
 
 #[test]
 fn reservation_growth_holds_old_permit_until_replacement_succeeds() {
-    let mut policy = Policy::new(None);
-    let mut owned = Owned::<u8, Permit>::new();
+    let mut policy = policy(None);
+    let mut owned = Owned::<u8, Reservation>::new();
     owned.push(1, &mut policy).unwrap();
-    let old = policy.live.get();
+    let old = policy.live_bytes();
     assert!(old > 0);
     // Force growth beyond the admitted capacity without assuming its size.
     let additional = usize::try_from(old).unwrap();
-    let (result, heap) = observe(Some(0), || owned.reserve(additional, &mut policy));
+    let (result, heap) = Observation::run(Some(0), || owned.reserve(additional, &mut policy));
     assert!(matches!(result, Err(BoundedError::Allocation { .. })));
-    assert!(heap.denied);
-    assert_eq!(policy.live.get(), old, "old storage still owns its permit");
+    assert_eq!(heap.denied, 1);
+    assert_eq!(
+        policy.live_bytes(),
+        old,
+        "old storage still owns its permit"
+    );
     assert_eq!(owned.as_slice(), &[1]);
-    let failed_peak = policy.peak;
+    let failed_peak = policy.peak_bytes();
     owned.reserve(additional, &mut policy).unwrap();
-    let new = policy.live.get();
+    let new = policy.live_bytes();
     assert!(new > old);
     assert!(
         failed_peak >= old + new,
         "new admission overlaps the live old reservation"
     );
     drop(owned);
-    assert_eq!(policy.live.get(), 0);
+    assert_eq!(policy.live_bytes(), 0);
 }
 
 #[test]
@@ -716,25 +507,15 @@ fn all_major_types_and_head_widths_have_literal_bytes() {
         (Argument::Fixed32(1), &[0x1a, 0, 0, 0, 1]),
         (Argument::Fixed64(1), &[0x1b, 0, 0, 0, 0, 0, 0, 0, 1]),
     ];
-    for (major, prefix) in [
-        (MajorType::Unsigned, 0x00),
-        (MajorType::Negative, 0x20),
-        (MajorType::ByteString, 0x40),
-        (MajorType::Text, 0x60),
-        (MajorType::Array, 0x80),
-        (MajorType::Map, 0xa0),
-        (MajorType::Tagged, 0xc0),
-        (MajorType::Simple, 0xe0),
-    ] {
+    for (major, prefix) in MAJORS {
         for &(argument, literal) in fixtures {
-            let mut guarded = [0xee; MAX_HEAD_LEN + 2];
-            let mut output = Output::new(&mut guarded[1..1 + literal.len()]);
-            output.argument::<()>(major, argument).unwrap();
-            output.finish::<()>(literal.len() as u64).unwrap();
-            assert_eq!(guarded[1], literal[0] | prefix);
-            assert_eq!(&guarded[2..1 + literal.len()], &literal[1..]);
-            assert_eq!(guarded[0], 0xee);
-            assert_eq!(guarded[1 + literal.len()], 0xee);
+            let mut limits = policy(None);
+            let encoded = encode(&HeadOnly(major, argument), &mut limits).unwrap();
+            let mut expected = literal.to_vec();
+            expected[0] |= prefix;
+            assert_eq!(encoded.as_ref(), expected, "{major:?} {argument:?}");
+            drop(encoded);
+            assert_eq!(limits.live_bytes(), 0);
         }
     }
 }
@@ -745,81 +526,110 @@ fn decoder_refuses_every_admission_and_real_allocation_without_leaking() {
     // NFC Maybe forces exact validation scratch; nesting grows the explicit
     // stack, while many siblings grow the flat node arena.
     let input = CBOR::from(vec![vec!["q\u{301}"; 12]; 4]).to_cbor_data();
-    let mut baseline = Policy::new(None);
-    let (result, heap) = observe(None, || decode(&input, 8, &mut baseline));
-    drop(result.unwrap());
-    assert_eq!(baseline.live.get(), 0);
-    assert_eq!(heap.unadmitted, 0);
-    assert!(heap.calls > 0);
-    for at in 0..baseline.calls {
-        let mut policy = Policy::new(Some(at));
-        let (result, heap) = observe(None, || decode(&input, 8, &mut policy));
-        assert!(
-            matches!(result, Err(DecodeError::Resource(BoundedError::Refused(Refusal(n)))) if n == at)
-        );
-        assert_eq!(policy.calls, at + 1);
-        assert_eq!(policy.live.get(), 0);
-        assert_eq!(heap.unadmitted, 0);
-    }
-    for at in 0..heap.calls {
-        let mut policy = Policy::new(None);
-        let (result, heap) = observe(Some(at), || decode(&input, 8, &mut policy));
-        assert!(heap.denied);
-        assert_eq!(heap.unadmitted, 0);
+    let mut baseline = policy(None);
+    drop(decode(&input, 8, &mut baseline).unwrap());
+    assert_eq!(baseline.live_bytes(), 0);
+    synchronous_matrix("decoding nested texts", baseline.attempts(), |at| {
+        let mut policy = policy(Some(at));
+        let (result, heap) = Observation::run(None, || decode(&input, 8, &mut policy));
         assert!(matches!(
             result,
-            Err(DecodeError::Resource(BoundedError::Allocation { .. }))
+            Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Scheduled(n)))) if n == at
         ));
-        drop(result);
-        assert_eq!(policy.live.get(), 0);
-    }
+        assert_eq!(policy.attempts(), at + 1);
+        assert_eq!(policy.live_bytes(), 0);
+        assert_eq!(heap.unadmitted, 0);
+    });
+    physical_matrix("decoding nested texts physically", |failure| {
+        let mut policy = policy(None);
+        let (result, heap) = Observation::run(failure, || decode(&input, 8, &mut policy));
+        assert_eq!(heap.unadmitted, 0);
+        match failure {
+            None => drop(result.expect("the unobstructed decode")),
+            Some(at) => {
+                assert_eq!(heap.denied, 1, "failure {at} was not exercised");
+                assert!(matches!(
+                    result,
+                    Err(DecodeError::Resource(BoundedError::Allocation { .. }))
+                ));
+                drop(result);
+            }
+        }
+        assert_eq!(policy.live_bytes(), 0);
+        heap.calls
+    });
 }
 
-fn extended_failures<T: BoundedEncodable>(value: &T) {
-    let mut baseline = Policy::new(None);
-    let (result, heap) = observe(None, || encode(value, &mut baseline));
+/// Encoding `value` survives every refusal and every physical allocation
+/// failure without leaking; the published encoding holds the plan's arena,
+/// at least its bytes and within its bound; writing the same plan into
+/// caller storage survives every refusal without allocating.
+fn extended_failures<T: Schema + ?Sized>(name: &str, value: &T) {
+    let source: &dyn Schema = &value;
+    let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
+    let bound = encode_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+    let mut baseline = policy(None);
+    let (result, heap) = Observation::run(None, || encode(value, &mut baseline));
     let expected = result.unwrap();
     assert_eq!(heap.unadmitted, 0);
-    assert_eq!(baseline.live.get(), expected.as_ref().len() as u64);
-    for at in 0..baseline.calls {
-        let mut policy = Policy::new(Some(at));
-        let (result, heap) = observe(None, || encode(value, &mut policy));
-        assert!(matches!(result, Err(BoundedError::Refused(Refusal(n))) if n == at));
-        assert_eq!(policy.calls, at + 1);
-        assert_eq!(policy.live.get(), 0);
+    let held = baseline.live_bytes();
+    let len = expected.as_ref().len() as u64;
+    assert!(
+        len <= held && held <= bound.retained,
+        "{len} encoded bytes held in {held}, bounded by {}",
+        bound.retained
+    );
+    synchronous_matrix(&format!("encoding {name}"), baseline.attempts(), |at| {
+        let mut policy = policy(Some(at));
+        let (result, heap) = Observation::run(None, || encode(value, &mut policy));
+        assert!(
+            matches!(result, Err(BoundedError::Refused(LimitRefusal::Scheduled(n))) if n == at)
+        );
+        assert_eq!(policy.attempts(), at + 1);
+        assert_eq!(policy.live_bytes(), 0);
         assert_eq!(heap.unadmitted, 0);
-    }
-    for at in 0..heap.calls {
-        let mut policy = Policy::new(None);
-        let (result, heap) = observe(Some(at), || encode(value, &mut policy));
-        assert!(heap.denied);
+    });
+    physical_matrix(&format!("encoding {name} physically"), |failure| {
+        let mut policy = policy(None);
+        let (result, heap) = Observation::run(failure, || encode(value, &mut policy));
         assert_eq!(heap.unadmitted, 0);
-        assert!(matches!(result, Err(BoundedError::Allocation { .. })));
-        drop(result);
-        assert_eq!(policy.live.get(), 0);
-    }
-    let mut policy = Policy::new(None);
-    let prepared = prepare(value, &mut policy).unwrap();
-    let mut bytes = vec![0; prepared.len() as usize];
-    let mut budget = Policy::new(None);
-    let (result, heap) = observe(None, || prepared.encode_into(&mut bytes, &mut budget));
+        match failure {
+            None => assert_eq!(
+                result.expect("the unobstructed encoding").as_ref(),
+                expected.as_ref()
+            ),
+            Some(at) => {
+                assert_eq!(heap.denied, 1, "failure {at} was not exercised");
+                assert!(matches!(result, Err(BoundedError::Allocation { .. })));
+            }
+        }
+        assert_eq!(policy.live_bytes(), 0);
+        heap.calls
+    });
+    let mut allocator = policy(None);
+    let prepared = prepare(value, &mut allocator).unwrap();
+    let mut bytes = vec![0; prepared.len()];
+    let mut budget = policy(None);
+    let (result, heap) = Observation::run(None, || prepared.encode_into(&mut bytes, &mut budget));
     result.unwrap();
     assert_eq!(heap.calls, 0);
     assert_eq!(bytes, expected.as_ref());
-    for at in 0..budget.calls {
-        let mut budget = Policy::new(Some(at));
-        let (result, heap) = observe(None, || prepared.encode_into(&mut bytes, &mut budget));
-        assert_eq!(result, Err(BoundedError::Refused(Refusal(at))));
+    synchronous_matrix(&format!("writing {name}'s plan"), budget.attempts(), |at| {
+        let mut budget = policy(Some(at));
+        let (result, heap) =
+            Observation::run(None, || prepared.encode_into(&mut bytes, &mut budget));
+        assert_eq!(
+            result,
+            Err(BoundedError::Refused(LimitRefusal::Scheduled(at)))
+        );
         assert_eq!(heap.calls, 0);
-        prepared
-            .encode_into(&mut bytes, &mut Policy::new(None))
-            .unwrap();
+        prepared.encode_into(&mut bytes, &mut policy(None)).unwrap();
         assert_eq!(bytes, expected.as_ref());
-    }
+    });
     drop(prepared);
-    assert_eq!(policy.live.get(), 0);
+    assert_eq!(allocator.live_bytes(), 0);
     drop(expected);
-    assert_eq!(baseline.live.get(), 0);
+    assert_eq!(baseline.live_bytes(), 0);
 }
 
 #[test]
@@ -828,13 +638,19 @@ fn extended_encoders_and_output_owner_handle_all_resource_failures() {
         ("aa", vec![Some("e\u{301}"), None]),
         ("b", vec![None, Some("q\u{301}")]),
     ]);
-    extended_failures(&map);
+    extended_failures("an ordered map", &map);
     let value = CBOR::from(record());
-    extended_failures(&value);
-    extended_failures(&Tagged {
-        tag: 1000,
-        value: dcbor::Date::from_timestamp(0.5),
-    });
+    extended_failures("a symbolic record", &value);
+    extended_failures(
+        "a tagged date",
+        &Tagged {
+            tag: 1000,
+            value: dcbor::Date::from_timestamp(0.5),
+        },
+    );
     #[cfg(feature = "num-bigint")]
-    extended_failures(&-(num_bigint::BigInt::from(1) << 129usize));
+    extended_failures(
+        "a negative bignum",
+        &-(num_bigint::BigInt::from(1) << 129usize),
+    );
 }

@@ -1,5 +1,5 @@
-//! Derive macros for dcbor `CBOREncodable`, `CBORDecodable` and
-//! `BoundedEncodable`.
+//! Derive macros for dcbor `CBOREncodable`, `CBORDecodable`, and the
+//! bounded encoding and decoding.
 //!
 //! Every derive parses its input once into a validated `Schema`: field
 //! keys, variant discriminants, optional fields, newtype and unit shapes,
@@ -7,7 +7,7 @@
 //! discriminants within one enum are compile errors. Each derive generates
 //! from that schema, so the symbolic conversions (`From<T> for CBOR`,
 //! `TryFrom<CBOR> for T`) and the bounded encoding
-//! (`dcbor::bounded::BoundedEncodable`) take every representation decision
+//! (`dcbor::bounded::encoding::Schema`) take every representation decision
 //! from one definition.
 //!
 //! # Struct encoding
@@ -116,61 +116,34 @@
 //!
 //! # Bounded encoding
 //!
-//! `CBORBoundedEncodable` generates `dcbor::bounded::BoundedEncodable`:
-//! the exact encoded length and predicted encoding work, and the encoding
-//! written directly into an exactly sized output, with the bytes the
-//! symbolic conversion produces. Map fields are written in the order of
-//! their encoded keys, decided here from the schema: the keys are unsigned
+//! `CBORBoundedEncodable` generates `dcbor::bounded::encoding::Schema`: the
+//! type's encoding as constant-work instructions, prepared by the bounded
+//! engine into the bytes the symbolic conversion produces. A map's head
+//! carries its count at once: the required fields and each optional field
+//! present, its presence checks announced first so they are admitted
+//! before they are made. Map fields are written in the order of their
+//! encoded keys, decided here from the schema: the keys are unsigned
 //! integers, whose shortest encodings order as the integers do.
 //!
 //! ```
-//! use dcbor::bounded::{prepare, Allocator, Budget};
+//! use dcbor::bounded::{BoundedError, LimitRefusal, Limits, encode, prepare};
 //! use dcbor_derive::CBORBoundedEncodable;
-//!
-//! // This example refuses preparation storage and caps total visited values.
-//! struct Limits { remaining: u64 }
-//! impl Budget for Limits {
-//!     type Refusal = &'static str;
-//!     fn traverse(&mut self, values: u64, _: u64) -> Result<(), Self::Refusal> {
-//!         self.remaining = self.remaining.checked_sub(values).ok_or("work limit")?;
-//!         Ok(())
-//!     }
-//! }
-//! impl Allocator for Limits {
-//!     type Permit = ();
-//!     fn allocate(&mut self, _: u64) -> Result<(), Self::Refusal> {
-//!         Err("scratch storage disabled")
-//!     }
-//! }
 //!
 //! #[derive(CBORBoundedEncodable)]
 //! struct Record {
 //!     #[cbor(n = 1)] count: u64,
 //!     #[cbor(n = 0)] enabled: bool,
+//!     #[cbor(n = 2)] note: Option<String>,
 //! }
-//! let value = Record { count: 24, enabled: true };
-//! let prepared = prepare(&value, &mut Limits { remaining: 100 }).unwrap();
-//! assert_eq!(prepared.len(), 6);
-//! let mut output = [0u8; 6];
-//! let mut budget = Limits { remaining: prepared.write_work().values };
-//! prepared.encode_into(&mut output, &mut budget).unwrap();
-//! assert_eq!(output, [0xa2, 0x00, 0xf5, 0x01, 0x18, 0x18]);
-//! assert_eq!(budget.remaining, 0);
+//! let value = Record { count: 24, enabled: true, note: None };
+//! let encoded = encode(&value, &mut Limits::unlimited()).unwrap();
+//! assert_eq!(encoded.as_ref(), [0xa2, 0x00, 0xf5, 0x01, 0x18, 0x18]);
 //!
-//! use dcbor::bounded::BoundedError;
-//! let mut unchanged = [0xee; 6];
+//! // The shape walk allocates nothing; preparation refuses at its first
+//! // allocation when no storage is allowed.
 //! assert!(matches!(
-//!     prepared.encode_into(&mut unchanged, &mut Limits { remaining: 0 }),
-//!     Err(BoundedError::Refused("work limit"))
-//! ));
-//! assert_eq!(unchanged, [0xee; 6]);
-//! assert!(matches!(
-//!     prepared.encode_into(&mut [0; 5], &mut Limits { remaining: 100 }),
-//!     Err(BoundedError::OutputSize { .. })
-//! ));
-//! assert!(matches!(
-//!     prepare("e\u{301}", &mut Limits { remaining: 100 }),
-//!     Err(BoundedError::Refused("scratch storage disabled"))
+//!     prepare(&value, &mut Limits::new(1_000, 1_000, 0)).map(|prepared| prepared.len()),
+//!     Err(BoundedError::Refused(LimitRefusal::Storage))
 //! ));
 //! ```
 
@@ -180,16 +153,6 @@ use quote::quote;
 use syn::{Data, DeriveInput, Error, Fields, Ident, Result, Type, parse_macro_input};
 mod construction;
 mod encoding;
-
-/// Generate constant-work instructions for retained schema preparation.
-#[proc_macro_derive(CBORResumableEncodable, attributes(cbor))]
-pub fn derive_cbor_resumable_encodable(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    match Schema::parse(&input).map(|schema| encoding::expand(&schema)) {
-        Ok(tokens) => tokens.into(),
-        Err(error) => error.to_compile_error().into(),
-    }
-}
 
 /// Derive `From<T> for dcbor::CBOR`, making the type CBOREncodable.
 #[proc_macro_derive(CBOREncodable, attributes(cbor))]
@@ -225,12 +188,12 @@ pub fn derive_cbor_codable(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive `dcbor::bounded::BoundedEncodable` from the same schema as the
-/// symbolic conversions.
+/// Derive `dcbor::bounded::encoding::Schema`, the bounded encoding, from the
+/// same schema as the symbolic conversions.
 #[proc_macro_derive(CBORBoundedEncodable, attributes(cbor))]
 pub fn derive_cbor_bounded_encodable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    match Schema::parse(&input).map(|schema| schema.bounded()) {
+    match Schema::parse(&input).map(|schema| encoding::expand(&schema)) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -913,329 +876,17 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded expansion
-// ---------------------------------------------------------------------------
-
-/// Report `values` visited values to the budget or allocator `meter`
-/// before the work, by the trait's full path so the expansion needs no
-/// import.
-fn visit(meter: &str, values: u64) -> TokenStream2 {
-    let meter = Ident::new(meter, proc_macro2::Span::call_site());
-    quote! {
-        dcbor::bounded::Budget::traverse(#meter, #values, 0)
-            .map_err(dcbor::bounded::BoundedError::Refused)?;
-    }
-}
-
-/// The measure and the writer of the map of `fields`, each field read
-/// through `access` as a reference: the measure's statements accumulate
-/// into `count`, `payload` and `write` (the map's own visit and each key's
-/// included) and bind the map's measure as `map`; the writer's count the
-/// present fields, then write the map.
-fn bounded_map(
-    fields: &MapFields,
-    access: impl Fn(&Ident) -> TokenStream2,
-) -> (TokenStream2, TokenStream2) {
-    let ordered = fields.in_key_order();
-    let measures = ordered.iter().map(|field| {
-        let key = field.key;
-        let value = access(&field.ident);
-        let measure = quote! {
-            let measured = dcbor::bounded::BoundedEncodable::measure(v, plan, allocator)?;
-            count = dcbor::bounded::add(count, 1)?;
-            payload = dcbor::bounded::add(
-                payload,
-                dcbor::bounded::item_len(#key, measured.len)?,
-            )?;
-            write = write
-                .then(dcbor::bounded::WriteWork::new(1, 0))?
-                .then(measured.write)?;
-        };
-        if field.optional {
-            quote! { if let Some(v) = #value { #measure } }
-        } else {
-            quote! { { let v = #value; #measure } }
-        }
-    });
-    let counts = ordered.iter().map(|field| {
-        let value = access(&field.ident);
-        if field.optional {
-            quote! { if (#value).is_some() { count = dcbor::bounded::add(count, 1)?; } }
-        } else {
-            quote! { count = dcbor::bounded::add(count, 1)?; }
-        }
-    });
-    let key_visit = visit("budget", 1);
-    let writes = ordered.iter().map(|field| {
-        let key = field.key;
-        let value = access(&field.ident);
-        let write = quote! {
-            #key_visit
-            output.head(dcbor::bounded::MajorType::Unsigned, #key)?;
-            dcbor::bounded::BoundedEncodable::write(v, plan, output, budget)?;
-        };
-        if field.optional {
-            quote! { if let Some(v) = #value { #write } }
-        } else {
-            quote! { { let v = #value; #write } }
-        }
-    });
-    // One inspection during measurement; writing counts present fields and
-    // then inspects them again to emit. Admit both passes before either starts.
-    let field_count = fields.0.len() as u64;
-    let measure_visit = visit("allocator", 1 + field_count);
-    let map_work = 1 + 2 * field_count;
-    let map_visit = visit("budget", map_work);
-    let measure = quote! {
-        #measure_visit
-        let mut count: u64 = 0;
-        let mut payload: u64 = 0;
-        let mut write = dcbor::bounded::WriteWork::new(#map_work, 0);
-        #(#measures)*
-        let map = dcbor::bounded::Measure {
-            len: dcbor::bounded::item_len(count, payload)?,
-            write,
-        };
-    };
-    let write = quote! {
-        #map_visit
-        let mut count: u64 = 0;
-        #(#counts)*
-        output.head(dcbor::bounded::MajorType::Map, count)?;
-        #(#writes)*
-    };
-    (measure, write)
-}
-
-impl Schema<'_> {
-    fn bounded(&self) -> TokenStream2 {
-        let name = self.name();
-        let mut generics = self.input.generics.clone();
-        for ty in self.field_types() {
-            generics
-                .make_where_clause()
-                .predicates
-                .push(syn::parse_quote!(#ty: dcbor::bounded::BoundedEncodable));
-        }
-        let allocator_type = self.fresh("__DcborAllocator");
-        let permit_type = self.fresh("__DcborPermit");
-        let budget_type = self.fresh("__DcborBudget");
-        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-        let measured_visit = visit("allocator", 1);
-        let written_visit = visit("budget", 1);
-
-        let (fixed, measure, write) = match &self.shape {
-            Shape::Map(fields) => {
-                let (measure, write) = bounded_map(fields, |field| quote! { &self.#field });
-                (
-                    quote! { None },
-                    quote! {
-                        #measure
-                        Ok(map)
-                    },
-                    write,
-                )
-            }
-            Shape::Newtype(inner) => (
-                quote! { <#inner as dcbor::bounded::BoundedEncodable>::FIXED },
-                quote! { dcbor::bounded::BoundedEncodable::measure(&self.0, plan, allocator) },
-                quote! { dcbor::bounded::BoundedEncodable::write(&self.0, plan, output, budget)?; },
-            ),
-            Shape::Unit => (
-                quote! { Some(dcbor::bounded::Measure::leaf(1, 0)) },
-                quote! {
-                    #measured_visit
-                    Ok(dcbor::bounded::Measure::leaf(1, 0))
-                },
-                quote! {
-                    #written_visit
-                    output.head(dcbor::bounded::MajorType::Simple, dcbor::bounded::NULL)?;
-                },
-            ),
-            Shape::Enum(variants) => bounded_enum(name, variants),
-        };
-
-        let write_body = if matches!(&self.shape, Shape::Enum(variants) if variants.is_empty()) {
-            quote! { match *self {} }
-        } else {
-            quote! { #write Ok(()) }
-        };
-        quote! {
-            impl #impl_generics dcbor::bounded::BoundedEncodable for #name #ty_generics #where_clause {
-                const FIXED: Option<dcbor::bounded::Measure> = #fixed;
-
-                #[allow(unused_variables, unused_mut)]
-                fn measure<#allocator_type: dcbor::bounded::Allocator>(
-                    &self,
-                    plan: &mut dcbor::bounded::Plan<#allocator_type::Permit>,
-                    allocator: &mut #allocator_type,
-                ) -> dcbor::bounded::BoundedResult<dcbor::bounded::Measure, #allocator_type> {
-                    #measure
-                }
-
-                #[allow(unused_variables, unused_mut)]
-                fn write<#permit_type, #budget_type: dcbor::bounded::Budget>(
-                    &self,
-                    plan: &mut dcbor::bounded::Cursor<'_, #permit_type>,
-                    output: &mut dcbor::bounded::Output<'_>,
-                    budget: &mut #budget_type,
-                ) -> dcbor::bounded::BoundedResult<(), #budget_type> {
-                    #write_body
-                }
-            }
-        }
-    }
-}
-
-/// The fixed measure, measure and writer of an enum. Every variant is one
-/// value: a unit variant its discriminant, a tuple variant the array
-/// `[discriminant, fields...]`, a struct variant the array
-/// `[discriminant, {map}]`. An enum of unit variants whose discriminants
-/// share one head width has a fixed measure.
-fn bounded_enum(name: &Ident, variants: &[Variant]) -> (TokenStream2, TokenStream2, TokenStream2) {
-    if variants.is_empty() {
-        return (
-            quote! { None },
-            quote! { match *self {} },
-            quote! { match *self {} },
-        );
-    }
-    let all_unit = !variants.is_empty()
-        && variants
-            .iter()
-            .all(|variant| matches!(variant.kind, VariantKind::Unit));
-    let fixed = if all_unit {
-        let discriminants = variants.iter().map(|variant| variant.discriminant);
-        quote! {{
-            let widths = [#(dcbor::bounded::head_len(#discriminants)),*];
-            let mut same = true;
-            let mut index = 1;
-            while index < widths.len() {
-                if widths[index] != widths[0] {
-                    same = false;
-                }
-                index += 1;
-            }
-            if same {
-                Some(dcbor::bounded::Measure::leaf(widths[0] as u64, 0))
-            } else {
-                None
-            }
-        }}
-    } else {
-        quote! { None }
-    };
-
-    let mut measure_arms = Vec::new();
-    let mut write_arms = Vec::new();
-    let one = visit("budget", 1);
-    // The enum visit is admitted before matching; the second visit accounts
-    // for the discriminant in an array representation.
-    let two = visit("budget", 1);
-    for variant in variants {
-        let disc = variant.discriminant;
-        let vname = &variant.ident;
-        match &variant.kind {
-            VariantKind::Unit => {
-                measure_arms.push(quote! {
-                    #name::#vname => Ok(dcbor::bounded::Measure::leaf(
-                        dcbor::bounded::widen(dcbor::bounded::head_len(#disc))?,
-                        0,
-                    )),
-                });
-                write_arms.push(quote! {
-                    #name::#vname => {
-                        output.head(dcbor::bounded::MajorType::Unsigned, #disc)?;
-                    }
-                });
-            }
-            VariantKind::Tuple(count) => {
-                let bindings = bindings(*count);
-                let elements = (*count as u64) + 1;
-                let field_visit = visit("budget", *count as u64);
-                let measure_fields = visit("allocator", elements);
-                let work = elements + 1;
-                measure_arms.push(quote! {
-                    #name::#vname(#(#bindings),*) => {
-                        #measure_fields
-                        let mut payload = dcbor::bounded::widen(dcbor::bounded::head_len(#disc))?;
-                        let mut write = dcbor::bounded::WriteWork::new(#work, 0);
-                        #(
-                            let measured = dcbor::bounded::BoundedEncodable::measure(
-                                #bindings,
-                                plan,
-                                allocator,
-                            )?;
-                            payload = dcbor::bounded::add(payload, measured.len)?;
-                            write = write.then(measured.write)?;
-                        )*
-                        Ok(dcbor::bounded::Measure {
-                            len: dcbor::bounded::item_len(#elements, payload)?,
-                            write,
-                        })
-                    }
-                });
-                write_arms.push(quote! {
-                    #name::#vname(#(#bindings),*) => {
-                        #two
-                        #field_visit
-                        output.head(dcbor::bounded::MajorType::Array, #elements)?;
-                        output.head(dcbor::bounded::MajorType::Unsigned, #disc)?;
-                        #(dcbor::bounded::BoundedEncodable::write(#bindings, plan, output, budget)?;)*
-                    }
-                });
-            }
-            VariantKind::Named(fields) => {
-                let names = fields.idents();
-                let aliases = bindings(names.len());
-                let (map_measure, map_write) = bounded_map(fields, |field| {
-                    let index = names.iter().position(|name| *name == field).unwrap();
-                    let alias = &aliases[index];
-                    quote! { #alias }
-                });
-                measure_arms.push(quote! {
-                    #name::#vname { #(#names: #aliases),* } => {
-                        #map_measure
-                        let payload = dcbor::bounded::add(
-                            dcbor::bounded::widen(dcbor::bounded::head_len(#disc))?,
-                            map.len,
-                        )?;
-                        Ok(dcbor::bounded::Measure {
-                            len: dcbor::bounded::item_len(2, payload)?,
-                            write: dcbor::bounded::WriteWork::new(2, 0).then(map.write)?,
-                        })
-                    }
-                });
-                write_arms.push(quote! {
-                    #name::#vname { #(#names: #aliases),* } => {
-                        #two
-                        output.head(dcbor::bounded::MajorType::Array, 2)?;
-                        output.head(dcbor::bounded::MajorType::Unsigned, #disc)?;
-                        #map_write
-                    }
-                });
-            }
-        }
-    }
-    let measured_visit = visit("allocator", 1);
-    let measure = quote! {
-        #measured_visit
-        match self {
-            #(#measure_arms)*
-        }
-    };
-    let write = quote! {
-        #one
-        match self {
-            #(#write_arms)*
-        }
-    };
-    (fixed, measure, write)
-}
-
-// ---------------------------------------------------------------------------
 // Bounded construction expansion
 // ---------------------------------------------------------------------------
+
+/// Report `values` values a synchronous construction examines to
+/// `allocator` before the work, through typed construction's admission
+/// route.
+fn examine(values: u64) -> TokenStream2 {
+    quote! {
+        dcbor::bounded::decode::visits(#values, allocator)?;
+    }
+}
 
 /// The construction of the map `node` (an expression of a decoded node) as
 /// `path { fields }`: one pass over its entries in canonical key order, each
@@ -1243,7 +894,7 @@ fn bounded_enum(name: &Ident, variants: &[Variant]) -> (TokenStream2, TokenStrea
 /// symbolic extraction ignores it; a required field without its key is
 /// `MissingMapKey`, an optional one is `None`.
 fn construct_map(fields: &MapFields, path: TokenStream2, node: TokenStream2) -> TokenStream2 {
-    let visit = visit("allocator", 1);
+    let visit = examine(1);
     let slots: Vec<Ident> = (0..fields.0.len())
         .map(|index| {
             Ident::new(
@@ -1302,7 +953,7 @@ fn construct_map(fields: &MapFields, path: TokenStream2, node: TokenStream2) -> 
 /// variant from `[discriminant, {map}]`, accepting exactly the forms
 /// `TryFrom<CBOR>` accepts.
 fn construct_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
-    let visit = visit("allocator", 1);
+    let visit = examine(1);
     let mut unit_arms = Vec::new();
     let mut array_arms = Vec::new();
     for variant in variants {
@@ -1398,7 +1049,7 @@ impl Schema<'_> {
         }
         let allocator_type = self.fresh("__DcborAllocator");
         let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-        let visit = visit("allocator", 1);
+        let visit = examine(1);
         let untagged = match &self.shape {
             Shape::Map(fields) => construct_map(fields, quote! { #name }, quote! { node }),
             Shape::Newtype(inner) => quote! {

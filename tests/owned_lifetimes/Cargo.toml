@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "dcbor-owned-lifetime-contracts"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dcbor = { path = "../.." }

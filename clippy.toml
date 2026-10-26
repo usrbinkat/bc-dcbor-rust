@@ -1,0 +1,9 @@
+# One admission route. Every admission this crate's engines make goes through
+# a charge rule's `admit` (`Unit`, `Capped`, `Scan`, `Rate`), which carries the
+# admission's place; derived bindings admit through the public helpers built
+# on the same rules. Code standing in for a third-party binding or policy
+# calls `Budget::traverse` itself, as the trait documents, and states so with
+# an `expect` naming why.
+disallowed-methods = [
+    { path = "dcbor::bounded::Budget::traverse", reason = "admit through a charge rule (`Unit`, `Capped`, `Scan`, `Rate`), whose admission carries its place" },
+]

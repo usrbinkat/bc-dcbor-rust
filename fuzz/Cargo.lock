@@ -107,11 +107,19 @@ name = "dcbor-fuzz"
 version = "0.0.0"
 dependencies = [
  "dcbor",
+ "dcbor-test-support",
  "half",
  "hashbrown",
  "libfuzzer-sys",
  "num-bigint",
  "unicode-normalization",
+]
+
+[[package]]
+name = "dcbor-test-support"
+version = "0.0.0"
+dependencies = [
+ "dcbor",
 ]
 
 [[package]]
@@ -181,7 +189,7 @@ dependencies = [
 [[package]]
 name = "hashbrown"
 version = "0.17.1"
-source = "git+https://github.com/usrbinkat/hashbrown?rev=3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8#3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8"
+source = "git+https://github.com/usrbinkat/hashbrown?rev=0fbe75be38372034b884d347419994d5fec0bc7d#0fbe75be38372034b884d347419994d5fec0bc7d"
 dependencies = [
  "allocator-api2",
  "equivalent",

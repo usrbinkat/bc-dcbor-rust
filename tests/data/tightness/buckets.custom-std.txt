@@ -1,0 +1,9 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+12919	12828	within-2	published	dense (batched): Inspection bytes
+205	201	within-2	published	dense (batched): Inspection values
+12919	12828	joint	published	dense (batched): total bytes
+206	202	joint	published	dense (batched): total values
+256	256	within-2	published	dense (one by one): Inspection bytes
+256	256	within-2	published	dense (one by one): Inspection values
+1	1	within-1	published	empty (batched): Completion values
+1	1	within-1	published	empty (one by one): Completion values

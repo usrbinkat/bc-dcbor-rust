@@ -1,17 +1,22 @@
+use super::bindings::{decoder, string_decoder};
 use super::harness::*;
-use dcbor::bounded::BoundedError;
-use dcbor::bounded::decode::{DecodeError, Options, decode};
+use super::support::{
+    self, Fault, allowed, checked, contracted, drive_faulted, drive_within, expect_progress,
+    pipeline::Refusal, refusal_matrix, refuse, rigor::rigor,
+};
+use dcbor::bounded::decode::{DecodeError, Options};
+use dcbor::bounded::{Allocator, BoundedError, Step};
 
 #[test]
 fn header_and_first_payload_admissions_are_separately_observed() {
-    use super::bindings::decode_driver;
-    use super::driver::{Step, finish};
     use dcbor::bounded::decode::cursor::Phase;
     let mut wire = vec![0x78, 0x18];
     wire.extend_from_slice(b"abcdefghijklmnopqrstuvwx");
-    let mut baseline = decode_driver(&wire, meter());
-    finish(&mut baseline, 4096);
-    assert_eq!(baseline.output.as_ref().unwrap().root().encoded(), wire);
+    let mut baseline = meter();
+    let document =
+        drive_within(&mut baseline, &mut decoder(&wire), decode_turns(wire.len())).unwrap();
+    assert_eq!(document.root().encoded(), wire);
+    drop(document);
     for (phase, header, payload) in [
         (Phase::Header, 0, 0),
         (Phase::Header, 1, 0),
@@ -20,11 +25,12 @@ fn header_and_first_payload_admissions_are_separately_observed() {
         (Phase::Utf8, 2, 23),
         (Phase::Complete, 2, 24),
     ] {
-        let mut operation = decode_driver(&wire, meter());
-        let pool = operation.meter.pool.clone();
+        let mut m = meter();
+        let pool = m.share();
+        let mut operation = decoder(&wire);
         let mut reached = false;
-        for _ in 0..4096 {
-            let position = operation.operation().position();
+        for _ in 0..decode_turns(wire.len()) {
+            let position = operation.position();
             if (
                 position.phase,
                 position.header_bytes,
@@ -34,145 +40,91 @@ fn header_and_first_payload_admissions_are_separately_observed() {
                 reached = true;
                 break;
             }
-            assert_eq!(operation.step(), Ok(Step::Progress));
+            match checked(&mut m, |m| contracted(m, &mut operation)) {
+                Err(error) if support::ordinary_exhaustion(&m, &error) => {}
+                result => expect_progress(result),
+            }
         }
         assert!(reached, "missing boundary {phase:?}/{header}/{payload}");
-        let before = operation.operation().position();
-        let stop = operation.meter.calls.len();
-        operation.meter.fail_at = Some((stop, Refusal::Work));
-        assert_eq!(operation.step(), Ok(Step::Refused(Refusal::Work)));
-        assert_eq!(operation.meter.refused, Some((stop, Refusal::Work)));
-        assert_eq!(operation.operation().position(), before);
-        assert!(operation.output.is_none());
-        operation.meter.fail_at = None;
-        finish(&mut operation, 4096);
-        let mut trace = baseline.meter.calls.clone();
-        trace.insert(stop, trace[stop]);
-        assert_eq!(operation.meter.calls, trace);
-        operation.meter.assert_units(3, 64);
-        let document = operation.output.take().unwrap();
+        let stop = m.attempts();
+        refuse(&mut m, Refusal::For(stop, LimitRefusal::Work));
+        let document = drive_within(&mut m, &mut operation, decode_turns(wire.len())).unwrap();
+        support::RefusalRun::of(&m).resumed(
+            &support::RefusalRun::of(&baseline),
+            stop,
+            LimitRefusal::Work,
+        );
+        m.assert_units(TURN);
         assert_eq!(
             document.root().kind(),
             dcbor::bounded::decode::Kind::Text("abcdefghijklmnopqrstuvwx")
         );
-        assert_eq!(operation.step(), Ok(Step::Finished));
         drop(operation);
-        assert!(pool.live() > 0);
+        assert!(pool.live_bytes() > 0);
         assert_eq!(document.root().encoded(), wire);
         drop(document);
-        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.live_bytes(), 0);
     }
 }
 
 #[test]
-fn constructor_failure_at_every_callback_releases_only_constructor_ownership() {
-    use dcbor::bounded::decode::construction::in_place::{Construction, Step};
-    use dcbor::bounded::decode::construction::reclamation::{Reclaimed, Reclaimer};
-    let wire = text_wire("q\u{301}😀");
-    let mut parser = meter();
-    let doc = decode(&wire, 8, &mut parser).unwrap();
-    let parser_live = parser.pool.live();
-    let run = |stop: Option<(usize, Refusal)>, cancel: bool| {
-        let mut m = meter();
-        m.fail_at = stop;
-        let owner = Reclaimer::new();
-        let mut operation = Construction::<String, Meter>::new(&owner, &doc, 0);
-        let mut observed = false;
-        let mut done = false;
-        for _ in 0..4096 {
-            let before = (m.values, m.bytes, m.pool.live());
-            m.limit_values = before.0 + 3;
-            m.limit_bytes = before.1 + 64;
-            m.refused = None;
-            let result = operation.step(&mut m);
-            assert!(m.values - before.0 <= 3 && m.bytes - before.1 <= 64);
-            assert_eq!(parser.pool.live(), parser_live);
-            match result {
-                // A resumed allocation commits metadata admitted on an earlier
-                // turn. Its newly retained reservation is useful progress.
-                Ok(Step::Progress) => assert_ne!((m.values, m.bytes, m.pool.live()), before),
-                Ok(Step::Complete(value)) => {
-                    assert_eq!(value.value(), "q\u{301}😀");
-                    assert!(m.pool.live() >= value.value().len() as u64);
-                    drop(value);
-                    done = true;
-                    break;
-                }
-                Err(DecodeError::Resource(BoundedError::Refused(reason))) => {
-                    assert_eq!(m.refused, stop);
-                    assert_eq!(Some((m.calls.len() - 1, reason)), stop);
-                    assert!(!observed);
-                    observed = true;
-                    m.fail_at = None;
-                    if cancel {
-                        done = true;
-                        break;
-                    }
-                }
-                _ => panic!("unexpected construction outcome"),
+fn constructor_failure_at_every_callback_never_touches_parser_storage() {
+    use dcbor::bounded::decode::construction::Construction;
+    let wire = text_wire("q\u{301}\u{1f600}");
+    // Each run parses its own document under `parser`, then constructs from
+    // it under its own policy. Construction owns the document: through every
+    // step, refusal and cancellation the parser's storage is untouched, and
+    // the scope's drain releases both policies' storage completely. The
+    // construction's calls are what the matrix compares.
+    refusal_matrix(
+        "construction from a parsed document",
+        rigor(),
+        |fault: Fault| {
+            let mut parser = meter();
+            let (mut owner, document) =
+                support::document(&mut parser, &wire, Options::normalizing(8));
+            let parser_live = parser.live_bytes();
+            let mut m = meter();
+            refuse(&mut m, fault.refusal);
+            let mut operation = Construction::<_, String, Limits>::construct(document);
+            let turns = allowed(&m, typed_turns::<String>(wire.len()));
+            let value = support::drive_faulted_observed(
+                &mut m,
+                &mut operation,
+                turns,
+                fault.cancel,
+                |_, _, _| assert_eq!(parser.live_bytes(), parser_live),
+            )
+            .expect("construction failed");
+            if let Some(value) = &value {
+                assert_eq!(value.value(), "q\u{301}\u{1f600}");
+                assert!(m.live_bytes() >= value.value().len() as u64);
             }
-        }
-        assert!(done, "construction did not terminate");
-        assert_eq!(observed, stop.is_some());
-        let construction_calls = m.calls.clone();
-        drop(operation);
-        let mut cleaned = false;
-        for _ in 0..4096 {
-            m.limit_values = m.values + 3;
-            m.limit_bytes = m.bytes + 64;
-            m.refused = None;
-            match owner.shutdown_step(&mut m) {
-                Ok(Reclaimed::Done) => {
-                    cleaned = true;
-                    break;
-                }
-                Ok(Reclaimed::Progress) | Err(BoundedError::Refused(_)) => {}
-                _ => panic!("constructor cleanup failed"),
-            }
-        }
-        assert!(cleaned);
-        assert_eq!(parser.pool.live(), parser_live);
-        assert_eq!(m.pool.live(), 0);
-        (m, construction_calls)
-    };
-    let (baseline, construction_calls) = run(None, false);
-    for (index, call) in construction_calls.iter().enumerate() {
-        let reason = if matches!(call, Call::Allocate(_)) {
-            Refusal::Capacity
-        } else {
-            Refusal::Work
-        };
-        let (resumed, resumed_construction) = run(Some((index, reason)), false);
-        let mut trace = baseline.calls.clone();
-        trace.insert(index, *call);
-        assert_eq!(resumed.calls, trace);
-        let mut construction_trace = construction_calls.clone();
-        construction_trace.insert(index, *call);
-        assert_eq!(resumed_construction, construction_trace);
-        assert_eq!(
-            (resumed.values, resumed.bytes),
-            (baseline.values, baseline.bytes)
-        );
-        let (_, cancelled) = run(Some((index, reason)), true);
-        assert_eq!(cancelled, construction_calls[..=index]);
-    }
-    drop(doc);
-    assert_eq!(parser.pool.live(), 0);
+            drop(value);
+            let construction_calls = support::RefusalRun::of(&m);
+            drop(operation);
+            assert_eq!(parser.live_bytes(), parser_live);
+            support::drain(&mut owner, &mut m);
+            assert_eq!(parser.live_bytes(), 0);
+            assert_eq!(m.live_bytes(), 0);
+            construction_calls
+        },
+    );
 }
 
 #[test]
 fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
+    use dcbor::bounded::decode::cursor::Decoder;
     use unicode_normalization::{IsNormalized, is_nfc_quick};
     fn check(text: &str) {
         let wire = text_wire(text);
         let mut m = meter();
-        use dcbor::bounded::decode::cursor::{DecodeStep, Decoder};
         let mut operation = Decoder::new(&wire, Options::quick_only(8));
         let mut result = None;
-        for _ in 0..text.len() * 8 + 64 {
-            match operation.step(&mut m) {
-                Ok(DecodeStep::Progress) => {}
-                Ok(DecodeStep::Complete(document)) => {
+        for _ in 0..decode_turns(wire.len()) {
+            match contracted(&mut m, &mut operation) {
+                Ok(Step::Progress) => {}
+                Ok(Step::Complete(document)) => {
                     result = Some(Ok(document));
                     break;
                 }
@@ -180,7 +132,7 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
                     result = Some(Err(error));
                     break;
                 }
-                Ok(DecodeStep::Finished) => panic!("quick check finished without an outcome"),
+                Ok(Step::Finished) => panic!("quick check finished without an outcome"),
             }
         }
         let result = result.expect("incremental quick check did not terminate");
@@ -192,8 +144,8 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
         }
         drop(result);
         drop(operation);
-        m.assert_units(3, 64);
-        assert_eq!(m.pool.live(), 0);
+        m.assert_units(TURN);
+        assert_eq!(m.live_bytes(), 0);
     }
     for scalar in 0..=0x10ffff {
         if let Some(ch) = char::from_u32(scalar) {
@@ -207,7 +159,7 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
         "\u{301}a",
         "a\u{301}",
         "\u{1100}\u{1162}",
-        "é😀",
+        "\u{e9}\u{1f600}",
     ] {
         check(text);
     }
@@ -215,113 +167,217 @@ fn quick_only_matches_upstream_for_all_scalars_and_cross_character_cases() {
 
 #[test]
 fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
-    use super::driver::{Driver, finish, resume};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "a\u{301}";
     let expected = [0x62, 0xc3, 0xa1];
-    let mut preparation = Driver::from_operation(TextPreparation::new(source), meter());
-    finish(&mut preparation, 4096);
-    let pool = preparation.meter.pool.clone();
-    let prepared = preparation.output.take().unwrap();
-    drop(preparation);
-    let live = pool.live();
-    let mut baseline_bytes = [0; 3];
-    let mut baseline = Driver::from_operation(prepared.writer(&mut baseline_bytes), meter());
-    finish(&mut baseline, 4096);
-    for index in 0..baseline.meter.calls.len() {
+    let mut preparation = meter();
+    let pool = preparation.share();
+    let prepared = drive_within(
+        &mut preparation,
+        &mut TextPreparation::new(source),
+        normalize_turns(source),
+    )
+    .unwrap();
+    let live = pool.live_bytes();
+    refusal_matrix("text writer", rigor(), |fault: Fault| {
         let mut guarded = [0xee; 5];
         let mut m = meter();
-        m.fail_at = Some((index, Refusal::Work));
-        let mut emission = Driver::from_operation(prepared.writer(&mut guarded[1..4]), m);
-        resume(&mut emission, Refusal::Work);
-        let mut trace = baseline.meter.calls.clone();
-        trace.insert(index, trace[index]);
-        assert_eq!(emission.meter.calls, trace);
-        assert_eq!(emission.operation().emitted_prefix(), expected);
-        emission.meter.assert_units(3, 64);
-        drop(emission);
+        refuse(&mut m, fault.refusal);
+        let mut emission = prepared.writer(&mut guarded[1..4]);
+        let turns = allowed(&m, text_emit_turns(expected.len()));
+        let emitted = drive_faulted(&mut m, &mut emission, turns, fault.cancel)
+            .expect("a prepared text emits");
+        if emitted.is_some() {
+            assert_eq!(emission.emitted_prefix(), expected);
+            m.assert_units(TURN);
+        }
+        // The writer's borrow of `guarded` ends here; it has no destructor.
         assert_eq!((guarded[0], guarded[4]), (0xee, 0xee));
         let written = guarded[1..4].iter().take_while(|b| **b != 0xee).count();
         assert_eq!(&guarded[1..1 + written], &expected[..written]);
         assert!(guarded[1 + written..4].iter().all(|b| *b == 0xee));
-        assert_eq!(pool.live(), live);
-    }
-    drop(baseline);
+        assert_eq!(pool.live_bytes(), live);
+        support::RefusalRun::of(&m)
+    });
     drop(prepared);
-    assert_eq!(pool.live(), 0);
+    assert_eq!(pool.live_bytes(), 0);
 }
 
 #[test]
 fn emission_is_bounded_independently_of_preparation() {
-    use super::driver::{Driver, finish};
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "x".repeat(65536);
-    let mut preparation = Driver::from_operation(TextPreparation::new(&source), meter());
-    finish(&mut preparation, source.len() * 32 + 4096);
-    let prepared = preparation.output.take().unwrap();
+    let mut preparation = meter();
+    let prepared = drive_within(
+        &mut preparation,
+        &mut TextPreparation::new(&source),
+        normalize_turns(&source),
+    )
+    .unwrap();
     let mut bytes = vec![0; prepared.len() as usize];
-    let mut emission = Driver::from_operation(prepared.writer(&mut bytes), meter());
-    finish(&mut emission, source.len() + 4096);
-    assert!(
-        !emission
-            .meter
-            .calls
-            .iter()
-            .any(|c| matches!(c, Call::Allocate(_)))
-    );
-    emission.meter.assert_units(3, 64);
-    drop(emission);
+    let turns = text_emit_turns(bytes.len());
+    let mut emission = meter();
+    drive_within(&mut emission, &mut prepared.writer(&mut bytes), turns).unwrap();
+    assert_eq!(emission.requests(), 0, "emission requested allocation");
+    emission.assert_units(TURN);
     assert_eq!(bytes, text_wire(&source));
 }
 
 #[test]
 fn capacity_pool_survives_concurrent_success_and_every_refused_constructor() {
-    use super::bindings::string_driver;
-    use super::driver::{finish, resume};
     let capacity = 32 * 1024 * 1024;
-    let pool = Pool::new(capacity);
-    let wire = text_wire("q\u{301}😀");
-    let mut baseline = string_driver(&wire, meter());
-    finish(&mut baseline, 4096);
-    let boundaries = baseline.meter.calls.len();
+    let mut pool = meter_with(capacity);
+    let wire = text_wire("q\u{301}\u{1f600}");
+    let mut baseline = meter();
+    drop(
+        drive_within(
+            &mut baseline,
+            &mut string_decoder(&wire),
+            string_turns(wire.len()),
+        )
+        .unwrap(),
+    );
+    let boundaries = baseline.calls().len();
     assert!(boundaries > 0);
+    // In rounds, every call refused once and as many decodes unrefused,
+    // about a thousand decodes in all; the cases are dealt to the workers
+    // in turn.
+    const WORKERS: usize = 8;
+    const DECODES: usize = 1000;
+    let rounds = DECODES.div_ceil(2 * boundaries);
+    let cases: Vec<Option<usize>> = (0..rounds)
+        .flat_map(|_| (0..boundaries).flat_map(|stop| [Some(stop), None]))
+        .collect();
     std::thread::scope(|scope| {
-        for worker in 0..8 {
-            let pool = pool.clone();
+        for worker in 0..WORKERS {
+            let shared = pool.share();
             let wire = &wire;
             let baseline = &baseline;
+            let mine: Vec<Option<usize>> = cases
+                .iter()
+                .copied()
+                .skip(worker)
+                .step_by(WORKERS)
+                .collect();
             scope.spawn(move || {
-                for iteration in 0..125 {
-                    let mut m = Meter::new(pool.clone());
-                    if (iteration + worker) % 2 == 0 {
-                        let stop = iteration % boundaries;
-                        m.fail_at = Some((stop, Refusal::Work));
-                        let mut operation = string_driver(wire, m);
-                        resume(&mut operation, Refusal::Work);
-                        assert_eq!(operation.output.as_ref().unwrap().value(), "q\u{301}😀");
-                        let mut trace = baseline.meter.calls.clone();
-                        trace.insert(stop, trace[stop]);
-                        assert_eq!(operation.meter.calls, trace);
+                for case in mine {
+                    let mut m = shared.share();
+                    let mut operation = string_decoder(wire);
+                    if let Some(stop) = case {
+                        refuse(&mut m, Refusal::For(stop, LimitRefusal::Work));
+                        let output =
+                            drive_within(&mut m, &mut operation, string_turns(wire.len())).unwrap();
+                        assert_eq!(output.value(), "q\u{301}\u{1f600}");
+                        support::RefusalRun::of(&m).resumed(
+                            &support::RefusalRun::of(baseline),
+                            stop,
+                            LimitRefusal::Work,
+                        );
                     } else {
-                        let mut operation = string_driver(wire, m);
-                        finish(&mut operation, 4096);
-                        assert_eq!(operation.output.as_ref().unwrap().value(), "q\u{301}😀");
+                        let output =
+                            drive_within(&mut m, &mut operation, string_turns(wire.len())).unwrap();
+                        assert_eq!(output.value(), "q\u{301}\u{1f600}");
                     }
                 }
             });
         }
     });
-    assert_eq!(pool.live(), 0);
-    let all = pool.reserve(capacity).unwrap();
-    assert!(pool.reserve(1).is_err());
+    assert_eq!(pool.live_bytes(), 0);
+    let all = pool.allocate(capacity).unwrap();
+    assert!(pool.allocate(1).is_err());
     drop(all);
-    assert_eq!(pool.live(), 0);
+    assert_eq!(pool.live_bytes(), 0);
 }
 
 #[test]
+fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacity() {
+    use dcbor::ByteString;
+    use dcbor::bounded::decode::construction::TypedDecoder;
+    let payload = vec![0x5a; 65536];
+    let wire = dcbor::CBOR::to_byte_string(&payload).to_cbor_data();
+    let turns = typed_turns::<ByteString>(wire.len());
+    // The admissions of an unobstructed decode of the same input.
+    let baseline = {
+        let mut m = meter();
+        let mut owner = support::scope(&mut m);
+        let input = support::copy(&owner, &mut m, &wire);
+        m.measure();
+        let value = support::decode::<_, ByteString>(&mut m, input, Options::normalizing(8))
+            .expect("baseline decode failed");
+        let trace = m.admitted().to_vec();
+        drop(value);
+        support::drain(&mut owner, &mut m);
+        trace
+    };
+    let capacity = 1 << 20;
+    let mut pool = meter_with(capacity);
+    let mut m = pool.share();
+    let mut owner = support::scope(&mut m);
+    let input = support::copy(&owner, &mut m, &wire);
+    m.measure();
+    let mut operation = TypedDecoder::<_, ByteString, Limits>::new(input, Options::normalizing(8));
+    match checked(&mut m, |m| contracted(m, &mut operation)) {
+        Err(error) if support::ordinary_exhaustion(&m, &error) => {}
+        result => expect_progress(result),
+    }
+    // Another owner takes every remaining byte of the shared capacity.
+    let blocker = pool.allocate(capacity - pool.live_bytes()).unwrap();
+    let mut refused = None;
+    for _ in 0..turns {
+        match checked(&mut m, |m| contracted(m, &mut operation)) {
+            Ok(Step::Progress) => {}
+            Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Storage))) => {
+                refused = Some(operation.position());
+                break;
+            }
+            Err(error) if support::ordinary_exhaustion(&m, &error) => {}
+            other => panic!("unexpected outcome {}", support::label(&other)),
+        }
+    }
+    let position = refused.expect("no allocation met the exhausted capacity");
+    let live = pool.live_bytes();
+    assert_eq!(live, capacity);
+    // While the capacity stays held the same operation is refused at the same
+    // unit, and nothing it holds is released or replayed.
+    for _ in 0..3 {
+        assert!(matches!(
+            checked(&mut m, |m| contracted(m, &mut operation)),
+            Err(DecodeError::Resource(BoundedError::Refused(
+                LimitRefusal::Storage
+            )))
+        ));
+        assert_eq!(operation.position(), position);
+        assert_eq!(pool.live_bytes(), live);
+    }
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        wait.recv().unwrap();
+        drop(blocker);
+    });
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let value = drive_within(&mut m, &mut operation, turns).expect("resumed decode failed");
+    assert_eq!(value.value().data(), &payload[..]);
+    assert_eq!(m.admitted(), baseline, "resumption replayed admitted work");
+    drop(operation);
+    drop(value);
+    support::drain(&mut owner, &mut m);
+    assert_eq!(pool.live_bytes(), 0);
+    let all = pool.allocate(capacity).unwrap();
+    assert!(pool.allocate(1).is_err());
+    drop(all);
+    assert_eq!(pool.live_bytes(), 0);
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an admission beyond one quantum made straight to the policy, which the \
+              unit assertion must reject"
+)]
 fn bound_assertion_rejects_oversized_instrumentation() {
     use dcbor::bounded::Budget;
     let mut m = meter();
     m.traverse(1, 256).unwrap();
-    assert!(std::panic::catch_unwind(|| m.assert_units(3, 64)).is_err());
+    assert!(std::panic::catch_unwind(|| m.assert_units(TURN)).is_err());
 }

@@ -1,189 +1,95 @@
-//! Real heap instrumentation. Only this test thread is observed. Bookkeeping
-//! uses fixed storage and cannot recursively allocate through GlobalAlloc.
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::RefCell;
+//! Physical heap tests over the shared observer: every real allocation of a
+//! retained decode, normalization and storage growth can fail, and failure,
+//! retirement and drain release physical storage and reservations exactly
+//! without allocating.
+use super::bindings::text_encoder;
+use super::harness::*;
+use super::heap::Observation;
+use super::support::{
+    self, Fault, allowed, drive_faulted, physical_matrix, refusal_matrix, refuse, rigor::rigor,
+};
+use dcbor::bounded::decode::construction::{
+    Borrowed, DecodeOwner, TypedDecoder, TypedValue,
+    in_place::{StableOption, Transferable},
+};
+use dcbor::bounded::decode::{DecodeError, Options};
+use dcbor::bounded::{BoundedError, Encoded, Reservation};
 
-#[path = "heap_lifecycle.rs"]
-mod lifecycle;
+type Decoded<'s, T> = Result<TypedValue<'s, Borrowed<'s>, T, Limits>, DecodeError<LimitRefusal>>;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stats {
-    pub calls: usize,
-    pub denied: bool,
-    pub live: usize,
-    pub peak: usize,
-    pub unadmitted: usize,
-    pub overflow: bool,
-}
-struct State {
-    active: bool,
-    fail_at: Option<usize>,
-    admitted: [u64; 512],
-    slots: [(usize, usize); 512],
-    stats: Stats,
-}
-thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State {
-        active: false, fail_at: None, admitted: [0; 512], slots: [(0, 0); 512],
-        stats: Stats { calls: 0, denied: false, live: 0, peak: 0,
-            unadmitted: 0, overflow: false },
-    }) };
+/// Open a scope over `wire` unobserved, then decode `T` in an armed window of
+/// `observer`.
+fn decoded<'s, T: Transferable<Limits> + 's>(
+    m: &mut Limits,
+    wire: &'s [u8],
+    observer: &Observation,
+) -> (DecodeOwner<'s, Limits>, Decoded<'s, T>) {
+    observer.stop();
+    let (owner, input) = support::open(m, wire);
+    let result = observer.window(|| support::decode::<_, T>(m, input, Options::normalizing(8)));
+    (owner, result)
 }
 
-pub fn admitted(bytes: u64) {
-    let _ = STATE.try_with(|state| {
-        let mut state = state.borrow_mut();
-        if state.active {
-            if bytes == 0 {
-                return;
+/// After cleanup: no physical request since `calls`, nothing observed live,
+/// every request admitted, and complete bookkeeping.
+fn cleaned(observer: &Observation, calls: usize) {
+    let stats = observer.snapshot();
+    assert_eq!(stats.calls, calls, "cleanup allocated");
+    assert_eq!(stats.live, 0);
+    assert_eq!(stats.unadmitted, 0);
+    assert!(!stats.overflow);
+}
+
+/// Every physical allocation of decoding `wire` as `T`, failed in turn. The
+/// baseline publishes a value `check` accepts, within its reservations;
+/// retirement and drain are observed and allocate nothing. Every failure is an
+/// allocation error whose cleanup allocates nothing and recovers every byte
+/// and reservation.
+fn allocation_matrix<T: Transferable<Limits> + 'static>(wire: &[u8], check: impl Fn(&T)) {
+    let name = format!("decode physically of {}", core::any::type_name::<T>());
+    physical_matrix(&name, |failure| {
+        let mut m = meter();
+        let observer = Observation::begin(failure);
+        let (mut owner, result) = decoded::<T>(&mut m, wire, &observer);
+        match failure {
+            None => {
+                let value = result.expect("baseline decode");
+                check(value.value());
+                let published = observer.snapshot();
+                assert!(published.calls > 0 && !published.overflow);
+                assert_eq!(published.unadmitted, 0);
+                assert!(published.live <= m.live_bytes() as usize);
+                assert!(published.peak <= m.peak_bytes() as usize);
+                observer.window(|| drop(value));
+                let queued = observer.snapshot();
+                assert_eq!(
+                    (queued.calls, queued.live),
+                    (published.calls, published.live),
+                    "retirement allocated or released synchronously"
+                );
+                observer.window(|| support::drain(&mut owner, &mut m));
+                cleaned(&observer, published.calls);
+                assert_eq!(m.live_bytes(), 0);
+                published.calls
             }
-            if let Some(slot) = state.admitted.iter_mut().find(|slot| **slot == 0) {
-                *slot = bytes;
-            } else {
-                state.stats.overflow = true;
+            Some(index) => {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DecodeError::Resource(BoundedError::Allocation { .. }))
+                    ),
+                    "allocation {index} did not fail the decode"
+                );
+                observer.window(|| drop(result));
+                let failed = observer.snapshot();
+                assert_eq!(failed.denied, 1, "allocation {index} never intercepted");
+                observer.window(|| support::drain(&mut owner, &mut m));
+                cleaned(&observer, failed.calls);
+                assert_eq!(m.live_bytes(), 0);
+                failed.calls
             }
         }
     });
-}
-
-fn deny(bytes: usize) -> bool {
-    STATE
-        .try_with(|state| {
-            let mut state = state.borrow_mut();
-            if !state.active {
-                return false;
-            }
-            // A field can be reserved before its permit-container metadata.
-            // Match outstanding admissions rather than assuming the last
-            // admitted allocation must be the next physical request.
-            if let Some((index, _)) = state
-                .admitted
-                .iter()
-                .enumerate()
-                .filter(|(_, held)| **held >= bytes as u64 && **held != 0)
-                .min_by_key(|(_, held)| **held)
-            {
-                state.admitted[index] = 0;
-            } else {
-                state.stats.unadmitted += 1;
-            }
-            let denied = state.fail_at == Some(state.stats.calls);
-            state.stats.calls += 1;
-            state.stats.denied |= denied;
-            denied
-        })
-        .unwrap_or(false)
-}
-
-fn allocated(ptr: *mut u8, bytes: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let _ = STATE.try_with(|state| {
-        let mut state = state.borrow_mut();
-        if !state.active {
-            return;
-        }
-        if let Some(slot) = state.slots.iter_mut().find(|slot| slot.0 == 0) {
-            *slot = (ptr as usize, bytes);
-            state.stats.live += bytes;
-            state.stats.peak = state.stats.peak.max(state.stats.live);
-        } else {
-            state.stats.overflow = true;
-        }
-    });
-}
-
-fn released(ptr: *mut u8) {
-    let _ = STATE.try_with(|state| {
-        let mut state = state.borrow_mut();
-        if state.stats.live == 0 {
-            return;
-        }
-        if let Some(index) = state
-            .slots
-            .iter()
-            .position(|slot| slot.0 == ptr as usize && slot.0 != 0)
-        {
-            state.stats.live -= state.slots[index].1;
-            state.slots[index] = (0, 0);
-        }
-    });
-}
-
-struct Observed;
-// System owns every pointer. The observer only refuses a selected request and
-// records addresses; it never dereferences them or changes allocation layouts.
-unsafe impl GlobalAlloc for Observed {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if deny(layout.size()) {
-            return std::ptr::null_mut();
-        }
-        let ptr = unsafe { System.alloc(layout) };
-        allocated(ptr, layout.size());
-        ptr
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if deny(layout.size()) {
-            return std::ptr::null_mut();
-        }
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        allocated(ptr, layout.size());
-        ptr
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if deny(size) {
-            return std::ptr::null_mut();
-        }
-        let replacement = unsafe { System.realloc(ptr, layout, size) };
-        if !replacement.is_null() {
-            // Count requested old/new overlap, even if System grew in place.
-            let _ = STATE.try_with(|state| {
-                let mut state = state.borrow_mut();
-                if state.active {
-                    state.stats.peak = state.stats.peak.max(state.stats.live + size);
-                }
-            });
-            released(ptr);
-            allocated(replacement, size);
-        }
-        replacement
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        released(ptr);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-}
-#[global_allocator]
-static ALLOCATOR: Observed = Observed;
-
-pub struct Observation;
-impl Observation {
-    pub fn begin(fail_at: Option<usize>) -> Self {
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            assert!(
-                !state.active && state.stats.live == 0,
-                "nested observation/live previous output"
-            );
-            state.stats = Stats::default();
-            state.admitted = [0; 512];
-            state.fail_at = fail_at;
-            state.active = true;
-        });
-        Self
-    }
-    pub fn snapshot(&self) -> Stats {
-        STATE.with(|state| state.borrow().stats)
-    }
-    pub fn stop(&self) {
-        STATE.with(|state| state.borrow_mut().active = false);
-    }
-}
-impl Drop for Observation {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
 
 #[test]
@@ -200,216 +106,164 @@ fn physical_observer_detects_an_unreported_allocation() {
 
 #[test]
 fn every_real_decoder_allocation_failure_releases_physical_and_permit_ownership() {
-    use super::harness::*;
-    use dcbor::bounded::BoundedError;
-    use dcbor::bounded::decode::DecodeError;
-    let wire = text_wire(&"q\u{301}😀".repeat(64));
-    let mut baseline = meter();
-    baseline.calls.reserve(16384);
-    let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
-    let observer = Observation::begin(None);
-    let value = retained_value::<String>(&owner, &wire, &mut baseline).unwrap();
-    observer.stop();
-    let stats = observer.snapshot();
-    assert!(!stats.overflow && stats.calls > 0);
-    assert_eq!(stats.unadmitted, 0);
-    assert!(stats.live <= baseline.pool.live() as usize);
-    assert!(stats.peak <= baseline.pool.peak() as usize);
-    drop(value);
-    drain_decode(&owner, &mut baseline);
-    assert_eq!(observer.snapshot().live, 0);
-    assert_eq!(baseline.pool.live(), 0);
-    drop(observer);
-    every_case(stats.calls, |index| {
-        let mut m = meter();
-        m.calls.reserve(16384);
-        let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
-        let observer = Observation::begin(Some(index));
-        let result = retained_value::<String>(&owner, &wire, &mut m);
-        observer.stop();
-        let stats = observer.snapshot();
-        assert!(stats.denied, "allocation {index} never intercepted");
-        assert!(!stats.overflow);
-        assert_eq!(stats.unadmitted, 0);
-        assert!(matches!(
-            result,
-            Err(DecodeError::Resource(BoundedError::Allocation { .. }))
-        ));
-        drop(result);
-        drain_decode(&owner, &mut m);
-        assert_eq!(observer.snapshot().live, 0);
-        assert_eq!(m.pool.live(), 0);
+    let text = "q\u{301}\u{1f600}".repeat(64);
+    allocation_matrix::<String>(&text_wire(&text), |value| assert_eq!(*value, text));
+}
+
+#[test]
+fn stable_optional_acquisitions_fail_physically_and_cleanup_never_allocates() {
+    allocation_matrix::<StableOption<String, Limits>>(&[0x63, b'q', 0xcc, 0x81], |value| {
+        assert_eq!(value.as_ref().map(String::as_str), Some("q\u{301}"));
     });
 }
 
-// Ownership floor: Tokio's sync_semaphore_owned.rs::try_acquire_many and
-// stress_test. Extend that floor by observing actual storage simultaneously
-// with reservations, including every physical allocation failure.
-fn retained_value<
-    'i,
-    'o,
-    T: dcbor::bounded::decode::construction::in_place::InPlace<super::harness::Meter> + 'i,
->(
-    owner: &'o dcbor::bounded::decode::construction::DecodeOwner<'i, super::harness::Meter>,
-    wire: &'i [u8],
-    meter: &mut super::harness::Meter,
-) -> Result<
-    dcbor::bounded::decode::construction::TypedValue<'i, 'o, T, super::harness::Meter>,
-    dcbor::bounded::decode::DecodeError<super::harness::Refusal>,
-> {
-    use dcbor::bounded::decode::Options;
-    use dcbor::bounded::decode::construction::{TypedDecoder, TypedStep};
-    let mut decoder = TypedDecoder::<T, _>::new(owner, wire, Options::normalizing(8));
-    for _ in 0..wire.len() * 128 + 4096 {
-        let before = (meter.values, meter.bytes);
-        meter.limit_values = before.0.checked_add(3).unwrap();
-        meter.limit_bytes = before.1.checked_add(64).unwrap();
-        let outcome = decoder.step(meter)?;
-        assert!(meter.values - before.0 <= 3 && meter.bytes - before.1 <= 64);
-        match outcome {
-            TypedStep::Progress => {
-                assert!(meter.values > before.0 || meter.bytes > before.1);
+/// A typed decode of a literal vector of texts under the fault matrix, its
+/// heap observed: constructing the decoder allocates nothing; wherever a
+/// refusal cancels it (each turn begins with an admission, so every turn
+/// boundary is among them), dropping it there allocates nothing and
+/// releases nothing synchronously, and the drain allocates nothing and
+/// releases everything; a resumed decode publishes the literal value.
+#[test]
+fn every_public_decoder_cancellation_transfers_custody_without_allocating() {
+    // Literal ["q\u{301}", "b"] crosses parser, normalizer, document transfer,
+    // vector child construction and pre-publication cleanup boundaries.
+    let wire = [0x82, 0x63, b'q', 0xcc, 0x81, 0x61, b'b'];
+    refusal_matrix(
+        "typed decode of a text vector, observed",
+        rigor(),
+        |fault: Fault| {
+            let mut m = meter();
+            let observer = Observation::begin(None);
+            observer.stop();
+            let (mut owner, input) = support::open(&mut m, &wire);
+            // The decode alone is under test: the scope and input are setup.
+            m.measure();
+            refuse(&mut m, fault.refusal);
+            let mut decoder = observer.window(|| {
+                TypedDecoder::<_, Vec<String>, Limits>::new(input, Options::normalizing(8))
+            });
+            assert_eq!(observer.snapshot().calls, 0, "constructors allocated");
+            let turns = allowed(&m, typed_turns::<Vec<String>>(wire.len()));
+            let value = observer
+                .window(|| drive_faulted(&mut m, &mut decoder, turns, fault.cancel))
+                .expect("a literal vector of texts decodes");
+            let calls = support::RefusalRun::of(&m);
+            if let Some(value) = &value {
+                assert_eq!(value.value(), &["q\u{301}", "b"]);
             }
-            TypedStep::Complete(value) => {
-                let held = meter.pool.live();
-                drop(decoder);
-                assert_eq!(meter.pool.live(), held);
-                return Ok(value);
-            }
-            TypedStep::Finished => panic!("retained decoder lost its output"),
-        }
-    }
-    panic!("retained decoder failed to terminate");
+            let before = observer.snapshot();
+            observer.window(|| drop(decoder));
+            observer.window(|| drop(value));
+            let queued = observer.snapshot();
+            assert_eq!(
+                (queued.calls, queued.live),
+                (before.calls, before.live),
+                "retirement allocated or released synchronously"
+            );
+            observer.window(|| support::drain(&mut owner, &mut m));
+            cleaned(&observer, before.calls);
+            assert_eq!(m.live_bytes(), 0);
+            calls
+        },
+    );
 }
 
-pub(super) fn drain_decode(
-    owner: &dcbor::bounded::decode::construction::DecodeOwner<'_, super::harness::Meter>,
-    meter: &mut super::harness::Meter,
+/// Encode `source` in an armed window of `observer`. A terminal failure is
+/// followed by the encoder's own cleanup, also observed. Returns the outcome
+/// and the policy holding any output's reservation.
+fn encoded(
+    source: &str,
+    observer: &Observation,
+) -> (
+    Result<Encoded<Reservation>, BoundedError<LimitRefusal>>,
+    Limits,
 ) {
-    use dcbor::bounded::decode::construction::reclamation::Reclaimed;
-    for _ in 0..16384 {
-        meter.limit_values = meter.values + 3;
-        meter.limit_bytes = meter.bytes + 64;
-        meter.refused = None;
-        if owner.shutdown_step(meter).unwrap() == Reclaimed::Done {
-            return;
-        }
+    observer.stop();
+    let mut m = meter();
+    let bound = normalize_turns(source);
+    let mut encoder = text_encoder(source);
+    let result = observer.window(|| support::drive_within(&mut m, &mut encoder, bound));
+    if result.is_err() {
+        observer.window(|| support::finish_within(&mut m, &mut encoder, bound));
     }
-    panic!("decode owner exceeded cleanup bound");
+    let held = m.live_bytes();
+    drop(encoder);
+    assert_eq!(
+        m.live_bytes(),
+        held,
+        "retiring the encoder released storage synchronously"
+    );
+    (result, m)
 }
 
 #[test]
 fn every_real_normalization_and_output_allocation_can_fail_without_leaking() {
-    use super::harness::*;
-    use dcbor::bounded::BoundedError;
     let source = format!("q{}", "\u{301}\u{316}".repeat(64));
     let expected = text_wire(&format!(
         "q{}{}",
         "\u{316}".repeat(64),
         "\u{301}".repeat(64)
     ));
-    let mut baseline = meter();
-    baseline.calls.reserve(16384);
-    let observer = Observation::begin(None);
-    let output = retained_text(&source, &mut baseline).unwrap();
-    observer.stop();
-    assert_eq!(output.as_ref(), expected);
-    let measured = observer.snapshot();
-    assert!(measured.calls > 0 && !measured.overflow);
-    assert_eq!(measured.unadmitted, 0);
-    assert!(measured.live <= baseline.pool.live() as usize);
-    assert!(measured.peak <= baseline.pool.peak() as usize);
-    drop(output);
-    assert_eq!(observer.snapshot().live, 0);
-    assert_eq!(baseline.pool.live(), 0);
-    drop(observer);
-    every_case(measured.calls, |index| {
-        let mut m = meter();
-        m.calls.reserve(16384);
-        let observer = Observation::begin(Some(index));
-        let output = retained_text(&source, &mut m);
-        observer.stop();
+    physical_matrix("text encoding physically", |failure| {
+        let observer = Observation::begin(failure);
+        let (output, pool) = encoded(&source, &observer);
         let measured = observer.snapshot();
-        assert!(
-            measured.denied,
-            "physical failure {index} was not exercised"
-        );
         assert!(!measured.overflow);
         assert_eq!(measured.unadmitted, 0);
-        assert!(matches!(output, Err(BoundedError::Allocation { .. })));
-        drop(output);
+        match failure {
+            None => {
+                let output = output.expect("baseline encoding failed");
+                assert_eq!(output.as_ref(), expected);
+                assert!(measured.calls > 0);
+                assert!(measured.live <= pool.live_bytes() as usize);
+                assert!(measured.peak <= pool.peak_bytes() as usize);
+                drop(output);
+            }
+            Some(index) => {
+                assert_eq!(
+                    measured.denied, 1,
+                    "physical failure {index} was not exercised"
+                );
+                assert!(
+                    matches!(output, Err(BoundedError::Allocation { .. })),
+                    "physical failure {index} did not fail the encoding"
+                );
+            }
+        }
         assert_eq!(observer.snapshot().live, 0);
-        assert_eq!(m.pool.live(), 0);
+        assert_eq!(pool.live_bytes(), 0);
+        measured.calls
     });
 }
 
 #[test]
 fn physical_growth_failure_preserves_old_bytes_and_their_reservation() {
-    use super::harness::*;
-    use dcbor::bounded::{BoundedError, Owned};
+    use dcbor::bounded::Owned;
     let mut m = meter();
-    m.calls.reserve(16384);
     let observer = Observation::begin(None);
     let mut bytes = Owned::new();
     bytes.push(7u8, &mut m).unwrap();
     observer.stop();
     let old = observer.snapshot().live;
-    let held = m.pool.live();
+    let held = m.live_bytes();
     assert!(old > 0 && old <= held as usize);
-    // Re-arm the existing observation, retaining the old allocation registry.
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        state.active = true;
-        state.fail_at = Some(state.stats.calls);
-    });
+    // Re-arm the same observation, retaining the old allocation registry.
+    observer.fail_next();
     let result = bytes.reserve(4096, &mut m);
     observer.stop();
     assert!(matches!(result, Err(BoundedError::Allocation { .. })));
-    assert!(observer.snapshot().denied);
+    assert_eq!(observer.snapshot().denied, 1);
     assert_eq!(bytes.as_slice(), &[7]);
     assert_eq!(observer.snapshot().live, old);
-    assert_eq!(m.pool.live(), held);
+    assert_eq!(m.live_bytes(), held);
     drop(bytes);
     assert_eq!(observer.snapshot().live, 0);
-    assert_eq!(m.pool.live(), 0);
-}
-
-fn retained_text(
-    source: &str,
-    meter: &mut super::harness::Meter,
-) -> Result<
-    dcbor::bounded::Encoded<super::harness::Permit>,
-    dcbor::bounded::BoundedError<super::harness::Refusal>,
-> {
-    use dcbor::bounded::text_cursor::{TextEncoder, TextStep};
-    let mut encoder = TextEncoder::new(source);
-    for _ in 0..source.len() * source.len() * 8 + 4096 {
-        let before = (meter.values, meter.bytes);
-        meter.limit_values = before.0.checked_add(3).unwrap();
-        meter.limit_bytes = before.1.checked_add(64).unwrap();
-        let outcome = encoder.step(meter)?;
-        assert!(meter.values - before.0 <= 3 && meter.bytes - before.1 <= 64);
-        match outcome {
-            TextStep::Progress => {
-                assert!(meter.values > before.0 || meter.bytes > before.1);
-            }
-            TextStep::Complete(value) => {
-                let held = meter.pool.live();
-                drop(encoder);
-                assert_eq!(meter.pool.live(), held);
-                return Ok(value);
-            }
-            TextStep::Finished => panic!("retained encoder lost its output"),
-        }
-    }
-    panic!("retained encoder failed to terminate");
+    assert_eq!(m.live_bytes(), 0);
 }
 
 #[cfg(feature = "derive")]
 #[test]
 fn derived_nested_values_release_every_failed_physical_allocation() {
-    use super::harness::*;
-    use dcbor::bounded::{BoundedError, decode::DecodeError};
     #[derive(dcbor::CBORBoundedDecodable)]
     struct Record {
         #[cbor(n = 1)]
@@ -421,42 +275,9 @@ fn derived_nested_values_release_every_failed_physical_allocation() {
     let wire = [
         0xa2, 1, 0x61, b'a', 2, 0x82, 0x82, 0x61, b'b', 0x61, b'c', 0x81, 0x61, b'd',
     ];
-    let mut baseline = meter();
-    baseline.calls.reserve(16384);
-    let observer = Observation::begin(None);
-    let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
-    let output = retained_value::<Record>(&owner, &wire, &mut baseline).unwrap();
-    observer.stop();
-    let stats = observer.snapshot();
-    assert!(stats.calls > 0 && !stats.overflow);
-    assert_eq!(stats.unadmitted, 0);
-    assert!(stats.live <= baseline.pool.live() as usize);
-    assert!(stats.peak <= baseline.pool.peak() as usize);
-    assert_eq!(output.value().first, "a");
-    assert_eq!(output.value().nested[0], ["b", "c"]);
-    assert_eq!(output.value().nested[1], ["d"]);
-    drop(output);
-    drain_decode(&owner, &mut baseline);
-    assert_eq!(observer.snapshot().live, 0);
-    assert_eq!(baseline.pool.live(), 0);
-    drop(observer);
-    every_case(stats.calls, |index| {
-        let mut meter = meter();
-        meter.calls.reserve(16384);
-        let owner = dcbor::bounded::decode::construction::DecodeOwner::new();
-        let observer = Observation::begin(Some(index));
-        let result = retained_value::<Record>(&owner, &wire, &mut meter);
-        observer.stop();
-        let measured = observer.snapshot();
-        assert!(measured.denied && !measured.overflow);
-        assert_eq!(measured.unadmitted, 0);
-        assert!(matches!(
-            result,
-            Err(DecodeError::Resource(BoundedError::Allocation { .. }))
-        ));
-        drop(result);
-        drain_decode(&owner, &mut meter);
-        assert_eq!(observer.snapshot().live, 0);
-        assert_eq!(meter.pool.live(), 0);
+    allocation_matrix::<Record>(&wire, |value| {
+        assert_eq!(value.first, "a");
+        assert_eq!(value.nested[0], ["b", "c"]);
+        assert_eq!(value.nested[1], ["d"]);
     });
 }

@@ -1,15 +1,22 @@
 //! Public lifecycle gates for stable construction and retained reclamation.
 //! These use the current public boundary; no substitute cleanup engine is used.
 #![cfg(feature = "std")]
+// The maximum-dispatch-depth fixture composes each child's full observation.
+#![recursion_limit = "256"]
 
-use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
-use dcbor::bounded::decode::construction::reclamation::{Cursor, Reclaim, Reclaimed};
-use dcbor::bounded::decode::construction::{DecodeOwner, TypedDecoder, TypedStep, TypedValue};
-use dcbor::bounded::decode::{ConstructResult, Document, Options, wrong_type};
-use dcbor::bounded::{Allocator, BoundedError, Budget};
+// The pipeline matrix fails each physical request through the observer.
+#[global_allocator]
+static HEAP: support::heap::Heap = support::heap::Heap;
+
+use dcbor::bounded::decode::construction::in_place::{
+    Built, ConstructionCost, InPlace, plus, times, unit,
+};
+use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reclaimed};
+use dcbor::bounded::decode::construction::{Borrowed, TypedDecoder, TypedValue};
+use dcbor::bounded::decode::{ConstructResult, DecodeError, Document, Options, wrong_type};
+use dcbor::bounded::{Allocator, BoundedError, Limits};
+use dcbor_test_support::{self as support, Input, drain, open};
 use std::cell::Cell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     mem::MaybeUninit,
     ptr::{NonNull, addr_of_mut},
@@ -21,63 +28,9 @@ thread_local! {
     static INITIALIZED: Cell<usize> = const { Cell::new(0) };
 }
 
-struct Permit {
-    live: Arc<AtomicU64>,
-    bytes: u64,
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        let old = self.live.fetch_sub(self.bytes, Ordering::SeqCst);
-        assert!(old >= self.bytes, "reservation released twice");
-    }
-}
-
-#[derive(Default)]
-struct Turn {
-    values: u64,
-    bytes: u64,
-    live: Arc<AtomicU64>,
-    attempts: usize,
-    deny_at: Option<usize>,
-    refusals: usize,
-    admitted: Vec<(u64, u64)>,
-}
-
-impl Turn {
-    fn fresh(&mut self) {
-        self.values = 0;
-        self.bytes = 0;
-    }
-}
-
-impl Budget for Turn {
-    type Refusal = ();
-
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), ()> {
-        let attempt = self.attempts;
-        self.attempts += 1;
-        if self.deny_at == Some(attempt) || values > 3 - self.values || bytes > 64 - self.bytes {
-            self.refusals += 1;
-            return Err(());
-        }
-        self.values += values;
-        self.bytes += bytes;
-        self.admitted.push((values, bytes));
-        Ok(())
-    }
-}
-
-impl Allocator for Turn {
-    type Permit = Permit;
-
-    fn allocate(&mut self, bytes: u64) -> Result<Permit, ()> {
-        self.live.fetch_add(bytes, Ordering::SeqCst);
-        Ok(Permit {
-            live: self.live.clone(),
-            bytes,
-        })
-    }
+/// The policy of these gates: logged, strict, refusing call `deny_at`.
+fn turns(deny_at: Option<usize>) -> Limits {
+    Limits::unlimited().logged().strict().refusing(deny_at)
 }
 
 struct Probe {
@@ -91,18 +44,46 @@ impl Drop for Probe {
     }
 }
 
+/// A [`Probe`]'s construction state: whether its address was written, and
+/// the bytes of its inline payload initialized.
+struct ProbeState {
+    started: bool,
+    written: usize,
+}
+
+/// Whether the address was written and how many payload bytes are: the
+/// probe's whole custody.
+impl Custody for ProbeState {
+    type Observation = (bool, usize);
+
+    fn observe(&mut self) -> (bool, usize) {
+        (self.started, self.written)
+    }
+}
+
 // SAFETY: each admitted unit initializes at most 64 bytes in the final slot.
-// The retained cursor describes the byte prefix even when construction fails.
+// The retained state describes the byte prefix even when construction fails.
 unsafe impl<A: Allocator> InPlace<A> for Probe {
+    // Build: the address write, four 64-byte units and the final unit;
+    // cleanup: four 64-byte units, or one unit before any byte.
+    const COST: ConstructionCost = ConstructionCost::fixed(plus(
+        plus(unit(std::mem::size_of::<usize>()), times(unit(64), 4)),
+        plus(unit(0), times(unit(64), 4)),
+    ));
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a third-party binding admits its own construction, as `InPlace` documents"
+    )]
     unsafe fn build_step(
         document: &Document<'_, A::Permit>,
         _: usize,
         place: NonNull<MaybeUninit<Self>>,
-        cursor: &mut Cursor,
+        state: &mut ProbeState,
         allocator: &mut A,
     ) -> ConstructResult<Built, A> {
         let raw = place.as_ptr().cast::<Self>();
-        if cursor.state == 0 {
+        if !state.started {
             allocator
                 .traverse(1, std::mem::size_of::<usize>() as u64)
                 .map_err(BoundedError::Refused)?;
@@ -110,19 +91,19 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
                 addr_of_mut!((*raw).construction_address).write(raw as usize);
             }
             STARTS.set(STARTS.get() + 1);
-            cursor.state = 1;
+            state.started = true;
             return Ok(Built::Progress);
         }
-        if cursor.position < 256 {
+        if state.written < 256 {
             allocator.traverse(1, 64).map_err(BoundedError::Refused)?;
             unsafe {
                 addr_of_mut!((*raw).inline)
                     .cast::<u8>()
-                    .add(cursor.position)
+                    .add(state.written)
                     .write_bytes(0x5a, 64);
             }
-            cursor.position += 64;
-            if cursor.position == 64 {
+            state.written += 64;
+            if state.written == 64 {
                 INITIALIZED.set(INITIALIZED.get() + 1);
             }
             return Ok(Built::Progress);
@@ -138,70 +119,67 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
 // SAFETY: the payload owns only plain bytes. Invalidate the initialized prefix
 // in admitted units, without invoking its deliberately instrumented Drop.
 unsafe impl<A: Allocator> Reclaim<A> for Probe {
+    type State = ProbeState;
+    const INITIAL: ProbeState = ProbeState {
+        started: false,
+        written: 0,
+    };
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
+    )]
     unsafe fn reclaim_step(
         _: NonNull<MaybeUninit<Self>>,
-        cursor: &mut Cursor,
+        state: &mut ProbeState,
         a: &mut A,
     ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
-        let bytes = cursor.position.min(64);
+        let bytes = state.written.min(64);
         a.traverse(1, bytes as u64).map_err(BoundedError::Refused)?;
-        cursor.position -= bytes;
-        if cursor.position == 0 {
-            cursor.state = 0;
+        state.written -= bytes;
+        if state.written == 0 {
+            state.started = false;
             Ok(Reclaimed::Done)
         } else {
             Ok(Reclaimed::Progress)
         }
     }
+
+    /// One call per 64-byte chunk written, and one for an empty prefix,
+    /// whose call reports `Done` at once.
+    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut ProbeState) -> u64 {
+        (state.written.div_ceil(64) as u64).max(1)
+    }
 }
 
-fn drain(owner: &DecodeOwner<'_, Turn>, turn: &mut Turn) {
-    for _ in 0..512 {
-        turn.fresh();
-        if owner.shutdown_step(turn).unwrap() == Reclaimed::Done {
-            assert_eq!(turn.live.load(Ordering::SeqCst), 0);
-            return;
-        }
-    }
-    panic!("owner did not drain");
-}
-
-fn finish<'o>(
-    owner: &'o DecodeOwner<'static, Turn>,
-    turn: &mut Turn,
-) -> TypedValue<'static, 'o, Probe, Turn> {
-    let mut decoder = TypedDecoder::<Probe, Turn>::new(owner, &[0xf6], Options::normalizing(8));
-    for _ in 0..256 {
-        turn.fresh();
-        match decoder.step(turn) {
-            Ok(TypedStep::Progress) => {}
-            Ok(TypedStep::Complete(value)) => return value,
-            _ => panic!("literal null did not complete under fresh turns"),
-        }
-    }
-    panic!("one-node construction exceeded its finite completion bound");
+fn finish<'s>(input: Input<'s>, m: &mut Limits) -> TypedValue<'s, Borrowed<'s>, Probe, Limits> {
+    support::decode(m, input, Options::normalizing(8)).expect("literal null did not complete")
 }
 
 #[test]
 fn construction_initialization_requires_an_admitted_turn() {
     STARTS.set(0);
-    let owner = DecodeOwner::new();
-    let decoder = TypedDecoder::<Probe, Turn>::new(&owner, &[0xf6], Options::normalizing(8));
+    let mut m = turns(None);
+    let (mut owner, input) = open(&mut m, &[0xf6]);
+    let decoder = TypedDecoder::<_, Probe, Limits>::new(input, Options::normalizing(8));
     let starts = STARTS.get();
     drop(decoder);
+    drain(&mut owner, &mut m);
     assert_eq!(starts, 0, "new ran custom initialization without admission");
 }
 
 #[test]
 fn publication_preserves_the_initialized_value_address() {
-    let mut turn = Turn::default();
-    let owner = DecodeOwner::new();
-    let output = finish(&owner, &mut turn);
+    let mut m = turns(None);
+    let (mut owner, input) = open(&mut m, &[0xf6]);
+    let output = finish(input, &mut m);
     assert_eq!(output.value().inline, [0x5a; 256]);
+    assert_eq!(output.bytes(), [0xf6]);
     let constructed = output.value().construction_address;
     let published = std::ptr::from_ref(output.value()) as usize;
     drop(output);
-    drain(&owner, &mut turn);
+    drain(&mut owner, &mut m);
+    assert_eq!(m.live_bytes(), 0);
     assert_eq!(
         constructed, published,
         "completion moved the initialized value"
@@ -211,12 +189,12 @@ fn publication_preserves_the_initialized_value_address() {
 #[test]
 fn dropping_output_does_not_execute_a_value_destructor() {
     DROPS.set(0);
-    let mut turn = Turn::default();
-    let owner = DecodeOwner::new();
-    let output = finish(&owner, &mut turn);
+    let mut m = turns(None);
+    let (mut owner, input) = open(&mut m, &[0xf6]);
+    let output = finish(input, &mut m);
     assert_eq!(DROPS.get(), 0);
     drop(output);
-    drain(&owner, &mut turn);
+    drain(&mut owner, &mut m);
     assert_eq!(
         DROPS.get(),
         0,
@@ -226,70 +204,57 @@ fn dropping_output_does_not_execute_a_value_destructor() {
 
 #[test]
 fn published_handle_size_is_independent_of_inline_payload() {
-    let small = std::mem::size_of::<TypedValue<'_, '_, u8, Turn>>();
-    let large = std::mem::size_of::<TypedValue<'_, '_, Probe, Turn>>();
+    let small = std::mem::size_of::<TypedValue<'_, Borrowed<'_>, u8, Limits>>();
+    let large = std::mem::size_of::<TypedValue<'_, Borrowed<'_>, Probe, Limits>>();
     assert_eq!(
         small, large,
         "publication carries the schema instead of an owning handle"
     );
 }
 
+/// The fault matrix of decoding a probe from a literal null through a custom
+/// input ([`support::pipeline::matrix`]): every admission refused once in
+/// one run and resumed without replaying committed work, each also in a run
+/// of its own in the exhaustive layer; every physical request failed; and a
+/// retire, an unwind and a cancellation at the decode's boundaries, every
+/// construction boundary among them since the probe declares no reduction.
+/// In every run no probe is destroyed by `Drop`; a published probe was
+/// started once, is whole, and sits at the address it was built at; and some
+/// stop reaches a partially written probe.
 #[test]
-fn cancellation_at_each_construction_boundary_does_not_run_destructors() {
-    // The fixture has one retained initialization step and one completion step.
-    // Discover all pre-publication boundaries through the public driver first.
-    let mut baseline = Turn::default();
-    let owner = DecodeOwner::new();
-    let mut decoder = TypedDecoder::<Probe, Turn>::new(&owner, &[0xf6], Options::normalizing(8));
-    let mut boundaries = None;
-    for step in 0..256 {
-        baseline.fresh();
-        match decoder.step(&mut baseline) {
-            Ok(TypedStep::Progress) => {}
-            Ok(TypedStep::Complete(value)) => {
-                drop(value);
-                boundaries = Some(step + 1);
-                break;
-            }
-            _ => panic!("baseline construction failed"),
-        }
-    }
-    drop(decoder);
-    drain(&owner, &mut baseline);
-    let boundaries = boundaries.expect("baseline exceeded finite bound");
-    let mut violations = Vec::new();
-    let mut observed_partial = false;
-    for stop in 0..boundaries {
+fn every_probe_lifecycle_fault_keeps_custody_without_destructors() {
+    use support::classes::parsed;
+    use support::pipeline::{Expected, decode, matrix};
+    use support::rigor::rigor;
+    let partial = Cell::new(false);
+    matrix("probe decode", rigor(), Expected::Complete, |schedule| {
+        STARTS.set(0);
         DROPS.set(0);
         INITIALIZED.set(0);
-        let mut turn = Turn::default();
-        let owner = DecodeOwner::new();
-        let mut decoder =
-            TypedDecoder::<Probe, Turn>::new(&owner, &[0xf6], Options::normalizing(8));
-        for _ in 0..stop {
-            turn.fresh();
-            assert!(matches!(decoder.step(&mut turn), Ok(TypedStep::Progress)));
-        }
-        assert_eq!(
-            DROPS.get(),
-            0,
-            "partial value destroyed before cancellation"
+        let report = decode::<Probe>(
+            &[0xf6],
+            Options::normalizing(8),
+            schedule,
+            &parsed::<Probe>(),
+            |probe| {
+                assert_eq!(probe.inline, [0x5a; 256]);
+                assert_eq!(
+                    probe.construction_address,
+                    std::ptr::from_ref(probe) as usize,
+                    "publication moved the probe"
+                );
+            },
         );
-        observed_partial |= INITIALIZED.get() > 0;
-        drop(decoder);
-        drain(&owner, &mut turn);
-        if DROPS.get() != 0 {
-            violations.push(stop);
+        if report.complete {
+            assert_eq!(STARTS.get(), 1, "the probe was started more than once");
         }
-    }
-    assert!(
-        observed_partial,
-        "fixture did not reach partial-value custody"
-    );
-    assert!(
-        violations.is_empty(),
-        "unadmitted destruction at cancellation turns {violations:?}"
-    );
+        assert_eq!(DROPS.get(), 0, "a probe was destroyed by Drop");
+        if report.stopped && INITIALIZED.get() > 0 {
+            partial.set(true);
+        }
+        report
+    });
+    assert!(partial.get(), "no stop reached partial-value custody");
 }
 
 #[cfg(feature = "derive")]
@@ -332,35 +297,21 @@ mod large_schema {
                 wire.push(key);
             }
         }
-        let owner = DecodeOwner::new();
-        let mut turn = Turn::default();
-        let mut decoder = TypedDecoder::<Large, Turn>::new(&owner, &wire, Options::normalizing(8));
-        let mut completed = false;
-        for _ in 0..16384 {
-            turn.fresh();
-            match decoder.step(&mut turn) {
-                Ok(TypedStep::Progress)
-                | Err(dcbor::bounded::decode::DecodeError::Resource(BoundedError::Refused(()))) => {
-                }
-                Ok(TypedStep::Complete(output)) => {
-                    output.value().assert_literal_fields();
-                    drop(output);
-                    completed = true;
-                    break;
-                }
-                _ => panic!("large schema did not publish its literal fields"),
-            }
-        }
-        assert!(completed, "large schema exceeded its finite bound");
-        drop(decoder);
-        drain(&owner, &mut turn);
+        let mut m = turns(None);
+        let (mut owner, input) = open(&mut m, &wire);
+        let output = support::decode::<_, Large>(&mut m, input, Options::normalizing(8))
+            .expect("large schema did not publish its literal fields");
+        output.value().assert_literal_fields();
+        drop(output);
+        drain(&mut owner, &mut m);
     }
 
     #[test]
-    fn derived_initial_state_fits_a_single_metadata_quantum() {
+    fn controller_size_is_independent_of_schema_size() {
         assert!(std::mem::size_of::<Large>() >= 256);
-        assert!(
-            std::mem::size_of::<TypedDecoder<'_, '_, Large, Turn>>() <= 64,
+        assert_eq!(
+            std::mem::size_of::<TypedDecoder<'_, Borrowed<'_>, Large, Limits>>(),
+            std::mem::size_of::<TypedDecoder<'_, Borrowed<'_>, u8, Limits>>(),
             "derive stores per-field construction state inline"
         );
     }
@@ -368,38 +319,26 @@ mod large_schema {
 
 #[test]
 fn terminal_error_cannot_report_finished_with_live_custody() {
-    let mut turn = Turn::default();
-    let owner = DecodeOwner::new();
-    let mut decoder = TypedDecoder::<Probe, Turn>::new(&owner, &[0xf4], Options::normalizing(8));
-    let mut failed = false;
-    for _ in 0..256 {
-        turn.fresh();
-        if decoder.step(&mut turn).is_err() {
-            failed = true;
-            break;
-        }
-    }
+    let mut m = turns(None);
+    let (mut owner, input) = open(&mut m, &[0xf4]);
+    let scope = m.live_bytes();
+    let mut decoder = TypedDecoder::<_, Probe, Limits>::new(input, Options::normalizing(8));
+    let bound = support::typed_turns::<Probe>(1);
+    let failed = support::fail_within(&mut m, &mut decoder, bound);
     assert!(
-        failed,
+        matches!(failed, DecodeError::Invalid(_)),
         "fixture never reached its terminal construction error"
     );
-    assert!(turn.live.load(Ordering::SeqCst) > 0);
-    for _ in 0..256 {
-        turn.fresh();
-        match decoder.step(&mut turn) {
-            Ok(TypedStep::Progress) => {}
-            Ok(TypedStep::Finished) => {
-                assert_eq!(
-                    turn.live.load(Ordering::SeqCst),
-                    0,
-                    "Finished abandoned charged construction resources"
-                );
-                return;
-            }
-            _ => panic!("terminal construction resumed or published a value"),
-        }
-    }
-    panic!("terminal cleanup failed to finish within its input-derived bound");
+    assert!(m.live_bytes() > scope);
+    support::finish_within(&mut m, &mut decoder, bound);
+    assert_eq!(
+        owner.outstanding(),
+        0,
+        "Finished abandoned charged construction records"
+    );
+    drop(decoder);
+    drain(&mut owner, &mut m);
+    assert_eq!(m.live_bytes(), 0);
 }
 
 #[path = "reclamation/typed_lifecycle_matrix.rs"]

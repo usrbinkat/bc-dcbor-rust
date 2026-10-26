@@ -6,6 +6,9 @@ use maps::order::{Entry, Order};
 pub enum DynamicPhase {
     #[default]
     Order,
+    /// Entries a cursor yielded in canonical order: each key compared with
+    /// the one before it, in place of sorting.
+    Verify,
     CheckOrder,
     Assemble,
     Clear,
@@ -14,6 +17,17 @@ pub enum DynamicPhase {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DynamicPosition {
+    /// Descriptor, merge-scratch and permutation-bitmap custody, including
+    /// retained growth admissions and relocation stages.
+    pub entry_storage: decode::storage::StoragePosition,
+    pub merge_storage: decode::storage::StoragePosition,
+    pub bitmap_storage: decode::storage::StoragePosition,
+    pub merge_middle: usize,
+    pub merge_end: usize,
+    pub merge_forward: bool,
+    pub permutation_saved: u8,
+    /// None distinguishes an absent compaction from one starting at zero.
+    pub compact_end: Option<usize>,
     pub entries: usize,
     pub phase: DynamicPhase,
     pub entry: usize,
@@ -33,6 +47,29 @@ struct Compact {
     end: usize,
 }
 
+/// Opening or closing one key's or value's compaction: one value and its
+/// record's bytes.
+pub(super) const COMPACT: Unit<PreparationPlace> =
+    Unit::of::<Compact>(PreparationPlace::Compaction);
+
+/// Removing one header gap from a compacted payload: its gap record read.
+pub(super) const GAP: Unit<PreparationPlace> =
+    Unit::of::<(usize, usize)>(PreparationPlace::Compaction);
+
+/// Moving a run of compacted bytes: one value and at most a quantum.
+pub(super) const MOVE: Capped<PreparationPlace> = Capped::new(
+    PreparationPlace::Compaction,
+    1,
+    decode::construction::stable::QUANTUM as u64,
+);
+
+/// Checking one entry of a nested map's order, or its end.
+pub(super) const CHECK: Unit<PreparationPlace> = Unit::new(PreparationPlace::Check, 1, 0);
+
+/// Popping a completed map's frame.
+pub(super) const COMPLETE: Unit<PreparationPlace> =
+    Unit::of::<Frame<'static>>(PreparationPlace::Completion);
+
 pub(super) struct Dynamic<P> {
     pub entries: Storage<Entry, P>,
     order: Order<P>,
@@ -44,6 +81,92 @@ pub(super) struct Dynamic<P> {
 }
 
 impl<P> Dynamic<P> {
+    /// Every unit of [`Self::initialize_step`]: the entry arena, the ordering
+    /// and permutation engines, and four scalar fields.
+    pub(super) const INIT_STEPS: usize = Storage::<Entry, P>::INIT_STEPS
+        + Order::<P>::INIT_STEPS
+        + permutation::Permutation::<P>::INIT_STEPS
+        + 4;
+
+    /// Initialize one unit of the empty engine [`Self::new`] builds.
+    ///
+    /// # Safety
+    /// The destination is unique, stable and uninitialized; `step` starts at
+    /// zero and is retained. An incomplete prefix owns nothing.
+    pub(super) unsafe fn initialize_step<A: Allocator<Permit = P>>(
+        place: *mut Self,
+        step: &mut usize,
+        a: &mut A,
+    ) -> BoundedResult<bool, A> {
+        let storage = Storage::<Entry, P>::INIT_STEPS;
+        let order = Order::<P>::INIT_STEPS;
+        let permutation = permutation::Permutation::<P>::INIT_STEPS;
+        // SAFETY: each unit writes one uninitialized field of the destination.
+        unsafe {
+            if *step < storage {
+                Storage::initialize_step(addr_of_mut!((*place).entries), step, a)?;
+                return Ok(false);
+            }
+            if *step < storage + order {
+                let mut sub = *step - storage;
+                Order::initialize_step(addr_of_mut!((*place).order), &mut sub, a)?;
+                *step = storage + sub;
+                return Ok(false);
+            }
+            if *step < storage + order + permutation {
+                let mut sub = *step - storage - order;
+                permutation::Permutation::initialize_step(
+                    addr_of_mut!((*place).permutation),
+                    &mut sub,
+                    a,
+                )?;
+                *step = storage + order + sub;
+                return Ok(false);
+            }
+            match *step - storage - order - permutation {
+                0 => field(addr_of_mut!((*place).compact), || None, a)?,
+                1 => field(addr_of_mut!((*place).phase), || DynamicPhase::Order, a)?,
+                2 => field(addr_of_mut!((*place).entry), || 0, a)?,
+                3 => field(addr_of_mut!((*place).byte), || 0, a)?,
+                _ => return Err(BoundedError::PlanMismatch),
+            }
+        }
+        *step += 1;
+        Ok(*step == Self::INIT_STEPS)
+    }
+
+    /// Whether the entry descriptors and both scratch arenas hold nothing.
+    pub(super) fn is_released(&self) -> bool {
+        self.entries.is_released() && self.order.is_released() && self.permutation.is_released()
+    }
+
+    /// One admitted unit releasing the entry descriptors, then the ordering
+    /// and permutation scratch. Called only while [`Self::is_released`] is
+    /// false.
+    pub(super) fn reclaim_step<A: Allocator<Permit = P>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<(), A> {
+        let cleanup = PreparationPlace::Cleanup;
+        if !self.entries.is_released() {
+            at(cleanup, || self.entries.reclaim_copy_step(a))?;
+        } else if !self.order.is_released() {
+            at(cleanup, || self.order.reclaim_step(a))?;
+        } else {
+            at(cleanup, || self.permutation.reclaim_step(a))?;
+        }
+        Ok(())
+    }
+
+    /// The most calls [`Self::reclaim_step`] still takes until
+    /// [`Self::is_released`]: each arena not yet released, its own count.
+    pub(super) fn reclaim_remaining(&self) -> u64 {
+        self.entries
+            .unreleased_remaining()
+            .saturating_add(self.order.scratch.unreleased_remaining())
+            .saturating_add(self.permutation.visited.unreleased_remaining())
+    }
+
     pub fn new() -> Self {
         Self {
             entries: Storage::new(),
@@ -58,6 +181,14 @@ impl<P> Dynamic<P> {
 
     pub fn position(&self) -> DynamicPosition {
         DynamicPosition {
+            entry_storage: self.entries.position(),
+            merge_storage: self.order.scratch.position(),
+            bitmap_storage: self.permutation.visited.position(),
+            merge_middle: self.order.middle,
+            merge_end: self.order.end,
+            merge_forward: self.order.forward,
+            permutation_saved: self.permutation.saved,
+            compact_end: self.compact.as_ref().map(|compact| compact.end),
             entries: self.entries.len(),
             phase: self.phase,
             entry: self.entry,
@@ -73,37 +204,39 @@ impl<P> Dynamic<P> {
 }
 
 impl<P> Preparation<'_, P> {
-    /// Runs only after a child frame has completed. Nested maps have already
-    /// removed their descriptors, so the last descriptor belongs to this map.
+    /// One unit of the top unordered map's own work, once a child frame has
+    /// completed: a key or value compacted, or the map sorted, checked,
+    /// permuted and completed. True when the step did work, a unit of an
+    /// arena's relocation included; false when the top frame has no
+    /// unordered map past its scan. Nested maps have already removed their
+    /// descriptors, so the last descriptor belongs to this map.
     pub(super) fn dynamic_step<A: Allocator<Permit = P>>(
         &mut self,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        let Some(frame) = self.frames.ready().and_then(|frames| frames.last()) else {
+        let frames = &mut self.frames;
+        let Some(frames) = at(PreparationPlace::Frames, || frames.settle_step(a))? else {
+            return Ok(true);
+        };
+        let Some(index) = frames.as_slice().last().and_then(|frame| frame.map) else {
             return Ok(false);
         };
-        let Some(index) = frame.map else {
-            return Ok(false);
+        let maps = &mut self.map_frames;
+        let Some(maps) = at(PreparationPlace::OpenMaps, || maps.settle_step(a))? else {
+            return Ok(true);
         };
-        let map = self
-            .map_frames
-            .ready()
-            .and_then(|s| s.get(index))
+        let map = maps
+            .as_slice()
+            .get(index)
             .ok_or(BoundedError::PlanMismatch)?;
-        let MapState::Dynamic { phase, .. } = &map.state else {
+        let MapState::Dynamic { phase, .. } = map.state else {
             return Ok(false);
         };
         match phase {
-            EntryPhase::Scan => {
-                // Reserve before asking the schema for its next bucket. This
-                // keeps successful bucket inspection from replaying on refusal.
-                if self.dynamic.entries.ready().is_none() {
-                    self.dynamic.entries.reserve_step(a)?;
-                    return Ok(true);
-                }
-                Ok(!self.dynamic.entries.reserve_step(a)?)
-            }
-            EntryPhase::Key(_) | EntryPhase::Value => {
+            // The next entry's slot is reserved with the instruction that
+            // draws it ([`Preparation::advance`]).
+            EntryPhase::Scan => Ok(false),
+            EntryPhase::Key | EntryPhase::Value => {
                 self.compact_child(a)?;
                 Ok(true)
             }
@@ -115,52 +248,61 @@ impl<P> Preparation<'_, P> {
     }
 
     fn compact_child<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
-        let frame = self
-            .frames
-            .ready_mut()
-            .and_then(|s| s.last_mut())
+        let frames = &mut self.frames;
+        let Some(frames) = at(PreparationPlace::Frames, || frames.settle_step(a))? else {
+            return Ok(());
+        };
+        let maps = &mut self.map_frames;
+        let Some(maps) = at(PreparationPlace::OpenMaps, || maps.settle_step(a))? else {
+            return Ok(());
+        };
+        let entries = &mut self.dynamic.entries;
+        let Some(entries) = at(PreparationPlace::EntryArena, || entries.settle_step(a))? else {
+            return Ok(());
+        };
+        let holes = &mut self.holes;
+        let Some(holes) = at(PreparationPlace::Gaps, || holes.settle_step(a))? else {
+            return Ok(());
+        };
+        let bytes = &mut self.bytes;
+        let Some(bytes) = at(PreparationPlace::PlanBytes, || bytes.settle_step(a))? else {
+            return Ok(());
+        };
+        let map = frames
+            .as_slice()
+            .last()
+            .and_then(|frame| frame.map)
+            .and_then(|index| maps.as_mut_slice().get_mut(index))
             .ok_or(BoundedError::PlanMismatch)?;
-        let map = self
-            .map_frames
-            .ready_mut()
-            .and_then(|s| frame.map.and_then(|i| s.get_mut(i)))
-            .ok_or(BoundedError::PlanMismatch)?;
-        let MapState::Dynamic { phase, .. } = &mut map.state else {
+        let holes_start = map.holes_start;
+        let MapState::Dynamic { phase, value, .. } = &mut map.state else {
             return Err(BoundedError::PlanMismatch);
         };
-        let entry = self
-            .dynamic
-            .entries
-            .ready_mut()
-            .and_then(|s| s.last_mut())
+        let entry = entries
+            .as_mut_slice()
+            .last_mut()
             .ok_or(BoundedError::PlanMismatch)?;
         let Some(c) = &mut self.dynamic.compact else {
-            a.traverse(1, 32).map_err(BoundedError::Refused)?;
+            COMPACT.admit(a)?;
             // Bytes before the first gap are already at their final addresses.
             // With no gaps, completion needs no payload scan at all.
-            let start = self
-                .holes
-                .ready()
-                .ok_or(BoundedError::PlanMismatch)?
-                .get(map.hole + 1)
-                .map_or(self.bytes.len(), |hole| hole.0);
+            let start = holes
+                .as_slice()
+                .get(holes_start)
+                .map_or(bytes.len(), |hole| hole.0);
             self.dynamic.compact = Some(Compact {
                 source: start,
                 destination: start,
-                hole: map.hole + 1,
-                end: self.bytes.len(),
+                hole: holes_start,
+                end: bytes.len(),
             });
             return Ok(());
         };
         if c.source < c.end {
-            if let Some(&(start, skip)) = self
-                .holes
-                .ready()
-                .ok_or(BoundedError::PlanMismatch)?
-                .get(c.hole)
+            if let Some(&(start, skip)) = holes.as_slice().get(c.hole)
                 && start == c.source
             {
-                a.traverse(1, 16).map_err(BoundedError::Refused)?;
+                GAP.admit(a)?;
                 c.source += skip;
                 c.hole += 1;
                 self.omitted = self
@@ -168,31 +310,37 @@ impl<P> Preparation<'_, P> {
                     .checked_sub(skip)
                     .ok_or(BoundedError::PlanMismatch)?;
             } else {
-                let boundary = self
-                    .holes
-                    .ready()
-                    .and_then(|s| s.get(c.hole))
-                    .map_or(c.end, |h| h.0);
-                let count = (boundary - c.source).min(64);
-                a.traverse(1, widen(count)?)
-                    .map_err(BoundedError::Refused)?;
-                let bytes = self.bytes.ready_mut().ok_or(BoundedError::PlanMismatch)?;
-                bytes.copy_within(c.source..c.source + count, c.destination);
+                let boundary = holes.as_slice().get(c.hole).map_or(c.end, |h| h.0);
+                let count = (boundary - c.source).min(decode::construction::stable::QUANTUM);
+                MOVE.admit(a, widen(count)?)?;
+                bytes
+                    .as_mut_slice()
+                    .copy_within(c.source..c.source + count, c.destination);
                 c.source += count;
                 c.destination += count;
             }
-        } else if self.bytes.len() > c.destination {
-            self.bytes.truncate_copy_step(c.destination, a)?;
-        } else if self.holes.len() > map.hole + 1 {
-            self.holes.truncate_copy_step(map.hole + 1, a)?;
+        } else if bytes.len() > c.destination {
+            let destination = c.destination;
+            let bytes = &mut self.bytes;
+            at(PreparationPlace::Compaction, || {
+                bytes.truncate_copy_step(destination, a)
+            })?;
+        } else if holes.len() > holes_start {
+            let holes = &mut self.holes;
+            at(PreparationPlace::Compaction, || {
+                holes.truncate_copy_step(holes_start, a)
+            })?;
         } else {
-            a.traverse(1, 32).map_err(BoundedError::Refused)?;
-            if let EntryPhase::Key(value) = phase {
-                entry.key_end = self.bytes.len();
-                self.child = Some(*value);
+            COMPACT.admit(a)?;
+            if *phase == EntryPhase::Key {
+                // The key is compacted: its value, held since the entry was
+                // drawn, is the next child.
+                let pending = value.take().ok_or(BoundedError::PlanMismatch)?;
+                entry.key_end = bytes.len();
+                self.child = Some(pending);
                 *phase = EntryPhase::Value;
             } else {
-                entry.end = self.bytes.len();
+                entry.end = bytes.len();
                 *phase = EntryPhase::Scan;
             }
             self.dynamic.compact = None;
@@ -201,90 +349,134 @@ impl<P> Preparation<'_, P> {
     }
 
     fn sort_map<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
-        let root = self.frames.len() == 1;
-        let frame = self
-            .frames
-            .ready()
-            .and_then(|s| s.last())
+        let frames = &mut self.frames;
+        let Some(frames) = at(PreparationPlace::Frames, || frames.settle_step(a))? else {
+            return Ok(());
+        };
+        let maps = &mut self.map_frames;
+        let Some(maps) = at(PreparationPlace::OpenMaps, || maps.settle_step(a))? else {
+            return Ok(());
+        };
+        let entries = &mut self.dynamic.entries;
+        let Some(entries) = at(PreparationPlace::EntryArena, || entries.settle_step(a))? else {
+            return Ok(());
+        };
+        let bytes = &mut self.bytes;
+        let Some(bytes) = at(PreparationPlace::PlanBytes, || bytes.settle_step(a))? else {
+            return Ok(());
+        };
+        let map = frames
+            .as_slice()
+            .last()
+            .and_then(|frame| frame.map)
+            .and_then(|index| maps.as_slice().get(index))
             .ok_or(BoundedError::PlanMismatch)?;
-        let map = self
-            .map_frames
-            .ready()
-            .and_then(|s| frame.map.and_then(|i| s.get(i)))
-            .ok_or(BoundedError::PlanMismatch)?;
-        let MapState::Dynamic { start, .. } = map.state else {
+        let MapState::Dynamic { start, ordered, .. } = map.state else {
             return Err(BoundedError::PlanMismatch);
         };
-        let data_start = self
-            .holes
-            .ready()
-            .and_then(|s| s.get(map.hole))
-            .ok_or(BoundedError::PlanMismatch)?
-            .0
-            + MAX_HEAD_LEN;
-        let d = &mut self.dynamic;
-        match d.phase {
+        let data_start = map.data_start;
+        // Each field the sort reads or advances, borrowed apart from the
+        // entry arena held above.
+        let order = &mut self.dynamic.order;
+        let permutation = &mut self.dynamic.permutation;
+        let phase = &mut self.dynamic.phase;
+        let at_entry = &mut self.dynamic.entry;
+        let byte = &mut self.dynamic.byte;
+        match *phase {
+            // A cursor yielding canonical order needs no sort: each key is
+            // checked against the one before it.
+            DynamicPhase::Order if ordered => {
+                CHECK.admit(a)?;
+                *phase = DynamicPhase::Verify;
+                *at_entry = start + 1;
+                *byte = 0;
+            }
             DynamicPhase::Order => {
-                if d.order.step(
-                    &mut d.entries.ready_mut().ok_or(BoundedError::PlanMismatch)?[start..],
-                    self.bytes.ready().ok_or(BoundedError::PlanMismatch)?,
-                    a,
-                )? {
-                    if root {
-                        // The writer can consume root descriptors directly.
-                        // A parent's key comparison cannot observe this payload.
-                        self.root_payload = Some(data_start);
-                        d.phase = DynamicPhase::Clear;
-                    } else {
-                        d.phase = DynamicPhase::CheckOrder;
+                if order.step(&mut entries.as_mut_slice()[start..], bytes.as_slice(), a)? {
+                    // Every map, the root's included, is put in order in its
+                    // own bytes: the plan is its encoding, gaps aside.
+                    *phase = DynamicPhase::CheckOrder;
+                    *at_entry = start;
+                    *byte = data_start;
+                }
+            }
+            DynamicPhase::Verify => {
+                let entries = entries.as_slice();
+                match (entries.get(*at_entry - 1), entries.get(*at_entry)) {
+                    (Some(previous), Some(entry)) => {
+                        let bytes = bytes.as_slice();
+                        let (previous, entry) = (
+                            &bytes[previous.start..previous.key_end],
+                            &bytes[entry.start..entry.key_end],
+                        );
+                        if let Some(ordering) = at(PreparationPlace::Comparisons, || {
+                            decode::comparison::compare_step(previous, entry, byte, a)
+                        })? {
+                            match ordering {
+                                cmp::Ordering::Less => {
+                                    *at_entry += 1;
+                                    *byte = 0;
+                                }
+                                cmp::Ordering::Equal => return Err(BoundedError::DuplicateKey),
+                                // A cursor claiming canonical order yielded
+                                // keys out of it.
+                                cmp::Ordering::Greater => return Err(BoundedError::PlanMismatch),
+                            }
+                        }
                     }
-                    d.entry = start;
-                    d.byte = data_start;
+                    _ => {
+                        CHECK.admit(a)?;
+                        *phase = DynamicPhase::Clear;
+                    }
                 }
             }
             DynamicPhase::CheckOrder => {
-                a.traverse(1, 0).map_err(BoundedError::Refused)?;
-                if let Some(entry) = d.entries.ready().and_then(|s| s.get(d.entry)) {
-                    if entry.start == d.byte {
-                        d.byte = entry.end;
-                        d.entry += 1;
+                CHECK.admit(a)?;
+                if let Some(entry) = entries.as_slice().get(*at_entry) {
+                    if entry.start == *byte {
+                        *byte = entry.end;
+                        *at_entry += 1;
                     } else {
-                        d.phase = DynamicPhase::Assemble;
-                        d.entry = start;
-                        d.byte = 0;
+                        *phase = DynamicPhase::Assemble;
+                        *at_entry = start;
+                        *byte = 0;
                     }
                 } else {
-                    d.phase = DynamicPhase::Clear;
+                    *phase = DynamicPhase::Clear;
                 }
             }
             DynamicPhase::Assemble => {
-                if d.permutation.step(
-                    &mut d.entries.ready_mut().ok_or(BoundedError::PlanMismatch)?[start..],
-                    self.bytes.ready_mut().ok_or(BoundedError::PlanMismatch)?,
+                if permutation.step(
+                    &mut entries.as_mut_slice()[start..],
+                    bytes.as_mut_slice(),
                     data_start,
                     a,
                 )? {
-                    d.phase = DynamicPhase::Clear;
+                    *phase = DynamicPhase::Clear;
                 }
             }
             DynamicPhase::Clear => {
-                if self.root_payload.is_none() && d.entries.len() > start {
-                    d.entries.truncate_copy_step(start, a)?;
+                if entries.len() > start {
+                    // Truncating plain descriptors is one unit; the entry
+                    // arena is settled, so it truncates in this one.
+                    let entries = &mut self.dynamic.entries;
+                    at(PreparationPlace::Completion, || {
+                        entries.truncate_copy_step(start, a)
+                    })?;
                 } else {
                     // Reset only ordering metadata; its flat scratch allocation
                     // is reused by the next completed map, including its parent.
-                    d.order.reset(a)?;
-                    d.phase = DynamicPhase::Complete;
+                    order.reset(a)?;
+                    *phase = DynamicPhase::Complete;
                 }
             }
             DynamicPhase::Complete => {
-                a.traverse(1, widen(core::mem::size_of::<Frame<'_>>())?)
-                    .map_err(BoundedError::Refused)?;
-                self.frames.pop_ready();
-                self.map_frames.pop_ready();
-                d.phase = DynamicPhase::Order;
-                d.entry = 0;
-                d.byte = 0;
+                COMPLETE.admit(a)?;
+                frames.pop();
+                maps.pop();
+                *phase = DynamicPhase::Order;
+                *at_entry = 0;
+                *byte = 0;
             }
         }
         Ok(())

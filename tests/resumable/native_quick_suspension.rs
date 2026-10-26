@@ -1,143 +1,116 @@
-use super::driver::{Driver, Event, Operation, Step, finish, finish_invalid};
 use super::harness::*;
-use dcbor::bounded::BoundedError;
-use dcbor::bounded::decode::{
-    DecodeError, Document, Options,
-    cursor::{DecodeStep, Decoder},
+use super::support::{
+    Fault, allowed, drive_faulted, drive_within, finish_within, refusal_matrix, refuse,
+    rigor::rigor,
 };
+use dcbor::bounded::decode::{DecodeError, Options, cursor::Decoder};
+use unicode_normalization::{IsNormalized, is_nfc_quick};
 
-struct QuickOperation<'a> {
-    decoder: Decoder<'a, Permit>,
-    unproven: bool,
+fn quick(input: &[u8]) -> Decoder<'_, Reservation> {
+    Decoder::new(input, Options::quick_only(8))
 }
 
-impl<'a> Operation<Document<'a, Permit>> for QuickOperation<'a> {
-    fn advance(&mut self, meter: &mut Meter) -> Result<Event<Document<'a, Permit>>, &'static str> {
-        Ok(match self.decoder.step(meter) {
-            Ok(DecodeStep::Progress) => Event::Progress,
-            Ok(DecodeStep::Complete(document)) => Event::Complete(document),
-            Ok(DecodeStep::Finished) => Event::Finished,
-            Err(DecodeError::UnprovenText) => {
-                self.unproven = true;
-                Event::Invalid
-            }
-            Err(DecodeError::Resource(BoundedError::Refused(reason))) => Event::Refused(reason),
-            Err(_) => return Err("unexpected QuickOnly error"),
-        })
-    }
-}
-
-fn quick_driver(input: &[u8], meter: Meter) -> Driver<QuickOperation<'_>, Document<'_, Permit>> {
-    Driver::from_operation(
-        QuickOperation {
-            decoder: Decoder::new(input, Options::quick_only(8)),
-            unproven: false,
-        },
-        meter,
-    )
-}
-
+/// For each fixture, every refusal of a QuickOnly decode resumed to the same
+/// outcome, the literal document or the specific QuickOnly rejection, never
+/// a silent normalization; and a cancellation at every call releasing what
+/// the decode held. A rejected decode's own cleanup runs under a shared
+/// policy, outside the measured trace.
 #[test]
 fn quick_only_policy_survives_every_refusal_without_silent_normalization() {
     let fixtures = [
         ("ASCII", true),
-        ("é", true),
+        ("\u{e9}", true),
         ("q\u{301}", false),
         ("e\u{301}", false),
     ];
-    every_case(fixtures.len(), |fixture| {
+    every_fixture(fixtures.len(), |fixture| {
         let (text, accepted) = fixtures[fixture];
         let wire = text_wire(text);
-        let mut reference = quick_driver(&wire, meter());
-        if accepted {
-            finish(&mut reference, 4096);
-            assert_eq!(reference.output.as_ref().unwrap().root().encoded(), wire);
-        } else {
-            finish_invalid(&mut reference, 4096);
-            assert!(reference.operation().unproven);
-        }
-        drop(reference.output.take());
-        let baseline = reference.meter;
-        assert_eq!(baseline.pool.live(), 0);
-        every_case(baseline.calls.len(), |stop| {
+        refusal_matrix(
+            &format!("QuickOnly decode of {text:?}"),
+            rigor(),
+            |fault: Fault| {
+                let mut m = meter();
+                refuse(&mut m, fault.refusal);
+                let pool = m.share();
+                let mut operation = quick(&wire);
+                let turns = allowed(&m, decode_turns(wire.len()));
+                match drive_faulted(&mut m, &mut operation, turns, fault.cancel) {
+                    Ok(Some(document)) => {
+                        assert!(accepted, "unproven text accepted");
+                        assert_eq!(document.root().encoded(), wire);
+                        m.assert_units(TURN);
+                        drop(operation);
+                        assert!(pool.live_bytes() > 0);
+                        drop(document);
+                    }
+                    Ok(None) => {
+                        assert!(fault.cancel, "unscheduled cancellation");
+                        drop(operation);
+                    }
+                    Err(error) => {
+                        assert!(!accepted, "proven text refused: {error:?}");
+                        assert!(
+                            matches!(error, DecodeError::UnprovenText),
+                            "lost the specific QuickOnly rejection: {error:?}"
+                        );
+                        m.assert_units(TURN);
+                        finish_within(&mut m.share(), &mut operation, decode_turns(wire.len()));
+                        drop(operation);
+                    }
+                }
+                assert_eq!(pool.live_bytes(), 0);
+                super::support::RefusalRun::of(&m)
+            },
+        );
+    });
+}
+
+/// Payload validation proceeds in quanta of at most 64 bytes. An ASCII prefix
+/// of every length from 56 through 72 places each byte of every scalar, and
+/// every boundary between a base and its marks, on each side of the first
+/// quantum's end. The QuickOnly verdict must equal upstream's for the whole
+/// text wherever the boundary falls.
+#[test]
+fn quick_check_agrees_with_upstream_wherever_a_scalar_meets_a_quantum_boundary() {
+    let texts = [
+        "\u{e9}",
+        "\u{1f600}",
+        "\u{ac1c}",
+        "q\u{301}a",
+        "a\u{301}",
+        "\u{301}a",
+        "q\u{301}\u{316}",
+        "\u{1100}\u{1161}\u{11a8}",
+        "\u{e9}\u{1f600}q\u{301}",
+    ];
+    every_fixture(texts.len(), |fixture| {
+        let text = texts[fixture];
+        for prefix in 56..=72 {
+            let source = format!("{}{text}", "x".repeat(prefix));
+            let proven = is_nfc_quick(source.chars()) == IsNormalized::Yes;
+            let wire = text_wire(&source);
             let mut m = meter();
-            m.fail_at = Some((stop, Refusal::Work));
-            let pool = m.pool.clone();
-            let mut operation = quick_driver(&wire, m);
-            let mut suspended = false;
-            for _ in 0..4096 {
-                let before = operation.operation().decoder.position();
-                match operation.step().unwrap() {
-                    Step::Progress => assert!(operation.output.is_none()),
-                    Step::Refused(Refusal::Work) => {
-                        assert_eq!(operation.operation().decoder.position(), before);
-                        suspended = true;
-                        break;
-                    }
-                    other => panic!("missing QuickOnly suspension at {before:?}: {other:?}"),
+            let mut operation = quick(&wire);
+            let bound = decode_turns(wire.len());
+            match drive_within(&mut m, &mut operation, bound) {
+                Ok(document) => {
+                    assert!(proven, "unproven text accepted: prefix={prefix} {text:?}");
+                    assert_eq!(document.root().encoded(), wire);
+                    drop(document);
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(error, DecodeError::UnprovenText),
+                        "prefix={prefix} {text:?}: {error:?}"
+                    );
+                    assert!(!proven, "proven text refused: prefix={prefix} {text:?}");
+                    finish_within(&mut m, &mut operation, bound);
                 }
             }
-            assert!(suspended);
-            assert_eq!(operation.meter.refused, Some((stop, Refusal::Work)));
-            assert!(
-                !operation.operation().unproven,
-                "policy outcome occurred before targeted suspension"
-            );
-            assert!(operation.output.is_none());
-            operation.meter.fail_at = None;
-            if accepted {
-                finish(&mut operation, 4096);
-                assert_eq!(operation.output.as_ref().unwrap().root().encoded(), wire);
-            } else {
-                let mut invalid = false;
-                for _ in 0..4096 {
-                    let before = (operation.meter.values, operation.meter.bytes);
-                    operation.meter.limit_values = before.0.checked_add(3).unwrap();
-                    operation.meter.limit_bytes = before.1.checked_add(64).unwrap();
-                    operation.meter.refused = None;
-                    let outcome = operation
-                        .step()
-                        .expect("missing retained QuickOnly operation");
-                    let after = (operation.meter.values, operation.meter.bytes);
-                    assert!(after.0 >= before.0 && after.1 >= before.1);
-                    assert!(after.0 - before.0 <= 3 && after.1 - before.1 <= 64);
-                    assert!(operation.output.is_none());
-                    match outcome {
-                        Step::Invalid => {
-                            invalid = true;
-                            break;
-                        }
-                        Step::Progress => assert_ne!(before, after),
-                        other => panic!("unexpected QuickOnly outcome {other:?}"),
-                    }
-                }
-                assert!(invalid);
-                assert!(
-                    operation.operation().unproven,
-                    "lost the specific QuickOnly rejection"
-                );
-            }
-            let mut trace = baseline.calls.clone();
-            trace.insert(stop, baseline.calls[stop]);
-            assert_eq!(
-                operation.meter.calls, trace,
-                "QuickOnly replayed completed work"
-            );
-            assert_eq!(
-                (operation.meter.values, operation.meter.bytes),
-                (baseline.values, baseline.bytes)
-            );
-            assert_eq!(operation.invocations, 1);
-            operation.meter.assert_units(3, 64);
-            assert_eq!(operation.step().unwrap(), Step::Finished);
-            let output = operation.output.take();
+            m.assert_units(TURN);
             drop(operation);
-            if let Some(document) = output {
-                assert!(pool.live() > 0);
-                assert_eq!(document.root().encoded(), wire);
-                drop(document);
-            }
-            assert_eq!(pool.live(), 0);
-        });
+            assert_eq!(m.live_bytes(), 0);
+        }
     });
 }

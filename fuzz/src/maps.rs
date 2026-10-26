@@ -1,6 +1,6 @@
 use hashbrown::HashTable;
 
-#[derive(dcbor::CBORResumableEncodable)]
+#[derive(dcbor::CBORBoundedEncodable)]
 struct Record<T> {
     #[cbor(n = 0)]
     value: T,
@@ -35,10 +35,6 @@ pub(super) fn exercise(data: &[u8]) {
         expected.insert(key_map, record);
     }
     let bytes = dcbor::CBOR::from(expected).to_cbor_data();
-    super::schema::scheduled(
-        &source,
-        &bytes,
-        seed * 257 + data.len(),
-        data.len() * 8192 + 8192,
-    );
+    let bound = dcbor_test_support::prepare_turns(dcbor_test_support::shape(&source));
+    super::schema::scheduled(&source, &bytes, seed * 257 + data.len(), bound);
 }

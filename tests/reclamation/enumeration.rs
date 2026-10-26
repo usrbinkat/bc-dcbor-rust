@@ -52,62 +52,82 @@ representation_matrix!(primitive_layout, u8);
 representation_matrix!(c_layout, C);
 representation_matrix!(c_primitive_layout, C, u8);
 
-fn cancellation<T: InPlace<Turn> + 'static>(wire: &[u8]) {
-    let mut observed_publication = false;
-    // Each successive run cancels one transition later. Stop only after the
-    // publication boundary has actually been reached, not at a guessed count.
-    for stop in 0..512 {
-        let mut a = Turn::new();
-        a.values = u64::MAX;
-        a.bytes = u64::MAX;
-        let document = decode(wire, 8, &mut a).unwrap();
-        let baseline = a.live.load(Ordering::SeqCst);
-        let owner = Reclaimer::new();
-        let mut operation = Construction::<T, Turn>::new(&owner, &document, 0);
-        let mut output = None;
-        for _ in 0..stop {
-            a.fresh();
-            match operation.step(&mut a).unwrap() {
-                Step::Progress => {}
-                Step::Complete(value) => {
-                    output = Some(value);
-                    observed_publication = true;
-                    break;
-                }
-                Step::Finished => panic!("publication omitted"),
-            }
-        }
-        let held = a.live.load(Ordering::SeqCst);
-        drop(operation);
-        drop(output);
-        assert_eq!(a.live.load(Ordering::SeqCst), held);
-        for _ in 0..512 {
-            a.values = 0;
-            a.bytes = 0;
-            let held = a.live.load(Ordering::SeqCst);
-            if owner.outstanding() != 0 {
-                assert!(matches!(
-                    owner.shutdown_step(&mut a),
-                    Err(BoundedError::Refused(()))
-                ));
-                assert_eq!(a.live.load(Ordering::SeqCst), held);
-            }
-            a.fresh();
-            if owner.shutdown_step(&mut a).unwrap() == Reclaimed::Done {
+/// Construct `T` from `wire`, retiring the construction after `stop` turns:
+/// retirement releases nothing synchronously, and the scope's queued cleanup
+/// takes every unit refused once, releasing nothing, before it is admitted,
+/// then recovers everything. Both are within the decode's own bound. The
+/// turns construction took to publish, when it published within `stop`.
+fn retired<T: Transferable<Limits> + 'static>(wire: &[u8], stop: usize) -> Option<usize> {
+    let bound = support::typed_turns::<T>(wire.len());
+    let mut m = meter();
+    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
+    let mut operation = Construction::<_, T, Limits>::construct(document);
+    let mut output = None;
+    let mut published = None;
+    for turn in 0..stop.min(bound) {
+        match support::checked(&mut m, |m| support::contracted(m, &mut operation)) {
+            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
+            Ok(Step::Complete(value)) => {
+                support::exhausted(&mut m, &mut operation);
+                output = Some(value);
+                published = Some(turn + 1);
                 break;
             }
+            _ => panic!("publication omitted"),
         }
-        assert_eq!(owner.outstanding(), 0);
-        assert_eq!(a.live.load(Ordering::SeqCst), baseline);
-        drop(document);
-        assert_eq!(a.live.load(Ordering::SeqCst), 0);
-        if observed_publication {
+    }
+    let held = m.live_bytes();
+    drop(operation);
+    drop(output);
+    assert_eq!(m.live_bytes(), held, "retirement released storage");
+    // Every queued cleanup unit is first refused without release.
+    let mut drained = false;
+    for _ in 0..bound {
+        m.clear_refusal();
+        m.exhaust();
+        let held = m.live_bytes();
+        if owner.outstanding() != 0 {
+            match owner.shutdown_step(&mut m) {
+                Err(BoundedError::Refused(_)) => assert_eq!(m.live_bytes(), held),
+                Ok(Reclaimed::Progress) => assert!(m.live_bytes() < held),
+                Ok(Reclaimed::Done) => {
+                    drained = true;
+                    break;
+                }
+                other => panic!("unexpected cleanup: {other:?}"),
+            }
+        }
+        if support::checked(&mut m, |m| owner.shutdown_step(m)).unwrap() == Reclaimed::Done {
+            drained = true;
             break;
         }
     }
-    assert!(
-        observed_publication,
-        "enumeration never reached publication"
+    assert!(drained, "cleanup exceeded its bound of {bound} turns");
+    assert_eq!(owner.outstanding(), 0);
+    assert_eq!(m.live_bytes(), 0);
+    published
+}
+
+/// The enumeration constructed from `wire` retired after every number of
+/// turns through its publication ([`support::stop_matrix`]): publication is
+/// reached within the decode's bound, and exactly the stops at or past it
+/// publish.
+fn cancellation<T: Transferable<Limits> + 'static>(wire: &[u8]) {
+    let boundaries = retired::<T>(wire, usize::MAX)
+        .expect("enumeration never reached publication within its bound");
+    support::stop_matrix(
+        &format!(
+            "retired construction of {} from {wire:02x?}",
+            core::any::type_name::<T>()
+        ),
+        boundaries,
+        |stop| {
+            assert_eq!(
+                retired::<T>(wire, stop).is_some(),
+                stop == boundaries,
+                "a stop after {stop} turns"
+            );
+        },
     );
 }
 

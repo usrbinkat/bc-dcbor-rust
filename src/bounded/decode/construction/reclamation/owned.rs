@@ -1,184 +1,597 @@
-//! Owning, movable references to the same intrusive reclamation mechanism.
+//! The decode scope: one custody owner for every record of every operation.
 //!
 //! The scope owns queued records. Each live record handle owns one scope
 //! reference. Only a record handle accesses its payload; after retirement only
-//! the scope's active cleanup slot does. Shutdown releases the scope allocation
-//! only when no other handle exists and the intrusive owner is empty.
+//! the scope's active cleanup slot does. Shutdown releases the scope block only
+//! when no other reference exists and the intrusive owner is empty.
+//!
+//! `'s` is the scope's data lifetime: every payload outlives it, and no handle,
+//! operation or the owner itself can outlive it. Owned inputs use `'static`;
+//! borrowed inputs bind the scope to the borrow.
+//!
+//! Every handle may move to, and retire on, any thread. Retirement pushes the
+//! record onto the queue before the handle's scope reference is released, so a
+//! stepping thread that observes the last reference also observes every push.
 use super::*;
+use crate::bounded::{Caller, Place, Places, ResourceBound, Unit, widen};
+use core::cell::Cell;
 
 struct Scope<A: Allocator> {
     owner: Reclaimer<A>,
-    references: Cell<usize>,
-    permit: A::Permit,
+    references: AtomicUsize,
+    terminal: MaybeUninit<unsafe fn(NonNull<ScopeBlock<A>>)>,
 }
 
-/// Single-threaded movable cleanup authority. `new` allocates nothing.
-/// Initialize with `initialize_step`, retain this authority while handles are
-/// live, then call `shutdown_step` until Done. Drop never drains resources.
-pub struct OwnedReclaimer<A: Allocator> {
-    scope: Option<NonNull<Scope<A>>>,
-    admitted: bool,
-}
+type ScopeBlock<A> = Held<Scope<A>, <A as Allocator>::Permit>;
 
-impl<A: Allocator> Default for OwnedReclaimer<A> {
-    fn default() -> Self {
-        Self::new()
+places! {
+    /// The places a decode scope's own lifecycle charges ([`DecodeOwner`]),
+    /// one term of [`scope_bound`] each. Its records are each accounted by
+    /// the operation that allocated them, their removal and release
+    /// included. Shutdown's release of the scope block was paid for by its
+    /// initialization, so shutdown charges nothing of its own.
+    pub(crate) enum ScopePlace {
+        Initialization,
     }
 }
 
-impl<A: Allocator> OwnedReclaimer<A> {
-    pub const fn new() -> Self {
-        Self {
-            scope: None,
-            admitted: false,
-        }
-    }
+/// Completing a handle's cleanup whose record was released or moved out
+/// earlier. The operation stepping it supplies the place.
+pub(crate) const EMPTIED: Unit<Caller> = Unit::new(Caller, 1, 0);
 
-    pub fn initialize_step(&mut self, a: &mut A) -> BoundedResult<bool, A> {
-        if self.scope.is_some() {
-            return Ok(true);
-        }
-        let layout = Layout::new::<Scope<A>>();
-        if layout.size() > 64 {
-            return Err(BoundedError::PlanMismatch);
-        }
-        if !self.admitted {
-            a.traverse(1, layout.size() as u64)
-                .map_err(BoundedError::Refused)?;
-            self.admitted = true;
-        }
-        let permit = a
-            .allocate(layout.size() as u64)
-            .map_err(BoundedError::Refused)?;
-        let raw = NonNull::new(unsafe { alloc(layout) }.cast::<Scope<A>>()).ok_or(
-            BoundedError::Allocation {
-                bytes: layout.size() as u64,
+/// The place of one cleanup step of a handle slot: `held`, whose term
+/// accounts the handle's own cleanup, while the slot holds a handle;
+/// `emptied` once it is empty, where the step admits [`EMPTIED`].
+pub(crate) fn slot_place<T, P: Place>(slot: &Option<T>, held: P, emptied: P) -> P {
+    if slot.is_some() { held } else { emptied }
+}
+
+/// The [`ResourceBound`] of a decode scope's own lifecycle with permits of
+/// `A`: its block written and allocated by [`DecodeOwner::initialize_step`],
+/// which admits the block's release with it; the block is held until
+/// [`DecodeOwner::shutdown_step`] releases it once every record has been
+/// released. Nothing remains held.
+pub fn scope_bound<A: Allocator, R>() -> Result<ResourceBound, BoundedError<R>> {
+    ScopeTerms::of::<A, R>()?.bound()
+}
+
+/// The terms [`scope_bound`] sums, one per [`ScopePlace`].
+pub(crate) struct ScopeTerms {
+    initialization: ResourceBound,
+}
+
+impl ScopeTerms {
+    pub(crate) fn of<A: Allocator, R>() -> Result<Self, BoundedError<R>> {
+        let block = widen(size_of::<ScopeBlock<A>>())?;
+        // The whole block written, as `initialize_step` acquires it, and its
+        // release, admitted with it.
+        let work = stable::acquire_cost(const { scope_metadata::<A>() })
+            .work()
+            .then(stable::release_cost::<A::Permit>().work())?
+            .then(
+                Unit::written::<unsafe fn(NonNull<ScopeBlock<A>>)>(Caller)
+                    .bound()
+                    .work(),
+            )?;
+        Ok(Self {
+            initialization: ResourceBound {
+                values: work.values,
+                bytes: work.bytes,
+                allocated: block,
+                peak: block,
+                retained: 0,
             },
-        )?;
-        unsafe {
-            raw.as_ptr().write(Scope {
-                owner: Reclaimer::new(),
-                references: Cell::new(1),
-                permit,
-            });
+        })
+    }
+}
+
+impl Places for ScopeTerms {
+    type Place = ScopePlace;
+
+    fn term(&self, place: ScopePlace) -> ResourceBound {
+        match place {
+            ScopePlace::Initialization => self.initialization,
         }
-        self.scope = Some(raw);
-        self.admitted = false;
-        Ok(true)
+    }
+}
+
+/// Invariant in `'s`: a scope can be neither shortened nor extended.
+type Lifetime<'s> = PhantomData<Cell<&'s ()>>;
+
+const fn scope_metadata<A: Allocator>() -> stable::Metadata {
+    stable::Metadata::new::<Scope<A>, A::Permit>(
+        size_of::<Reclaimer<A>>() + size_of::<AtomicUsize>() + size_of::<A::Permit>(),
+    )
+}
+
+/// Run the existing queue state machine with an allocation-free terminal policy.
+/// The caller keeps its reference until this returns, including through child
+/// retirement, so no recursive reference release can free this scope beneath it.
+unsafe fn terminal<A: crate::bounded::TerminalAllocator>(block: NonNull<ScopeBlock<A>>) {
+    struct AbortOnUnwind;
+    impl Drop for AbortOnUnwind {
+        fn drop(&mut self) {
+            reference_overflow();
+        }
+    }
+    let guard = AbortOnUnwind;
+    // SAFETY: the calling reference keeps the initialized block and permit live.
+    let mut policy = A::terminal(unsafe { block.as_ref().permit() });
+    loop {
+        match scope(&block).owner.shutdown_step(&mut policy) {
+            Ok(Reclaimed::Progress) => {}
+            Ok(Reclaimed::Done | Reclaimed::Waiting) => break,
+            Err(_) => reference_overflow(),
+        }
+    }
+    drop(policy);
+    core::mem::forget(guard);
+}
+
+fn release_reference<A: Allocator>(block: NonNull<ScopeBlock<A>>) {
+    let state = scope(&block);
+    if state.owner.abandoned.load(Ordering::Acquire)
+        && !state.owner.stepping.load(Ordering::Acquire)
+    {
+        // SAFETY: references are exposed only after terminal initialization;
+        // this reference remains counted throughout the drain.
+        unsafe { state.terminal.assume_init()(block) };
+    }
+    if scope(&block).references.fetch_sub(1, Ordering::AcqRel) == 1 {
+        // All producers retired before releasing their references. With no
+        // other stepper or holder, the terminal drain must have emptied the
+        // queue. An invalid binding cannot turn this into a leak or unwind.
+        if scope(&block).owner.outstanding() != 0 {
+            reference_overflow();
+        }
+        // SAFETY: this was the last reference and all records are reclaimed.
+        unsafe { stable::free(block) };
+    }
+}
+
+/// References beyond this bound can only come from leaked handles; counting
+/// further would risk wrapping the count, so the process is aborted instead,
+/// as for reference-counted pointers.
+const MAX_REFERENCES: usize = isize::MAX as usize;
+
+#[cold]
+fn reference_overflow() -> ! {
+    #[cfg(feature = "std")]
+    {
+        std::process::abort()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // A panic while panicking aborts.
+        struct Abort;
+        impl Drop for Abort {
+            fn drop(&mut self) {
+                panic!("decode scope reference count overflow");
+            }
+        }
+        let _abort = Abort;
+        panic!("decode scope reference count overflow");
+    }
+}
+
+/// The scope behind a counted reference, borrowed no longer than the holder.
+fn scope<A: Allocator>(block: &NonNull<ScopeBlock<A>>) -> &Scope<A> {
+    // SAFETY: every holder of the pointer holds a counted reference, which
+    // keeps the block allocated; the scope is only accessed through atomics.
+    unsafe { &(*block.as_ptr()).value }
+}
+
+fn add_reference<A: Allocator>(block: &NonNull<ScopeBlock<A>>) {
+    if scope(block).references.fetch_add(1, Ordering::Relaxed) >= MAX_REFERENCES {
+        reference_overflow();
+    }
+}
+
+/// A live reference, never a shutdown authority. The block remains valid
+/// through explicit shutdown or until the last abandoned-scope reference
+/// finishes terminal cleanup.
+/// Public only as an unnameable type of the sealed operation interface.
+pub struct ScopeRef<'s, A: Allocator> {
+    scope: NonNull<ScopeBlock<A>>,
+    lifetime: Lifetime<'s>,
+}
+
+// SAFETY: a `ScopeRef` reaches the scope block only through `scope`, which
+// yields `&Scope`, and every field of `Scope` is an atomic (the reference
+// count, and the `Reclaimer`'s queue pointers, counters and flags). The
+// queue's non-atomic fields `active` and `removal_admitted` are touched only
+// by the caller holding the `stepping` flag, whose acquiring swap and
+// releasing store order them between steppers. The queue holds only records
+// allocated by `allocate_step`, which requires each payload and its state to
+// be `Send`, so a record retired on one thread may be stepped and released on
+// another; their permits are dropped by that stepping thread.
+unsafe impl<A: Allocator> Send for ScopeRef<'_, A> where A::Permit: Send {}
+// SAFETY: as above; shared access mutates only atomics, and the stepping
+// fields under the `stepping` flag.
+unsafe impl<A: Allocator> Sync for ScopeRef<'_, A> where A::Permit: Send {}
+
+impl<'s, A: Allocator> ScopeRef<'s, A> {
+    fn new(block: NonNull<ScopeBlock<A>>) -> Self {
+        add_reference(&block);
+        Self {
+            scope: block,
+            lifetime: PhantomData,
+        }
     }
 
-    fn duplicate(&self) -> Self {
-        let scope = self.scope.expect("initialized scope");
-        let references = unsafe { &scope.as_ref().references };
-        references.set(
-            references
-                .get()
-                .checked_add(1)
-                .expect("scope reference overflow"),
-        );
-        Self {
-            scope: Some(scope),
-            admitted: false,
-        }
+    pub(crate) fn duplicate(&self) -> Self {
+        Self::new(self.scope)
     }
 
     fn owner(&self) -> &Reclaimer<A> {
-        unsafe { &self.scope.expect("initialized scope").as_ref().owner }
+        &scope(&self.scope).owner
     }
 
-    pub fn outstanding(&self) -> usize {
-        self.scope
-            .map_or(0, |scope| unsafe { scope.as_ref().owner.outstanding() })
+    pub(crate) fn outstanding(&self) -> usize {
+        self.owner().outstanding()
     }
 
-    pub fn allocate_step<T: Reclaim<A> + 'static>(
+    /// Allocate one record in this scope, admission retained in `acquisition`.
+    pub(crate) fn allocate_step<T: Reclaim<A> + Send + 's>(
         &self,
         a: &mut A,
-        admitted: &mut bool,
-    ) -> BoundedResult<OwnedRecord<T, A>, A> {
-        if self.scope.is_none() {
-            return Err(BoundedError::PlanMismatch);
+        acquisition: &mut Acquisition<'s, T, A>,
+    ) -> BoundedResult<OwnedRecord<'s, T, A>, A>
+    where
+        T::State: Send,
+    {
+        if let Some(bound) = &acquisition.scope {
+            if bound.scope != self.scope {
+                return Err(BoundedError::PlanMismatch);
+            }
+        } else {
+            acquisition.scope = Some(self.duplicate());
         }
-        let record =
-            core::mem::ManuallyDrop::new(self.owner().allocate_retained::<T>(a, admitted)?);
+        // SAFETY: T outlives 's, and neither the owner nor any handle of this
+        // scope can outlive 's, so every borrow in T outlives final cleanup.
+        let record = core::mem::ManuallyDrop::new(unsafe {
+            self.owner().allocate::<T>(a, &mut acquisition.admitted)?
+        });
+        acquisition.scope = None;
         Ok(OwnedRecord {
             block: record.block,
             scope: self.duplicate(),
             marker: PhantomData,
         })
     }
+}
 
+impl<A: Allocator> Drop for ScopeRef<'_, A> {
+    fn drop(&mut self) {
+        release_reference(self.scope);
+    }
+}
+
+/// Opaque retained admission for one record allocation, bound to its payload
+/// type and owning scope. Dropping an unfinished token cancels acquisition
+/// without allocating or destroying a payload. Success resets it for reuse.
+pub struct Acquisition<'s, T: Reclaim<A>, A: Allocator> {
+    scope: Option<ScopeRef<'s, A>>,
+    admitted: stable::Admitted,
+    marker: InvariantOwned<T>,
+}
+
+impl<T: Reclaim<A>, A: Allocator> Acquisition<'_, T, A> {
+    pub const fn new() -> Self {
+        Self {
+            scope: None,
+            admitted: stable::Admitted::Nothing,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Reclaim<A>, A: Allocator> Default for Acquisition<'_, T, A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The cleanup authority of one decode scope. `new` allocates nothing.
+/// Initialize with `initialize_step`, retain this authority while handles are
+/// live, then call `shutdown_step` until Done. Records may retire on any
+/// thread, and the authority may be shared: any thread holding `&DecodeOwner`
+/// may allocate records and step cleanup, one stepper at a time (a concurrent
+/// one is answered `Waiting`). Initialization and shutdown take `&mut self`.
+///
+/// Dropping the authority closes the scope and drains queued records through
+/// their reclamation state machines without refusal. Live handles retain the
+/// scope; their later retirement continues terminal draining. The last reference
+/// releases the scope allocation and then its permit.
+pub struct DecodeOwner<'s, A: Allocator> {
+    scope: Option<NonNull<ScopeBlock<A>>>,
+    admitted: stable::Admitted,
+    /// Terminal: shutdown completed. A closed authority never acquires a new
+    /// scope, so shutdown cannot be undone by a later initialization.
+    closed: bool,
+    ready: bool,
+    lifetime: Lifetime<'s>,
+}
+
+// SAFETY: the authority's own fields (`scope`, `admitted`, `closed`) are
+// plain values it exclusively owns; the scope block it points to is shared
+// state reached only as for `ScopeRef`, so moving the authority to another
+// thread moves only those values.
+unsafe impl<A: Allocator> Send for DecodeOwner<'_, A> where A::Permit: Send {}
+// SAFETY: through `&DecodeOwner` the methods are `position`, `outstanding`,
+// `reference`, `allocate_step` and `step`. They read the authority's own
+// fields without writing them (only `initialize_step` and `shutdown_step`
+// write them, and those take `&mut self`), and reach the scope block only
+// through `scope`, whose shared access is the atomics and the
+// `stepping`-guarded fields `ScopeRef`'s `Sync` argument covers. Concurrent
+// `step` calls are serialized by the `stepping` flag: the loser performs and
+// admits nothing and returns `Waiting`.
+unsafe impl<A: Allocator> Sync for DecodeOwner<'_, A> where A::Permit: Send {}
+
+impl<A: Allocator> Default for DecodeOwner<'_, A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Observation of a decode scope, allocation-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopePosition {
+    pub initialized: bool,
+    pub closed: bool,
+    pub outstanding: usize,
+    pub references: usize,
+}
+
+impl<'s, A: Allocator> DecodeOwner<'s, A> {
+    pub const fn new() -> Self {
+        Self {
+            scope: None,
+            admitted: stable::Admitted::Nothing,
+            closed: false,
+            ready: false,
+            lifetime: PhantomData,
+        }
+    }
+
+    /// Admit and allocate the scope's queue and reference count, then admit
+    /// its terminal dispatch write. A refusal retains what was admitted for the
+    /// next call; once `Ok`, later calls do nothing and return `Ok`. A closed
+    /// authority refuses with `PlanMismatch`.
+    pub fn initialize_step(&mut self, a: &mut A) -> BoundedResult<(), A>
+    where
+        A: crate::bounded::TerminalAllocator,
+    {
+        if self.closed {
+            return Err(BoundedError::PlanMismatch);
+        }
+        if self.ready {
+            return Ok(());
+        }
+        if self.scope.is_none() {
+            let admitted = &mut self.admitted;
+            // SAFETY: the initializer writes the queue and reference count;
+            // the remaining field is MaybeUninit until the final admitted write.
+            let block = at(ScopePlace::Initialization, || unsafe {
+                stable::acquire::<Scope<A>, A>(
+                    admitted,
+                    const { scope_metadata::<A>() },
+                    || true,
+                    |scope| {
+                        ptr::addr_of_mut!((*scope).owner).write(Reclaimer::new());
+                        ptr::addr_of_mut!((*scope).references).write(AtomicUsize::new(1));
+                    },
+                    a,
+                )
+            })?;
+            self.scope = Some(block);
+        }
+        let block = self.scope.ok_or(BoundedError::PlanMismatch)?;
+        // SAFETY: no reference is exposed until this final field is initialized.
+        // Refusal leaves the empty scope retained for initialization or Drop.
+        at(ScopePlace::Initialization, || unsafe {
+            crate::bounded::decode::initialization::field(
+                ptr::addr_of_mut!((*block.as_ptr()).value.terminal),
+                || MaybeUninit::new(terminal::<A> as unsafe fn(NonNull<ScopeBlock<A>>)),
+                a,
+            )
+        })?;
+        self.ready = true;
+        Ok(())
+    }
+
+    pub fn position(&self) -> ScopePosition {
+        ScopePosition {
+            initialized: self.ready,
+            closed: self.closed
+                || self
+                    .scope
+                    .as_ref()
+                    .is_some_and(|block| scope(block).owner.is_closed()),
+            outstanding: self
+                .scope
+                .as_ref()
+                .map_or(0, |block| scope(block).owner.outstanding()),
+            references: self
+                .scope
+                .as_ref()
+                .map_or(0, |block| scope(block).references.load(Ordering::Acquire)),
+        }
+    }
+
+    pub fn outstanding(&self) -> usize {
+        self.position().outstanding
+    }
+
+    pub(crate) fn reference(&self) -> Option<ScopeRef<'s, A>> {
+        if self.ready {
+            self.scope.map(ScopeRef::new)
+        } else {
+            None
+        }
+    }
+
+    /// Allocate one record for a custom resource binding. Initialize it through
+    /// [`OwnedRecord::destination`] and publish it; retain `acquisition` across
+    /// refusals.
+    pub fn allocate_step<T: Reclaim<A> + Send + 's>(
+        &self,
+        a: &mut A,
+        acquisition: &mut Acquisition<'s, T, A>,
+    ) -> BoundedResult<OwnedRecord<'s, T, A>, A>
+    where
+        T::State: Send,
+    {
+        self.reference()
+            .ok_or(BoundedError::PlanMismatch)?
+            .allocate_step(a, acquisition)
+    }
+
+    /// One unit of queued cleanup. Waiting: nothing can advance until a
+    /// handle retires.
     pub fn step(&self, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        match self.scope {
-            Some(_) => self.owner().step(a),
+        match &self.scope {
+            Some(block) => scope(block).owner.step(a),
             None => Ok(Reclaimed::Done),
         }
     }
 
+    /// Close allocation and perform one unit of shutdown. Done only after
+    /// every record and the scope block itself have been released.
     pub fn shutdown_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        let Some(scope) = self.scope else {
+        let Some(block) = self.scope else {
+            self.closed = true;
             return Ok(Reclaimed::Done);
         };
-        if self.owner().shutdown_step(a)? != Reclaimed::Done {
-            return Ok(Reclaimed::Progress);
+        match scope(&block).owner.shutdown_step(a)? {
+            Reclaimed::Done => {}
+            pending => return Ok(pending),
         }
-        if unsafe { scope.as_ref().references.get() } != 1 {
-            return Ok(Reclaimed::Progress);
+        // Every record is released, but another handle still references the
+        // scope block: nothing here can advance until it retires.
+        if scope(&block).references.load(Ordering::Acquire) != 1 {
+            return Ok(Reclaimed::Waiting);
         }
-        a.traverse(1, size_of::<A::Permit>() as u64)
-            .map_err(BoundedError::Refused)?;
+        // SAFETY: the only reference is this authority's; the queue is empty
+        // and closed, so the scope owns nothing. Its release was paid for by
+        // its initialization.
+        unsafe { stable::free(block) };
         self.scope = None;
-        unsafe {
-            let permit = ptr::addr_of!((*scope.as_ptr()).permit).read();
-            dealloc(scope.as_ptr().cast(), Layout::new::<Scope<A>>());
-            drop(permit);
-        }
+        self.ready = false;
+        self.closed = true;
         Ok(Reclaimed::Done)
     }
 }
 
-impl<A: Allocator> Drop for OwnedReclaimer<A> {
+impl<A: Allocator> Drop for DecodeOwner<'_, A> {
     fn drop(&mut self) {
-        if let Some(scope) = self.scope {
-            let references = unsafe { &scope.as_ref().references };
-            let count = references.get();
-            // The allocation is deliberately retained on misuse: unwinding may
-            // not invalidate queued resources or run unadmitted destructors.
-            assert!(count > 1, "owned reclamation scope dropped before shutdown");
-            references.set(count - 1);
+        if let Some(block) = self.scope.take() {
+            if self.ready {
+                scope(&block).owner.closed.store(true, Ordering::Release);
+                scope(&block).owner.abandoned.store(true, Ordering::Release);
+                release_reference(block);
+            } else {
+                // SAFETY: partial initialization exposed no references and
+                // acquired no records. The scope's release was prepaid.
+                unsafe { stable::free(block) };
+            }
         }
     }
 }
 
 /// An owning stable destination; retirement transfers to the scope's queue.
-pub struct OwnedRecord<T: Reclaim<A>, A: Allocator> {
+pub struct OwnedRecord<'s, T: Reclaim<A>, A: Allocator> {
     block: NonNull<Block<T, A>>,
-    scope: OwnedReclaimer<A>,
+    scope: ScopeRef<'s, A>,
     marker: InvariantOwned<T>,
 }
 
-impl<T: Reclaim<A>, A: Allocator> OwnedRecord<T, A> {
+// SAFETY: the handle exclusively owns its block, payload and state together
+// (moving it moves both, which are `Send`); the scope reference is `Send`.
+unsafe impl<T: Reclaim<A> + Send, A: Allocator> Send for OwnedRecord<'_, T, A>
+where
+    T::State: Send,
+    A::Permit: Send,
+{
+}
+// SAFETY: shared access exposes only `&T` (through `OwnedInitialized::value`)
+// and atomic scope operations; the state is reached only through `&mut self`.
+unsafe impl<T: Reclaim<A> + Sync, A: Allocator> Sync for OwnedRecord<'_, T, A> where A::Permit: Send {}
+
+impl<'s, T: Reclaim<A>, A: Allocator> OwnedRecord<'s, T, A> {
     /// # Safety
-    /// Same stable initialization and cursor obligations as Record::destination.
-    pub unsafe fn destination(&mut self) -> (NonNull<MaybeUninit<T>>, &mut Cursor) {
-        unsafe {
-            (
-                NonNull::new_unchecked(ptr::addr_of_mut!((*self.block.as_ptr()).value)),
-                &mut (*self.block.as_ptr()).cursor,
-            )
-        }
+    /// The caller must admit all work, update the state to track every
+    /// acquired resource, and preserve the invariants required by
+    /// `T::reclaim_step` on every return, including error and cancellation.
+    /// No initialized T may be moved out; no pointer may outlive this handle.
+    pub unsafe fn destination(&mut self) -> (NonNull<MaybeUninit<T>>, &mut T::State) {
+        // SAFETY: the handle has exclusive custody of its block.
+        unsafe { destination(self.block) }
     }
 
     /// # Safety
-    /// T must be fully initialized and its cursor must describe all resources.
-    pub unsafe fn publish(self) -> OwnedInitialized<T, A> {
+    /// T must be fully initialized and its state must describe all resources.
+    pub unsafe fn publish(self) -> OwnedInitialized<'s, T, A> {
         OwnedInitialized { record: self }
+    }
+
+    pub(crate) fn scope(&self) -> &ScopeRef<'s, A> {
+        &self.scope
+    }
+
+    /// One unit of this record's own cleanup, performed in place rather than
+    /// through the scope queue: completion is independent of every other
+    /// record in the scope. Refusal and errors leave the slot holding the
+    /// record with its progress retained. Done releases the block and
+    /// reservation, returns the handle's scope reference, and empties the slot.
+    pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        // An empty slot was released or moved out earlier; a caller stepping
+        // its phase through it still admits the completion reported here.
+        let Some(current) = slot.as_ref() else {
+            EMPTIED.admit(a)?;
+            return Ok(Reclaimed::Done);
+        };
+        let mut held = Some(Record {
+            block: current.block,
+            owner: current.scope.owner(),
+            marker: PhantomData::<(T, fn(T) -> T)>,
+        });
+        let result = Record::reclaim_step(&mut held, a);
+        let released = held.is_none();
+        // While the block is not released the slot still owns it, so this
+        // temporary view must not transfer it to the queue. Forgetting the
+        // emptied view after release is a no-op.
+        core::mem::forget(held);
+        if released {
+            let handle =
+                core::mem::ManuallyDrop::new(slot.take().ok_or(BoundedError::PlanMismatch)?);
+            // SAFETY: `handle` is never dropped, so its scope reference is read
+            // out exactly once and released here.
+            drop(unsafe { ptr::read(&handle.scope) });
+        }
+        result
+    }
+
+    /// The calls [`Self::reclaim_step`] still takes from `slot`: an empty
+    /// slot, one; otherwise the record's own ([`Reclaim::remaining`]), the
+    /// last of which also releases the block.
+    pub(crate) fn remaining(slot: &mut Option<Self>) -> u64 {
+        let Some(current) = slot.as_mut() else {
+            return 1;
+        };
+        // SAFETY: the handle has exclusive custody of its block, whose place
+        // and state are the record's own pair.
+        unsafe {
+            let (place, state) = destination::<T, A>(current.block);
+            T::remaining(place, state)
+        }
     }
 }
 
-impl<T: Reclaim<A>, A: Allocator> Drop for OwnedRecord<T, A> {
+impl<T: Reclaim<A>, A: Allocator> Drop for OwnedRecord<'_, T, A> {
     fn drop(&mut self) {
-        // A real, short-lived borrow of the stable scope; no lifetime erasure.
+        // The push happens here, before the scope field's releasing decrement.
+        // A short-lived borrow of the stable scope; no lifetime erasure.
         drop(Record {
             block: self.block,
             owner: self.scope.owner(),
@@ -187,15 +600,46 @@ impl<T: Reclaim<A>, A: Allocator> Drop for OwnedRecord<T, A> {
     }
 }
 
-pub struct OwnedInitialized<T: Reclaim<A>, A: Allocator> {
-    record: OwnedRecord<T, A>,
+/// A published record: shared access to its fully initialized payload.
+pub struct OwnedInitialized<'s, T: Reclaim<A>, A: Allocator> {
+    record: OwnedRecord<'s, T, A>,
 }
 
-impl<T: Reclaim<A>, A: Allocator> OwnedInitialized<T, A> {
-    pub(crate) fn scope(&self) -> OwnedReclaimer<A> {
-        self.record.scope.duplicate()
+impl<'s, T: Reclaim<A>, A: Allocator> OwnedInitialized<'s, T, A> {
+    pub(crate) fn scope(&self) -> &ScopeRef<'s, A> {
+        self.record.scope()
     }
+
     pub fn value(&self) -> &T {
-        unsafe { (&*ptr::addr_of!((*self.record.block.as_ptr()).value)).assume_init_ref() }
+        // SAFETY: published records are fully initialized; this handle keeps
+        // the record out of the queue while the borrow is live.
+        unsafe { published(self.record.block) }
+    }
+
+    /// # Safety
+    /// The caller must preserve every invariant `T::reclaim_step` relies on.
+    pub(crate) unsafe fn value_mut(&mut self) -> &mut T {
+        // SAFETY: &mut self is exclusive custody of a published record.
+        unsafe { (*destination::<T, A>(self.record.block).0.as_ptr()).assume_init_mut() }
+    }
+
+    /// Operation-local cleanup of a published value ([`OwnedRecord::reclaim_step`]).
+    pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        reclaim_within(
+            slot,
+            a,
+            |Self { record }| record,
+            |record| Self { record },
+            OwnedRecord::reclaim_step,
+        )
+    }
+
+    /// The calls [`Self::reclaim_step`] still takes from `slot`
+    /// ([`OwnedRecord::remaining`]).
+    pub(crate) fn remaining(slot: &mut Option<Self>) -> u64 {
+        let mut record = slot.take().map(|Self { record }| record);
+        let remaining = OwnedRecord::remaining(&mut record);
+        *slot = record.map(|record| Self { record });
+        remaining
     }
 }

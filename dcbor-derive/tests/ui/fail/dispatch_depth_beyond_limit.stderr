@@ -1,0 +1,30 @@
+error[E0080]: evaluation panicked: a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `dcbor::bounded::decode::construction::reclamation::Reclaimer::<policy::Policy>::allocate::<dcbor::bounded::decode::construction::construct::Constructed<'_, dcbor::bounded::decode::construction::Borrowed<'_>, AtLimit, policy::Policy>>::{constant#0}` failed here
+  |
+ ::: $WORKSPACE/src/bounded/decode/construction/reclamation.rs
+  |
+  | /             assert!(
+  | |                 T::DISPATCH_DEPTH <= MAX_DISPATCH_DEPTH,
+  | |                 "a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH"
+  | |             )
+  | |_____________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/src/bounded/decode/construction/reclamation.rs
+  |
+  | /         const {
+  | |             assert!(
+  | |                 T::DISPATCH_DEPTH <= MAX_DISPATCH_DEPTH,
+  | |                 "a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH"
+  | |             )
+  | |         };
+  | |_________^
+
+note: the above error was encountered while instantiating `fn reclamation::Reclaimer::<Policy>::allocate::<construction::construct::Constructed<'_, dcbor::bounded::decode::construction::Borrowed<'_>, AtLimit, Policy>>`
+ --> $WORKSPACE/src/bounded/decode/construction/reclamation/owned.rs
+  |
+  |             self.owner().allocate::<T>(a, &mut acquisition.admitted)?
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

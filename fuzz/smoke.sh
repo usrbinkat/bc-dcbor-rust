@@ -11,3 +11,4 @@ cargo fuzz run decode -- -runs=1000 -max_len=4096
 cargo fuzz run decode_schedule -- -runs=1000 -max_len=4096
 cargo fuzz run schema_schedule -- -runs=1000 -max_len=1024
 cargo fuzz run representations -- -runs=1000 -max_len=256
+cargo fuzz run owned_lifecycle -- -runs=1000 -max_len=1024

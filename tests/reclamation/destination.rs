@@ -1,102 +1,99 @@
 use super::*;
-use dcbor::bounded::decode::construction::in_place::{Destination, Step};
-use dcbor::bounded::decode::{DecodeError, decode};
 
-#[test]
-fn cancelled_destination_reclaims_without_the_document() {
-    let wire = [0x82, 0x61, b'a', 0x61, b'b'];
-    let mut reached_publication = false;
-    for stop in 0..256 {
-        let mut a = Turn::new();
-        a.values = u64::MAX;
-        a.bytes = u64::MAX;
-        let document = decode(&wire, 8, &mut a).unwrap();
-        let owner = Reclaimer::new();
-        let mut destination = Destination::<Vec<String>, Turn>::new(&owner);
-        let mut output = None;
-        for _ in 0..stop {
-            a.fresh();
-            // SAFETY: every step uses this same immutable document and root.
-            match unsafe { destination.step(&document, 0, &mut a) }.unwrap() {
-                Step::Progress => {}
-                Step::Complete(value) => {
-                    assert_eq!(value.value(), &["a", "b"]);
-                    output = Some(value);
-                    reached_publication = true;
-                    break;
-                }
-                Step::Finished => panic!("construction skipped publication"),
-            }
-        }
-        let held = a.live.load(Ordering::SeqCst);
-        destination.cancel();
-        assert_eq!(a.live.load(Ordering::SeqCst), held);
-        // Cleanup must not dereference the document or borrow its arena.
-        drop(document);
-        let mut done = false;
-        for _ in 0..256 {
-            a.values = 0;
-            a.bytes = 0;
-            let held = a.live.load(Ordering::SeqCst);
-            match destination.reclaim_step(&mut a) {
-                Err(BoundedError::Refused(())) => {
-                    assert_eq!(a.live.load(Ordering::SeqCst), held);
-                }
-                Ok(Reclaimed::Done) => {
-                    done = true;
-                    break;
-                }
-                _ => panic!("cleanup advanced without admission"),
-            }
-            a.fresh();
-            if destination.reclaim_step(&mut a).unwrap() == Reclaimed::Done {
-                done = true;
+/// Construct `["a", "b"]` from `wire`, cancelling the construction after
+/// `stop` turns: cancellation releases nothing synchronously, and its own
+/// cleanup takes every unit refused once, releasing nothing, before it is
+/// admitted, within the decode's bound. The turns construction took to
+/// publish, when it published within `stop`.
+fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
+    let bound = support::typed_turns::<Vec<String>>(wire.len());
+    let mut m = meter();
+    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
+    let mut construction = Construction::<_, Vec<String>, Limits>::construct(document);
+    let mut output = None;
+    let mut published = None;
+    for turn in 0..stop.min(bound) {
+        match support::checked(&mut m, |m| support::contracted(m, &mut construction)) {
+            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
+            Ok(Step::Complete(value)) => {
+                assert_eq!(value.value(), &["a", "b"]);
+                output = Some(value);
+                published = Some(turn + 1);
                 break;
             }
+            _ => panic!("construction skipped publication"),
         }
-        assert!(done);
-        drop(destination);
-        drop(output);
-        for _ in 0..256 {
-            a.fresh();
-            if owner.shutdown_step(&mut a).unwrap() == Reclaimed::Done {
+    }
+    let held = m.live_bytes();
+    construction.cancel();
+    assert_eq!(m.live_bytes(), held, "cancellation released synchronously");
+    // Every cleanup unit is refused once, without release, before it runs.
+    let mut finished = false;
+    for _ in 0..bound {
+        m.clear_refusal();
+        m.exhaust();
+        let held = m.live_bytes();
+        match support::contracted(&mut m, &mut construction) {
+            Err(DecodeError::Resource(BoundedError::Refused(_))) => {
+                assert_eq!(m.live_bytes(), held);
+            }
+            Ok(Step::Finished) => {
+                finished = true;
                 break;
             }
+            Ok(Step::Progress) => {
+                assert!(m.live_bytes() < held, "unpaid cleanup progress");
+                continue;
+            }
+            _ => panic!("cleanup advanced without admission"),
         }
-        assert_eq!(owner.outstanding(), 0);
-        assert_eq!(a.live.load(Ordering::SeqCst), 0);
-        if reached_publication {
+        if matches!(
+            support::checked(&mut m, |m| support::contracted(m, &mut construction)).unwrap(),
+            Step::Finished
+        ) {
+            finished = true;
             break;
         }
     }
-    assert!(reached_publication);
+    assert!(finished, "cleanup exceeded its bound of {bound} turns");
+    support::exhausted(&mut m, &mut construction);
+    drop(construction);
+    drop(output);
+    drain(&mut owner, &mut m);
+    assert_eq!(owner.outstanding(), 0);
+    assert_eq!(m.live_bytes(), 0);
+    published
+}
+
+/// The construction cancelled after every number of turns through its
+/// publication ([`support::stop_matrix`]): publication is reached within the
+/// decode's bound, and exactly the stop at it publishes.
+#[test]
+fn cancelled_construction_reclaims_at_every_boundary() {
+    let wire = [0x82, 0x61, b'a', 0x61, b'b'];
+    let boundaries = cancelled(&wire, usize::MAX).expect("construction never reached publication");
+    support::stop_matrix("cancelled construction of two texts", boundaries, |stop| {
+        assert_eq!(
+            cancelled(&wire, stop).is_some(),
+            stop == boundaries,
+            "a stop after {stop} turns"
+        );
+    });
 }
 
 #[test]
 fn terminal_allocation_error_is_not_replayed() {
-    let mut a = Turn::new();
-    a.values = u64::MAX;
-    a.bytes = u64::MAX;
-    let document = decode(&[7], 8, &mut a).unwrap();
-    let owner = Reclaimer::new();
-    assert_eq!(owner.shutdown_step(&mut a).unwrap(), Reclaimed::Done);
-    let mut destination = Destination::<u64, Turn>::new(&owner);
-    a.fresh();
-    // SAFETY: every call uses the same immutable document and root.
+    let mut m = meter();
+    let (mut owner, document) = document(&mut m, &[7], Options::normalizing(8));
+    // Close the scope: the live document keeps it from completing.
+    assert_eq!(owner.shutdown_step(&mut m).unwrap(), Reclaimed::Waiting);
+    let mut construction = Construction::<_, u64, Limits>::construct(document);
     assert!(matches!(
-        unsafe { destination.step(&document, 0, &mut a) },
+        support::checked(&mut m, |m| support::contracted(m, &mut construction)),
         Err(DecodeError::Resource(BoundedError::PlanMismatch))
     ));
-    a.fresh();
-    assert!(matches!(
-        unsafe { destination.step(&document, 0, &mut a) },
-        Ok(Step::Progress)
-    ));
-    assert!(matches!(
-        unsafe { destination.step(&document, 0, &mut a) },
-        Ok(Step::Finished)
-    ));
-    drop(destination);
-    drop(document);
-    assert_eq!(a.live.load(Ordering::SeqCst), 0);
+    support::finish_within(&mut m, &mut construction, support::typed_turns::<u64>(1));
+    drop(construction);
+    drain(&mut owner, &mut m);
+    assert_eq!(m.live_bytes(), 0);
 }

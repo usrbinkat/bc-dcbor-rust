@@ -91,14 +91,17 @@ version = "0.25.2"
 dependencies = [
  "chrono",
  "dcbor-derive",
+ "dcbor-test-support",
  "half",
- "hashbrown 0.17.1 (git+https://github.com/usrbinkat/hashbrown?rev=3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8)",
+ "hashbrown 0.17.1 (git+https://github.com/usrbinkat/hashbrown?rev=0fbe75be38372034b884d347419994d5fec0bc7d)",
  "hex",
  "hex-literal",
  "indoc",
  "num-bigint",
  "paste",
+ "proc-macro2",
  "spin",
+ "syn 2.0.119",
  "thiserror",
  "unicode-normalization",
  "version-sync",
@@ -114,6 +117,13 @@ dependencies = [
  "rustversion",
  "syn 2.0.119",
  "trybuild",
+]
+
+[[package]]
+name = "dcbor-test-support"
+version = "0.0.0"
+dependencies = [
+ "dcbor",
 ]
 
 [[package]]
@@ -204,7 +214,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hashbrown"
 version = "0.17.1"
-source = "git+https://github.com/usrbinkat/hashbrown?rev=3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8#3ef9948893f0abf3dff0d6dfc850ea3fa33df6a8"
+source = "git+https://github.com/usrbinkat/hashbrown?rev=0fbe75be38372034b884d347419994d5fec0bc7d#0fbe75be38372034b884d347419994d5fec0bc7d"
 dependencies = [
  "allocator-api2",
  "equivalent",

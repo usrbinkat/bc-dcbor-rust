@@ -23,21 +23,40 @@ printf 'Campaign logs: %s\n' "$logs"
 printf 'STARTED\n' >"$logs/results.txt"
 trap 'status=$?; printf "EXIT %s\n" "$status" >> "$logs/results.txt"' EXIT
 
+snapshot() {
+	for file in flake.nix flake.lock Cargo.toml Cargo.lock fuzz/Cargo.toml fuzz/Cargo.lock; do
+		if [[ -f $file ]]; then sha256sum "$file"; fi
+	done
+	find src dcbor-derive/src fuzz/src fuzz/fuzz_targets tests -type f \
+		\( -name '*.rs' -o -name '*.toml' -o -name '*.txt' \) -print0 |
+		LC_ALL=C sort -z | xargs -0 sha256sum
+	sha256sum fuzz/qualify.sh
+}
+
+unchanged() {
+	snapshot >"$logs/current-source.sha256"
+	if ! diff -u "$logs/source.sha256" "$logs/current-source.sha256" >"$logs/source-diff.log"; then
+		printf 'SOURCE CHANGED\n' >>"$logs/results.txt"
+		cat "$logs/source-diff.log" >&2
+		exit 1
+	fi
+}
+
+# Fuzzing checks the existing oracles; inherited recorder settings must not
+# turn a campaign into baseline publication or cost-record generation.
+unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECTORY DCBOR_CLASS_COVERAGE
+snapshot >"$logs/source.sha256"
 {
 	date -u
 	rustc -Vv
 	cargo -V
 	cargo fuzz --version
 	printf 'seconds_per_target=%s seed=%s\n' "$seconds" "$seed"
-	for file in flake.nix flake.lock Cargo.toml Cargo.lock fuzz/Cargo.toml fuzz/Cargo.lock; do
-		if [[ -f $file ]]; then sha256sum "$file"; fi
-	done
-	find src dcbor-derive/src fuzz/src fuzz/fuzz_targets -type f -name '*.rs' -print0 |
-		sort -z | xargs -0 sha256sum
-	sha256sum fuzz/qualify.sh
+	cat "$logs/source.sha256"
 } >"$logs/environment-and-sources.log" 2>&1
 
 if cargo fuzz build >"$logs/build.log" 2>&1; then
+	unchanged
 	printf 'BUILD PASS\n' >>"$logs/results.txt"
 else
 	status=$?
@@ -52,6 +71,7 @@ while read -r target max_len; do
 		-seed="$seed" -max_total_time="$seconds" -max_len="$max_len" \
 		-timeout=30 -rss_limit_mb=4096 -print_final_stats=1 \
 		>"$logs/$target.log" 2>&1; then
+		unchanged
 		printf '%s PASS\n' "$target" >>"$logs/results.txt"
 	else
 		status=$?
@@ -68,6 +88,7 @@ decode 4096
 decode_schedule 4096
 schema_schedule 1024
 representations 256
+owned_lifecycle 1024
 TARGETS
 
 cat "$logs/results.txt"

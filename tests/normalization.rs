@@ -1,26 +1,18 @@
-//! Unicode NFC conformance for the bounded path, independent of its algorithm.
+//! Unicode NFC conformance for the bounded and symbolic paths, independent
+//! of their algorithms: the conformance file is the oracle.
 #[path = "data/normalization_tests.rs"]
 mod data;
 
 use dcbor::{CBOR, bounded::*};
 
-struct Admit;
-impl Budget for Admit {
-    type Refusal = ();
-    fn traverse(&mut self, _: u64, _: u64) -> Result<(), ()> {
-        Ok(())
-    }
-}
-impl Allocator for Admit {
-    type Permit = ();
-    fn allocate(&mut self, _: u64) -> Result<(), ()> {
-        Ok(())
-    }
-}
-
+/// Every row's five forms normalize to the row's NFC (or NFKC) form on the
+/// bounded path, the symbolic path encodes the same bytes, and those bytes
+/// decode back to the form. A row's NFD form, where it differs from its NFC,
+/// is rejected by the decoder as not normalized.
 #[test]
 fn unicode_nfc_conformance() {
     assert_eq!(data::NORMALIZATION_TESTS.len(), 20_034);
+    let mut rejected = 0;
     for (index, row) in data::NORMALIZATION_TESTS.iter().enumerate() {
         for (input, expected) in [
             (row.source, row.nfc),
@@ -29,23 +21,61 @@ fn unicode_nfc_conformance() {
             (row.nfkc, row.nfkc),
             (row.nfkd, row.nfkc),
         ] {
-            let prepared = prepare(input, &mut Admit).unwrap();
-            let mut bytes = vec![0; usize::try_from(prepared.len()).unwrap()];
-            prepared.encode_into(&mut bytes, &mut Admit).unwrap();
-            let actual: String = CBOR::try_from_data(bytes).unwrap().try_into().unwrap();
+            let actual = normalized(input);
             assert_eq!(
                 actual, expected,
                 "normalization row {index}, input {input:?}"
             );
         }
+        if row.nfd != row.nfc {
+            let result = CBOR::try_from_data(text_wire(row.nfd));
+            assert!(
+                matches!(result, Err(dcbor::Error::NonCanonicalString)),
+                "normalization row {index}: NFD {:?} decoded as {result:?}",
+                row.nfd
+            );
+            rejected += 1;
+        }
     }
+    assert!(rejected > 0, "no row has an NFD form distinct from its NFC");
 }
 
+/// `input` normalized and encoded on the bounded path, the symbolic path
+/// required to encode the same bytes, decoded back to text.
 fn normalized(input: &str) -> String {
-    let prepared = prepare(input, &mut Admit).unwrap();
-    let mut bytes = vec![0; usize::try_from(prepared.len()).unwrap()];
-    prepared.encode_into(&mut bytes, &mut Admit).unwrap();
+    let prepared = prepare(input, &mut Limits::unlimited()).unwrap();
+    let mut bytes = vec![0; prepared.len()];
+    prepared
+        .encode_into(&mut bytes, &mut Limits::unlimited())
+        .unwrap();
+    assert_eq!(
+        CBOR::from(input).to_cbor_data(),
+        bytes,
+        "symbolic and bounded normalization of {input:?} differ"
+    );
     CBOR::try_from_data(bytes).unwrap().try_into().unwrap()
+}
+
+/// `text`'s bytes as a CBOR text string, unnormalized: the shortest head of
+/// its length, then its bytes.
+fn text_wire(text: &str) -> Vec<u8> {
+    let n = text.len();
+    let mut wire = match n {
+        0..24 => vec![0x60 | n as u8],
+        24..256 => vec![0x78, n as u8],
+        256..65536 => vec![0x79, (n >> 8) as u8, n as u8],
+        _ => {
+            let mut head = vec![0x7a];
+            head.extend(
+                u32::try_from(n)
+                    .expect("a conformance row fits in u32")
+                    .to_be_bytes(),
+            );
+            head
+        }
+    };
+    wire.extend_from_slice(text.as_bytes());
+    wire
 }
 
 #[test]

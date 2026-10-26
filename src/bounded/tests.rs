@@ -1,130 +1,161 @@
-extern crate alloc;
-
-use alloc::rc::Rc;
-use core::cell::Cell;
-
 use half::f16;
 
 use super::*;
 use crate::CBOR;
 
-/// A budget and allocator that records what it is told, refuses
-/// traversal past `value_limit` visited values and allocation past
-/// `scratch_limit` requested bytes, and tracks live and peak allocation
-/// through its permits.
-pub(crate) struct Tally {
-    pub(crate) values: u64,
-    pub(crate) bytes: u64,
-    pub(crate) requested: u64,
-    value_limit: u64,
-    scratch_limit: u64,
-    live: Rc<Cell<u64>>,
-    peak: Rc<Cell<u64>>,
+/// Refuses past `values` visited values; nothing else is limited.
+pub(crate) fn limited(values: u64) -> Limits {
+    Limits::new(values, u64::MAX, u64::MAX)
 }
 
-/// One admitted allocation; dropping it releases its bytes.
-pub(crate) struct TallyPermit {
-    bytes: u64,
-    live: Rc<Cell<u64>>,
-}
+/// A deterministic generator of inputs for the attribution checks: symbolic
+/// values of every major type, nested; texts from scalars that exercise
+/// every normalization path (ordinary, combining marks in and out of order,
+/// precomposed, Hangul, four-byte, singletons); and mutations of encodings,
+/// a byte changed or the input cut short. One seed, one sequence, so a
+/// failing input is reproduced by its position. Its users, the attribution
+/// checks, are compiled under `std`.
+#[cfg(feature = "std")]
+pub(crate) struct Generator(u64);
 
-impl Drop for TallyPermit {
-    fn drop(&mut self) {
-        self.live.set(self.live.get() - self.bytes);
+#[cfg(feature = "std")]
+impl Generator {
+    pub(crate) const fn new(seed: u64) -> Self {
+        Self(seed)
     }
-}
 
-impl Tally {
-    fn with(value_limit: u64, scratch_limit: u64) -> Self {
-        Self {
-            values: 0,
-            bytes: 0,
-            requested: 0,
-            value_limit,
-            scratch_limit,
-            live: Rc::new(Cell::new(0)),
-            peak: Rc::new(Cell::new(0)),
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    /// A number below `bound`, which is not zero.
+    pub(crate) fn below(&mut self, bound: u64) -> u64 {
+        (self.next() >> 33) % bound
+    }
+
+    /// One of `items`, which is not empty.
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len() as u64) as usize]
+    }
+
+    /// A text of at most `max` scalars.
+    pub(crate) fn text(&mut self, max: u64) -> String {
+        const POOLS: [&[char]; 6] = [
+            &['a', 'e', 'q', 'x', 'A', '1', ' '],
+            &[
+                '\u{301}', '\u{316}', '\u{308}', '\u{327}', '\u{344}', '\u{30a}',
+            ],
+            &['\u{e9}', '\u{c5}', '\u{1e69}', '\u{3d3}'],
+            &['\u{1100}', '\u{1161}', '\u{11a8}', '\u{ac00}'],
+            &['\u{1f600}', '\u{10000}'],
+            &['\u{37e}', '\u{212b}', '\u{2126}'],
+        ];
+        let len = self.below(max + 1);
+        let mut text = String::new();
+        for _ in 0..len {
+            let pool = self.pick(&POOLS);
+            text.push(self.pick(pool));
+        }
+        text
+    }
+
+    /// A value nested at most `depth` deep.
+    pub(crate) fn value(&mut self, depth: usize) -> CBOR {
+        const LEAVES: u64 = 7;
+        let kinds = if depth == 0 { LEAVES } else { LEAVES + 3 };
+        match self.below(kinds) {
+            0 => {
+                let shift = self.below(64);
+                CBOR::from(self.next() >> shift)
+            }
+            1 => {
+                let shift = 1 + self.below(63);
+                CBOR::from(-1 - (self.next() >> shift) as i64)
+            }
+            2 => CBOR::from(f64::from_bits(self.next())),
+            3 => CBOR::from(self.text(24)),
+            4 => {
+                let len = self.below(80);
+                let bytes: Vec<u8> = (0..len).map(|_| self.next() as u8).collect();
+                CBOR::to_byte_string(bytes)
+            }
+            5 => CBOR::from(self.below(2) == 0),
+            6 => CBOR::null(),
+            7 => {
+                let len = self.below(6);
+                let items: Vec<CBOR> = (0..len).map(|_| self.value(depth - 1)).collect();
+                CBOR::from(items)
+            }
+            8 => {
+                let mut map = crate::Map::new();
+                for _ in 0..self.below(6) {
+                    let key = self.value(0);
+                    let value = self.value(depth - 1);
+                    map.insert(key, value);
+                }
+                CBOR::from(map)
+            }
+            _ => {
+                let tag = crate::Tag::with_value(self.below(1000));
+                CBOR::to_tagged_value(tag, self.value(depth - 1))
+            }
         }
     }
 
-    pub(crate) fn unlimited() -> Self {
-        Self::with(u64::MAX, u64::MAX)
-    }
-
-    /// Refuses past `values` visited values.
-    pub(crate) fn limited(values: u64) -> Self {
-        Self::with(values, u64::MAX)
-    }
-
-    /// Refuses past `bytes` requested allocation bytes.
-    pub(crate) fn scratch_limited(bytes: u64) -> Self {
-        Self::with(u64::MAX, bytes)
-    }
-
-    pub(crate) fn live(&self) -> u64 {
-        self.live.get()
-    }
-
-    pub(crate) fn peak(&self) -> u64 {
-        self.peak.get()
-    }
-}
-
-impl Budget for Tally {
-    type Refusal = &'static str;
-
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), &'static str> {
-        let values = self.values.checked_add(values).ok_or("overflow")?;
-        let bytes = self.bytes.checked_add(bytes).ok_or("overflow")?;
-        if values > self.value_limit {
-            return Err("traversal refused");
+    /// `bytes` with one byte changed, or cut short; empty bytes unchanged.
+    pub(crate) fn mutated(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut mutated = bytes.to_vec();
+        if mutated.is_empty() {
+            return mutated;
         }
-        self.values = values;
-        self.bytes = bytes;
-        Ok(())
-    }
-}
-
-impl Allocator for Tally {
-    type Permit = TallyPermit;
-
-    fn allocate(&mut self, bytes: u64) -> Result<TallyPermit, &'static str> {
-        let requested = self.requested.checked_add(bytes).ok_or("overflow")?;
-        if requested > self.scratch_limit {
-            return Err("allocation refused");
+        let at = self.below(mutated.len() as u64) as usize;
+        if self.below(2) == 0 {
+            mutated[at] ^= 1 << self.below(8);
+        } else {
+            mutated.truncate(at);
         }
-        self.requested = requested;
-        let live = self.live.get().checked_add(bytes).ok_or("overflow")?;
-        self.live.set(live);
-        self.peak.set(self.peak.get().max(live));
-        Ok(TallyPermit {
-            bytes,
-            live: Rc::clone(&self.live),
-        })
+        mutated
     }
 }
 
-/// Both passes of `value` against the symbolic encoding `symbolic`: the
-/// bytes are equal, both strictly decode to one value, the length is
-/// exact, the write reports no more than predicted, and every allocation
-/// is released once the preparation drops.
-pub(crate) fn check<T: BoundedEncodable + ?Sized>(value: &T, symbolic: &[u8]) -> Vec<u8> {
-    let mut allocator = Tally::unlimited();
+/// `value`'s encoding against the symbolic encoding `symbolic`, both ways a
+/// plan is consumed: written into an output of exactly its length within
+/// its predicted work and allocating nothing, and published in place. The
+/// bytes are equal, both strictly decode to one value, and every
+/// allocation is released once the encodings drop.
+pub(crate) fn check<T: Schema + ?Sized>(value: &T, symbolic: &[u8]) -> Vec<u8> {
+    let mut allocator = Limits::unlimited();
     let bytes = {
-        let prepared = prepare(value, &mut allocator).unwrap();
-        let mut bytes = vec![0u8; usize::try_from(prepared.len()).unwrap()];
-        let mut written = Tally::unlimited();
-        prepared.encode_into(&mut bytes, &mut written).unwrap();
-        let reported = WriteWork::new(written.values, written.bytes);
+        let prepared = prepare(value, &mut allocator).expect("an unlimited preparation completes");
+        let mut bytes = vec![0u8; prepared.len()];
+        let mut written = Limits::unlimited();
+        prepared
+            .encode_into(&mut bytes, &mut written)
+            .expect("an unlimited write completes");
+        let predicted = prepared
+            .write_work::<()>()
+            .expect("the prediction fits in u64");
+        let reported = written.used();
         assert!(
-            prepared.write_work().covers(&reported),
-            "the write reported {reported:?} beyond {:?}",
-            prepared.write_work()
+            predicted.covers(&reported),
+            "the write reported {reported:?} beyond {predicted:?}"
         );
-        assert_eq!(written.requested, 0, "a write allocates nothing");
+        assert_eq!(written.requested_bytes(), 0, "a write allocates nothing");
+        let published = prepared
+            .publish(&mut allocator)
+            .expect("an unlimited publication completes");
+        assert_eq!(
+            published.as_ref(),
+            bytes,
+            "publication in place writes the same bytes"
+        );
         bytes
     };
-    assert_eq!(allocator.live(), 0, "every allocation is released");
+    assert_eq!(allocator.live_bytes(), 0, "every allocation is released");
     assert_eq!(bytes, symbolic, "the bounded bytes are the symbolic bytes");
     assert_eq!(
         CBOR::try_from_data(&bytes).unwrap(),
@@ -254,96 +285,56 @@ fn byte_strings_booleans_and_arrays_match_the_symbolic_encoding() {
     check(&empty, &CBOR::from(empty.clone()).to_cbor_data());
 }
 
-/// Elements of a fixed measure are measured from their count, and the
-/// prediction still covers every element the write visits; an array of
-/// them has a fixed measure itself.
+/// A wrong-sized output is refused before anything is written, a larger
+/// one and a smaller one alike.
 #[test]
-fn fixed_measures_compose() {
-    let flags = vec![true, false, true];
-    let mut measuring = Tally::unlimited();
-    let prepared = prepare(&flags, &mut measuring).unwrap();
-    assert_eq!(measuring.values, 1, "measurement visits the array only");
-    assert_eq!(
-        prepared.write_work().values,
-        4,
-        "the write visits the array and each flag"
-    );
-    check(&flags, &CBOR::from(flags.clone()).to_cbor_data());
-    let fixed = <[bool; 3]>::FIXED.unwrap();
-    assert_eq!(fixed.len, 4);
-    assert_eq!(fixed.write, WriteWork::new(4, 0));
-    assert_eq!(<[u8; 3]>::FIXED, None, "integers are not of fixed length");
+fn the_output_refuses_wrong_sizes() {
+    let prepared = prepare(&1u64, &mut Limits::unlimited()).unwrap();
+    for size in [0usize, 3] {
+        let mut bytes = vec![0xeeu8; size];
+        assert_eq!(
+            prepared.encode_into(&mut bytes, &mut Limits::unlimited()),
+            Err(BoundedError::OutputSize {
+                measured: 1,
+                provided: size as u64
+            })
+        );
+        assert!(
+            bytes.iter().all(|&byte| byte == 0xee),
+            "nothing was written"
+        );
+    }
 }
 
-/// A wrong-sized output is refused before anything is written; a write
-/// past the output writes nothing of it; a short write is refused at its
-/// end.
+/// A source whose counted head disagrees with the fields it visits is
+/// refused when its map ends, never published with a wrong count, in
+/// either direction.
 #[test]
-fn the_output_refuses_wrong_sizes_overflow_and_a_short_finish() {
-    let prepared = prepare(&1u64, &mut Tally::unlimited()).unwrap();
-    let mut bytes = [0xeeu8; 3];
-    assert_eq!(
-        prepared.encode_into(&mut bytes, &mut Tally::unlimited()),
-        Err(BoundedError::OutputSize {
-            measured: 1,
-            provided: 3
-        })
-    );
-    assert_eq!(bytes, [0xee; 3], "nothing was written");
-    let mut short = [0u8; 2];
-    let mut output = Output::new(&mut short);
-    assert_eq!(
-        output.slice::<()>(&[1, 2, 3]),
-        Err(BoundedError::Capacity {
-            needed: 3,
-            remaining: 2
-        })
-    );
-    assert_eq!(output.written(), 0);
-    output.byte::<()>(7).unwrap();
-    assert_eq!(
-        output.finish::<()>(1),
-        Err(BoundedError::Length {
-            measured: 1,
-            written: 1
-        }),
-        "one of two bytes written is not a complete output"
-    );
-    assert_eq!(short, [7, 0]);
-}
-
-/// A measure that is wrong for what is written is caught at the sink, not
-/// trusted.
-#[test]
-fn a_wrong_measure_is_refused_at_the_sink() {
-    struct Understated;
-    impl BoundedEncodable for Understated {
-        fn measure<A: Allocator>(
-            &self,
-            _: &mut Plan<A::Permit>,
-            _: &mut A,
-        ) -> BoundedResult<Measure, A> {
-            Ok(Measure::leaf(1, 0))
-        }
-
-        fn write<P, B: Budget>(
-            &self,
-            _: &mut Cursor<'_, P>,
-            output: &mut Output<'_>,
-            _: &mut B,
-        ) -> BoundedResult<(), B> {
-            output.head(MajorType::Unsigned, 256)
+fn a_miscounted_map_is_refused_at_its_end() {
+    struct Miscounted(u64);
+    impl Schema for Miscounted {
+        fn instruction(&self, index: usize) -> encoding::Instruction<'_> {
+            match index {
+                0 => encoding::Instruction::CountedMap(self.0),
+                1 => encoding::Instruction::Field(0, Some(&true)),
+                _ => encoding::Instruction::End,
+            }
         }
     }
-    let prepared = prepare(&Understated, &mut Tally::unlimited()).unwrap();
-    let mut bytes = [0u8; 1];
-    assert_eq!(
-        prepared.encode_into(&mut bytes, &mut Tally::unlimited()),
-        Err(BoundedError::Capacity {
-            needed: 3,
-            remaining: 1
-        })
-    );
+    for count in [0, 2] {
+        let mut limits = Limits::unlimited();
+        assert_eq!(
+            encode(&Miscounted(count), &mut limits).map(|encoded| encoded.as_ref().to_vec()),
+            Err(BoundedError::PlanMismatch),
+            "a head of {count} over one field"
+        );
+        assert_eq!(
+            limits.live_bytes(),
+            0,
+            "the refused plan's storage is released"
+        );
+    }
+    check(&Miscounted(1), &[0xa1, 0x00, 0xf5]);
 }
 
 /// A refusing budget stops the preparation before the value is visited,
@@ -351,8 +342,8 @@ fn a_wrong_measure_is_refused_at_the_sink() {
 #[test]
 fn a_refusal_is_returned_as_the_budget_gave_it() {
     assert_eq!(
-        prepare(&42u64, &mut Tally::limited(0)).map(|prepared| prepared.len()),
-        Err(BoundedError::Refused("traversal refused"))
+        prepare(&42u64, &mut limited(0)).map(|prepared| prepared.len()),
+        Err(BoundedError::Refused(LimitRefusal::Work))
     );
 }
 
@@ -362,28 +353,36 @@ fn a_refusal_is_returned_as_the_budget_gave_it() {
 /// publishes nothing and drops the permit.
 #[test]
 fn an_owned_encoding_is_written_under_its_own_budget() {
-    let mut preparing = Tally::unlimited();
+    let mut preparing = Limits::unlimited();
     let prepared = prepare(&24u64, &mut preparing).unwrap();
-    let mut storage = Tally::unlimited();
-    let permit = storage.allocate(prepared.len()).unwrap();
-    let mut writing = Tally::unlimited();
+    let mut storage = Limits::unlimited();
+    let permit = storage.allocate(prepared.len() as u64).unwrap();
+    let mut writing = Limits::unlimited();
     let encoded = prepared.encode_owned(permit, &mut writing).unwrap();
     assert_eq!(encoded.as_ref(), [0x18, 0x18]);
-    assert_eq!(writing.bytes, 2, "the initialization of both bytes");
-    assert_eq!(writing.values, 1, "the number's one value");
-    assert_eq!(writing.requested, 0, "the writing budget allocates nothing");
-    assert_eq!(storage.live(), 2, "the permit lives with the bytes");
+    assert_eq!(
+        writing.used().bytes,
+        4,
+        "the initialization of both bytes, then their one segment"
+    );
+    assert_eq!(writing.used().values, 2, "the segment and the completion");
+    assert_eq!(
+        writing.requested_bytes(),
+        0,
+        "the writing budget allocates nothing"
+    );
+    assert_eq!(storage.live_bytes(), 2, "the permit lives with the bytes");
     drop(encoded);
-    assert_eq!(storage.live(), 0, "and is released with them");
+    assert_eq!(storage.live_bytes(), 0, "and is released with them");
 
-    let permit = storage.allocate(prepared.len()).unwrap();
+    let permit = storage.allocate(prepared.len() as u64).unwrap();
     assert_eq!(
         prepared
-            .encode_owned(permit, &mut Tally::limited(0))
+            .encode_owned(permit, &mut limited(0))
             .map(|encoded| encoded.as_ref().to_vec()),
-        Err(BoundedError::Refused("traversal refused"))
+        Err(BoundedError::Refused(LimitRefusal::Work))
     );
-    assert_eq!(storage.live(), 0, "a refused write drops its permit");
+    assert_eq!(storage.live_bytes(), 0, "a refused write drops its permit");
 }
 
 /// The growth bound is exactly what an `Owned` reports and holds: element
@@ -392,23 +391,27 @@ fn an_owned_encoding_is_written_under_its_own_budget() {
 #[test]
 fn owned_growth_is_exact() {
     fn measured<T: Default>(elements: usize, one_at_a_time: bool) -> Growth {
-        let mut tally = Tally::unlimited();
-        let mut owned = Owned::<T, TallyPermit>::new();
+        let mut limits = Limits::unlimited();
+        let mut owned = Owned::<T, Reservation>::new();
         if one_at_a_time {
             for _ in 0..elements {
-                owned.push(T::default(), &mut tally).unwrap();
+                owned.push(T::default(), &mut limits).unwrap();
             }
         } else {
-            owned.reserve(elements, &mut tally).unwrap();
+            owned.reserve(elements, &mut limits).unwrap();
         }
         let growth = Growth {
-            copied: tally.bytes,
-            allocated: tally.requested,
-            held: tally.live(),
-            peak: tally.peak(),
+            allocations: limits.requests() as u64,
+            // Growth.copied measures relocation alone. Acquisition also
+            // prepays one release per request, charged separately.
+            copied: limits.used().bytes
+                - limits.requests() as u64 * Owned::<T, Reservation>::RELEASE_BYTES,
+            allocated: limits.requested_bytes(),
+            held: limits.live_bytes(),
+            peak: limits.peak_bytes(),
         };
         drop(owned);
-        assert_eq!(tally.live(), 0);
+        assert_eq!(limits.live_bytes(), 0);
         growth
     }
     for elements in 0..=300usize {
@@ -442,7 +445,119 @@ fn work_composition_is_checked() {
     );
     assert_eq!(most.times::<()>(2), Err(BoundedError::Overflow));
     assert_eq!(
-        prepare(&[0u8; 0], &mut Tally::unlimited()).map(|p| p.len()),
+        prepare(&[0u8; 0], &mut Limits::unlimited()).map(|p| p.len()),
         Ok(1)
     );
+}
+
+/// A bignum's encoding is the symbolic conversion's (`num_bigint.rs`), for
+/// both signs, at zero and minus one, at every digit boundary where the
+/// borrow of a negative magnitude crosses digits, and over generated
+/// magnitudes of many digits: read from its digits a quantum at a time.
+#[cfg(feature = "num-bigint")]
+#[test]
+fn bignums_match_the_symbolic_encoding() {
+    use num_bigint::{BigInt, BigUint, Sign};
+    let mut magnitudes = vec![
+        BigUint::ZERO,
+        BigUint::from(1u8),
+        BigUint::from(255u8),
+        BigUint::from(256u16),
+        BigUint::from(u64::MAX),
+        BigUint::from(1u128 << 64),
+        (BigUint::from(1u128 << 64) << 64usize) - 1u8,
+        BigUint::from(1u8) << 512usize,
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for digits in [1usize, 7, 8, 9, 16, 17, 40] {
+        let mut limbs = Vec::with_capacity(digits * 2);
+        for _ in 0..digits * 2 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            limbs.push((state >> 32) as u32);
+        }
+        magnitudes.push(BigUint::new(limbs));
+    }
+    for magnitude in magnitudes {
+        check(&magnitude, &CBOR::from(magnitude.clone()).to_cbor_data());
+        let positive = BigInt::from_biguint(Sign::Plus, magnitude.clone());
+        check(&positive, &CBOR::from(positive.clone()).to_cbor_data());
+        if magnitude != BigUint::ZERO {
+            let negative = BigInt::from_biguint(Sign::Minus, magnitude);
+            check(&negative, &CBOR::from(negative.clone()).to_cbor_data());
+        }
+    }
+}
+
+/// A tree keyed by its entries' encoded keys yields them in canonical
+/// order: the order the engine checks in place of sorting is the sorted
+/// order of the encoded keys, for keys of every major type and length.
+#[test]
+fn a_maps_iteration_order_is_its_encoded_key_order() {
+    let mut map = crate::Map::new();
+    for key in [
+        CBOR::from(10u64),
+        CBOR::from(-1i64),
+        CBOR::from("z"),
+        CBOR::from("aa"),
+        CBOR::from(vec![1u64, 2]),
+        CBOR::from(100_000u64),
+        CBOR::from(false),
+    ] {
+        map.insert(key, 0u64);
+    }
+    let iterated: Vec<Vec<u8>> = map.iter().map(|(key, _)| key.to_cbor_data()).collect();
+    let mut sorted = iterated.clone();
+    sorted.sort();
+    assert_eq!(iterated, sorted);
+    check(&map, &CBOR::from(map.clone()).to_cbor_data());
+}
+
+/// The stable walk of a tree, its whole range created and stepped, compares
+/// no keys at any height from a single leaf to several levels, and yields
+/// every entry once: its cost is its node moves alone, which
+/// [`encoding::tree_moves`] bounds from the standard library's node
+/// capacity and minimum fill (`B = 6`, `MIN_LEN = 5`). The height bound
+/// steps exactly at the fewest entries each height holds.
+#[cfg(feature = "std")]
+#[test]
+fn a_tree_iterators_steps_compare_no_keys() {
+    use core::cell::Cell;
+    use core::cmp::Ordering;
+    std::thread_local! {
+        static COMPARISONS: Cell<u64> = const { Cell::new(0) };
+    }
+    #[derive(PartialEq, Eq)]
+    struct Counted(u64);
+    impl PartialOrd for Counted {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Counted {
+        fn cmp(&self, other: &Self) -> Ordering {
+            COMPARISONS.with(|count| count.set(count.get() + 1));
+            self.0.cmp(&other.0)
+        }
+    }
+    for len in [0u64, 1, 11, 12, 71, 72, 1_000, 20_000] {
+        let tree: BTreeMap<Counted, ()> = (0..len).map(|key| (Counted(key), ())).collect();
+        COMPARISONS.with(|count| count.set(0));
+        let mut range = tree.range::<Counted, _>(..);
+        let mut yielded = 0;
+        while range.next().is_some() {
+            yielded += 1;
+        }
+        assert_eq!(yielded, len);
+        assert_eq!(COMPARISONS.with(Cell::get), 0, "{len} entries");
+        assert!(encoding::tree_height(len as usize) >= 1);
+    }
+    // The least entries of `h` levels, `2 * 6^(h - 1) - 1`, is where the
+    // height bound steps.
+    assert_eq!(encoding::tree_height(10), 1);
+    assert_eq!(encoding::tree_height(11), 2);
+    assert_eq!(encoding::tree_height(70), 2);
+    assert_eq!(encoding::tree_height(71), 3);
+    assert_eq!(encoding::tree_moves(71), 6);
 }

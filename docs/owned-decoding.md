@@ -1,52 +1,174 @@
 # Owned decoding
 
-`bounded::decode::construction::OwnedTypedDecoder` retains its input through an
-`OwnedInitialized<I, A>` resource handle. `I: DecodeInput<A>` promises immutable
-bytes and implements incremental `Reclaim<A>` for input storage, evidence, and
-reservations. `ByteString` supplies a built-in binding.
+Owned decoding retains every operation's state in stable records held by one
+decode scope, so an operation can be stepped across turns, moved between
+threads, cancelled, or dropped at any point without running an unadmitted
+destructor or allocation. The interfaces live in
+`bounded::decode::construction`; owned encoding of a decoded value lives in
+`bounded::encoding`.
 
-The scheduler retains `OwnedDecodeOwner<A>`. Its constructor is allocation-free;
-`initialize_step` admits and allocates the stable scope. `allocate_step` creates
-an uninitialized owning record, retaining its allocation admission across a
-refusal. Resource bindings initialize the record at `destination()`, maintaining
-its cursor, then call unsafe `publish()` only after complete initialization.
-These low-level operations have the same safety obligations as the borrowed
-`Record` API. Input must already have this custody before being passed to the
-decoder; passing a plain generic value would permit its arbitrary destructor to
-run when cancellation occurs before lifecycle allocation.
+## Owned B-tree maps
 
-`OwnedTypedDecoder::new(input, options)` creates only a small controller. Call
-`step` with a fresh work allowance each turn. A refusal retains progress.
-`OwnedDecodeStep::Complete` yields a movable `OwnedTypedValue`; `value()` borrows
-the stable destination. The decoder can then be dropped independently.
+With `custom-std-collections`, `BTreeMap<K, V>` supports owned construction,
+transfer, preparation and incremental reclamation. `K` implements both
+`InPlace<A>` and `TreeKey`; `V` implements `InPlace<A>`. Thread transfer also
+requires the existing `Transferable` and `TransferableSchema` contracts.
+Built-in `TreeKey` bindings cover `String`, `ByteString`, booleans, and the
+signed and unsigned 8-, 16-, 32- and 64-bit integers, plus `usize`.
 
-## Ownership and access
+Construction sorts document indices by the keys' Rust ordering before
+allocating the final tree shape. This matters for text and integer keys:
+canonical CBOR key order is not necessarily Rust `Ord` order. Keys and values
+are then built in their final node slots; publication neither inserts nor
+moves entries. `TreeKey` is unsafe because its allocation-free source view
+must agree with the constructed key's ordering and comparison-work bound.
 
-| Holder | Authority |
+The retained state records every partially initialized child, node allocation
+and permit. Reclamation detaches a published map, reclaims values and keys in
+reverse construction order, and releases child nodes before parents. Each
+node's allocation is freed before its permit. The sorting and custody arenas
+are reclaimed through the same `Storage` state machine as other bindings.
+Child construction states are held in `ManuallyDrop`: reclamation never invokes
+their Rust destructors. Removing an exhausted entry is a separate admitted
+phase, so refusal at that boundary cannot repeat either child's cleanup.
+
+The fork API is `btree_in_place`. The custom shell applies
+`nix/btree-in-place.patch` to the pinned fork and records the patch's SHA-256
+in `DCBOR_CONFIGURATION`. Re-enter the custom shell after changing this patch;
+an existing shell retains its previous standard-library source. Stock-std
+builds retain borrowed B-tree encoding but do not expose this owned binding.
+
+## The scope
+
+`DecodeOwner<'s, A>` is the cleanup authority of one scope. `new` allocates
+nothing. `initialize_step` admits and allocates the scope block and initializes
+its terminal cleanup dispatch in separately admitted writes; a
+refusal retains the admission for the next call, and a closed authority refuses
+with `PlanMismatch`. `'s` is the scope's data lifetime: every payload outlives
+it, and no handle, operation or the owner itself can outlive it. Owned inputs
+use `'static`; a borrowed input binds the scope to its borrow.
+
+`step` performs one unit of queued cleanup. `Reclaimed::Waiting` means nothing
+can advance: no record is queued while handles still hold records, or a
+retiring thread has published its record and not yet linked it. A waiting call
+performs no unit; an admission already granted for the next removal is
+retained. `shutdown_step` closes allocation and drains the queue, then releases
+the scope block once it holds the only remaining reference; after `Done` the
+authority is closed and initialization refuses with `PlanMismatch`.
+
+Initializing an owned scope requires `A: TerminalAllocator`. This unsafe policy
+capability constructs an allocation-free, non-refusing cleanup policy from the
+scope's retained permit. `Limits` implements it without creating new counters,
+logging allocations, or consulting the scheduler's refusal schedule.
+
+Dropping the authority closes the scope and runs the same queued reclamation
+state machine with that terminal policy. Live handles keep their values and the
+scope alive; retiring them continues cleanup, including on another thread. The
+last reference frees the empty scope before releasing its permit. A partially
+initialized scope exposes no handles and releases its block directly. Terminal
+cleanup never invokes payload or construction-state destructors; a violating
+binding that unwinds or refuses terminal cleanup aborts rather than unwinding
+through an owner destructor. Explicit `step` and `shutdown_step` retain their
+ordinary refusal and quantum behavior.
+
+## Operations
+
+Every owned operation is an `Operation`, the one retained controller: it
+allocates one stable record in the scope, its allocation admission retained in
+an `Acquisition` across refusals; initializes the record's resource-free prefix
+in admitted units; advances it; and publishes it as a pointer-sized handle.
+Construction allocates nothing. Each implements `Resumable`: `step` returns
+`Step::Progress`, `Step::Complete` with the published handle, or
+`Step::Finished`, and `position` observes the record's allocation,
+initialization, cancellation, the scope's outstanding records and the task's
+own progress without allocating.
+
+| Operation | Built by | Publishes |
+| --- | --- | --- |
+| `InputAcquisition` | `owner.copy_input(bytes)` | `OwnedInitialized<ByteString>`: an independent copy, at most 64 bytes copied per admitted unit; the source is borrowed only while copying |
+| `InputBorrow` | `owner.borrow_input(bytes)` | `OwnedInitialized<Borrowed>`: the borrowed bytes recorded without copying |
+| `DocumentDecoder` | `DocumentDecoder::parse(input, options)` | `OwnedDocument`: the node arena paired with its own input |
+| `Construction` | `Construction::construct(document)` | `TypedValue<T>`: `T` built in place in its record |
+| `TypedDecoder` | `TypedDecoder::new(input, options)` | a parse, then a construction from the parsed document |
+| `OwnedPreparation` | `OwnedPreparation::prepare(value)` | `OwnedPrepared`: the value's plan kept in place beside the value |
+
+A custom input implements the unsafe `DecodeInput<A>`: immutable bytes for its
+whole live lifetime, `Send`, and incremental `Reclaim<A>` for its storage,
+evidence and reservations, declaring with `Reclaim::remaining` the most
+cleanup calls each state can still take: the scope refuses a record's call
+beyond that count as a defect, so no drain runs unbounded. `owner.allocate_step` creates its uninitialized
+record; the binding initializes it through `OwnedRecord::destination`,
+maintaining its cursor, and calls the unsafe `publish` only once it is
+complete. A custom binding admits its own work through `Budget::traverse`
+before doing it, as `DecodeInput`, `Reclaim` and `InPlace` document; it is
+trusted to do so, and its cost is its own to state.
+
+## Documents and values
+
+`OwnedDocument::root` and `with_document` give views borrowed from the handle,
+always over the document's own input; the caller cannot substitute bytes.
+`bytes` and `input` borrow the retained input, custom evidence included.
+`into_input` gives up the document and keeps its input handle, without
+copying; the arena is retired through the scope queue.
+
+A construction builds `T` in its final stable record through `InPlace`; the
+value never moves. Once built, the document's input handle moves into the
+value's record without copying and the document's record, holding only its
+arena, is retired. `TypedValue::value` borrows the value, and `bytes` the
+original input it was decoded from: identity and signature checks run over
+these, never over a re-encoding, which may differ when decoding skipped
+unknown fields.
+
+An `OwnedPrepared` plan holds its source value until it is retired.
+`into_writer` emits the plan in chunks borrowed from it (`OwnedEmitStep`:
+`Progress`, `Chunk`, `Complete`, then `Finished`); emission allocates nothing.
+
+## Cancellation and retirement
+
+`cancel`, or a terminal error, switches an operation to its operation-local
+cleanup: subsequent steps reclaim its own record, partial initialization
+included, and any resource the task still holds, in place and in admitted
+units, then return `Step::Finished`. This cleanup neither waits for nor spends
+work on any other record in the scope. Published handles have the same
+operation-local cleanup through their `reclaim_step`.
+
+Dropping an operation or a handle at any point only retires its record: a
+wait-free push onto the scope's intrusive queue, with no allocation, traversal
+or destructor. The scope's `step` later reclaims it. Every handle may move to,
+and retire on, any thread when its payload and `A::Permit` are `Send`; the
+push precedes the release of the handle's scope reference, so the stepping
+thread that observes the last reference also observes every push.
+
+## Bounds
+
+Every owned operation has a whole-operation `ResourceBound`, derived from its
+input or source: the work it reports, the storage it requests, what it holds
+at its peak and what its publication retains, on success or at any failure and
+the cleanup after it. Each turn admits at most one quantum (`TURN`), and every
+step admits at least one value or makes one allocation request alone, so an
+operation completes within the bound's values and requested bytes in turns.
+
+Each bound is a sum of terms, one per place its operation charges: the
+operation's record, its initialization, its task and its release, and within
+the task the task's own places. A record's cleanup, in place or through the
+scope queue, is its operation's task's. A record holding another operation's
+handle (a parse's input, a construction's document or input) charges that
+handle's cleanup at its own place, accounted by the other operation's bound.
+
+| Operation | Bound |
 | --- | --- |
-| Scheduler's owner | Step queued cleanup; close admission and drain shutdown |
-| Decoder record handle | Exclusive access to partially initialized lifecycle state |
-| Output record handle | Shared typed access after construction and scratch release |
-| Intrusive queue / active slot | Exclusive cleanup access after handle retirement |
+| `DecodeOwner` | `scope_bound()`: the scope block, its initialization and its release |
+| `InputAcquisition` | `copy_bound(len)`: the copy's construction and cleanup, and, cancelled, the scope reference retired |
+| `InputBorrow` | `borrow_bound()`: its completion or its cancelled retirement, and the borrow's cleanup |
+| `DocumentDecoder` | `parse_bound(len, options)`: the retained parse, the arena's transfer, publication, and the record's cleanup, an emptied input slot included |
+| `Construction` | `construction_bound(len)`: `InPlace::COST`, detachment, publication, and the record's cleanup, its emptied slots included |
+| `TypedDecoder` | `typed_decode_bound(len, options)` |
+| `OwnedPreparation` | `encoding::owned_prepare_bound(shape)`, from `encoding::Shape::of` the value |
 
-Parser continuations retain offsets, scalar progress, and owned scratch. Header,
-UTF-8, normalization, and key comparison borrow input only during a step. Arena
-views are temporary and always paired with the operation's immutable input.
-Publication transfers the record handle without moving the typed destination.
+## Borrowed interfaces
 
-Drop of a record handle enqueues its existing record without allocating or
-destroying the payload. Cleanup runs value, arena, parser, and input retirement
-phases. The input record then runs its own incremental cleanup in the same queue.
-Cancellation uses this path, including cancellation during partial initialization.
-An aborting decoder steps its scope until it is empty, so other live records in
-that scope must also be retired before it can report `Finished`.
-
-Drop all decoder/output handles, then call `shutdown_step` until `Done`.
-The scope allocation and its reservation are released only when the queue is
-empty and no other owning handle remains. Dropping the final cleanup authority
-before explicit shutdown is an invariant failure; it never triggers a hidden
-synchronous drain. These handles are single-threaded.
-
-The borrowed `TypedDecoder`, `DecodeOwner`, `Document`, and text/header cursor
-interfaces remain available. No lifetime extension or self-referential consumer
-wrapper is used by the owned API.
+The borrowed interfaces remain available: the synchronous `decode`,
+`decode_with` and `decode_typed`; the retained `cursor::Decoder` and its
+`Document`; the string, header and text cursors; and the borrowed
+`encoding::Preparation`, `Prepared` and `Writer`. No lifetime extension or
+self-referential consumer wrapper is used by the owned interfaces.

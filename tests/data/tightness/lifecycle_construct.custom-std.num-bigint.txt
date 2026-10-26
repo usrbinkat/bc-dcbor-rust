@@ -1,0 +1,13 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+24	24	measured	cancelled	cancelled construction: Input bytes
+1	1	measured	cancelled	cancelled construction: Input values
+61430	60064	measured	published	construction of empty strings: Build allocated
+97726	84120	measured	published	construction of empty strings: Build bytes
+61430	60064	measured	published	construction of empty strings: Build peak
+61430	60064	measured	published	construction of empty strings: Build retained
+5558	4507	measured	published	construction of empty strings: Build values
+1	1	measured	published	construction: Detach values
+1	1	measured	published	construction: Publish values
+3	3	measured	invalid	wrongly typed construction: Cleanup values
+64	64	measured	invalid	wrongly typed construction: Document bytes
+6	5	measured	invalid	wrongly typed construction: Document values

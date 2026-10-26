@@ -3,6 +3,10 @@
 use dcbor::bounded::{Budget, Limits, Owned, decode::decode};
 use std::io::{Read, Write};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an application admits its own input and output work to its policy"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const MAX_INPUT: usize = 1_048_576;
     let mut limits = Limits::new(10_000_000, 128_000_000, 64_000_000);

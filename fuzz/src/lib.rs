@@ -1,102 +1,44 @@
 //! Bounded-size property runners. Specification fixtures remain authoritative;
 //! symbolic comparison here supplements value, length and resource assertions.
 use dcbor::bounded::*;
-use std::{cell::Cell, rc::Rc};
+use dcbor_test_support as support;
 mod maps;
 mod schema;
 pub use schema::exercise_schema_schedule;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Scheduled,
-    Limit,
+/// The fuzzing policy: 2M values and 32M bytes of work, 4M live bytes, and a
+/// scheduled refusal of attempted call `refuse_at`.
+fn policy(refuse_at: Option<usize>) -> Limits {
+    Limits::new(2_000_000, 32_000_000, 4_000_000).refusing(refuse_at)
 }
 
-struct Permit {
-    live: Rc<Cell<u64>>,
-    bytes: u64,
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.live
-            .set(self.live.get().checked_sub(self.bytes).unwrap());
-    }
+/// Panic unless one step, run under a cumulative allowance, admitted at most
+/// one quantum of work by itself.
+fn within_turn(before: WriteWork, after: WriteWork) {
+    assert!(after.values >= before.values && after.bytes >= before.bytes);
+    assert!(after.values - before.values <= TURN.values);
+    assert!(after.bytes - before.bytes <= TURN.bytes);
 }
 
-struct Policy {
-    live: Rc<Cell<u64>>,
-    calls: usize,
-    refuse_at: Option<usize>,
-    work: WriteWork,
-}
-impl Policy {
-    fn new(refuse_at: Option<usize>) -> Self {
-        Self {
-            live: Rc::new(Cell::new(0)),
-            calls: 0,
-            refuse_at,
-            work: WriteWork::default(),
-        }
-    }
-    fn admit(&mut self) -> Result<(), Refusal> {
-        let index = self.calls;
-        self.calls += 1;
-        if Some(index) == self.refuse_at {
-            Err(Refusal::Scheduled)
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Budget for Policy {
-    type Refusal = Refusal;
-    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Refusal> {
-        self.admit()?;
-        let work = self
-            .work
-            .then::<()>(WriteWork::new(values, bytes))
-            .map_err(|_| Refusal::Limit)?;
-        if work.values > 2_000_000 || work.bytes > 32_000_000 {
-            return Err(Refusal::Limit);
-        }
-        self.work = work;
-        Ok(())
-    }
-}
-impl Allocator for Policy {
-    type Permit = Permit;
-    fn allocate(&mut self, bytes: u64) -> Result<Permit, Refusal> {
-        self.admit()?;
-        let live = self.live.get().checked_add(bytes).ok_or(Refusal::Limit)?;
-        if live > 4_000_000 {
-            return Err(Refusal::Limit);
-        }
-        self.live.set(live);
-        Ok(Permit {
-            live: self.live.clone(),
-            bytes,
-        })
-    }
-}
-
-fn expected_failure(error: BoundedError<Refusal>, policy: &Policy) {
+/// A refusal is either the scheduled one, at exactly the scheduled call, or a
+/// work or storage limit. Anything else is an encoder invariant failure.
+fn expected_failure(error: BoundedError<LimitRefusal>, policy: &Limits, scheduled: Option<usize>) {
     match error {
-        BoundedError::Refused(Refusal::Scheduled) => {
-            assert_eq!(Some(policy.calls - 1), policy.refuse_at);
+        BoundedError::Refused(LimitRefusal::Scheduled(at)) => {
+            assert_eq!(Some(at), scheduled);
+            assert_eq!(at, policy.attempts() - 1);
         }
-        BoundedError::Refused(Refusal::Limit) => {}
+        BoundedError::Refused(LimitRefusal::Work | LimitRefusal::Storage) => {}
         other => panic!("encoding invariant failed: {other:?}"),
     }
 }
 
-/// Output storage and its reservation share one owner, with storage dropped
-/// first. Failed attempts never publish partial output.
-struct OutputStorage {
-    bytes: Vec<u8>,
-    _permit: Permit,
-}
-
-pub fn exercise<T: BoundedEncodable + ?Sized>(value: &T, expected: &[u8], refusal: Option<usize>) {
+/// Prepare `value`, write its plan into caller-owned output
+/// ([`Prepared::encode_owned`]), possibly refused and then retried, and
+/// publish the plan in place ([`Prepared::publish`]): every output is
+/// `expected`, within the write bound, and published only once complete;
+/// every reservation is released with its owner.
+pub fn exercise<T: Schema + ?Sized>(value: &T, expected: &[u8], refusal: Option<usize>) {
     // Select the phase independently. Reusing one refusal index in both
     // passes can stop preparation before the write refusal is ever reached.
     let preparation_refusal = refusal
@@ -105,57 +47,57 @@ pub fn exercise<T: BoundedEncodable + ?Sized>(value: &T, expected: &[u8], refusa
     let write_refusal = refusal
         .filter(|index| index % 2 != 0)
         .map(|index| index / 2);
-    let mut allocator = Policy::new(preparation_refusal);
-    let live = allocator.live.clone();
+    let mut allocator = policy(preparation_refusal);
     let result = prepare(value, &mut allocator);
     match result {
-        Err(error) => expected_failure(error, &allocator),
+        Err(error) => expected_failure(error, &allocator, preparation_refusal),
         Ok(prepared) => {
-            assert_eq!(prepared.len(), u64::try_from(expected.len()).unwrap());
-            let size = usize::try_from(prepared.len()).unwrap();
-            // The output reservation is admitted before the fallible heap call.
-            // Keep it separate from the injected scratch schedule.
-            let mut output_policy = Policy::new(None);
-            let output_live = output_policy.live.clone();
-            let permit = output_policy.allocate(prepared.len()).unwrap();
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(size).unwrap();
-            output_policy.traverse(0, prepared.len()).unwrap();
-            bytes.resize(size, 0xee);
-            let mut output = OutputStorage {
-                bytes,
-                _permit: permit,
-            };
-            let mut budget = Policy::new(write_refusal);
-            match prepared.encode_into(&mut output.bytes, &mut budget) {
-                Ok(()) => {
-                    assert_eq!(output.bytes, expected);
-                    assert!(prepared.write_work().covers(&budget.work));
+            assert_eq!(prepared.len(), expected.len());
+            let len = u64::try_from(prepared.len()).unwrap();
+            let write = prepared.write_work::<()>().unwrap();
+            // The output reservation is admitted under its own policy, apart
+            // from the injected schedules, before its storage is allocated.
+            let mut output_policy = policy(None);
+            let permit = output_policy.allocate(len).unwrap();
+            let mut budget = policy(write_refusal);
+            match prepared.encode_owned(permit, &mut budget) {
+                Ok(encoded) => {
+                    assert_eq!(encoded.as_ref(), expected);
+                    assert!(write.covers(&budget.used()));
                     assert_eq!(
-                        dcbor::CBOR::try_from_data(&output.bytes)
+                        dcbor::CBOR::try_from_data(encoded.as_ref())
                             .unwrap()
                             .to_cbor_data(),
                         expected
                     );
                 }
-                Err(error) => expected_failure(error, &budget),
+                Err(error) => expected_failure(error, &budget, write_refusal),
             }
-            // Each encode attempt starts with a fresh cursor, including after
-            // refusal. Retry must be canonical and exactly measured.
-            let mut retry = Policy::new(None);
-            prepared.encode_into(&mut output.bytes, &mut retry).unwrap();
-            assert_eq!(output.bytes, expected);
-            assert!(prepared.write_work().covers(&retry.work));
-            drop(output);
-            assert_eq!(output_live.get(), 0);
+            assert_eq!(output_policy.live_bytes(), 0);
+            // Each write starts with a fresh writer, including after a
+            // refusal. Retry must be canonical and within the write bound.
+            let permit = output_policy.allocate(len).unwrap();
+            let mut retry = policy(None);
+            let encoded = prepared.encode_owned(permit, &mut retry).unwrap();
+            assert_eq!(encoded.as_ref(), expected);
+            assert!(write.covers(&retry.used()));
+            drop(encoded);
+            assert_eq!(output_policy.live_bytes(), 0);
+            // The plan's own arena published in place as the encoding.
+            let mut publishing = policy(None);
+            let published = prepared.publish(&mut publishing).unwrap();
+            assert_eq!(published.as_ref(), expected);
+            assert!(write.covers(&publishing.used()));
+            assert!(allocator.live_bytes() >= len);
+            drop(published);
         }
     }
-    assert_eq!(live.get(), 0);
+    assert_eq!(allocator.live_bytes(), 0);
 }
 
 pub fn exercise_decode(input: &[u8], refusal: Option<usize>) {
     use dcbor::bounded::decode::{DecodeError, decode};
-    let mut policy = Policy::new(refusal);
+    let mut policy = policy(refusal);
     match decode(input, 32, &mut policy) {
         Ok(document) => {
             assert_eq!(document.root().encoded(), input);
@@ -165,11 +107,11 @@ pub fn exercise_decode(input: &[u8], refusal: Option<usize>) {
             assert_eq!(symbolic.to_cbor_data(), input);
             assert!(document.node_count() <= input.len());
         }
-        Err(DecodeError::Resource(error)) => expected_failure(error, &policy),
+        Err(DecodeError::Resource(error)) => expected_failure(error, &policy, refusal),
         Err(DecodeError::Invalid(_) | DecodeError::DepthLimit { .. }) => {}
         Err(DecodeError::UnprovenText) => panic!("normalizing policy returned QuickOnly refusal"),
     }
-    assert_eq!(policy.live.get(), 0);
+    assert_eq!(policy.live_bytes(), 0);
 }
 
 /// Arbitrary malformed inputs, every proper prefix of a bounded sample, and a
@@ -192,59 +134,69 @@ pub fn exercise_decode_schedule(data: &[u8]) {
 }
 
 fn retained_schedule(input: &[u8], schedule: usize) {
-    use dcbor::bounded::decode::{
-        DecodeError, Options,
-        cursor::{DecodeStep, Decoder},
-    };
-    fn run(input: &[u8], stop: Option<usize>, cancel: bool) -> (usize, WriteWork, u8) {
-        let mut policy = Policy::new(stop);
+    use dcbor::bounded::decode::{DecodeError, Options, cursor::Decoder};
+    /// The terminal outcome of one retained decode: published, invalid,
+    /// beyond the depth limit, refused by a policy limit, or cancelled.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Terminal {
+        Published,
+        Invalid,
+        Depth,
+        Limit,
+        Cancelled,
+    }
+    fn run(input: &[u8], stop: Option<usize>, cancel: bool) -> (usize, WriteWork, Terminal) {
+        let mut policy = policy(stop);
         let mut operation = Decoder::new(input, Options::normalizing(32));
         let mut observed = false;
         let mut terminal = None;
-        for _ in 0..input.len() * input.len() * 512 + 4096 {
-            let before = policy.work;
-            let outcome = operation.step(&mut policy);
-            assert!(policy.work.values >= before.values && policy.work.bytes >= before.bytes);
-            assert!(policy.work.values - before.values <= 3);
-            assert!(policy.work.bytes - before.bytes <= 64);
+        for _ in 0..support::decode_turns(input.len()) {
+            let before = policy.used();
+            let outcome = support::contracted(&mut policy, &mut operation);
+            within_turn(before, policy.used());
             match outcome {
-                Ok(DecodeStep::Progress) => assert_ne!(policy.work, before),
-                Ok(DecodeStep::Complete(document)) => {
+                Ok(Step::Progress) => {}
+                Ok(Step::Complete(document)) => {
+                    support::exhausted(&mut policy, &mut operation);
                     assert_eq!(document.root().encoded(), input);
                     let expected = dcbor::CBOR::try_from_data(input).unwrap();
                     assert_eq!(expected.to_cbor_data(), input);
-                    let held = policy.live.get();
+                    let held = policy.live_bytes();
                     drop(operation);
-                    assert_eq!(policy.live.get(), held);
+                    assert_eq!(policy.live_bytes(), held);
                     drop(document);
-                    assert_eq!(policy.live.get(), 0);
+                    assert_eq!(policy.live_bytes(), 0);
                     assert_eq!(observed, stop.is_some());
-                    return (policy.calls, policy.work, 0);
+                    return (policy.attempts(), policy.used(), Terminal::Published);
                 }
-                Err(DecodeError::Resource(BoundedError::Refused(Refusal::Scheduled))) => {
-                    assert_eq!(Some(policy.calls - 1), stop);
+                Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Scheduled(at)))) => {
+                    assert_eq!(Some(at), stop);
+                    assert_eq!(at, policy.attempts() - 1);
                     assert!(!observed);
                     observed = true;
-                    policy.refuse_at = None;
+                    policy.fail_call(None);
                     if cancel {
-                        terminal = Some(4);
+                        terminal = Some(Terminal::Cancelled);
                         break;
                     }
                 }
                 Err(DecodeError::Invalid(_)) => {
-                    terminal = Some(1);
+                    terminal = Some(Terminal::Invalid);
                     break;
                 }
                 Err(DecodeError::DepthLimit { .. }) => {
-                    terminal = Some(2);
+                    terminal = Some(Terminal::Depth);
                     break;
                 }
-                Err(DecodeError::Resource(BoundedError::Refused(Refusal::Limit))) => {
-                    terminal = Some(3);
+                Err(DecodeError::Resource(BoundedError::Refused(
+                    LimitRefusal::Work | LimitRefusal::Storage,
+                ))) => {
+                    terminal = Some(Terminal::Limit);
                     break;
                 }
-                _ => panic!(
-                    "unexpected retained decode outcome at {:?}",
+                other => panic!(
+                    "unexpected retained decode outcome {} at {:?}",
+                    support::label(&other),
                     operation.position()
                 ),
             }
@@ -252,8 +204,8 @@ fn retained_schedule(input: &[u8], schedule: usize) {
         let terminal = terminal.expect("bounded retained decode failed to terminate");
         assert_eq!(observed, stop.is_some());
         drop(operation);
-        assert_eq!(policy.live.get(), 0);
-        (policy.calls, policy.work, terminal)
+        assert_eq!(policy.live_bytes(), 0);
+        (policy.attempts(), policy.used(), terminal)
     }
     let baseline = run(input, None, false);
     assert!(baseline.0 > 0);
