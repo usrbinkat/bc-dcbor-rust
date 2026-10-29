@@ -62,7 +62,7 @@ elif (($# != 0)); then
 	echo "usage: tests/miri-owned.sh [--judge PLAN OUT BASELINE]" >&2
 	exit 2
 else
-	logs="${MIRI_LOG_DIR:-${TMPDIR:?required, or MIRI_LOG_DIR: the gate's log directory}/miri-owned}"
+	logs="${MIRI_LOG_DIR:-${TMPDIR:?required, or MIRI_LOG_DIR: the gate log directory}/miri-owned}"
 fi
 mkdir -p "$logs" || exit 2
 rigor="${DCBOR_RIGOR:-fast}"

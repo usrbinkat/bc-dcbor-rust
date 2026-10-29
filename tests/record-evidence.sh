@@ -50,7 +50,7 @@ fi
 
 costs() {
 	local action="$1" index layer log manifest observed line directory old_identity new_identity header
-	: "${TMPDIR:?required: the cost recorder's staging directory}"
+	: "${TMPDIR:?required: the cost recorder staging directory}"
 	local logs checkpoint reused=''
 	local -A staged_identities=()
 	local baseline="${DCBOR_COST_BASELINE:-$PWD/tests/data/costs}"

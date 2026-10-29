@@ -41,7 +41,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
-: "${TMPDIR:?required: the reach map's output directory}"
+: "${TMPDIR:?required: the reach map output directory}"
 for tool in cargo cargo-llvm-cov rustc python3 sha256sum; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Reach map prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2

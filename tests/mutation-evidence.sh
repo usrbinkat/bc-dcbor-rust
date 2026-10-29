@@ -11,7 +11,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
-: "${TMPDIR:?required: the campaign's log directory}"
+: "${TMPDIR:?required: the campaign log directory}"
 for tool in cargo rustc cargo-mutants cargo-llvm-cov python3 patch time systemd-run systemctl sha256sum; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Mutation prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
