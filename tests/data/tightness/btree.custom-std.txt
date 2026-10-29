@@ -1,0 +1,31 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
+23118	2424	total	published	a full leaf: run allocated
+829726	6600	total	published	a full leaf: run bytes
+23118	1560	total	published	a full leaf: run peak
+23118	0	total	published	a full leaf: run retained
+13514	377	total	published	a full leaf: run values
+24978	2944	total	published	a root over two leaves: run allocated
+901474	7028	total	published	a root over two leaves: run bytes
+24978	2080	total	published	a root over two leaves: run peak
+24978	0	total	published	a root over two leaves: run retained
+14680	412	total	published	a root over two leaves: run values
+2658	448	total	published	empty: run allocated
+40498	506	total	published	empty: run bytes
+2658	448	total	published	empty: run peak
+2658	0	total	published	empty: run retained
+688	27	total	published	empty: run values
+4518	992	total	published	one entry: run allocated
+112246	1672	total	published	one entry: run bytes
+4518	800	total	published	one entry: run peak
+4518	0	total	published	one entry: run retained
+1854	67	total	published	one entry: run values
+50616	4549	total	published	text keys: run allocated
+1447112	9577	total	published	text keys: run bytes
+50616	3376	total	published	text keys: run peak
+50616	0	total	published	text keys: run retained
+23627	505	total	published	text keys: run values
+494628	22752	total	published	two levels: run allocated
+19017844	79962	total	published	two levels: run bytes
+494628	13600	total	published	two levels: run peak
+494628	0	total	published	two levels: run retained
+309095	6033	total	published	two levels: run values

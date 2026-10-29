@@ -96,12 +96,52 @@ A custom input implements the unsafe `DecodeInput<A>`: immutable bytes for its
 whole live lifetime, `Send`, and incremental `Reclaim<A>` for its storage,
 evidence and reservations, declaring with `Reclaim::remaining` the most
 cleanup calls each state can still take: the scope refuses a record's call
-beyond that count as a defect, so no drain runs unbounded. `owner.allocate_step` creates its uninitialized
-record; the binding initializes it through `OwnedRecord::destination`,
-maintaining its cursor, and calls the unsafe `publish` only once it is
-complete. A custom binding admits its own work through `Budget::traverse`
-before doing it, as `DecodeInput`, `Reclaim` and `InPlace` document; it is
-trusted to do so, and its cost is its own to state.
+beyond that count as a defect, so no drain runs unbounded. The count reads
+the value through its slot observed, a `PeekSlot`: no write and no exclusive
+access to the value's bytes, since a published value may still be borrowed
+when it is read; only the record's own custody stays reachable
+(`Place::custody`). `owner.allocate_step` creates its uninitialized record;
+`OwnedRecord::destination` issues the record's `Slot`: its `Place`, the root
+of its provenance, and its cursor, paired. Construction, cleanup and the count
+take slots through safe signatures; the `unsafe trait` contracts hold each
+implementation sound for every call a slot's holder can make, in any order.
+The binding initializes the value through the slot's place (`write`, or raw
+projections of its parts), never through a reference over the whole value,
+maintains its cursor, and calls the unsafe `publish` only once it is
+complete. Every access through the place takes the cursor, borrowed: shared
+for a read, exclusively for a write, so a write under a live read, or two
+exclusive accesses at once, does not compile. A custom binding admits its own
+work through `Budget::traverse` before doing it, as `DecodeInput`, `Reclaim`
+and `InPlace` document; it is trusted to do so, and its cost is its own to
+state.
+
+A custom `Reclaim` also makes its custody observable: its `State` implements
+`Custody`, whose observation is a projection of that one state, never a
+second record kept beside it. The observation distinguishes every state
+whose cleanup differs: what is initialized, which allocations, blocks and
+permits are held or awaiting release, how many cleanup units remain, and
+what an active child holds (a parent embeds its active child's whole
+observation). It holds counts and phases, never an address; taking it needs
+the state's exclusive custody and admits, allocates and changes nothing.
+`Custody` has no default. A binding may also declare a `Reduction`, a class
+map under which two states of one class take each cleanup unit, admitted or
+refused, with the same outcome, release and calls, into states again of one
+class; it is optional, has no default, and states its argument where it is
+declared. Verification uses the observation to check cleanup and the
+reduction to choose which stops it runs (`tests/OWNED-CONTRIBUTION.md`).
+
+The engine's own records follow the same rule. Metadata initialized field by
+field (a parser, a preparation, their arenas and engines) is written through a
+`Slot` of the destination and its units initialized, one field per admitted
+unit, each nested part over a child slot of its own units; a parse record's
+arena is transferred and released through a slot pairing it with its parts
+transferred and released. No engine step takes a raw destination pointer.
+
+A cleanup step must not unwind: unwound half done, it would leave its state
+recording what it no longer holds. A policy's release observer
+(`Limits::observe_releases`) runs inside cleanup steps, held to their
+contract: bounded, nonblocking work that allocates nothing. One that panics
+aborts the process rather than unwind out of the release.
 
 ## Documents and values
 

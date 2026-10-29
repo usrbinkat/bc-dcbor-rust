@@ -2,8 +2,6 @@
 extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
-use core::mem::MaybeUninit;
-use core::ptr::{self, NonNull};
 
 use super::*;
 use crate::bounded::Capped;
@@ -54,6 +52,15 @@ impl<P> BufferState<P> {
         meta: None,
         admitted: stable::Admitted::Nothing,
     };
+
+    /// The installed metadata, borrowed from the state: released before the
+    /// header's place is accessed under the state, the place's custody.
+    fn installed<R>(&mut self) -> Result<&mut Meta<P>, BoundedError<R>> {
+        self.meta
+            .as_mut()
+            .map(Installed::get)
+            .ok_or(BoundedError::PlanMismatch)
+    }
 }
 
 /// What a byte buffer's construction holds: no metadata block, with the
@@ -131,6 +138,58 @@ impl<P> Custody for BufferState<P> {
     }
 }
 
+/// A byte buffer header the shared engine builds and reclaims in place
+/// ([`copy_buffer`], [`reclaim_buffer`]): `String` and `ByteString`.
+///
+/// # Safety
+/// [`Self::empty`] owns no allocation. [`Self::bytes`] returns the header's
+/// own byte vector, owned by it alone. Dropping the header frees only that
+/// vector's allocation and runs no other code. A vector holding the
+/// concatenation of pieces of [`Self::Source`] values, each piece starting
+/// and ending where [`Self::boundary`] allows, is a valid header.
+pub(crate) unsafe trait Buffer: Sized {
+    /// What the header is copied from: a validated text for a `String`,
+    /// any bytes for a `ByteString`.
+    type Source: ?Sized;
+    /// The empty header, written before its bytes are reserved.
+    fn empty() -> Self;
+    /// The source's bytes.
+    fn source(source: &Self::Source) -> &[u8];
+    /// Whether a copy may start or end at byte `at` of `source`.
+    fn boundary(source: &Self::Source, at: usize) -> bool;
+    /// The header's own byte vector.
+    ///
+    /// # Safety
+    /// The vector holds a valid header's bytes ([`Buffer`]) whenever the
+    /// header is next used.
+    unsafe fn bytes(&mut self) -> &mut Vec<u8>;
+}
+
+// SAFETY: an empty String owns no allocation; its vector is its own, and
+// dropping it frees only that vector; whole scalars of validated texts
+// concatenate to valid UTF-8, and a copy starts and ends only on a scalar
+// boundary.
+unsafe impl Buffer for String {
+    type Source = str;
+
+    fn empty() -> Self {
+        String::new()
+    }
+
+    fn source(source: &str) -> &[u8] {
+        source.as_bytes()
+    }
+
+    fn boundary(source: &str, at: usize) -> bool {
+        source.is_char_boundary(at)
+    }
+
+    unsafe fn bytes(&mut self) -> &mut Vec<u8> {
+        // SAFETY: forwarded from the caller: the vector stays valid UTF-8.
+        unsafe { self.as_mut_vec() }
+    }
+}
+
 /// Copying source bytes into the buffer: one value and at most a quantum.
 const COPY: Capped<Caller> = Capped::new(Caller, 1, stable::QUANTUM as u64);
 
@@ -142,19 +201,17 @@ fn allocate_meta<A: Allocator>(
     state: &mut BufferState<A::Permit>,
     a: &mut A,
 ) -> BoundedResult<(), A> {
-    // SAFETY: every metadata field is written.
+    // SAFETY: the header is the whole metadata, every field written.
     unsafe {
-        stable::install::<Meta<A::Permit>, A>(
+        stable::install::<Meta<A::Permit>, Meta<A::Permit>, A>(
             &mut state.meta,
             &mut state.admitted,
-            const { stable::Metadata::whole::<Meta<A::Permit>, A::Permit>() },
-            |meta| {
-                meta.write(Meta {
-                    phase: Phase::Empty,
-                    payload: None,
-                    copied: 0,
-                })
+            || Meta {
+                phase: Phase::Empty,
+                payload: None,
+                copied: 0,
             },
+            |meta| meta,
             a,
         )
     }
@@ -203,26 +260,22 @@ pub(crate) const fn buffer_cleanup<H>() -> ResourceBound {
     sized::<H>().bound()
 }
 
-/// One admitted unit of byte-buffer cleanup, shared by every binding.
-/// `destroy` drops the initialized buffer header `H` in place.
-///
-/// # Safety
-/// `state` was produced by this binding's construction, and `destroy` drops
-/// exactly the buffer at the original destination.
-pub(crate) unsafe fn reclaim_buffer<H, A: Allocator>(
-    state: &mut BufferState<A::Permit>,
-    destroy: impl FnOnce(),
+/// One admitted unit of byte-buffer cleanup, shared by every binding: the
+/// header `H` in `slot`, once written, dropped in place. Releasing the
+/// metadata leaves the state `INITIAL`.
+pub(crate) fn reclaim_buffer<H: Buffer, A: Allocator>(
+    mut slot: Slot<'_, H, BufferState<A::Permit>>,
     a: &mut A,
 ) -> BoundedResult<Reclaimed, A> {
-    let Some(installed) = state.meta.as_mut() else {
+    let (place, state) = slot.parts();
+    if state.meta.is_none() {
         STEP.admit(a)?;
         return Ok(Reclaimed::Done);
-    };
-    let meta = installed.get();
-    match meta.phase {
+    }
+    match state.installed()?.phase {
         Phase::Empty => {
             STEP.admit(a)?;
-            meta.phase = Phase::BufferFreed;
+            state.installed()?.phase = Phase::BufferFreed;
         }
         Phase::Initialized
         | Phase::ReleasePayload
@@ -230,13 +283,16 @@ pub(crate) unsafe fn reclaim_buffer<H, A: Allocator>(
         | Phase::Copy
         | Phase::Complete => {
             sized::<H>().admit(a)?;
-            destroy();
-            meta.phase = Phase::BufferFreed;
+            // SAFETY: the slot pairs the place with this state, whose written
+            // phases prove the header initialized; a `Buffer`'s drop frees
+            // only its bytes.
+            unsafe { place.drop_in_place(state) };
+            state.installed()?.phase = Phase::BufferFreed;
         }
         Phase::BufferFreed => {
             // The payload's permit, if one was granted, and the metadata are
             // released: both releases were paid for by their acquisitions.
-            drop(meta.payload.take());
+            drop(state.installed()?.payload.take());
             // SAFETY: the buffer is dropped and owns nothing.
             unsafe { stable::uninstall(&mut state.meta) };
             return Ok(Reclaimed::Done);
@@ -264,89 +320,114 @@ unsafe impl<A: Allocator> Reclaim<A> for String {
     type State = BufferState<A::Permit>;
     const INITIAL: Self::State = BufferState::INITIAL;
 
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
-        // SAFETY: the buffer phases prove String initialization. This is the
-        // built-in byte-buffer destructor, not an arbitrary custom Drop.
-        unsafe {
-            reclaim_buffer::<String, A>(
-                state,
-                || ptr::drop_in_place(place.as_ptr().cast::<String>()),
-                a,
-            )
-        }
+    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        reclaim_buffer::<String, A>(slot, a)
     }
 
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
-        buffer_remaining(state)
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+        buffer_remaining(slot.custody())
     }
 }
 
 /// One admitted unit of byte-buffer construction, shared by every binding:
-/// metadata, then the empty header `H` written in place, then one payload
-/// reservation, then copies of at most one quantum ([`COPY`]). A `text`
-/// source is valid UTF-8 and each copy ends on a scalar boundary.
-///
-/// # Safety
-/// `empty` writes the binding's empty buffer at the original destination;
-/// `buffer` returns that buffer's byte vector once it is written. The state
-/// and destination are the binding's original construction pair.
-pub(crate) unsafe fn copy_buffer<H, A: Allocator>(
-    source: &[u8],
-    text: bool,
-    empty: impl FnOnce(),
-    buffer: impl FnOnce() -> *mut Vec<u8>,
-    state: &mut BufferState<A::Permit>,
+/// metadata, then the empty header `H` written in `slot`, then one payload
+/// reservation, then copies of at most one quantum ([`COPY`]) into the
+/// header's byte vector. Each copy starts and ends where the source's
+/// [`Buffer::boundary`] allows, so the vector stays a valid header's bytes,
+/// and never exceeds the capacity reserved, so it never reallocates: a source
+/// that does not continue the copy so far (one copy starting off a boundary,
+/// or more bytes than were reserved) is refused before anything is admitted.
+/// A header holds no place of its own: its bytes are a separate allocation,
+/// so borrowing the header for one call invalidates nothing.
+pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
+    source: &H::Source,
+    mut slot: Slot<'_, H, BufferState<A::Permit>>,
     a: &mut A,
 ) -> BoundedResult<Built, A> {
-    let Some(installed) = state.meta.as_mut() else {
+    let (place, state) = slot.parts();
+    let bytes = H::source(source);
+    if state.meta.is_none() {
         allocate_meta(state, a)?;
         return Ok(Built::Progress);
-    };
-    let meta = installed.get();
-    match meta.phase {
+    }
+    match state.installed()?.phase {
         Phase::Empty => {
             sized::<H>().admit(a)?;
-            empty();
-            meta.phase = Phase::Initialized;
+            // SAFETY: the slot pairs the place with this state, whose phase
+            // says nothing is written yet; the write is admitted above.
+            unsafe { place.write(state, H::empty()) };
+            state.installed()?.phase = Phase::Initialized;
         }
         Phase::Initialized => {
             STEP.admit(a)?;
-            meta.phase = Phase::ReleasePayload;
+            state.installed()?.phase = Phase::ReleasePayload;
         }
         Phase::ReleasePayload => {
             stable::admit_release(a)?;
-            meta.phase = Phase::AllocatePayload;
+            state.installed()?.phase = Phase::AllocatePayload;
         }
         Phase::AllocatePayload => {
-            let bytes = u64::try_from(source.len()).map_err(|_| BoundedError::Overflow)?;
-            meta.payload = Some(a.allocate(bytes).map_err(BoundedError::Refused)?);
-            // SAFETY: Initialized proves a valid empty buffer.
-            unsafe { &mut *buffer() }
-                .try_reserve_exact(source.len())
-                .map_err(|_| BoundedError::Allocation { bytes })?;
-            meta.phase = Phase::Copy;
+            if state.installed()?.payload.is_some() {
+                // A permit is already held: a step after a failed
+                // reservation, refused rather than releasing it unadmitted.
+                return Err(BoundedError::PlanMismatch);
+            }
+            let requested = u64::try_from(bytes.len()).map_err(|_| BoundedError::Overflow)?;
+            state.installed()?.payload =
+                Some(a.allocate(requested).map_err(BoundedError::Refused)?);
+            // SAFETY: Initialized proves a valid empty header, which holds no
+            // place; reserving leaves its vector empty, a valid header's
+            // bytes.
+            unsafe {
+                place.with_mut(state, |header| {
+                    H::bytes(header).try_reserve_exact(bytes.len())
+                })
+            }
+            .map_err(|_| BoundedError::Allocation { bytes: requested })?;
+            state.installed()?.phase = Phase::Copy;
         }
         Phase::Copy => {
-            let start = meta.copied;
-            let remaining = source
+            let start = state.installed()?.copied;
+            let remaining = bytes
                 .len()
                 .checked_sub(start)
                 .ok_or(BoundedError::PlanMismatch)?;
+            if !H::boundary(source, start) {
+                return Err(BoundedError::PlanMismatch);
+            }
             let mut end = start + remaining.min(stable::QUANTUM);
-            // A UTF-8 scalar boundary is at most three bytes before the end.
-            while text && end < source.len() && source[end] & 0xc0 == 0x80 {
+            // A boundary is at most three bytes before the end: a scalar is
+            // at most four bytes.
+            while end > start && !H::boundary(source, end) {
                 end -= 1;
             }
+            if end == start && remaining != 0 {
+                return Err(BoundedError::PlanMismatch);
+            }
+            // SAFETY: Copy proves the header initialized; it holds no place,
+            // and reading its capacity leaves its vector unchanged.
+            let spare = unsafe {
+                place.with_mut(state, |header| {
+                    let vector = H::bytes(header);
+                    vector.capacity() - vector.len()
+                })
+            };
+            if end - start > spare {
+                return Err(BoundedError::PlanMismatch);
+            }
             COPY.admit(a, (end - start) as u64)?;
-            // SAFETY: Copy proves initialization and reserved capacity; text
-            // chunks are whole scalars of a validated source.
-            unsafe { &mut *buffer() }.extend_from_slice(&source[start..end]);
+            // SAFETY: Copy proves initialization, and the chunk fits the
+            // capacity reserved, so nothing reallocates; the chunk starts and
+            // ends on the source's boundaries, so the vector stays a valid
+            // header's bytes; the header holds no place.
+            unsafe {
+                place.with_mut(state, |header| {
+                    H::bytes(header).extend_from_slice(&bytes[start..end])
+                })
+            };
+            let meta = state.installed()?;
             meta.copied = end;
-            if end == source.len() {
+            if end == bytes.len() {
                 meta.phase = Phase::Complete;
                 return Ok(Built::Done);
             }
@@ -362,29 +443,45 @@ pub(crate) unsafe fn copy_buffer<H, A: Allocator>(
 unsafe impl<A: Allocator> InPlace<A> for String {
     const COST: ConstructionCost = buffer_cost::<String, A::Permit>();
 
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
         let Some(Kind::Text(source)) = node_at(document, index).map(|n| n.kind()) else {
             return rejected(a);
         };
-        let place = place.as_ptr().cast::<String>();
-        // SAFETY: the destination is the original String slot; its vector is
-        // reached only after the empty String is written.
-        unsafe {
-            copy_buffer::<String, A>(
-                source.as_bytes(),
-                true,
-                || place.write(String::new()),
-                || (*place).as_mut_vec(),
-                state,
-                a,
-            )
-        }
-        .map_err(Into::into)
+        copy_buffer::<String, A>(source, slot, a).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::{Limits, Reservation};
+
+    /// A byte buffer's cost, evaluated at run time as every buffer binding
+    /// evaluates it in constants: per byte, every byte copied, allocated,
+    /// held and retained once, and the copies' values, each copy but the
+    /// last covering at least a quantum less the three continuation bytes a
+    /// text copy backs off (61 of 64), at `ceil(64 / 61) = 2` sixty-fourths;
+    /// fixed, cleanup's header drop among its parts.
+    #[test]
+    fn a_buffers_cost_charges_each_byte_once_and_a_copy_per_61_bytes() {
+        assert_eq!(COPIED, 61);
+        let cost = buffer_cost::<String, Reservation>();
+        assert_eq!(cost, <String as InPlace<Limits>>::COST);
+        assert_eq!(
+            cost.per_byte,
+            ResourceBound {
+                values: 2,
+                bytes: 64,
+                allocated: 64,
+                peak: 64,
+                retained: 64,
+            }
+        );
+        assert_eq!(buffer_cleanup::<String>(), sized::<String>().bound());
     }
 }

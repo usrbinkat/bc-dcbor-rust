@@ -4,47 +4,48 @@ use half::f16;
 
 macro_rules! scalar {
     ($ty:ty, $zero:expr, $node:ident, $value:expr) => {
-        // SAFETY: the scalar owns no child resources and needs no destructor.
+        // SAFETY: the scalar owns no child resources and needs no destructor;
+        // its one cleanup unit, from either state, only marks it empty.
         unsafe impl<A: Allocator> Reclaim<A> for $ty {
             type State = Written;
             const INITIAL: Written = Written::Empty;
 
-            unsafe fn reclaim_step(
-                _: NonNull<MaybeUninit<Self>>,
-                state: &mut Written,
+            fn reclaim_step(
+                mut slot: Slot<'_, Self, Written>,
                 a: &mut A,
             ) -> BoundedResult<Reclaimed, A> {
                 STEP.admit(a)?;
-                *state = Written::Empty;
+                *slot.custody() = Written::Empty;
                 Ok(Reclaimed::Done)
             }
 
             /// One call, which is `Done`.
-            unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+            fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
                 1
             }
         }
-        // SAFETY: admission precedes the only scalar write; errors leave the
-        // destination uninitialized and the empty state safe to reclaim.
+        // SAFETY: admission precedes the only scalar write, made only from
+        // the empty state; errors leave the destination uninitialized and the
+        // empty state safe to reclaim.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
             const COST: ConstructionCost = scalar_cost::<$ty>();
 
-            unsafe fn build_step(
+            fn build_step(
                 document: &Document<'_, A::Permit>,
                 index: usize,
-                place: NonNull<MaybeUninit<Self>>,
-                state: &mut Written,
+                mut slot: Slot<'_, Self, Written>,
                 a: &mut A,
             ) -> ConstructResult<Built, A> {
+                let (place, state) = slot.parts();
                 if *state != Written::Empty {
                     return Err(BoundedError::PlanMismatch.into());
                 }
                 sized::<Self>().admit(a)?;
                 let $node = node_at(document, index).ok_or_else(wrong_type)?.kind();
                 let value: Self = $value;
-                unsafe {
-                    place.as_ptr().write(MaybeUninit::new(value));
-                }
+                // SAFETY: the slot pairs the place with this state, which is
+                // empty: nothing to drop, the write admitted above.
+                unsafe { place.write(state, value) };
                 *state = Written::Initialized;
                 Ok(Built::Done)
             }

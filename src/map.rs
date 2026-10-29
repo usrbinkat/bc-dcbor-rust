@@ -69,9 +69,11 @@ use crate::{CBOR, CBORCase, Error, Result};
 /// ### Converting from standard Rust collections
 ///
 /// ```
-/// use std::collections::{BTreeMap, HashMap};
+/// use std::collections::BTreeMap;
 ///
-/// use dcbor::prelude::*;
+/// // The crate's `HashMap`: the standard library's, or `hashbrown`'s
+/// // without it.
+/// use dcbor::{HashMap, prelude::*};
 ///
 /// // Convert HashMap to CBOR Map
 /// let mut hash_map = HashMap::new();

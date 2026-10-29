@@ -6,7 +6,9 @@
 //! owning each allocation exactly once, and every transition writes the
 //! whole state in one unit of at most a quantum.
 use super::super::*;
-use super::construction::stable::{self, Admitted, Installed, Metadata};
+use super::construction::reclamation::Slot;
+use super::construction::stable::{self, Admitted, Installed};
+use super::initialization::init_field;
 use core::mem::{self, MaybeUninit, size_of};
 
 /// The old allocation's elements still to relocate, and its permit. Field
@@ -252,20 +254,22 @@ impl<T, P> Storage<T, P> {
         Self { state: Self::EMPTY }
     }
 
-    /// Initialize the empty arena directly in its final destination, in one
-    /// unit of the whole state. Partial initialization owns no resources.
-    ///
-    /// # Safety
-    /// The destination is unique and stable; step starts at zero and is
-    /// retained.
-    pub(crate) unsafe fn initialize_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        step: &mut usize,
+    /// Initialize the empty arena directly in its final destination, `slot`,
+    /// in one unit of the whole state. Partial initialization owns no
+    /// resources. Refused once initialized: a second write would discard
+    /// whatever the arena has acquired since.
+    pub(crate) fn initialize_step<A: Allocator<Permit = P>>(
+        mut slot: Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        // SAFETY: forwarded from the caller; the empty arena owns nothing.
-        unsafe { super::initialization::field(place, Self::new, a)? };
-        *step = Self::INIT_STEPS;
+        let (place, units) = slot.parts();
+        if *units >= Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
+        // SAFETY: the slot's place is valid, aligned and writable for the
+        // arena; the empty arena owns nothing.
+        unsafe { super::initialization::field(place.as_ptr(units), Self::new, a)? };
+        *units = Self::INIT_STEPS;
         Ok(true)
     }
 
@@ -350,15 +354,14 @@ impl<T, P> Storage<T, P> {
 
     /// The newest element, in whichever allocation holds it: a total
     /// observation, valid in every state. Relocation moves the oldest first,
-    /// so while it runs the newest is the old allocation's last.
+    /// so while it runs the newest is the old allocation's last. A relocating
+    /// arena always holds an element still to move: relocation begins only
+    /// from a nonempty arena, and leaves `Relocating` in the step that moves
+    /// its last element, as cleanup does in the step that drains it.
     pub fn last(&self) -> Option<&T> {
         match &self.state {
             State::Settled { arena, .. } => arena.items.last(),
-            State::Relocating { from, into } => from
-                .remaining
-                .as_slice()
-                .last()
-                .or_else(|| into.peek().items.last()),
+            State::Relocating { from, .. } => from.remaining.as_slice().last(),
             State::Relocated { into } => into.peek().items.last(),
         }
     }
@@ -366,17 +369,13 @@ impl<T, P> Storage<T, P> {
     /// The newest element, writable, in whichever allocation holds it: how
     /// the holder of an arena of construction records observes the active
     /// record's custody in every state, relocation included. Moves nothing
-    /// and admits nothing.
+    /// and admits nothing. While relocating, the old allocation's last, as
+    /// [`Self::last`].
     #[cfg(feature = "custom-std-collections")]
     pub(crate) fn last_mut(&mut self) -> Option<&mut T> {
         match &mut self.state {
             State::Settled { arena, .. } => arena.items.last_mut(),
-            State::Relocating { from, into } => {
-                if let Some(last) = from.remaining.as_mut_slice().last_mut() {
-                    return Some(last);
-                }
-                into.get().items.last_mut()
-            }
+            State::Relocating { from, .. } => from.remaining.as_mut_slice().last_mut(),
             State::Relocated { into } => into.get().items.last_mut(),
         }
     }
@@ -531,12 +530,12 @@ impl<T, P> Storage<T, P> {
                     Growth::Staging(admitted) => admitted,
                     _ => Admitted::Nothing,
                 };
-                // SAFETY: the initializer writes the empty arena whole.
+                // SAFETY: the header is the empty arena, written whole.
                 match unsafe {
-                    stable::installed::<Owned<T, P>, A>(
+                    stable::installed::<Owned<T, P>, Owned<T, P>, A>(
                         &mut admitted,
-                        const { Metadata::whole::<Owned<T, P>, P>() },
-                        |owned| owned.write(Owned::new()),
+                        Owned::new,
+                        |owned| owned,
                         a,
                     )
                 } {
@@ -824,35 +823,29 @@ impl<T, P> Storage<T, P> {
         }
     }
 
-    /// One part of a transfer of the settled arena into `destination`, one
-    /// admitted unit each; while its elements are relocating, one unit of
-    /// the relocation instead. True once every part is transferred.
-    ///
-    /// # Safety
-    /// Destination is stable uninitialized Owned storage. Retain part from zero
-    /// and do not use this storage except to finish transfer or reclaim it.
-    pub(crate) unsafe fn transfer_step<A: Allocator<Permit = P>>(
+    /// One part of a transfer of the settled arena into `destination`, the
+    /// destination paired with the parts transferred, one admitted unit
+    /// each ([`Self::TRANSFER`], the unit [`init_field!`] admits for the
+    /// part's type); while its elements are relocating, one unit of the
+    /// relocation instead. True once every part is transferred; refused past
+    /// the last part.
+    pub(crate) fn transfer_step<A: Allocator<Permit = P>>(
         &mut self,
-        destination: *mut Owned<T, P>,
-        part: &mut usize,
+        mut destination: Slot<'_, Owned<T, P>, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        use core::ptr::addr_of_mut;
+        if *destination.custody() >= Self::TRANSFER.len() {
+            return Err(BoundedError::PlanMismatch);
+        }
         let Some(arena) = self.settle_step(a)? else {
             return Ok(false);
         };
-        Self::TRANSFER
-            .get(*part)
-            .ok_or(BoundedError::PlanMismatch)?
-            .admit(a)?;
-        // SAFETY: forwarded from the caller; each part is written once.
-        unsafe {
-            match *part {
-                0 => addr_of_mut!((*destination).items).write(mem::take(&mut arena.items)),
-                1 => addr_of_mut!((*destination).capacity).write(mem::take(&mut arena.capacity)),
-                _ => addr_of_mut!((*destination).permit).write(arena.permit.take()),
-            }
+        match *destination.custody() {
+            0 => init_field!(destination, items, || mem::take(&mut arena.items), a)?,
+            1 => init_field!(destination, capacity, || mem::take(&mut arena.capacity), a)?,
+            _ => init_field!(destination, permit, || arena.permit.take(), a)?,
         }
+        let part = destination.custody();
         *part += 1;
         Ok(*part == Self::TRANSFER.len())
     }
@@ -927,7 +920,8 @@ impl<T, P> Drop for Storage<T, P> {
 /// ([`Storage::settle_remaining`]), checked exactly: it is the calls of
 /// [`Storage::settle_step`] that do not yet grant the arena, from every
 /// relocation position and once settled.
-#[cfg(all(test, feature = "custom-std-collections"))]
+#[cfg(test)]
+#[cfg(feature = "custom-std-collections")]
 mod tests {
     use super::*;
     use crate::bounded::{Limits, Reservation};
@@ -970,5 +964,47 @@ mod tests {
             assert_eq!(declared, taken, "after {moved} relocated elements");
             assert_eq!(storage.settle_remaining(), 0, "a settled arena");
         }
+    }
+
+    /// While an arena relocates, an element always remains to move, so the
+    /// newest is the old allocation's last at every relocation position,
+    /// writable as readable, until the arena is relocated.
+    #[test]
+    fn a_relocating_arenas_newest_element_is_still_to_move() {
+        let mut a = Limits::unlimited();
+        for moved in 0..4 {
+            let mut storage = relocating(moved, &mut a);
+            assert_eq!(storage.position().stage, StorageStage::Relocating);
+            assert_eq!(storage.position().relocating_remaining, 4 - moved);
+            assert_eq!(storage.last(), Some(&3), "after {moved} moved");
+            assert_eq!(storage.last_mut().copied(), Some(3), "after {moved} moved");
+        }
+        let relocated = relocating(4, &mut a);
+        assert_eq!(relocated.position().stage, StorageStage::Relocated);
+        assert_eq!(relocated.last(), Some(&3));
+    }
+
+    /// The defaults are the empty arena and its position: settled, nothing
+    /// held, nothing staged.
+    #[test]
+    fn the_default_arena_is_empty_and_settled() {
+        let storage = Storage::<u8, ()>::default();
+        assert!(storage.is_released());
+        assert_eq!(storage.position(), StoragePosition::default());
+        assert_eq!(
+            StoragePosition::default(),
+            StoragePosition {
+                stage: StorageStage::Settled,
+                initialized: 0,
+                reserved_capacity: 0,
+                physical_capacity: 0,
+                relocating_remaining: 0,
+                has_current_permit: false,
+                staged_reserved_capacity: 0,
+                staged_physical_capacity: 0,
+                has_staged_permit: false,
+                has_relocating_permit: false,
+            }
+        );
     }
 }

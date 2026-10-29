@@ -39,19 +39,18 @@ unsafe impl<A: Allocator> Reclaim<A> for Value {
     type State = State;
     const INITIAL: State = State(Written::Empty);
 
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut State,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(slot: Slot<'_, Self, State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
         // SAFETY: transparent representation and the matching u64 state.
-        unsafe { u64::reclaim_step(place.cast(), &mut state.0, a) }
+        let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
+        u64::reclaim_step(scalar, a)
     }
 
     /// The wrapped scalar's own count.
-    unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, state: &mut State) -> u64 {
-        // SAFETY: transparent representation and the matching u64 state.
-        unsafe { <u64 as Reclaim<A>>::remaining(place.cast(), &mut state.0) }
+    fn remaining(slot: PeekSlot<'_, Self, State>) -> u64 {
+        // SAFETY: transparent representation and the matching u64 state; the
+        // cast is the projection construction and cleanup use.
+        let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
+        <u64 as Reclaim<A>>::remaining(scalar)
     }
 }
 
@@ -60,15 +59,15 @@ unsafe impl<A: Allocator> Reclaim<A> for Value {
 unsafe impl<A: Allocator> InPlace<A> for Value {
     const COST: ConstructionCost = <u64 as InPlace<A>>::COST;
 
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut State,
+        slot: Slot<'_, Self, State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
         // SAFETY: transparent representation and the matching u64 state.
-        unsafe { u64::build_step(document, index, place.cast(), &mut state.0, a) }
+        let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
+        u64::build_step(document, index, scalar, a)
     }
 }
 

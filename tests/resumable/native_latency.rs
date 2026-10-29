@@ -9,6 +9,14 @@ use std::time::{Duration, Instant};
 // and completed step count. No sleep, allowance accumulation, or retry occurs.
 const STEP_LATENCY: Duration = Duration::from_millis(10);
 
+/// Set by the host qualification gate (`run_tests.sh`) alone: only then does
+/// the wall-clock ceiling decide the outcome. Elsewhere, under mutation runs
+/// above all, a step's duration depends on the host's load, not on the code,
+/// so it is measured and reported but never asserted; the deterministic
+/// assertions (completion, suspension, the trace, ownership, the output)
+/// hold in every run.
+const QUALIFICATION: &str = "DCBOR_LATENCY_QUALIFICATION";
+
 /// Drive `operation` through timed shared checked turns to its output.
 fn measured_completion<O: Resumable<Limits>>(
     m: &mut Limits,
@@ -18,6 +26,7 @@ fn measured_completion<O: Resumable<Limits>>(
 where
     O::Error: std::fmt::Debug,
 {
+    let qualifying = std::env::var_os(QUALIFICATION).is_some();
     let mut maximum = Duration::ZERO;
     let mut suspended = false;
     for step in 0..steps {
@@ -27,7 +36,7 @@ where
         let elapsed = started.elapsed();
         maximum = maximum.max(elapsed);
         assert!(
-            elapsed <= STEP_LATENCY,
+            !qualifying || elapsed <= STEP_LATENCY,
             "step {step}: elapsed={elapsed:?}, maximum={maximum:?}, outcome={}",
             label(&outcome)
         );

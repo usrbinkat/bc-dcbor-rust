@@ -65,3 +65,29 @@ pub(super) const fn cost<K: InPlace<A>, V: InPlace<A>, A: Allocator>() -> Constr
         .plus(K::COST.children())
         .plus(V::COST.children())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The units a node's allocation and each link admit, evaluated at run
+    /// time (the engine evaluates both only in constants), against what each
+    /// step writes. The allocation writes the new node's parent pointer and
+    /// length (the fork's `try_allocate`), then the pending node handle and
+    /// the pending permit; a link writes one edge, the child's parent pointer
+    /// and its parent index.
+    #[test]
+    fn a_nodes_allocation_and_link_admit_exactly_the_fields_they_write() {
+        let pointer = size_of::<usize>();
+        let length = size_of::<u16>();
+        let allocate = allocate_write::<u64, u64, u64>();
+        assert_eq!(allocate.values(), 1);
+        assert_eq!(
+            allocate.bytes(),
+            (pointer + length + pointer + size_of::<Option<u64>>()) as u64
+        );
+        let link = link::<u64, u64>();
+        assert_eq!(link.values(), 1);
+        assert_eq!(link.bytes(), (pointer + pointer + length) as u64);
+    }
+}

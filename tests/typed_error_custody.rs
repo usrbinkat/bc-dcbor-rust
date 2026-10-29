@@ -4,12 +4,13 @@ use dcbor::bounded::decode::construction::TypedDecoder;
 use dcbor::bounded::decode::construction::in_place::{
     Built, ConstructionCost, InPlace, plus, unit,
 };
-use dcbor::bounded::decode::construction::reclamation::{Reclaim, Reclaimed, Written};
+use dcbor::bounded::decode::construction::reclamation::{
+    PeekSlot, Reclaim, Reclaimed, Slot, Written,
+};
 use dcbor::bounded::decode::{ConstructResult, DecodeError, Document, Options, wrong_type};
 use dcbor::bounded::{Allocator, BoundedError, BoundedResult, Limits};
 use dcbor_test_support as support;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{mem::MaybeUninit, ptr::NonNull};
 
 static STARTS: AtomicUsize = AtomicUsize::new(0);
 static DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -32,18 +33,18 @@ unsafe impl<A: Allocator> InPlace<A> for Fails {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own work, as `InPlace` documents"
     )]
-    unsafe fn build_step(
+    fn build_step(
         _: &Document<'_, A::Permit>,
         _: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
+        mut slot: Slot<'_, Self, Written>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
+        let (place, state) = slot.parts();
         a.traverse(1, 0).map_err(BoundedError::Refused)?;
         if *state == Written::Empty {
-            unsafe {
-                place.as_ptr().write(MaybeUninit::new(Self));
-            }
+            // SAFETY: the slot pairs the place with this state, which is
+            // empty; the write admitted above.
+            unsafe { place.write(state, Self) };
             *state = Written::Initialized;
             STARTS.fetch_add(1, Ordering::SeqCst);
             return Ok(Built::Progress);
@@ -62,12 +63,9 @@ unsafe impl<A: Allocator> Reclaim<A> for Fails {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(mut slot: Slot<'_, Self, Written>, a: &mut A) -> BoundedResult<Reclaimed, A> {
         a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        let state = slot.custody();
         if *state != Written::Empty {
             CLEANED.fetch_add(1, Ordering::SeqCst);
             *state = Written::Empty;
@@ -76,7 +74,7 @@ unsafe impl<A: Allocator> Reclaim<A> for Fails {
     }
 
     /// One call, which is `Done`.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
         1
     }
 }

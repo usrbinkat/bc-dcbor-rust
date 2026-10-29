@@ -1,7 +1,31 @@
 use super::*;
+use dcbor::bounded::decode::construction::reclamation::Place;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 
 #[path = "enumeration.rs"]
 mod enumeration;
+
+/// Step a binding's cleanup to `Done` through `reclaim`, requiring it to
+/// take exactly the `declared` calls its state declared when cleanup began
+/// ([`Reclaim::remaining`]): never more, which would break the binding's
+/// contract, and, for these exact witnesses, never fewer.
+fn reclaims_as_declared(what: &str, declared: u64, mut reclaim: impl FnMut() -> Reclaimed) {
+    let mut taken = 0u64;
+    loop {
+        taken += 1;
+        assert!(
+            taken <= declared,
+            "{what}: cleanup beyond its declared {declared} calls"
+        );
+        match reclaim() {
+            Reclaimed::Done => break,
+            Reclaimed::Progress => {}
+            Reclaimed::Waiting => panic!("{what}: a binding's own cleanup never waits"),
+        }
+    }
+    assert_eq!(taken, declared, "{what}: the cleanup's declared calls");
+}
 
 /// Construct `T` from `wire`, observing that every transition is first
 /// refused, without releasing anything, before it is admitted. An invalid
@@ -210,9 +234,11 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
     let mut parser = Limits::unlimited();
     let document = dcbor::bounded::decode::decode(&wire, 1, &mut parser).unwrap();
     let mut a = Limits::unlimited();
-    let mut place = MaybeUninit::<Choice>::uninit();
-    let place = NonNull::from(&mut place);
+    let mut value = MaybeUninit::<Choice>::uninit();
     let mut state = <Choice as Reclaim<Limits>>::INITIAL;
+    // SAFETY: the test owns the destination and pairs it with its initial
+    // state; every access to either is through this slot for the test.
+    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
     let count = <Choice as Variants<Limits>>::COUNT;
     let (mut selecting, mut charged) = (0u64, 0u64);
     // Installation, the tag, shape and discriminant inspections, then at
@@ -220,16 +246,14 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
     let mut rejection = None;
     for _ in 0..4 + count + 1 {
         let selects = matches!(
-            state.observe(),
+            slot.custody().observe(),
             EnumObservation::Held {
                 phase: EnumPhase::Select { .. },
                 ..
             }
         );
         let before = a.used().values;
-        let result = unsafe {
-            enumeration::build::<Choice, Limits>(&document, 0, place, &mut state, &mut a)
-        };
+        let result = enumeration::build::<Choice, Limits>(&document, 0, slot.reborrow(), &mut a);
         if selects {
             selecting += 1;
             charged += a.used().values - before;
@@ -259,22 +283,10 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
         times(STEP_COST, selecting),
         "the declared selection against the measured"
     );
-    let declared = unsafe { enumeration::remaining::<Choice, Limits>(place, &mut state) };
-    let mut taken = 0u64;
-    loop {
-        taken += 1;
-        assert!(
-            taken <= declared,
-            "cleanup beyond its declared {declared} calls"
-        );
-        match unsafe { enumeration::reclaim::<Choice, Limits>(place, &mut state, &mut a) }.unwrap()
-        {
-            Reclaimed::Done => break,
-            Reclaimed::Progress => {}
-            Reclaimed::Waiting => panic!("an enum's own cleanup never waits"),
-        }
-    }
-    assert_eq!(taken, declared, "the cleanup's declared calls");
+    let declared = enumeration::remaining::<Choice, Limits>(slot.observe());
+    reclaims_as_declared("an enum", declared, || {
+        enumeration::reclaim::<Choice, Limits>(slot.reborrow(), &mut a).unwrap()
+    });
     assert_eq!(a.live_bytes(), 0);
     // The same enum's known discriminants select their variants and build
     // their payloads.
@@ -288,14 +300,15 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
 }
 
 /// The units of one keyed entry, measured: the record of `T`, whose fields
-/// are keyed from 1 and all optional, built from `wire`, a map whose first
-/// entry is the unknown key 0. Counts the calls made while the record is
-/// observed finding or searching before the map's end, each admitting one
-/// value; then the record is built, its absent fields written, and cleaned
-/// up within the calls its state declares.
-fn unknown_entry_units<T>(wire: &[u8]) -> u64
+/// are all optional, built from `wire`, a map of that one entry. Counts the
+/// calls made while the record is observed finding or searching before the
+/// map's end, each admitting one value; then the record is built, its
+/// absent fields written, and cleaned up within the calls its state
+/// declares.
+fn entry_units<T>(wire: &[u8]) -> u64
 where
     T: dcbor::bounded::decode::construction::in_place::fields::Fields<Limits>
+        + dcbor::bounded::decode::construction::in_place::InPlace<Limits>
         + Reclaim<
             Limits,
             State = dcbor::bounded::decode::construction::in_place::fields::State<
@@ -304,25 +317,34 @@ where
             >,
         >,
 {
-    use dcbor::bounded::decode::construction::in_place::Built;
     use dcbor::bounded::decode::construction::in_place::fields::{self, FieldsObservation, Phase};
+    use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
     let mut parser = Limits::unlimited();
     let document = dcbor::bounded::decode::decode(wire, 1, &mut parser).unwrap();
     let mut a = Limits::unlimited();
-    let mut place = MaybeUninit::<T>::uninit();
-    let place = NonNull::from(&mut place);
+    let mut value = MaybeUninit::<T>::uninit();
     let mut state = <T as Reclaim<Limits>>::INITIAL;
+    // SAFETY: the function owns the destination and pairs it with its initial
+    // state; every access to either is through this slot until it returns.
+    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
     let (mut searching, mut charged) = (0u64, 0u64);
     let mut built = false;
-    for _ in 0..support::TURNS {
+    // The record's own cost bounds its build calls; the unlimited policy
+    // never refuses.
+    let calls = support::turns(
+        <T as InPlace<Limits>>::COST
+            .bound::<()>(wire.len() as u64)
+            .expect("the cost of a fixture fits in u64"),
+    );
+    for _ in 0..calls {
         let entry = matches!(
-            state.observe(),
+            slot.custody().observe(),
             FieldsObservation::Held(custody)
                 if matches!(custody.phase, Phase::Find | Phase::Search)
                     && custody.next != custody.end
         );
         let before = a.used().values;
-        let result = unsafe { fields::build::<T, Limits>(&document, 0, place, &mut state, &mut a) };
+        let result = fields::build::<T, Limits>(&document, 0, slot.reborrow(), &mut a);
         if entry {
             searching += 1;
             charged += a.used().values - before;
@@ -332,27 +354,12 @@ where
             break;
         }
     }
-    assert!(
-        built,
-        "the record was not built within {} calls",
-        support::TURNS
-    );
+    assert!(built, "the record was not built within {calls} calls");
     assert_eq!(charged, searching, "one value per find and search call");
-    let declared = unsafe { fields::remaining::<T, Limits>(place, &mut state) };
-    let mut taken = 0u64;
-    loop {
-        taken += 1;
-        assert!(
-            taken <= declared,
-            "cleanup beyond its declared {declared} calls"
-        );
-        match unsafe { fields::reclaim::<T, Limits>(place, &mut state, &mut a) }.unwrap() {
-            Reclaimed::Done => break,
-            Reclaimed::Progress => {}
-            Reclaimed::Waiting => panic!("a record's own cleanup never waits"),
-        }
-    }
-    assert_eq!(taken, declared, "the cleanup's declared calls");
+    let declared = fields::remaining::<T, Limits>(slot.observe());
+    reclaims_as_declared("a record", declared, || {
+        fields::reclaim::<T, Limits>(slot.reborrow(), &mut a).unwrap()
+    });
     assert_eq!(a.live_bytes(), 0);
     searching
 }
@@ -386,14 +393,9 @@ fn an_unknown_key_takes_exactly_the_declared_entry() {
     // {0: true}: one entry of two bytes, its key below every field's.
     let wire = [0xa1, 0x00, 0xf5];
     for (count, measured) in [
-        (1usize, unknown_entry_units::<One>(&wire)),
-        (4, unknown_entry_units::<Four>(&wire)),
+        (1usize, entry_units::<One>(&wire)),
+        (4, entry_units::<Four>(&wire)),
     ] {
-        assert_eq!(
-            measured,
-            count.ilog2() as u64 + 3,
-            "a find, every comparison and the skip, of {count} fields"
-        );
         assert_eq!(
             fields::entry(count),
             times(STEP_COST, measured),
@@ -405,6 +407,172 @@ fn an_unknown_key_takes_exactly_the_declared_entry() {
             "the per-byte entry term over a two-byte entry of {count} fields"
         );
     }
+}
+
+/// The find and search calls the half-interval binary search specifies for
+/// an entry whose key is `key` (none for a key that is not an integer) over
+/// fields keyed `keys`, ascending: the find; then, while the interval
+/// `[low, high)` is nonempty, one comparison with its midpoint, rounded
+/// down, ending at an equal key; an exhausted interval, or a key that is
+/// not an integer, takes one more call to skip the entry's value.
+fn search_path(keys: &[u64], key: Option<u64>) -> u64 {
+    let Some(key) = key else {
+        return 2;
+    };
+    let (mut low, mut high, mut calls) = (0usize, keys.len(), 1u64);
+    loop {
+        calls += 1;
+        if low >= high {
+            return calls;
+        }
+        let mid = low + (high - low) / 2;
+        match key.cmp(&keys[mid]) {
+            std::cmp::Ordering::Less => high = mid,
+            std::cmp::Ordering::Greater => low = mid + 1,
+            std::cmp::Ordering::Equal => return calls,
+        }
+    }
+}
+
+/// Every key position takes exactly the search path the binary search
+/// specifies ([`search_path`], derived from the specification, not from the
+/// cost), and no path exceeds the declared entry ([`fields::entry`]): keys
+/// below every field, between each two, equal to each, past the last, and
+/// a key that is not an integer, over a record of five optional fields
+/// keyed 2, 4, 6, 8 and 10. The worst position attains the declared entry.
+#[test]
+fn every_key_position_takes_its_search_path_within_the_declared_entry() {
+    use dcbor::bounded::decode::construction::in_place::fields;
+    #[derive(dcbor::CBORBoundedDecodable)]
+    struct Five {
+        #[cbor(n = 2)]
+        a: Option<u64>,
+        #[cbor(n = 4)]
+        b: Option<u64>,
+        #[cbor(n = 6)]
+        c: Option<u64>,
+        #[cbor(n = 8)]
+        d: Option<u64>,
+        #[cbor(n = 10)]
+        e: Option<u64>,
+    }
+    let keys = [2u64, 4, 6, 8, 10];
+    let declared = fields::entry(keys.len()).values;
+    let mut worst = 0;
+    // Each integer key 0 through 11 as a one-entry map {key: 7}, then a text
+    // key, {"x": 7}.
+    let mut wires: Vec<(Option<u64>, Vec<u8>)> = (0u8..12)
+        .map(|key| (Some(u64::from(key)), vec![0xa1, key, 0x07]))
+        .collect();
+    wires.push((None, vec![0xa1, 0x61, b'x', 0x07]));
+    for (key, wire) in wires {
+        let measured = entry_units::<Five>(&wire);
+        assert_eq!(
+            measured,
+            search_path(&keys, key),
+            "the search path of key {key:?}"
+        );
+        assert!(
+            measured <= declared,
+            "key {key:?} took {measured} calls, beyond the declared {declared}"
+        );
+        worst = worst.max(measured);
+    }
+    assert_eq!(
+        worst, declared,
+        "the worst position attains the declared entry"
+    );
+}
+
+/// A text whose every copy backs off to a scalar boundary is within its
+/// cost, and the per-byte copy term is exactly what its copies require: the
+/// values a copy charges for every sixty-fourth's share of the fewest bytes
+/// a copy but the last covers, both measured from the construction (the
+/// copied count it observes between copy calls, and the meter's values per
+/// call). A leading run of 61 ASCII bytes puts a four-byte scalar across the
+/// first quantum's end, and each period of 57 ASCII bytes and one such
+/// scalar puts the next one across the next copy's end, so every copy but
+/// the last backs off its three continuation bytes.
+#[test]
+fn a_text_whose_every_copy_backs_off_is_within_its_cost() {
+    use dcbor::bounded::decode::construction::in_place::{
+        BufferCustody, BufferObservation, BufferPhase, Built, InPlace, PER_BYTE_SCALE,
+    };
+    let mut text = "a".repeat(61);
+    for _ in 0..400 {
+        text.push('\u{1f600}');
+        text.push_str(&"a".repeat(57));
+    }
+    let wire = dcbor::CBOR::from(text.as_str()).to_cbor_data();
+    support::builds_within_cost::<String>(&wire, |v| assert_eq!(v, &text));
+    let mut parser = Limits::unlimited();
+    let document = dcbor::bounded::decode::decode(&wire, 1, &mut parser).unwrap();
+    let mut a = Limits::unlimited();
+    let mut value = MaybeUninit::<String>::uninit();
+    let mut state = <String as Reclaim<Limits>>::INITIAL;
+    // SAFETY: the test owns the destination and pairs it with its initial
+    // state; every access to either is through this slot for the test.
+    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+    // Bytes covered and values charged by each copy call, in order.
+    let mut copies = Vec::new();
+    let mut built = false;
+    // The text's own cost bounds its build calls; the unlimited policy never
+    // refuses.
+    let calls = support::turns(
+        <String as InPlace<Limits>>::COST
+            .bound::<()>(wire.len() as u64)
+            .expect("the cost of a fixture fits in u64"),
+    );
+    for _ in 0..calls {
+        let copying = match slot.custody().observe() {
+            BufferObservation::Held(BufferCustody {
+                phase: BufferPhase::Copy,
+                copied,
+                ..
+            }) => Some(copied),
+            _ => None,
+        };
+        let before = a.used().values;
+        let step = <String as InPlace<Limits>>::build_step(&document, 0, slot.reborrow(), &mut a)
+            .expect("the text builds");
+        if let (Some(start), BufferObservation::Held(BufferCustody { copied, .. })) =
+            (copying, slot.custody().observe())
+        {
+            copies.push((copied - start, a.used().values - before));
+        }
+        if step == Built::Done {
+            built = true;
+            break;
+        }
+    }
+    assert!(built, "the text was not built within {calls} calls");
+    assert_eq!(
+        copies.iter().map(|(bytes, _)| bytes).sum::<usize>(),
+        text.len(),
+        "every byte copied once"
+    );
+    let (last, others) = copies.split_last().expect("a text of many quanta copies");
+    assert!(last.0 > 0, "the last copy covers the rest");
+    let fewest = others
+        .iter()
+        .map(|(bytes, _)| *bytes as u64)
+        .min()
+        .expect("more than one copy");
+    let charged = copies[0].1;
+    assert!(
+        copies.iter().all(|(_, values)| *values == charged),
+        "every copy charges alike: {copies:?}"
+    );
+    assert_eq!(
+        <String as InPlace<Limits>>::COST.per_byte.values,
+        charged * PER_BYTE_SCALE.div_ceil(fewest),
+        "the per-byte copy term against the fewest bytes a copy covered ({fewest})"
+    );
+    let declared = <String as Reclaim<Limits>>::remaining(slot.observe());
+    reclaims_as_declared("a text", declared, || {
+        <String as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a).unwrap()
+    });
+    assert_eq!(a.live_bytes(), 0);
 }
 
 /// Every derived container's observation is complete for custody

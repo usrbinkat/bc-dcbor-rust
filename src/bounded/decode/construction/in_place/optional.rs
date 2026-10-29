@@ -1,11 +1,9 @@
 //! Native Option projections through a valid, resource-free placeholder.
 extern crate alloc;
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction};
+use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place, Reduction};
 use crate::bounded::decode::construction::stable::{self, Installed};
 use alloc::{string::String, vec::Vec};
-use core::mem::MaybeUninit;
-use core::ptr::{self, NonNull};
 
 /// A resource-free placeholder whose construction and move fit one quantum.
 ///
@@ -51,7 +49,10 @@ pub enum Phase {
 }
 struct Meta<S, T> {
     child: S,
-    place: *mut MaybeUninit<T>,
+    /// The payload's place, found once `Some` is written ([`Place::reach`]):
+    /// a place stays valid for the option's whole life, so construction,
+    /// cleanup and the cleanup count all step the payload through it.
+    place: Option<Place<T>>,
     phase: Phase,
 }
 
@@ -66,9 +67,20 @@ pub struct OptionalState<S, T, P> {
     meta: Option<Installed<Meta<S, T>, P>>,
 }
 
-// SAFETY: the metadata's `place` is a projection into the option's own
-// destination, which moves with this state in the same record; the state is
-// `Send` exactly when the child state, the payload and the permit are.
+impl<S, T, P> OptionalState<S, T, P> {
+    /// The installed metadata, borrowed from the state: released before the
+    /// option's place is accessed under the state, the place's custody.
+    fn installed<R>(&mut self) -> Result<&mut Meta<S, T>, BoundedError<R>> {
+        self.meta
+            .as_mut()
+            .map(Installed::get)
+            .ok_or(BoundedError::PlanMismatch)
+    }
+}
+
+// SAFETY: the metadata's place lies within the option's own destination,
+// which moves with this state in the same record; the state is `Send`
+// exactly when the child state, the payload and the permit are.
 unsafe impl<S: Send, T: Send, P: Send> Send for OptionalState<S, T, P> {}
 // SAFETY: the state has no `&self` method: its observation takes the
 // state's exclusive custody (`Custody::observe` takes `&mut self`), so
@@ -152,26 +164,25 @@ fn metadata<T: Reclaim<A>, A: Allocator>(
     state: &mut OptionalState<T::State, T, A::Permit>,
     a: &mut A,
 ) -> BoundedResult<(), A> {
-    // SAFETY: the initializer writes every metadata field.
+    // SAFETY: the header is the whole metadata, every field written.
     unsafe {
-        stable::install::<Meta<T::State, T>, A>(
+        stable::install::<Meta<T::State, T>, Meta<T::State, T>, A>(
             &mut state.meta,
             &mut state.admitted,
-            const { stable::Metadata::whole::<Meta<T::State, T>, A::Permit>() },
-            |meta| {
-                meta.write(Meta {
-                    child: T::INITIAL,
-                    place: ptr::null_mut(),
-                    phase: Phase::Empty,
-                })
+            || Meta {
+                child: T::INITIAL,
+                place: None,
+                phase: Phase::Empty,
             },
+            |meta| meta,
             a,
         )
     }
 }
 
-// SAFETY: None owns no child; Some retains its child's actual projected address
-// and cleanup state. No assumed Option layout or whole-value destructor is used.
+// SAFETY: None owns no child; Some retains its child's place and cleanup
+// state. No assumed Option layout or whole-value destructor is used. Every
+// cleanup that releases the metadata leaves the state `INITIAL`.
 unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> {
     const DISPATCH_DEPTH: usize = T::DISPATCH_DEPTH.saturating_add(2);
     type State = OptionalState<T::State, T, A::Permit>;
@@ -181,11 +192,11 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
         meta: None,
     };
 
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
+        let state = slot.custody();
         let Some(installed) = state.meta.as_mut() else {
             STEP.admit(a)?;
             state.present = false;
@@ -195,8 +206,11 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
         let meta = installed.get();
         match meta.phase {
             Phase::Child | Phase::Complete => {
-                let child = NonNull::new(meta.place).ok_or(BoundedError::PlanMismatch)?;
-                if unsafe { T::reclaim_step(child, &mut meta.child, a)? } == Reclaimed::Done {
+                let child = meta.place.ok_or(BoundedError::PlanMismatch)?;
+                // SAFETY: the payload's place, kept from `Some`'s write,
+                // paired with its own state.
+                let payload = unsafe { Slot::new(child, &mut meta.child) };
+                if T::reclaim_step(payload, a)? == Reclaimed::Done {
                     meta.phase = Phase::Release;
                 }
             }
@@ -208,6 +222,7 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
                 // SAFETY: the child, if any, has been reclaimed. The
                 // metadata's release was paid for by its acquisition.
                 unsafe { stable::uninstall(&mut state.meta) };
+                state.present = false;
                 return Ok(Reclaimed::Done);
             }
         }
@@ -217,18 +232,19 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
     /// No metadata: one call. Nothing or `None` written: one to `Release`,
     /// one to release. The payload live: its own calls, the last of which
     /// reaches `Release`, then one. `Release`: one.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
-        let Some(installed) = state.meta.as_mut() else {
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+        let Some(installed) = slot.custody().meta.as_mut() else {
             return 1;
         };
         let meta = installed.get();
         match meta.phase {
             Phase::Empty | Phase::Absent => 2,
-            Phase::Child | Phase::Complete => match NonNull::new(meta.place) {
-                // SAFETY: the payload's projection is retained from `Some`'s
-                // write, paired with the payload's own state.
-                Some(child) => unsafe { T::remaining(child, &mut meta.child) }.saturating_add(1),
-                // Cleanup refuses a missing projection as a defect in one call.
+            Phase::Child | Phase::Complete => match meta.place {
+                // SAFETY: the payload's place, observed, paired with its own
+                // state.
+                Some(child) => T::remaining(unsafe { Slot::new(child.observe(), &mut meta.child) })
+                    .saturating_add(1),
+                // Cleanup refuses a missing place as a defect in one call.
                 None => 1,
             },
             Phase::Release => 1,
@@ -236,9 +252,10 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
     }
 }
 
-// SAFETY: only bounded, resource-free placeholders are used. Projection occurs
-// while Some is valid, before child construction; the raw projection is retained
-// instead of forming references through a partially initialized Option later.
+// SAFETY: only bounded, resource-free placeholders are used. The payload's
+// place is found while Some is valid, before child construction, and kept:
+// a place stays valid for the option's whole life, so no reference is ever
+// formed through a partially initialized Option.
 unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> {
     const OPTIONAL: bool = true;
 
@@ -260,76 +277,78 @@ unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> 
         .plus(T::COST)
     };
 
-    unsafe fn build_present(
+    fn build_present(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
+        let state = slot.custody();
         if !state.present {
             STEP.admit(a)?;
             state.present = true;
             return Ok(Built::Progress);
         }
-        unsafe { Self::build_step(document, index, place, state, a) }
+        Self::build_step(document, index, slot, a)
     }
-    unsafe fn build_absent(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
-        a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        let Some(installed) = state.meta.as_mut() else {
+    fn build_absent(mut slot: Slot<'_, Self, Self::State>, a: &mut A) -> ConstructResult<Built, A> {
+        let (place, state) = slot.parts();
+        if state.meta.is_none() {
             metadata::<T, A>(state, a)?;
             return Ok(Built::Progress);
-        };
-        let meta = installed.get();
-        if meta.phase != Phase::Empty {
+        }
+        if state.installed()?.phase != Phase::Empty {
             return Err(BoundedError::PlanMismatch.into());
         }
         sized::<Self>().admit(a)?;
-        unsafe { place.as_ptr().write(MaybeUninit::new(None)) };
-        meta.phase = Phase::Absent;
+        // SAFETY: the slot pairs the place with this state, whose phase says
+        // nothing is written yet; the write is admitted above.
+        unsafe { place.write(state, None) };
+        state.installed()?.phase = Phase::Absent;
         Ok(Built::Done)
     }
 
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
+        let (place, state) = slot.parts();
         let present = state.present;
-        let Some(installed) = state.meta.as_mut() else {
+        if state.meta.is_none() {
             metadata::<T, A>(state, a)?;
             return Ok(Built::Progress);
-        };
-        let meta = installed.get();
-        match meta.phase {
+        }
+        match state.installed()?.phase {
             Phase::Empty => {
                 sized::<Self>().admit(a)?;
                 let node = node_at(document, index).ok_or_else(wrong_type)?;
                 if !present && matches!(node.kind(), Kind::Null) {
-                    unsafe { place.as_ptr().write(MaybeUninit::new(None)) };
-                    meta.phase = Phase::Absent;
+                    // SAFETY: nothing is written yet; the write is admitted.
+                    unsafe { place.write(state, None) };
+                    state.installed()?.phase = Phase::Absent;
                     return Ok(Built::Done);
                 }
-                unsafe {
-                    place
-                        .as_ptr()
-                        .write(MaybeUninit::new(Some(T::placeholder())))
-                };
-                // SAFETY: just initialized Some with a valid resource-free T.
-                let value = unsafe { &mut *place.as_ptr().cast::<Option<T>>() };
-                meta.place = value.as_mut().ok_or(BoundedError::PlanMismatch)? as *mut T
-                    as *mut MaybeUninit<T>;
+                // SAFETY: nothing is written yet; the write is admitted. The
+                // placeholder is resource-free, so the payload is then
+                // reached through the option, which no place lies within yet,
+                // and its place kept for every later step.
+                unsafe { place.write(state, Some(T::placeholder())) };
+                let child = unsafe { place.reach(state, Option::as_mut) }
+                    .ok_or(BoundedError::PlanMismatch)?;
+                let meta = state.installed()?;
+                meta.place = Some(child);
                 meta.phase = Phase::Child;
                 Ok(Built::Progress)
             }
             Phase::Child => {
-                let child = NonNull::new(meta.place).ok_or(BoundedError::PlanMismatch)?;
-                let result = unsafe { T::build_step(document, index, child, &mut meta.child, a)? };
+                let meta = state.installed()?;
+                let child = meta.place.ok_or(BoundedError::PlanMismatch)?;
+                // SAFETY: the payload's place, kept from `Some`'s write,
+                // paired with its own state.
+                let payload = unsafe { Slot::new(child, &mut meta.child) };
+                let result = T::build_step(document, index, payload, a)?;
                 if result == Built::Done {
                     meta.phase = Phase::Complete;
                 }
@@ -337,5 +356,83 @@ unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> 
             }
             _ => Err(BoundedError::PlanMismatch.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::Limits;
+    use crate::bounded::decode::decode;
+    use core::mem::MaybeUninit;
+    use core::ops::ControlFlow;
+    use core::ptr::NonNull;
+
+    /// An option of `T` decoded from `wire`: `Some` written with `T`'s
+    /// placeholder, which is `empty`, then `T` built in place over it to
+    /// `expected`; then cleanup, within its declared count, releases
+    /// everything.
+    fn built_over_its_placeholder<T>(name: &str, wire: &[u8], empty: T, expected: T)
+    where
+        T: InPlace<Limits> + Placeholder + PartialEq + core::fmt::Debug,
+    {
+        assert_eq!(T::placeholder(), empty, "{name}");
+        let mut parser = Limits::unlimited();
+        let document = decode(wire, 2, &mut parser).unwrap();
+        let mut a = Limits::unlimited();
+        let mut value = MaybeUninit::<Option<T>>::uninit();
+        let mut state = <Option<T> as Reclaim<Limits>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its
+        // initial state; every access to either is through this slot.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+        crate::bounded::within_steps(
+            name,
+            64,
+            || match <Option<T> as InPlace<Limits>>::build_step(
+                &document,
+                0,
+                slot.reborrow(),
+                &mut a,
+            )
+            .unwrap()
+            {
+                Built::Done => ControlFlow::Break(()),
+                Built::Progress => ControlFlow::Continue(()),
+            },
+        );
+        let (place, built) = slot.parts();
+        // SAFETY: construction reported the option written.
+        assert_eq!(
+            unsafe { place.get(&*built) }.as_ref(),
+            Some(&expected),
+            "{name}"
+        );
+        let declared = <Option<T> as Reclaim<Limits>>::remaining(slot.observe());
+        crate::bounded::within_steps(name, declared, || {
+            match <Option<T> as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a).unwrap() {
+                Reclaimed::Done => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        });
+        assert_eq!(a.live_bytes(), 0, "{name}");
+    }
+
+    /// Options of a vector and of a byte string each write `Some` with an
+    /// empty placeholder owning nothing, then build the payload over it:
+    /// `[7]` decodes to `Some([7])`, `h'0102'` to `Some(h'0102')`.
+    #[test]
+    fn an_option_builds_its_payload_over_its_empty_placeholder() {
+        built_over_its_placeholder::<Vec<u64>>(
+            "an option of a vector",
+            &[0x81, 0x07],
+            Vec::new(),
+            Vec::from([7]),
+        );
+        built_over_its_placeholder::<crate::ByteString>(
+            "an option of a byte string",
+            &[0x42, 0x01, 0x02],
+            crate::ByteString::from(Vec::new()),
+            crate::ByteString::from(Vec::from([1u8, 2])),
+        );
     }
 }

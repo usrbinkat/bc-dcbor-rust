@@ -13,12 +13,20 @@
 //! record onto the queue before the handle's scope reference is released, so a
 //! stepping thread that observes the last reference also observes every push.
 use super::*;
-use crate::bounded::{Caller, Place, Places, ResourceBound, Unit, widen};
+use crate::bounded::{Caller, Places, ResourceBound, Unit, widen};
 use core::cell::Cell;
 
-struct Scope<A: Allocator> {
+/// What the scope block's acquisition writes, whole: its queue and its
+/// reference count, every field an atomic.
+struct ScopeHead<A: Allocator> {
     owner: Reclaimer<A>,
     references: AtomicUsize,
+}
+
+/// The scope block's value: its header, then its terminal dispatch, written
+/// in an admitted unit of its own before any reference is exposed.
+struct Scope<A: Allocator> {
+    head: ScopeHead<A>,
     terminal: MaybeUninit<unsafe fn(NonNull<ScopeBlock<A>>)>,
 }
 
@@ -39,10 +47,12 @@ places! {
 /// earlier. The operation stepping it supplies the place.
 pub(crate) const EMPTIED: Unit<Caller> = Unit::new(Caller, 1, 0);
 
-/// The place of one cleanup step of a handle slot: `held`, whose term
-/// accounts the handle's own cleanup, while the slot holds a handle;
-/// `emptied` once it is empty, where the step admits [`EMPTIED`].
-pub(crate) fn slot_place<T, P: Place>(slot: &Option<T>, held: P, emptied: P) -> P {
+/// The accounting place of one cleanup step of a handle slot: `held`, whose
+/// term accounts the handle's own cleanup, while the slot holds a handle;
+/// `emptied` once it is empty, where the step admits [`EMPTIED`]. The bound
+/// is named by path: in this module `Place` is a record's destination
+/// ([`super::Place`]).
+pub(crate) fn slot_place<T, P: crate::bounded::Place>(slot: &Option<T>, held: P, emptied: P) -> P {
     if slot.is_some() { held } else { emptied }
 }
 
@@ -98,34 +108,72 @@ impl Places for ScopeTerms {
 /// Invariant in `'s`: a scope can be neither shortened nor extended.
 type Lifetime<'s> = PhantomData<Cell<&'s ()>>;
 
+/// What the scope block's acquisition writes: its header, whole, and the
+/// permit.
 const fn scope_metadata<A: Allocator>() -> stable::Metadata {
-    stable::Metadata::new::<Scope<A>, A::Permit>(
-        size_of::<Reclaimer<A>>() + size_of::<AtomicUsize>() + size_of::<A::Permit>(),
-    )
+    stable::Metadata::header::<ScopeHead<A>, Scope<A>, A::Permit>()
 }
 
-/// Run the existing queue state machine with an allocation-free terminal policy.
-/// The caller keeps its reference until this returns, including through child
-/// retirement, so no recursive reference release can free this scope beneath it.
+/// The scope's terminal dispatch, written into its block so a reference that
+/// does not know the allocator's terminal policy can run it: the block's
+/// queue drained with that policy ([`drain_terminally`]).
+///
+/// # Safety
+/// The caller holds a counted reference to the initialized block, kept until
+/// this returns, including through child retirement, so no recursive
+/// reference release can free this scope beneath it.
 unsafe fn terminal<A: crate::bounded::TerminalAllocator>(block: NonNull<ScopeBlock<A>>) {
-    struct AbortOnUnwind;
-    impl Drop for AbortOnUnwind {
-        fn drop(&mut self) {
-            reference_overflow();
-        }
-    }
+    // SAFETY: forwarded from the caller: the calling reference keeps the
+    // initialized block, its header and its permit live.
+    let permit = unsafe { block.as_ref().permit() };
+    drain_terminally::<A>(scope(&block), permit);
+}
+
+/// Run the queue's state machine with an allocation-free terminal policy
+/// over the scope's own permit, until the queue reports `Done` or `Waiting`.
+/// A drain that fails, or unwinds, aborts: a terminal drain cannot report.
+fn drain_terminally<A: crate::bounded::TerminalAllocator>(head: &ScopeHead<A>, permit: &A::Permit) {
     let guard = AbortOnUnwind;
-    // SAFETY: the calling reference keeps the initialized block and permit live.
-    let mut policy = A::terminal(unsafe { block.as_ref().permit() });
+    let mut policy = A::terminal(permit);
     loop {
-        match scope(&block).owner.shutdown_step(&mut policy) {
+        match head.owner.shutdown_step(&mut policy) {
             Ok(Reclaimed::Progress) => {}
             Ok(Reclaimed::Done | Reclaimed::Waiting) => break,
-            Err(_) => reference_overflow(),
+            Err(_) => abort(),
         }
     }
     drop(policy);
     core::mem::forget(guard);
+}
+
+/// Armed around work that must not unwind, and forgotten once that work
+/// returns: dropped by an unwind instead, it aborts the process ([`abort`]).
+/// A terminal drain is such work, and so is a callback a release runs
+/// inside a cleanup step (`policy::Reservation`): a step half done by an
+/// unwind leaves a state that no longer records what it holds.
+pub(crate) struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        abort();
+    }
+}
+
+/// The scope's last reference, released: no other holder of its block
+/// exists. Minted only where the reference count reached zero
+/// ([`release_reference`]), and consumed by [`release_last`], so the block's
+/// final release can happen once.
+struct LastReference<A: Allocator> {
+    block: NonNull<ScopeBlock<A>>,
+}
+
+impl<A: Allocator> LastReference<A> {
+    /// # Safety
+    /// The caller released the scope's last reference to `block`: no other
+    /// holder exists.
+    unsafe fn new(block: NonNull<ScopeBlock<A>>) -> Self {
+        Self { block }
+    }
 }
 
 fn release_reference<A: Allocator>(block: NonNull<ScopeBlock<A>>) {
@@ -133,20 +181,47 @@ fn release_reference<A: Allocator>(block: NonNull<ScopeBlock<A>>) {
     if state.owner.abandoned.load(Ordering::Acquire)
         && !state.owner.stepping.load(Ordering::Acquire)
     {
-        // SAFETY: references are exposed only after terminal initialization;
-        // this reference remains counted throughout the drain.
-        unsafe { state.terminal.assume_init()(block) };
+        // SAFETY: references are exposed only after terminal initialization,
+        // so the dispatch is written; this counted reference keeps the block
+        // allocated and remains counted throughout the drain.
+        unsafe { (*block.as_ptr()).value.terminal.assume_init()(block) };
     }
     if scope(&block).references.fetch_sub(1, Ordering::AcqRel) == 1 {
-        // All producers retired before releasing their references. With no
-        // other stepper or holder, the terminal drain must have emptied the
-        // queue. An invalid binding cannot turn this into a leak or unwind.
-        if scope(&block).owner.outstanding() != 0 {
-            reference_overflow();
-        }
-        // SAFETY: this was the last reference and all records are reclaimed.
-        unsafe { stable::free(block) };
+        // SAFETY: this was the last reference.
+        release_last(unsafe { LastReference::new(block) });
     }
+}
+
+/// The last reference's release: the remaining records drained, then the
+/// scope block freed.
+///
+/// A drain that met a record still being linked by a retiring thread
+/// (`Front::InFlight`) reports `Waiting` and stops, and the retiring thread,
+/// finding the queue stepped, leaves the drain to the stepper: the scope's
+/// count can then reach zero with that record queued. Every other holder
+/// enqueued its records before releasing its reference, which the caller's
+/// count acquired, so here the queue holds every remaining record, linked,
+/// and none of them holds a reference (it would be counted): nothing is left
+/// to race, and the drain completes. Only a record whose own cleanup cannot
+/// finish is left after it, a defect, and an invalid binding cannot turn
+/// that into a leak or an unwind.
+fn release_last<A: Allocator>(last: LastReference<A>) {
+    let block = last.block;
+    if scope(&block).owner.outstanding() != 0 {
+        // The drain holds a counted reference while it runs, as every
+        // terminal drain does; no other holder can observe it.
+        scope(&block).references.store(1, Ordering::Relaxed);
+        // SAFETY: references are exposed only after terminal initialization,
+        // so the dispatch is written; this function, holding the last
+        // reference, keeps the block allocated until it frees it.
+        unsafe { (*block.as_ptr()).value.terminal.assume_init()(block) };
+    }
+    if scope(&block).owner.outstanding() != 0 {
+        abort();
+    }
+    // SAFETY: the token proves no other reference exists, and every record
+    // is reclaimed.
+    unsafe { stable::free(block) };
 }
 
 /// References beyond this bound can only come from leaked handles; counting
@@ -154,8 +229,11 @@ fn release_reference<A: Allocator>(block: NonNull<ScopeBlock<A>>) {
 /// as for reference-counted pointers.
 const MAX_REFERENCES: usize = isize::MAX as usize;
 
+/// End the process where continuing cannot be reported: a scope reference
+/// count past [`MAX_REFERENCES`], a terminal drain that fails, or an unwind
+/// through work that must not unwind ([`AbortOnUnwind`]).
 #[cold]
-fn reference_overflow() -> ! {
+fn abort() -> ! {
     #[cfg(feature = "std")]
     {
         std::process::abort()
@@ -166,24 +244,26 @@ fn reference_overflow() -> ! {
         struct Abort;
         impl Drop for Abort {
             fn drop(&mut self) {
-                panic!("decode scope reference count overflow");
+                panic!("dcbor aborted: a scope or cleanup step could not continue");
             }
         }
         let _abort = Abort;
-        panic!("decode scope reference count overflow");
+        panic!("dcbor aborted: a scope or cleanup step could not continue");
     }
 }
 
-/// The scope behind a counted reference, borrowed no longer than the holder.
-fn scope<A: Allocator>(block: &NonNull<ScopeBlock<A>>) -> &Scope<A> {
+/// The scope's queue and reference count behind a counted reference,
+/// borrowed no longer than the holder.
+fn scope<A: Allocator>(block: &NonNull<ScopeBlock<A>>) -> &ScopeHead<A> {
     // SAFETY: every holder of the pointer holds a counted reference, which
-    // keeps the block allocated; the scope is only accessed through atomics.
-    unsafe { &(*block.as_ptr()).value }
+    // keeps the block allocated, and its acquisition wrote the header; the
+    // header is only accessed through atomics.
+    unsafe { &(*block.as_ptr()).value.head }
 }
 
 fn add_reference<A: Allocator>(block: &NonNull<ScopeBlock<A>>) {
     if scope(block).references.fetch_add(1, Ordering::Relaxed) >= MAX_REFERENCES {
-        reference_overflow();
+        abort();
     }
 }
 
@@ -199,9 +279,10 @@ pub struct ScopeRef<'s, A: Allocator> {
 // SAFETY: a `ScopeRef` reaches the scope block only through `scope`, which
 // yields `&Scope`, and every field of `Scope` is an atomic (the reference
 // count, and the `Reclaimer`'s queue pointers, counters and flags). The
-// queue's non-atomic fields `active` and `removal_admitted` are touched only
+// queue's stepping fields `active` and `removal_admitted` are written only
 // by the caller holding the `stepping` flag, whose acquiring swap and
-// releasing store order them between steppers. The queue holds only records
+// releasing store order them between steppers; observation reads
+// `removal_admitted` atomically, writing nothing. The queue holds only records
 // allocated by `allocate_step`, which requires each payload and its state to
 // be `Send`, so a record retired on one thread may be stepped and released on
 // another; their permits are dropped by that stepping thread.
@@ -341,6 +422,12 @@ pub struct ScopePosition {
     pub closed: bool,
     pub outstanding: usize,
     pub references: usize,
+    /// The next removal's unit is admitted and retained: a step admitted it,
+    /// found the front record still being linked by a retiring thread and
+    /// returned `Waiting`. The step that removes the record spends it and
+    /// reports `Progress` without admitting. Exact for the thread that
+    /// steps; a snapshot for any other while a step is in progress there.
+    pub removal_admitted: bool,
 }
 
 impl<'s, A: Allocator> DecodeOwner<'s, A> {
@@ -370,17 +457,18 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
         }
         if self.scope.is_none() {
             let admitted = &mut self.admitted;
-            // SAFETY: the initializer writes the queue and reference count;
-            // the remaining field is MaybeUninit until the final admitted write.
+            // SAFETY: the header, the queue and reference count, is written
+            // whole at its field; the terminal dispatch is MaybeUninit until
+            // the final admitted write.
             let block = at(ScopePlace::Initialization, || unsafe {
-                stable::acquire::<Scope<A>, A>(
+                stable::acquire::<Scope<A>, ScopeHead<A>, A>(
                     admitted,
-                    const { scope_metadata::<A>() },
                     || true,
-                    |scope| {
-                        ptr::addr_of_mut!((*scope).owner).write(Reclaimer::new());
-                        ptr::addr_of_mut!((*scope).references).write(AtomicUsize::new(1));
+                    || ScopeHead {
+                        owner: Reclaimer::new(),
+                        references: AtomicUsize::new(1),
                     },
+                    |scope| ptr::addr_of_mut!((*scope).head),
                     a,
                 )
             })?;
@@ -416,6 +504,10 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
                 .scope
                 .as_ref()
                 .map_or(0, |block| scope(block).references.load(Ordering::Acquire)),
+            removal_admitted: self
+                .scope
+                .as_ref()
+                .is_some_and(|block| scope(block).owner.removal_admitted()),
         }
     }
 
@@ -448,7 +540,10 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
     }
 
     /// One unit of queued cleanup. Waiting: nothing can advance until a
-    /// handle retires.
+    /// handle retires, a retiring thread links its record, or another
+    /// stepper returns. A removal admitted before a `Waiting` is retained
+    /// ([`ScopePosition::removal_admitted`]); the call that removes the
+    /// record spends it and reports `Progress` without admitting.
     pub fn step(&self, a: &mut A) -> BoundedResult<Reclaimed, A> {
         match &self.scope {
             Some(block) => scope(block).owner.step(a),
@@ -519,13 +614,16 @@ where
 unsafe impl<T: Reclaim<A> + Sync, A: Allocator> Sync for OwnedRecord<'_, T, A> where A::Permit: Send {}
 
 impl<'s, T: Reclaim<A>, A: Allocator> OwnedRecord<'s, T, A> {
-    /// # Safety
-    /// The caller must admit all work, update the state to track every
-    /// acquired resource, and preserve the invariants required by
-    /// `T::reclaim_step` on every return, including error and cancellation.
-    /// No initialized T may be moved out; no pointer may outlive this handle.
-    pub unsafe fn destination(&mut self) -> (NonNull<MaybeUninit<T>>, &mut T::State) {
-        // SAFETY: the handle has exclusive custody of its block.
+    /// The record's slot: its place, the root of its payload's provenance
+    /// for the record's whole life ([`Place`]), and its state, for as long as
+    /// this handle is borrowed. Its holder builds the payload through `T`'s
+    /// own methods, whose contracts keep the state describing every
+    /// initialized part and acquired resource; every other access to the
+    /// payload is through the slot's place, whose operations are each
+    /// `unsafe` under their own contracts.
+    pub fn destination(&mut self) -> Slot<'_, T, T::State> {
+        // SAFETY: the handle has exclusive custody of its block for the
+        // borrow.
         unsafe { destination(self.block) }
     }
 
@@ -579,12 +677,7 @@ impl<'s, T: Reclaim<A>, A: Allocator> OwnedRecord<'s, T, A> {
         let Some(current) = slot.as_mut() else {
             return 1;
         };
-        // SAFETY: the handle has exclusive custody of its block, whose place
-        // and state are the record's own pair.
-        unsafe {
-            let (place, state) = destination::<T, A>(current.block);
-            T::remaining(place, state)
-        }
+        T::remaining(current.destination().into_observe())
     }
 }
 
@@ -616,11 +709,14 @@ impl<'s, T: Reclaim<A>, A: Allocator> OwnedInitialized<'s, T, A> {
         unsafe { published(self.record.block) }
     }
 
-    /// # Safety
-    /// The caller must preserve every invariant `T::reclaim_step` relies on.
-    pub(crate) unsafe fn value_mut(&mut self) -> &mut T {
-        // SAFETY: &mut self is exclusive custody of a published record.
-        unsafe { (*destination::<T, A>(self.record.block).0.as_ptr()).assume_init_mut() }
+    /// The published record's slot, its place and its progress, the custody
+    /// every access through the place borrows ([`Place`]): how its holder
+    /// changes a part of the record it owns (a handle it gives up) without
+    /// reborrowing the value. The same slot [`OwnedRecord::destination`]
+    /// gives an unpublished record; `&mut self` excludes every reader of the
+    /// value while it is held.
+    pub(crate) fn destination(&mut self) -> Slot<'_, T, T::State> {
+        self.record.destination()
     }
 
     /// Operation-local cleanup of a published value ([`OwnedRecord::reclaim_step`]).
@@ -641,5 +737,148 @@ impl<'s, T: Reclaim<A>, A: Allocator> OwnedInitialized<'s, T, A> {
         let remaining = OwnedRecord::remaining(&mut record);
         *slot = record.map(|record| Self { record });
         remaining
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::Limits;
+
+    /// An abandoned scope whose count reaches zero with a record still
+    /// queued, linked: the state a terminal drain leaves when it meets a
+    /// record still being linked by a retiring thread, reports `Waiting` and
+    /// stops, while that thread, finding the queue stepped, leaves the drain
+    /// to the stepper and releases its reference first. The interleaving
+    /// lies inside the queue's wait-free enqueue, between its tail swap and
+    /// its link, so the state is built directly: a record queued, the
+    /// authority given up without draining it, its reference released. The
+    /// last reference drains the record and frees the scope; it neither
+    /// aborts nor leaks.
+    #[test]
+    fn the_last_reference_drains_what_a_stopped_drain_left() {
+        let mut m = Limits::unlimited();
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(&mut m).unwrap();
+        let record = owner
+            .allocate_step::<u64>(&mut m, &mut Acquisition::new())
+            .unwrap();
+        // Queued and linked; its handle's reference released.
+        drop(record);
+        let block = owner.scope.take().expect("an initialized scope");
+        // The authority given up as its drop gives it up, without the drain
+        // a concurrent stepper would have held off.
+        owner.ready = false;
+        drop(owner);
+        let state = scope(&block);
+        state.owner.closed.store(true, Ordering::Release);
+        state.owner.abandoned.store(true, Ordering::Release);
+        assert_eq!(state.owner.outstanding(), 1, "the record was not queued");
+        assert_eq!(
+            state.references.fetch_sub(1, Ordering::AcqRel),
+            1,
+            "the authority's was not the last reference"
+        );
+        // SAFETY: the last reference was just released.
+        release_last(unsafe { LastReference::new(block) });
+        assert_eq!(
+            m.live_bytes(),
+            0,
+            "the record or the scope outlived the last reference"
+        );
+    }
+
+    /// A removal admitted by a step that then returned `Waiting` is custody
+    /// the scope holds: the position reports it, and the step that removes
+    /// the record spends it, reporting `Progress` with no admission of its
+    /// own, after which the position no longer reports it. The race that
+    /// leaves it (a retiring thread swapping the tail between the step's
+    /// front check and its removal) lies inside the queue's wait-free
+    /// enqueue, so the state is built directly: a record queued, its removal
+    /// admitted as the step admits it, the admission retained.
+    #[test]
+    fn a_retained_removal_admission_is_observed_and_spent_without_admitting() {
+        let mut m = Limits::unlimited().logged();
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(&mut m).unwrap();
+        let record = owner
+            .allocate_step::<u64>(&mut m, &mut Acquisition::new())
+            .unwrap();
+        drop(record);
+        assert!(
+            !owner.position().removal_admitted,
+            "a queued record reported its removal admitted before any step"
+        );
+        let block = owner.scope.expect("an initialized scope");
+        crate::bounded::decode::construction::operation::REMOVAL
+            .admit(&mut m)
+            .unwrap();
+        scope(&block)
+            .owner
+            .removal_admitted
+            .store(true, Ordering::Relaxed);
+        assert!(
+            owner.position().removal_admitted,
+            "the retained removal admission is not observed"
+        );
+        let attempts = m.attempts();
+        assert_eq!(owner.step(&mut m), Ok(Reclaimed::Progress));
+        assert_eq!(
+            m.attempts(),
+            attempts,
+            "the removal was admitted again where its admission was retained"
+        );
+        assert!(
+            !owner.position().removal_admitted,
+            "the spent removal admission is still reported"
+        );
+        let mut done = false;
+        for _ in 0..4 {
+            if owner.shutdown_step(&mut m).unwrap() == Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the scope did not shut down");
+        assert_eq!(m.live_bytes(), 0, "the record or the scope was kept");
+    }
+
+    /// The defaults are the empty forms: an authority that holds no scope,
+    /// and an acquisition that holds no admission, with which a record is
+    /// acquired as with a new one; the scope's metadata evaluated at run
+    /// time is the constant its initialization admits.
+    #[test]
+    fn the_defaults_hold_nothing() {
+        let mut owner = DecodeOwner::<'static, Limits>::default();
+        assert_eq!(
+            owner.position(),
+            ScopePosition {
+                initialized: false,
+                closed: false,
+                outstanding: 0,
+                references: 0,
+                removal_admitted: false,
+            }
+        );
+        let mut m = Limits::unlimited();
+        owner.initialize_step(&mut m).unwrap();
+        let record = owner
+            .allocate_step::<u64>(&mut m, &mut Acquisition::default())
+            .unwrap();
+        assert_eq!(owner.outstanding(), 1);
+        drop(record);
+        let mut done = false;
+        for _ in 0..4 {
+            if owner.shutdown_step(&mut m).unwrap() == Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the scope did not shut down");
+        assert_eq!(m.live_bytes(), 0);
+        assert_eq!(
+            scope_metadata::<Limits>().bytes(),
+            const { scope_metadata::<Limits>() }.bytes()
+        );
     }
 }

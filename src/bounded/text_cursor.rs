@@ -302,10 +302,12 @@ impl TextShape {
 ///   cleared table, `r` counts, a summed table, `r` scatters and `r` copies
 ///   back: `4` table units and `6r` part units, `6 S + 4 Q` for `S` sorted
 ///   parts in `Q` sorted runs. Linear in the text, whatever its runs;
-/// - releasing the scratch, then later the characters: one unit per
-///   element and at most two releases, each at most 64 bytes; a text of no
-///   parts never allocates either arena, and each release is one unit of no
-///   bytes (`Storage::reclaim_step`); cancelled after either release,
+/// - releasing the scratch, then later the characters: plain data, a settled
+///   arena discarded in one unit of no bytes (`Storage::reclaim_copy_step`),
+///   one cancelled while staging a growth or relocating drained one unit per
+///   element, the most charged; and at most two releases, each at most 64
+///   bytes; a text of no parts never allocates either arena, and each
+///   release is one unit of no bytes; cancelled after either release,
 ///   cleanup passes over that released arena in one more unit of no bytes;
 /// - composing: one unit of two values and eight bytes per part and one at
 ///   the end; measuring and emitting: one unit per composed character, at
@@ -555,10 +557,13 @@ impl TextTerms {
         // theirs: no head is shorter for a longer payload.
         let head = widen(head_len(text.part_bytes))?;
         let output = add(text.part_bytes, head)?;
-        // Every element drained, then the arena's cleanup, its releases paid
-        // for by its growths; and, cancelled after that cleanup, cleanup's
-        // pass over the released arena, one step of no bytes
-        // (`Storage::reclaim_step`).
+        // Every element drained, the most a release takes: a settled arena
+        // of plain characters is discarded in one unit, but one cancelled
+        // while staging a growth or relocating drains one unit per element
+        // (`Storage::reclaim_copy_step`); then the arena's cleanup, its
+        // releases paid for by its growths; and, cancelled after that
+        // cleanup, cleanup's pass over the released arena, one step of no
+        // bytes.
         let drained = Storage::<char, ()>::element_work(parts)?
             .then(Storage::<char, ()>::cleanup_work(parts != 0)?)?
             .then(Storage::<char, ()>::step_work(1)?)?;
@@ -739,9 +744,12 @@ impl<S, P> TextContinuation<S, P> {
                     self.phase = Phase::ReclaimChars;
                 }
             }
+            // Characters are plain data: a settled arena of them is discarded
+            // in one unit, whatever it holds; one cancelled while relocating
+            // or staging drains per element, which the bound counts.
             Phase::ReclaimChars => {
                 if at(TextPlace::ReleasingChars, || {
-                    self.chars.reclaim_step(allocator)
+                    self.chars.reclaim_copy_step(allocator)
                 })? {
                     // The output, if one was requested, is released in the
                     // same unit: its request paid for its release.
@@ -935,7 +943,7 @@ impl<S, P> TextContinuation<S, P> {
             }
             Phase::ReleaseChars => {
                 if at(TextPlace::ReleasingChars, || {
-                    self.chars.reclaim_step(allocator)
+                    self.chars.reclaim_copy_step(allocator)
                 })? {
                     self.phase = Phase::Publish;
                 }
@@ -1240,11 +1248,12 @@ mod tests {
     /// and no two of one.
     #[test]
     fn the_alphabet_holds_every_entry_once() {
-        let every: std::collections::BTreeSet<_> = (0..=0x10_ffffu32)
+        // The prelude's set (`import_stdlib!`): `alloc`'s without `std`.
+        let every: BTreeSet<_> = (0..=0x10_ffffu32)
             .filter_map(char::from_u32)
             .map(entry)
             .collect();
-        let alphabet: std::collections::BTreeSet<_> = ALPHABET.into_iter().map(entry).collect();
+        let alphabet: BTreeSet<_> = ALPHABET.into_iter().map(entry).collect();
         assert_eq!(alphabet.len(), ALPHABET.len(), "two scalars share an entry");
         assert_eq!(alphabet, every);
     }
@@ -1727,11 +1736,26 @@ mod tests {
         assert_eq!("\u{37e}".nfc().collect::<String>(), ";");
     }
 
-    /// A text whose encoding charges `place`, and the step after which it
-    /// is cancelled into its cleanup, if it is: a place without a witness
-    /// does not compile.
+    /// Where an encoding is cancelled into its cleanup: before the step
+    /// numbered by the count of steps taken, at a position the condition
+    /// holds of.
     #[cfg(feature = "std")]
-    fn witness(place: TextPlace) -> (String, Option<usize>) {
+    type Cancel = fn(usize, &Position) -> bool;
+
+    /// A text whose encoding charges `place`, and where it is cancelled into
+    /// its cleanup, if it is: a place without a witness does not compile.
+    /// The releases are witnessed where they drain one character per unit,
+    /// which their terms charge: an arena is discarded in one unit once
+    /// settled, so each is cancelled while relocating, at its last growth.
+    /// The text's 129 parts fill each arena's capacity of 128, whose growth
+    /// relocates all 128.
+    #[cfg(feature = "std")]
+    fn witness(place: TextPlace) -> (String, Option<Cancel>) {
+        use crate::bounded::decode::storage::{StoragePosition, StorageStage};
+        /// Whether an arena relocates its last growth's 128 characters.
+        fn last_growth(arena: StoragePosition) -> bool {
+            arena.stage == StorageStage::Relocating && arena.relocating_remaining >= 128
+        }
         match place {
             TextPlace::Reading
             | TextPlace::Appending
@@ -1740,12 +1764,22 @@ mod tests {
             | TextPlace::Output
             | TextPlace::Header
             | TextPlace::Emitting
-            | TextPlace::ReleasingChars
             | TextPlace::Publishing => ("ordinary".into(), None),
-            TextPlace::Copying | TextPlace::Ordering | TextPlace::ReleasingScratch => {
+            TextPlace::ReleasingChars => (
+                format!("q{}", "\u{301}\u{316}".repeat(64)),
+                Some(|_, position| last_growth(position.characters)),
+            ),
+            TextPlace::Copying | TextPlace::Ordering => {
                 (format!("q{}", "\u{301}\u{316}".repeat(64)), None)
             }
-            TextPlace::Cleanup => (format!("q{}", "\u{301}\u{316}".repeat(64)), Some(200)),
+            TextPlace::ReleasingScratch => (
+                format!("q{}", "\u{301}\u{316}".repeat(64)),
+                Some(|_, position| last_growth(position.ordering_state.scratch)),
+            ),
+            TextPlace::Cleanup => (
+                format!("q{}", "\u{301}\u{316}".repeat(64)),
+                Some(|steps, _| steps == 200),
+            ),
         }
     }
 
@@ -1770,7 +1804,7 @@ mod tests {
             )
             .unwrap()
         };
-        let mut cases: Vec<(String, Option<TextPlace>, String, Option<usize>)> = TextPlace::ALL
+        let mut cases: Vec<(String, Option<TextPlace>, String, Option<Cancel>)> = TextPlace::ALL
             .iter()
             .map(|&place| {
                 let (text, cancel) = witness(place);
@@ -1791,7 +1825,7 @@ mod tests {
             let mut encoder = TextEncoder::<Permit>::new(text);
             let mut steps = 0;
             let outcome = within(name, bound, || {
-                if *cancel == Some(steps) {
+                if cancel.is_some_and(|cancel| cancel(steps, &encoder.position())) {
                     within(name, bound, || {
                         if encoder.reclaim_step(&mut policy).unwrap() {
                             ControlFlow::Break(())

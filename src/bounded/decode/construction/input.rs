@@ -1,12 +1,9 @@
 //! Input handles: immutable bytes in scope custody, copied or borrowed.
-use core::mem::MaybeUninit;
-use core::ptr::NonNull;
-
 use super::in_place::Built;
 use super::in_place::text::{BufferObservation, BufferState};
 use super::operation::{Operation, OperationTerms, Task};
 use super::reclamation::{
-    Custody, DecodeOwner, OwnedInitialized, Prefix, Reclaim, Reclaimed, ScopeRef,
+    Custody, DecodeOwner, OwnedInitialized, PeekSlot, Prefix, Reclaim, Reclaimed, ScopeRef, Slot,
 };
 use crate::ByteString;
 use crate::bounded::decode::initialization::field;
@@ -68,18 +65,14 @@ unsafe impl<A: Allocator> Reclaim<A> for Borrowed<'_> {
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        prefix: &mut Prefix,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
         RETIRE.admit(a)?;
-        *prefix = Prefix::EMPTY;
+        *slot.custody() = Prefix::EMPTY;
         Ok(Reclaimed::Done)
     }
 
     /// One call, which is `Done`.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Prefix) -> u64 {
+    fn remaining(_: PeekSlot<'_, Self, Prefix>) -> u64 {
         1
     }
 }
@@ -141,23 +134,22 @@ where
         0
     }
 
-    unsafe fn initialize(
+    fn initialize(
         &mut self,
-        _: *mut ByteString,
-        _: &mut BufferState<A::Permit>,
+        _: Slot<'_, ByteString, BufferState<A::Permit>>,
         _: &mut A,
     ) -> Result<(), Self::Error> {
         Err(BoundedError::PlanMismatch)
     }
 
-    unsafe fn advance(
+    /// One unit of the copy, whose construction state is the record's own
+    /// progress: complete exactly when the byte string is.
+    fn advance(
         &mut self,
-        place: NonNull<MaybeUninit<ByteString>>,
-        state: &mut BufferState<A::Permit>,
+        slot: Slot<'_, ByteString, BufferState<A::Permit>>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
-        // SAFETY: the original destination and state, per the Task contract.
-        Ok(unsafe { ByteString::copy_step(self.source, place, state, a)? } == Built::Done)
+        Ok(ByteString::copy_step(self.source, slot, a)? == Built::Done)
     }
 
     fn publish(&mut self, record: OwnedInitialized<'s, ByteString, A>) -> Self::Output {
@@ -169,11 +161,11 @@ where
         release_scope(&mut self.scope, a)
     }
 
-    unsafe fn detail(
+    fn detail(
         &self,
-        record: Option<(&mut MaybeUninit<ByteString>, &mut BufferState<A::Permit>)>,
+        record: Option<PeekSlot<'_, ByteString, BufferState<A::Permit>>>,
     ) -> InputDetail<BufferObservation> {
-        let record = record.map(|(_, state)| state.observe());
+        let record = record.map(|mut slot| slot.custody().observe());
         InputDetail {
             length: self.source.len(),
             held: match record {
@@ -208,25 +200,33 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         prefix.initialized()
     }
 
-    unsafe fn initialize(
+    fn initialize(
         &mut self,
-        place: *mut Borrowed<'s>,
-        prefix: &mut Prefix,
+        mut slot: Slot<'_, Borrowed<'s>, Prefix>,
         a: &mut A,
     ) -> Result<(), Self::Error> {
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() >= Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
         let source = self.source;
-        // SAFETY: the uninitialized destination, per the Task contract.
-        unsafe { field(place, || Borrowed(source), a)? };
+        // SAFETY: the slot pairs the record's place with its progress, which
+        // records nothing written: the destination is uninitialized.
+        unsafe { field(place.as_ptr(prefix), || Borrowed(source), a)? };
         prefix.advance();
         Ok(())
     }
 
-    unsafe fn advance(
+    /// Completion, once the record is written: the operation publishes the
+    /// borrow on it, so it is refused before.
+    fn advance(
         &mut self,
-        _: NonNull<MaybeUninit<Borrowed<'s>>>,
-        _: &mut Prefix,
+        mut slot: Slot<'_, Borrowed<'s>, Prefix>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
+        if slot.custody().initialized() != Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
         SETTLE.admit(a)?;
         Ok(true)
     }
@@ -240,11 +240,8 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         release_scope(&mut self.scope, a)
     }
 
-    unsafe fn detail(
-        &self,
-        record: Option<(&mut MaybeUninit<Borrowed<'s>>, &mut Prefix)>,
-    ) -> InputDetail<Prefix> {
-        let record = record.map(|(_, prefix)| prefix.observe());
+    fn detail(&self, record: Option<PeekSlot<'_, Borrowed<'s>, Prefix>>) -> InputDetail<Prefix> {
+        let record = record.map(|mut slot| slot.custody().observe());
         InputDetail {
             length: self.source.len(),
             held: record.map_or(0, |prefix| {
@@ -369,5 +366,130 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
             source,
             scope: self.reference(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::reclamation::{Build, Place};
+    use super::*;
+    use crate::bounded::{Limits, Step};
+    use core::{mem::MaybeUninit, ptr::NonNull};
+
+    /// A copy has no prefix of its own: its record is its byte string,
+    /// built by `advance`, so an initialization unit is refused and changes
+    /// nothing.
+    #[test]
+    fn a_copy_refuses_an_initialization_unit() {
+        let mut task = CopyInput::<'_, 'static, Limits> {
+            source: &[1, 2, 3],
+            scope: None,
+        };
+        let mut value = MaybeUninit::<ByteString>::uninit();
+        let mut state = <ByteString as Reclaim<Limits>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its
+        // initial state; nothing else reaches either.
+        let slot = unsafe {
+            Slot::new(
+                Place::<ByteString, Build>::root(NonNull::from(&mut value)),
+                &mut state,
+            )
+        };
+        let mut a = Limits::unlimited().logged();
+        assert_eq!(
+            task.initialize(slot, &mut a),
+            Err(BoundedError::PlanMismatch)
+        );
+        assert_eq!(a.attempts(), 0, "a refused unit admits nothing");
+        assert_eq!(
+            state.observe(),
+            BufferObservation::Unallocated(Default::default())
+        );
+    }
+
+    /// An operation reports cancelling from its cancellation on, through
+    /// its own cleanup to `Finished`; a finished operation is not cancelled
+    /// again.
+    #[test]
+    fn an_operation_reports_cancelling_from_its_cancellation() {
+        let mut a = Limits::unlimited();
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(&mut a).unwrap();
+        let mut copy = owner.copy_input(&[7]);
+        assert!(!copy.is_cancelling());
+        assert!(
+            matches!(copy.step(&mut a).unwrap(), Step::Progress),
+            "the record's allocation"
+        );
+        copy.cancel();
+        assert!(copy.is_cancelling());
+        let mut finished = false;
+        for _ in 0..16 {
+            if matches!(copy.step(&mut a).unwrap(), Step::Finished) {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "the cancelled copy's cleanup did not finish");
+        assert!(copy.is_cancelling());
+        drop(copy);
+
+        let mut published = owner.copy_input(&[7]);
+        let mut input = None;
+        for _ in 0..16 {
+            if let Step::Complete(record) = published.step(&mut a).unwrap() {
+                input = Some(record);
+                break;
+            }
+        }
+        let input = input.expect("the copy did not publish");
+        published.cancel();
+        assert!(
+            !published.is_cancelling(),
+            "a finished operation was cancelled"
+        );
+        assert_eq!(input.value().data(), [7]);
+        drop((input, published));
+        let mut done = false;
+        for _ in 0..16 {
+            if owner.shutdown_step(&mut a).unwrap() == Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the scope did not shut down");
+        assert_eq!(a.live_bytes(), 0);
+    }
+
+    /// A borrow cancelled once its record is allocated reclaims the record
+    /// in place in one step, then retires its scope reference in the next,
+    /// which finishes it.
+    #[test]
+    fn a_cancelled_borrow_reclaims_its_record_then_retires_its_scope() {
+        let mut a = Limits::unlimited();
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(&mut a).unwrap();
+        let mut borrow = owner.borrow_input(&[1, 2]);
+        assert!(
+            matches!(borrow.step(&mut a).unwrap(), Step::Progress),
+            "the record's allocation"
+        );
+        assert_eq!(owner.outstanding(), 1);
+        borrow.cancel();
+        assert!(matches!(borrow.step(&mut a).unwrap(), Step::Progress));
+        assert_eq!(owner.outstanding(), 0, "the record was reclaimed in place");
+        assert!(borrow.position().detail.scope, "the scope is still held");
+        assert!(matches!(borrow.step(&mut a).unwrap(), Step::Finished));
+        assert!(!borrow.position().detail.scope, "the scope was retired");
+        drop(borrow);
+        let mut done = false;
+        for _ in 0..4 {
+            if owner.shutdown_step(&mut a).unwrap() == Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the scope did not shut down");
+        assert_eq!(a.live_bytes(), 0);
     }
 }

@@ -6,15 +6,15 @@
 //! (identity and signature checks keep the original bytes), and the document's
 //! record, holding only its arena, is retired to the scope queue.
 use core::mem::MaybeUninit;
-use core::ptr::{NonNull, addr_of, addr_of_mut};
+use core::ptr::addr_of_mut;
 
 use super::in_place::{Built, InPlace, Transferable};
 use super::input::DecodeInput;
-use super::operation::{Operation, OperationTerms, Position, Task};
+use super::operation::{Observed, Operation, OperationTerms, Position, Task};
 use super::parse::{DocumentDecoder, OwnedDocument, ParseDetail};
 use super::reclamation::{
-    Custody, EMPTIED, OwnedInitialized, Prefix, Reclaim, Reclaimed, ScopeRef, reclaim_within,
-    slot_place,
+    Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
+    ScopeRef, Slot, reclaim_within, slot_place,
 };
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::{ConstructResult, DecodeError, Options};
@@ -67,16 +67,68 @@ pub enum ConstructPhase {
 /// The construction record. Public only as the unnameable state of
 /// [`Construct`].
 pub struct Constructed<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> {
+    /// Everything the record holds besides the value.
+    custody: ConstructCustody<'s, I, T, A>,
+    value: MaybeUninit<T>,
+}
+
+/// A construction record's own custody ([`Place::custody`]): the document
+/// it holds until detachment, the input it holds after, the value's
+/// construction state and the phase. Initialized field by field; reached
+/// whole, once initialized, through one exclusive borrow of the record's
+/// progress, its fields then borrowing disjointly.
+struct ConstructCustody<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> {
     document: Option<OwnedDocument<'s, I, A>>,
     input: Option<OwnedInitialized<'s, I, A>>,
     /// The value's own construction state.
     build: T::State,
     phase: ConstructPhase,
-    value: MaybeUninit<T>,
 }
 
-impl<I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> Constructed<'_, I, T, A> {
+impl<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> Constructed<'s, I, T, A> {
     const INIT_STEPS: usize = 4;
+
+    /// The value's place within the record's, in the record's mode: the one
+    /// projection its construction, its cleanup and its count share.
+    fn value<M: Mode>(slot: &mut Slot<'_, Self, Prefix, M>) -> Place<T, M> {
+        let (place, _) = slot.parts();
+        // SAFETY: a field projection by raw pointer within the slot's own
+        // record, forming no reference; `MaybeUninit<T>` lays out a `T` at
+        // its start.
+        unsafe { place.project(|record| addr_of_mut!((*record).value).cast::<T>()) }
+    }
+
+    /// The record's whole custody, for as long as the slot is borrowed;
+    /// refused unless its progress records every custody field initialized.
+    fn custody<'p, M: Mode, R>(
+        slot: &'p mut Slot<'_, Self, Prefix, M>,
+    ) -> Result<&'p mut ConstructCustody<'s, I, T, A>, BoundedError<R>> {
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() < Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
+        // SAFETY: the slot pairs the record's place with its progress, which
+        // records every custody field initialized; the custody field is
+        // disjoint from the value, no place lies within it, and no reader
+        // of the published value borrows it.
+        Ok(unsafe { place.custody(prefix, |record| addr_of_mut!((*record).custody)) })
+    }
+
+    /// The document slot alone, for as long as the slot is borrowed: what
+    /// the record holds before its other custody fields are initialized;
+    /// `None` before the document field is.
+    fn document<'p, M: Mode>(
+        slot: &'p mut Slot<'_, Self, Prefix, M>,
+    ) -> Option<&'p mut Option<OwnedDocument<'s, I, A>>> {
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() == 0 {
+            return None;
+        }
+        // SAFETY: the slot pairs the record's place with its progress, which
+        // records the document field initialized; the projection reaches that
+        // field alone.
+        Some(unsafe { place.custody(prefix, |record| addr_of_mut!((*record).custody.document)) })
+    }
 }
 
 // SAFETY: the prefix is the document handle, the input slot, the value's
@@ -94,70 +146,59 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        prefix: &mut Prefix,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
-        let raw = place.as_ptr().cast::<Self>();
-        if prefix.initialized() < Self::INIT_STEPS {
-            if prefix.initialized() > 0 {
-                // SAFETY: a nonempty prefix includes the document field.
-                let document = unsafe { &mut *addr_of_mut!((*raw).document) };
-                if document.is_some() {
-                    at(ConstructPlace::Document, || {
-                        OwnedDocument::reclaim_step(document, a)
-                    })?;
-                    return Ok(Reclaimed::Progress);
-                }
+    fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            if let Some(document) = Self::document(&mut slot)
+                && document.is_some()
+            {
+                at(ConstructPlace::Document, || {
+                    OwnedDocument::reclaim_step(document, a)
+                })?;
+                return Ok(Reclaimed::Progress);
             }
             // The rest of the prefix is resource-free: the empty input slot,
             // the value's initial state and the phase.
             CLEANUP.admit(a)?;
-            *prefix = Prefix::EMPTY;
+            *slot.custody() = Prefix::EMPTY;
             return Ok(Reclaimed::Done);
         }
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *raw };
-        match state.phase {
+        let value = Self::value(&mut slot);
+        let ConstructCustody {
+            document,
+            input,
+            build,
+            phase,
+        } = Self::custody(&mut slot)?;
+        match *phase {
             ConstructPhase::ReclaimValue => {
-                let (value, build) = (NonNull::from(&mut state.value), &mut state.build);
-                // SAFETY: the value's state describes every initialized part.
-                if at(ConstructPlace::Build, || unsafe {
-                    T::reclaim_step(value, build, a)
+                // SAFETY: the value's place, paired with its construction
+                // state, which the record keeps beside it and which describes
+                // every initialized part.
+                if at(ConstructPlace::Build, || {
+                    T::reclaim_step(unsafe { Slot::new(value, &mut *build) }, a)
                 })? == Reclaimed::Done
                 {
-                    state.phase = ConstructPhase::ReclaimDocument;
+                    *phase = ConstructPhase::ReclaimDocument;
                 }
             }
             ConstructPhase::ReclaimDocument => {
-                let place = slot_place(
-                    &state.document,
-                    ConstructPlace::Document,
-                    ConstructPlace::Cleanup,
-                );
-                if at(place, || {
-                    OwnedDocument::reclaim_step(&mut state.document, a)
-                })? == Reclaimed::Done
-                {
-                    state.phase = ConstructPhase::ReclaimInput;
+                let charge =
+                    slot_place(document, ConstructPlace::Document, ConstructPlace::Cleanup);
+                if at(charge, || OwnedDocument::reclaim_step(document, a))? == Reclaimed::Done {
+                    *phase = ConstructPhase::ReclaimInput;
                 }
             }
             ConstructPhase::ReclaimInput => {
-                let place =
-                    slot_place(&state.input, ConstructPlace::Input, ConstructPlace::Cleanup);
-                if at(place, || {
-                    OwnedInitialized::reclaim_step(&mut state.input, a)
-                })? == Reclaimed::Done
-                {
-                    state.phase = ConstructPhase::Done;
+                let charge = slot_place(input, ConstructPlace::Input, ConstructPlace::Cleanup);
+                if at(charge, || OwnedInitialized::reclaim_step(input, a))? == Reclaimed::Done {
+                    *phase = ConstructPhase::Done;
                     return Ok(Reclaimed::Done);
                 }
             }
             ConstructPhase::Done => return Ok(Reclaimed::Done),
             _ => {
                 CLEANUP.admit(a)?;
-                state.phase = ConstructPhase::ReclaimValue;
+                *phase = ConstructPhase::ReclaimValue;
             }
         }
         Ok(Reclaimed::Progress)
@@ -167,28 +208,34 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     /// the one releasing the record. After it: the transition into cleanup
     /// unless it has begun, the value's own count, the document slot's and
     /// the input slot's.
-    unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, prefix: &mut Prefix) -> u64 {
-        let raw = place.as_ptr().cast::<Self>();
-        if prefix.initialized() < Self::INIT_STEPS {
-            if prefix.initialized() == 0 {
-                return 1;
-            }
-            // SAFETY: a nonempty prefix includes the document field.
-            let document = unsafe { &mut *addr_of_mut!((*raw).document) };
-            return match document {
-                Some(_) => OwnedDocument::remaining(document).saturating_add(1),
-                None => 1,
+    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> u64 {
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            return match Self::document(&mut slot) {
+                Some(document) if document.is_some() => {
+                    OwnedDocument::remaining(document).saturating_add(1)
+                }
+                _ => 1,
             };
         }
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *raw };
-        let input = OwnedInitialized::remaining(&mut state.input);
-        let document = OwnedDocument::remaining(&mut state.document).saturating_add(input);
-        // SAFETY: the value's state describes every initialized part, as for
-        // its cleanup.
-        let value = unsafe { T::remaining(NonNull::from(&mut state.value), &mut state.build) }
-            .saturating_add(document);
-        match state.phase {
+        // The value, which a reader of the published record may hold
+        // borrowed, is never reborrowed: its place is observed.
+        let value = Self::value(&mut slot);
+        let Ok(ConstructCustody {
+            document,
+            input,
+            build,
+            phase,
+        }) = Self::custody::<_, ()>(&mut slot)
+        else {
+            return 1;
+        };
+        let phase = *phase;
+        let input = OwnedInitialized::remaining(input);
+        let document = OwnedDocument::remaining(document).saturating_add(input);
+        // SAFETY: the value's place, observed, paired with its own state, as
+        // its cleanup steps it.
+        let value = T::remaining(unsafe { Slot::new(value, build) }).saturating_add(document);
+        match phase {
             ConstructPhase::Done => 1,
             ConstructPhase::ReclaimInput => input,
             ConstructPhase::ReclaimDocument => document,
@@ -239,19 +286,31 @@ where
         prefix.initialized()
     }
 
-    unsafe fn initialize(
+    fn initialize(
         &mut self,
-        place: *mut Self::State,
-        prefix: &mut Prefix,
+        mut slot: Slot<'_, Self::State, Prefix>,
         a: &mut A,
     ) -> Result<(), Self::Error> {
-        // SAFETY: each unit writes one uninitialized field of the destination.
+        let (place, prefix) = slot.parts();
+        let raw = place.as_ptr(prefix);
+        // SAFETY: the slot pairs the record's place with its progress, so the
+        // unit the progress names next is uninitialized; each unit writes
+        // that one custody field by raw projection, forming no reference to
+        // the rest, and every unit past the last is refused.
         unsafe {
             match prefix.initialized() {
-                0 => field(addr_of_mut!((*place).document), || self.document.take(), a)?,
-                1 => field(addr_of_mut!((*place).input), || None, a)?,
-                2 => field(addr_of_mut!((*place).build), || T::INITIAL, a)?,
-                3 => field(addr_of_mut!((*place).phase), || ConstructPhase::Build, a)?,
+                0 => field(
+                    addr_of_mut!((*raw).custody.document),
+                    || self.document.take(),
+                    a,
+                )?,
+                1 => field(addr_of_mut!((*raw).custody.input), || None, a)?,
+                2 => field(addr_of_mut!((*raw).custody.build), || T::INITIAL, a)?,
+                3 => field(
+                    addr_of_mut!((*raw).custody.phase),
+                    || ConstructPhase::Build,
+                    a,
+                )?,
                 _ => return Err(BoundedError::PlanMismatch.into()),
             }
         }
@@ -259,40 +318,46 @@ where
         Ok(())
     }
 
-    unsafe fn advance(
+    fn advance(
         &mut self,
-        place: NonNull<MaybeUninit<Self::State>>,
-        _: &mut Prefix,
+        mut slot: Slot<'_, Self::State, Prefix>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *place.as_ptr().cast::<Self::State>() };
-        match state.phase {
+        // The value is reached only through its place; the custody is refused
+        // until initialization is complete.
+        let value = Constructed::value(&mut slot);
+        let ConstructCustody {
+            document,
+            input,
+            build,
+            phase,
+        } = Constructed::custody(&mut slot)?;
+        match *phase {
             ConstructPhase::Build => {
-                let document = state.document.as_ref().ok_or(BoundedError::PlanMismatch)?;
-                let value = NonNull::from(&mut state.value);
-                let build = &mut state.build;
-                // SAFETY: the stable destination and its state are retained
-                // across every call; the document view ends with this call.
+                let document = document.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                // SAFETY: the value's place and its construction state, kept
+                // in the record's custody, are retained across every call; the
+                // document view ends with this call.
                 let built = at(ConstructPlace::Build, || {
-                    document
-                        .with_document(|view| unsafe { T::build_step(view, 0, value, build, a) })
+                    document.with_document(|view| {
+                        T::build_step(view, 0, unsafe { Slot::new(value, &mut *build) }, a)
+                    })
                 })?;
                 if built == Built::Done {
-                    state.phase = ConstructPhase::Detach;
+                    *phase = ConstructPhase::Detach;
                 }
             }
             ConstructPhase::Detach => {
                 DETACH.admit(a)?;
-                let document = state.document.take().ok_or(BoundedError::PlanMismatch)?;
+                let document = document.take().ok_or(BoundedError::PlanMismatch)?;
                 // The input moves without copying; the document's arena and
                 // parser record is retired to the scope queue.
-                state.input = Some(document.into_input());
-                state.phase = ConstructPhase::Publish;
+                *input = Some(document.into_input());
+                *phase = ConstructPhase::Publish;
             }
             ConstructPhase::Publish => {
                 PUBLISH.admit(a)?;
-                state.phase = ConstructPhase::Published;
+                *phase = ConstructPhase::Published;
                 return Ok(true);
             }
             _ => return Err(BoundedError::PlanMismatch.into()),
@@ -313,11 +378,8 @@ where
         at(place, || OwnedDocument::reclaim_step(&mut self.document, a))
     }
 
-    unsafe fn detail(
-        &self,
-        record: Option<(&mut MaybeUninit<Self::State>, &mut Prefix)>,
-    ) -> Self::Detail {
-        let Some((storage, prefix)) = record else {
+    fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
+        let Some(mut slot) = record else {
             return ConstructDetail {
                 phase: None,
                 document: self.document.is_some(),
@@ -325,21 +387,38 @@ where
                 build: None,
             };
         };
-        let raw = storage.as_mut_ptr();
+        let (place, prefix) = slot.parts();
         let initialized = prefix.initialized();
-        // SAFETY: each field is read in place only once the prefix records
-        // it written, without forming a reference to the rest; the record's
-        // custody, held exclusively here, reaches the value's state.
+        // SAFETY: the slot pairs the record's place with its progress; each
+        // custody field is read only once the prefix records it written,
+        // through a view of that field alone, the prefix borrowed for each
+        // read; the value's construction state is observed under the prefix's
+        // exclusive borrow; the value is never read.
         unsafe {
             ConstructDetail {
                 document: if initialized > 0 {
-                    (*addr_of!((*raw).document)).is_some()
+                    place
+                        .project(|record| addr_of_mut!((*record).custody.document))
+                        .get(&*prefix)
+                        .is_some()
                 } else {
                     self.document.is_some()
                 },
-                input: initialized > 1 && (*addr_of!((*raw).input)).is_some(),
-                build: (initialized > 2).then(|| (*addr_of_mut!((*raw).build)).observe()),
-                phase: (initialized > 3).then(|| *addr_of!((*raw).phase)),
+                input: initialized > 1
+                    && place
+                        .project(|record| addr_of_mut!((*record).custody.input))
+                        .get(&*prefix)
+                        .is_some(),
+                build: (initialized > 2).then(|| {
+                    place
+                        .custody(&mut *prefix, |record| addr_of_mut!((*record).custody.build))
+                        .observe()
+                }),
+                phase: (initialized > 3).then(|| {
+                    *place
+                        .project(|record| addr_of_mut!((*record).custody.phase))
+                        .get(&*prefix)
+                }),
             }
         }
     }
@@ -368,7 +447,7 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> TypedValue<'s, I, T, A>
 
     /// The original input the value was decoded from.
     pub fn input(&self) -> &I {
-        match self.record.value().input.as_ref() {
+        match self.record.value().custody.input.as_ref() {
             Some(input) => input.value(),
             None => unreachable!("a published value retains its input"),
         }

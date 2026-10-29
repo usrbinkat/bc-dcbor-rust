@@ -181,42 +181,48 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
             #callbacks
         });
         union_fields.push(quote!(#union_field: core::mem::ManuallyDrop<#helper #tg>));
-        let projection = if c {
+        // The variant's payload place from the root's, in the root place's
+        // mode, by raw projection alone. With repr(C) the tag precedes the
+        // payload union, whose `ManuallyDrop` members lay out each helper at
+        // its start; with repr(u8) the enum is a union of repr(C) variant
+        // structs, each starting with the native tag and then its own
+        // fields. Construction, cleanup and the cleanup count all project the
+        // payload through this one expression.
+        let place_of = if c {
             quote! {
-                // SAFETY: repr(C) places the tag before the payload union.
-                let payload = unsafe { core::ptr::NonNull::new_unchecked(
-                    core::ptr::addr_of_mut!((*place.as_ptr().cast::<#root_name #tg>()).payload)
-                        .cast::<core::mem::MaybeUninit<#helper #tg>>()
-                ) };
+                place.project(|value| {
+                    core::ptr::addr_of_mut!((*value.cast::<#root_name #tg>()).payload)
+                        .cast::<#helper #tg>()
+                })
             }
         } else {
-            quote! {
-                // SAFETY: repr(u8) is a union of repr(C) variant structs,
-                // each starting with the native tag and then its own fields.
-                let payload = place.cast::<core::mem::MaybeUninit<#helper #tg>>();
+            quote! { place.cast::<#helper #tg>() }
+        };
+        let payload = quote! {
+            // SAFETY: the payload projection above, by raw pointer alone,
+            // paired with the payload's own field-engine state, which this
+            // variant carries.
+            unsafe {
+                dcbor::bounded::decode::construction::reclamation::Slot::new(#place_of, state)
             }
         };
-        builds.push(quote! { #payload_name::#payload_variant(state) => {
-            #projection
-            unsafe { dcbor::bounded::decode::construction::in_place::fields::build::<#helper #tg, #a>(
-                document, index, payload, state, allocator
-            ) }
-        } });
-        reclaims.push(quote! { #payload_name::#payload_variant(state) => {
-            #projection
-            unsafe { dcbor::bounded::decode::construction::in_place::fields::reclaim::<#helper #tg, #a>(
-                payload, state, allocator
-            ) }
-        } });
-        remainings.push(quote! { #payload_name::#payload_variant(state) => {
-            #projection
-            unsafe { dcbor::bounded::decode::construction::in_place::fields::remaining::<#helper #tg, #a>(
-                payload, state
-            ) }
-        } });
-        commits.push(quote! { #payload_name::#payload_variant(_) => unsafe {
-            place.as_ptr().cast::<#tag_name>().write(#tag_name::#native_variant);
-        } });
+        builds.push(quote! { #payload_name::#payload_variant(state) =>
+            dcbor::bounded::decode::construction::in_place::fields::build::<#helper #tg, #a>(
+                document, index, #payload, allocator
+            )
+        });
+        reclaims.push(quote! { #payload_name::#payload_variant(state) =>
+            dcbor::bounded::decode::construction::in_place::fields::reclaim::<#helper #tg, #a>(
+                #payload, allocator
+            )
+        });
+        remainings.push(quote! { #payload_name::#payload_variant(state) =>
+            dcbor::bounded::decode::construction::in_place::fields::remaining::<#helper #tg, #a>(
+                #payload
+            )
+        });
+        // The native tag of the variant the payload state names.
+        commits.push(quote! { #payload_name::#payload_variant(_) => #tag_name::#native_variant });
     }
     // The uninhabited marker variant uses every generic parameter and can
     // never be constructed.
@@ -274,27 +280,34 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
                 fn start(variant: usize) -> Option<Self::Payload> {
                     match variant { #(#starts,)* _ => None }
                 }
-                unsafe fn build_variant(
+                fn build_variant(
                     document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Payload, allocator: &mut #a,
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Payload>,
+                    allocator: &mut #a,
                 ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
+                    let (place, state) = slot.into_parts();
                     match state { #(#builds,)* #marker }
                 }
-                unsafe fn reclaim_variant(
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Payload, allocator: &mut #a,
+                fn reclaim_variant(
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Payload>,
+                    allocator: &mut #a,
                 ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
+                    let (place, state) = slot.into_parts();
                     match state { #(#reclaims,)* #marker }
                 }
-                unsafe fn remaining_variant(
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Payload,
+                fn remaining_variant(
+                    slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::Payload>,
                 ) -> u64 {
+                    let (place, state) = slot.into_parts();
                     match state { #(#remainings,)* #marker }
                 }
-                unsafe fn commit(state: &Self::Payload, place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>) {
-                    match state { #(#commits,)* #marker }
+                fn commit(slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Payload>) {
+                    let (place, state) = slot.into_parts();
+                    let tag = match state { #(#commits,)* #marker };
+                    // SAFETY: the native tag lies at the start of the value in
+                    // both layouts, in bytes no payload place covers; it is
+                    // plain data, so the write drops nothing.
+                    unsafe { place.cast::<#tag_name>().write(state, tag) };
                 }
             }
             unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
@@ -307,11 +320,11 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
                         &[#(#costs),*],
                     );
 
-                unsafe fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State, allocator: &mut #a,
+                fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
+                    allocator: &mut #a,
                 ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
-                    unsafe { dcbor::bounded::decode::construction::in_place::enumeration::build(document, index, place, state, allocator) }
+                    dcbor::bounded::decode::construction::in_place::enumeration::build(document, index, slot, allocator)
                 }
             }
             unsafe impl #ig dcbor::bounded::decode::construction::reclamation::Reclaim<#a> for #name #tg #wc {
@@ -321,15 +334,16 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
                     #permit,
                 >;
                 const INITIAL: Self::State = dcbor::bounded::decode::construction::in_place::enumeration::State::INITIAL;
-                unsafe fn reclaim_step(place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State, allocator: &mut #a,
+                fn reclaim_step(
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
+                    allocator: &mut #a,
                 ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
-                    unsafe { dcbor::bounded::decode::construction::in_place::enumeration::reclaim(place, state, allocator) }
+                    dcbor::bounded::decode::construction::in_place::enumeration::reclaim(slot, allocator)
                 }
-                unsafe fn remaining(place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State,
+                fn remaining(
+                    slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::State>,
                 ) -> u64 {
-                    unsafe { dcbor::bounded::decode::construction::in_place::enumeration::remaining::<Self, #a>(place, state) }
+                    dcbor::bounded::decode::construction::in_place::enumeration::remaining::<Self, #a>(slot)
                 }
             }
         };

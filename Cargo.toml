@@ -48,10 +48,13 @@ dcbor-derive = { version = "0.1.0", path = "dcbor-derive", optional = true }
 dcbor-test-support = { path = "tests/support" }
 hex-literal = "^1.1.0"
 indoc = "^2.0.0"
-# tests/charge_identity.rs parses this crate's source to check where charge
-# rules are constructed; syn's major matches dcbor-derive's.
-proc-macro2 = "1"
-syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+# tests/charge_identity.rs and tests/unsafe_census.rs parse this crate's
+# source through one module walk (tests/source_tree); syn's major matches
+# dcbor-derive's. The census records each module's line span, which needs
+# proc-macro2's span locations, and scans items' tokens through quote.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 version-sync = "^0.9.0"
 
 [features]

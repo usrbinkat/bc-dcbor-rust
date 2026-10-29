@@ -3,7 +3,7 @@
 # Keep compile-contract failures from hiding independent runtime regressions.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
-log_dir="${CONTRACT_LOG_DIR:-${TMPDIR:?set TMPDIR to the session scratchpad}/contribution-contracts}"
+log_dir="${CONTRACT_LOG_DIR:-${TMPDIR:?required, or CONTRACT_LOG_DIR: the suites' log directory}/contribution-contracts}"
 mkdir -p "$log_dir" || exit 2
 status=0
 # The verification layer every matrix runs: fast, the default, or

@@ -135,8 +135,8 @@ cargo check --no-default-features --features no_std,derive,num-bigint
 cargo doc --no-deps
 ```
 
-`fuzz/README.md` records the six bounded-input fuzz targets and their build and
-smoke commands. Source availability is not evidence that those runs succeeded.
+`fuzz/README.md` records the nine fuzz targets, `owned_lifecycle` among
+them, and their build and smoke commands. Source availability is not evidence that those runs succeeded.
 The bounded module's executable output-owner example demonstrates separate
 output admission through `Prepared::encode_owned` (fallible allocation,
 initialization admission, permit lifetime and discard on write refusal). It is
@@ -164,12 +164,15 @@ Matrix cost recording and checking are in `data/README.md`. Costs include
 schedule selection; they are not inferred from wall-clock duration.
 
 `bash tests/mutation-evidence.sh`, in the configured development shell,
-measures both layers against the same cargo-mutants domain: storage,
-in-place binding construction/cleanup, owned queue reclamation, owned
-emission and normalizer initialization. The shell supplies cargo-mutants
-and Python; no installation or source-tree mutation is performed by the
-script. Cargo-mutants uses copied build directories and the active Cargo
-wrapper. Each layer first requires a successful unmutated baseline.
+measures both layers against the same cargo-mutants domain, for each of two
+domains: every feature, over storage, in-place binding construction and
+cleanup, owned queue reclamation, owned emission and normalizer
+initialization; and `no_std`, over the owned scope's reclamation, the only
+code of that domain compiled without std and never under every feature.
+The shell supplies cargo-mutants (with `--mutate-unsafe`, so `unsafe fn`
+bodies are in the domain), cargo-llvm-cov and Python; nothing is installed.
+Cargo-mutants uses copied build directories and the active Cargo wrapper.
+Each layer first requires a successful unmutated baseline.
 
 Each layer runs in its own scope of the user's systemd manager, capped at
 `DCBOR_MUTATION_MEMORY` (default `48G`) with no swap and
@@ -179,18 +182,66 @@ test, while the campaign and every other session keep running. A host
 without a running user manager is refused; the campaign never runs
 uncapped. The cap applied is written to `containment.txt` in the logs.
 
-Set `TMPDIR` to the session scratchpad. Logs, source hashes, mutant diffs,
-outcomes and `comparison.json` are retained there. The comparator requires
+`TMPDIR` is required: the campaign's log directory. Logs, source hashes,
+mutant diffs, outcomes and each domain's `comparison.json` are retained
+there, with the run's identity over its whole input closure. The comparator requires
 identical planned mutants and diffs, complete outcomes and identical tool
 versions. It reports each layer's caught count over the common viable
 domain, misses by both, and either direction of detection disagreement.
 Timeouts do not count as detections; incomplete runs, viability differences,
-an empty viable domain, or detection disagreements fail. Equal detection
-does not assert that mutants missed by both layers are harmless. The report
-names them explicitly. Evidence applies only to the measured domain.
+an empty viable domain, or detection disagreements fail. A mutant missed by
+both layers fails the run unless `mutation-equivalents.json` declares it
+equivalent in its domain, by its file, mutation, removed and inserted text,
+with the reason no behavior distinguishes it and that reason's scope; a
+declaration that matches no mutant or several, a duplicate, one of an
+unknown domain, and a declared mutant some layer catches each fail the run.
+Evidence applies only to the measured domains.
+
+A native run cannot observe undefined behavior, so a mutant both layers miss
+in a module that holds `unsafe`, or in a descendant of one, is decided under
+Miri. `tests/unsafe_census.rs` finds those modules from the parsed source (a
+module's own `unsafe` tokens, or a crate `macro_rules!` holding `unsafe`
+that it invokes). Each suite of the Miri gate's selection
+(`tests/miri-suites.txt`) names its mutation domain and is built and run in
+that domain's features, so the `no_std` domain's code (the decode scope's
+abort) is judged by `no_std` builds; an `abort` suite's scenarios each end
+their own process and pass by aborting, natively by SIGABRT and under Miri by
+its abnormal termination with no undefined behavior. A survivor is judged
+only on tests of its own domain. `tests/reach-map.sh` runs every test of the
+selection alone under source-based coverage, built against the forked std,
+its profile written in continuous mode so an aborting scenario keeps its
+coverage, at the minimal witness sizes Miri runs
+(`DCBOR_WITNESS=minimal`) and again at full sizes: it fails when a function
+of such a module is reached by no test Miri runs, or when a minimal witness
+leaves unexecuted a region its full size executes. Test code, a module the
+census finds compiled only under `cfg(test)` or beneath one, is never
+mutated, so it is no trust boundary and need not be reached. Every reader
+of the census parses its rows through one type (`reach-map.py`
+`CensusModule`), which rejects a row of any other shape. The campaign then runs
+the Miri gate unmutated (`tests/miri-owned.sh`, one Miri process per test
+and model, strict provenance, Stacked and Tree Borrows) as the baseline,
+plans each such survivor on exactly the tests whose execution overlaps its
+mutated span, and judges it with `tests/miri-owned.sh --judge`, which
+applies its diff to the working tree, runs those tests under both models
+and reverts it, checking the source snapshot after each. A survivor is then
+`caught_under_miri` or `missed_under_miri`; one with no reaching test
+(`unreached_under_miri`), a selected test without an unmutated pass under
+both models (`no_baseline`), a planned mutant without a verdict
+(`undecided`), a verdict for no planned mutant (`stale`) and two for one
+(`duplicate`) each fail the run, as does a declared equivalent Miri
+catches. Every judgement counts only against a baseline of the same
+identity: sources, locks, features, the forked std and both models'
+`MIRIFLAGS`.
 
 The comparator's planted-defect checks run with:
 
 ```sh
 python3 -B tests/mutation_evidence_test.py
+```
+
+The reach map's census rows and index verdicts (unreached, test code,
+witness loss, a row of another shape) are checked with:
+
+```sh
+python3 -B tests/reach_map_test.py
 ```

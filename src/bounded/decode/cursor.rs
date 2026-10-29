@@ -1,5 +1,8 @@
 //! Retained iterative canonical parser over a complete immutable input.
 use super::comparison::RangeComparison;
+// Named by path: the bare `Place` is the accounting trait `bounded::Place`,
+// which `RetainedPlace::ALL` needs.
+use super::construction::reclamation;
 use super::header::{Header, HeaderState};
 use super::storage::Storage;
 use super::utf8::Utf8;
@@ -7,11 +10,13 @@ use super::*;
 use crate::bounded::text_cursor::TextContinuation;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 use unicode_normalization::IsNormalized;
 mod initialization;
 mod observation;
 mod publication;
 pub use observation::Resources;
+pub(crate) use publication::ArenaParts;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
@@ -74,8 +79,11 @@ pub type Decoder<'a, P> = ParserContinuation<&'a [u8], P>;
 ///   its output's release among them, and its comparison in units of at
 ///   most 64 bytes;
 /// - the node arena and the frame stack ([`storage_growth`]): one unit per
-///   node and per frame pushed and per element relocated, and on cleanup
-///   one unit per element and two releases each, each at most 64 bytes; the
+///   node and per frame pushed and per element relocated, and on cleanup,
+///   plain data, a settled arena discarded in one unit
+///   (`Storage::reclaim_copy_step`) but one cancelled while staging a
+///   growth or relocating drained one unit per element, the most charged,
+///   and two releases each, each at most 64 bytes; the
 ///   arena's nodes and an interrupted text share the input, so cleanup
 ///   drains the more of the two at their extremes, the input all nodes or
 ///   all one text;
@@ -158,7 +166,8 @@ const CLEANUP: Unit<RetainedPlace> = Unit::new(RetainedPlace::Cleanup, 1, 0);
 /// A published parser's cleanup call ([`ParserContinuation::reclaim_step`] at
 /// [`Phase::Finished`]): the one unit it admits, what an owned document's
 /// in-place cleanup charges for its released parser.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 pub(crate) fn finished_cleanup<R>() -> Result<WriteWork, BoundedError<R>> {
     CLEANUP.times(1)
 }
@@ -224,7 +233,10 @@ impl RetainedTerms {
             RetainedPlace::Publication,
             work(Storage::<Frame, P>::step_work(1)?.then(PUBLISH.times(1)?)?),
         );
-        // Cleanup: the arena and the stack drained and cleaned up; the
+        // Cleanup: the arena and the stack drained and cleaned up, each
+        // charged a unit per element, the most it takes: settled, each is
+        // discarded in one unit (`Storage::reclaim_copy_step`), cancelled
+        // while staging a growth or relocating, drained per element; the
         // transitions, and, under normalization, an interrupted text's
         // continuation; every release paid for by its acquisition. The arena's
         // nodes and the interrupted text share the input: a text of `L`
@@ -484,13 +496,16 @@ impl<I, P> ParserContinuation<I, P> {
                 self.normalized = None;
                 self.phase = Phase::ReclaimEntries;
             }
+            // Nodes and frames are plain data: a settled arena of them is
+            // discarded in one unit, whatever it holds; one cancelled while
+            // relocating or staging drains per element, which the bound counts.
             Phase::ReclaimEntries => {
-                if at(cleanup, || self.entries.reclaim_step(allocator))? {
+                if at(cleanup, || self.entries.reclaim_copy_step(allocator))? {
                     self.phase = Phase::ReclaimStack;
                 }
             }
             Phase::ReclaimStack => {
-                if at(cleanup, || self.stack.reclaim_step(allocator))? {
+                if at(cleanup, || self.stack.reclaim_copy_step(allocator))? {
                     self.phase = Phase::Finished;
                     return Ok(true);
                 }
@@ -668,15 +683,21 @@ impl<I, P> ParserContinuation<I, P> {
                 let StoredKind::Text { .. } = self.kind else {
                     return Err(BoundedError::PlanMismatch.into());
                 };
-                // SAFETY: this final-location slot is not exposed until every
-                // initialization step has committed. Its prefix owns no resources.
-                if at(RetainedPlace::NormalizerInit, || unsafe {
-                    TextContinuation::initialize_step(
-                        self.normalizer.as_mut_ptr(),
-                        (),
+                // SAFETY: the normalizer's place is rooted at an exclusive
+                // borrow of its own `MaybeUninit` field, valid, aligned and
+                // writable for it, and no place derived from it outlives this
+                // call; its units are `normalizer_init`, which counts exactly
+                // the units written since the field was last reset. Its
+                // prefix owns no resources, and nothing reads it as a
+                // normalizer until every unit has committed.
+                let normalizer = unsafe {
+                    reclamation::Slot::new(
+                        reclamation::Place::root(NonNull::from(&mut self.normalizer)),
                         &mut self.normalizer_init,
-                        allocator,
                     )
+                };
+                if at(RetainedPlace::NormalizerInit, || {
+                    TextContinuation::initialize_step(normalizer, (), allocator)
                 })? {
                     self.phase = Phase::Normalize;
                 }
@@ -804,7 +825,7 @@ impl<I, P> ParserContinuation<I, P> {
             }
             Phase::ReleaseStack => {
                 if at(RetainedPlace::Publication, || {
-                    self.stack.reclaim_step(allocator)
+                    self.stack.reclaim_copy_step(allocator)
                 })? {
                     self.phase = Phase::Publish;
                 }
@@ -879,15 +900,16 @@ impl<I, P> ParserContinuation<I, P> {
 
 /// Place attribution of the retained parse, which this crate's tests record
 /// under `std`.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::*;
     use crate::bounded::places::{self, Factor, Ledgered, Permit, Run, STORAGE, WORK};
     use crate::{ByteString, CBOR, Map};
 
-    /// Where a parse is cancelled into its cleanup: once it reaches the
-    /// phase, after that many more steps.
-    type Cancel = Option<(Phase, usize)>;
+    /// Where a parse is cancelled into its cleanup: before the first step
+    /// whose resources the condition holds of.
+    type Cancel = Option<fn(&Resources) -> bool>;
 
     #[test]
     fn publication_of_a_drained_stack_charges_only_two_transitions() {
@@ -986,8 +1008,12 @@ mod attribution {
                     None,
                 )
             }
-            // Half the input nodes, drained, and half an undecided text whose
-            // normalization is interrupted.
+            // Half the input nodes, discarded in one unit, and half an
+            // undecided text whose normalization is interrupted while its
+            // characters relocate their last growth, so cleanup drains them
+            // one per unit, as its term charges: a leading mark and 150
+            // letters of two parts are 301 parts, filling a capacity of 256
+            // whose growth relocates all 256.
             RetainedPlace::Cleanup => {
                 let mut items = vec![CBOR::from(0u64); 300];
                 items.push(CBOR::from(
@@ -997,7 +1023,13 @@ mod attribution {
                     "cancelled text",
                     CBOR::from(items).to_cbor_data(),
                     Options::normalizing(1),
-                    Some((Phase::Normalize, 100)),
+                    Some(|resources| {
+                        resources.normalizer.is_some_and(|normalizer| {
+                            normalizer.characters.stage
+                                == super::super::storage::StorageStage::Relocating
+                                && normalizer.characters.relocating_remaining >= 256
+                        })
+                    }),
                 )
             }
         }
@@ -1035,29 +1067,20 @@ mod attribution {
         let mut parser = Decoder::<Permit>::new(input, options);
         let bound = retained_decode_bound::<Permit, ()>(input.len() as u64, options)
             .expect("the bound of a fixture fits in u64");
-        let mut remaining = None;
         let mut rejected = false;
         let document = crate::bounded::within(name, bound, || {
-            if let Some((phase, steps)) = cancel {
-                if remaining.is_none() && parser.position().phase == phase {
-                    remaining = Some(steps);
-                }
-                if remaining == Some(0) {
-                    crate::bounded::within(name, bound, || {
-                        if parser
-                            .reclaim_step(&mut policy)
-                            .expect("an unlimited policy never refuses")
-                        {
-                            core::ops::ControlFlow::Break(())
-                        } else {
-                            core::ops::ControlFlow::Continue(())
-                        }
-                    });
-                    return core::ops::ControlFlow::Break(None);
-                }
-                if let Some(remaining) = remaining.as_mut() {
-                    *remaining -= 1;
-                }
+            if cancel.is_some_and(|cancel| cancel(&parser.resources())) {
+                crate::bounded::within(name, bound, || {
+                    if parser
+                        .reclaim_step(&mut policy)
+                        .expect("an unlimited policy never refuses")
+                    {
+                        core::ops::ControlFlow::Break(())
+                    } else {
+                        core::ops::ControlFlow::Continue(())
+                    }
+                });
+                return core::ops::ControlFlow::Break(None);
             }
             match parser.step(&mut policy) {
                 Ok(Step::Progress) => core::ops::ControlFlow::Continue(()),

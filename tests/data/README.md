@@ -80,7 +80,8 @@ and one-pass refusal must leave successful admission traces unchanged.
 
 The same recording command also records matrix costs for both rigor layers
 and all four feature projections. Set `DCBOR_COST_REASON` to the mechanism
-explaining the change and `TMPDIR` to the session scratchpad:
+explaining the change. `TMPDIR` is required: the recorder's staging
+directory.
 
 ```sh
 DCBOR_COST_REASON='Describe the verified mechanism here' bash tests/record-evidence.sh record

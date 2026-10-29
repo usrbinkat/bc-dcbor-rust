@@ -2,8 +2,8 @@
 1554182	787264	joint	invalid	flat array: total allocated
 590272	590080	joint	invalid	flat array: total peak
 4099	4096	joint	published	long text: total retained
-964566	57892	joint	published	undecided text: total bytes
-65835	12807	joint	published	undecided text: total values
+964566	54684	joint	published	undecided text: total bytes
+65835	12007	joint	published	undecided text: total values
 1203	1200	measured	published	witness of Copies: Copies allocated
 1243	1240	measured	published	witness of Copies: Copies bytes
 1203	1200	measured	published	witness of Copies: Copies peak

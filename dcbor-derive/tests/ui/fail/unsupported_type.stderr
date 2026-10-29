@@ -1,3 +1,21 @@
+error[E0277]: the trait bound `VecDeque<bool>: TransferableSchema` is not satisfied
+ --> tests/ui/fail/unsupported_type.rs:3:10
+  |
+3 | #[derive(CBORBoundedEncodable)]
+  |          ^^^^^^^^^^^^^^^^^^^^ the trait `TransferableSchema` is not implemented for `VecDeque<bool>`
+  |
+  = help: the following other types implement trait `TransferableSchema`:
+            &T
+            Arc<T>
+            BTreeMap<K, V>
+            Box<T>
+            Date
+            Option<T>
+            StableOption<T, A>
+            String
+          and $N others
+  = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)
+
 error[E0277]: the trait bound `VecDeque<bool>: Schema` is not satisfied
  --> tests/ui/fail/unsupported_type.rs:3:10
   |

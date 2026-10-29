@@ -223,7 +223,8 @@ pub fn written() -> Legality<Written> {
 /// completing the option. Cleaned: no metadata completes at once, the
 /// marker and admissions reset; empty or absent reaches `Release`; the
 /// payload's own cleanup units, the last reaching `Release`; the metadata's
-/// release completes.
+/// release completes, the marker reset with it. Every completing unit leaves
+/// the initial state, so a later build starts from it.
 pub fn optional<S: Copy + PartialEq + 'static>(
     child: Legality<S>,
 ) -> Legality<OptionalObservation<S>> {
@@ -324,17 +325,10 @@ pub fn optional<S: Copy + PartialEq + 'static>(
                         _ => false,
                     }
             }
-            (
-                Held {
-                    present,
-                    phase: Release,
-                    ..
-                },
-                after,
-            ) => {
+            (Held { phase: Release, .. }, after) => {
                 after
                     == Unallocated {
-                        present,
+                        present: false,
                         admitted: Admitted::Nothing,
                     }
             }
@@ -368,7 +362,8 @@ pub fn optional<S: Copy + PartialEq + 'static>(
 /// writes the option. Cleaned: no block completes at once, the decision and
 /// admissions reset; the payload's own cleanup units, in `Build` and
 /// `Publish` alike, the last reaching `Clean`; the block's release
-/// completes.
+/// completes, the decision reset with it. Every completing unit leaves the
+/// initial state, so a later build starts from it.
 pub fn stable_option<S: Copy + PartialEq + 'static>(
     child: Legality<S>,
 ) -> Legality<StableOptionObservation<S>> {
@@ -465,17 +460,10 @@ pub fn stable_option<S: Copy + PartialEq + 'static>(
                         _ => false,
                     }
             }
-            (
-                Held {
-                    decision,
-                    phase: Clean,
-                    ..
-                },
-                after,
-            ) => {
+            (Held { phase: Clean, .. }, after) => {
                 after
                     == Unallocated {
-                        decision,
+                        decision: Decision::Undecided,
                         admitted: Admitted::Nothing,
                     }
             }

@@ -3,12 +3,11 @@
 #[path = "../support/policy.rs"]
 mod policy;
 
-use core::{mem::MaybeUninit, ptr::NonNull};
 use dcbor::bounded::decode::construction::in_place::{
     Built, ConstructionCost, InPlace, plus, step, unit,
 };
 use dcbor::bounded::decode::construction::reclamation::{
-    MAX_DISPATCH_DEPTH, Reclaim, Reclaimed, Written,
+    MAX_DISPATCH_DEPTH, PeekSlot, Reclaim, Reclaimed, Slot, Written,
 };
 use dcbor::bounded::decode::construction::{Borrowed, OwnedInitialized, TypedDecoder};
 use dcbor::bounded::decode::{ConstructResult, Document, Options};
@@ -21,17 +20,13 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
     type State = Written;
     const INITIAL: Written = Written::Empty;
 
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(mut slot: Slot<'_, Self, Written>, a: &mut A) -> BoundedResult<Reclaimed, A> {
         step(a)?;
-        *state = Written::Empty;
+        *slot.custody() = Written::Empty;
         Ok(Reclaimed::Done)
     }
 
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
         1
     }
 }
@@ -39,15 +34,14 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
 unsafe impl<A: Allocator> InPlace<A> for AtLimit {
     const COST: ConstructionCost = ConstructionCost::fixed(plus(unit(0), unit(0)));
 
-    unsafe fn build_step(
+    fn build_step(
         _: &Document<'_, A::Permit>,
         _: usize,
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
+        mut slot: Slot<'_, Self, Written>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
         step(a)?;
-        *state = Written::Initialized;
+        *slot.custody() = Written::Initialized;
         Ok(Built::Done)
     }
 }

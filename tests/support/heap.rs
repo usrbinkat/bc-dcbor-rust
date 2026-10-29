@@ -97,11 +97,12 @@ pub fn reservation_released(_: u64) {
     let _ = RESERVATION_RELEASES.try_with(|count| count.set(count.get().wrapping_add(1)));
 }
 
-/// Install the reservation witness before the policy is shared or used.
+/// Install the reservation witness before the policy is shared or used. The
+/// callback only updates a const-initialized TLS Cell: it does bounded,
+/// nonblocking work, allocates nothing and does not panic, as the policy's
+/// release contract requires.
 pub fn observe_releases(m: dcbor::bounded::Limits) -> dcbor::bounded::Limits {
-    // SAFETY: the callback only updates a const-initialized TLS Cell; it
-    // neither allocates, panics, nor accesses the policy.
-    unsafe { m.observe_releases(reservation_released) }
+    m.observe_releases(reservation_released)
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {

@@ -1,8 +1,5 @@
 //! Construction directly into a reclamation-owned stable destination.
-use core::mem::MaybeUninit;
-use core::ptr::NonNull;
-
-use super::reclamation::{Reclaim, Reclaimed, Written};
+use super::reclamation::{PeekSlot, Reclaim, Reclaimed, Slot, Written};
 use super::{node_at, wrong_type};
 use crate::bounded::decode::{ConstructResult, Document, Kind};
 use crate::bounded::{
@@ -255,12 +252,21 @@ pub(crate) fn rejected<A: Allocator>(a: &mut A) -> ConstructResult<Built, A> {
 /// Constructs into stable storage and shares its initialization state with
 /// mandatory incremental cleanup. Completion carries no value by value.
 ///
+/// The destination is received as a [`Slot`], its place and its state
+/// together, so a caller holding one has nothing to promise.
+///
 /// # Safety
 /// Each write must be admitted before execution. [`Reclaim::INITIAL`] means
 /// uninitialized storage. Every successful write or acquired resource must be
 /// represented in the state before returning, including on error. Done means
 /// the destination is fully initialized. No pointer may escape construction;
 /// cleanup must be valid after every call. There is no synchronous Drop fallback.
+/// The destination is reached only through its slot's place, which keeps its
+/// provenance for its whole life: a place a step derives within it stays
+/// valid in every later step. Every method is sound for every call a slot's
+/// holder can make, in any order: a build from a state it does not continue
+/// (completed, cleaning up, or another phase's) is refused with
+/// [`BoundedError::PlanMismatch`] and changes nothing.
 pub unsafe trait InPlace<A: Allocator>: Reclaim<A> {
     const OPTIONAL: bool = false;
 
@@ -272,39 +278,29 @@ pub unsafe trait InPlace<A: Allocator>: Reclaim<A> {
     const COST: ConstructionCost;
 
     /// Construct a present map field, distinct from standalone nullable values.
-    ///
-    /// # Safety
-    /// The destination and state satisfy build_step's requirements.
-    unsafe fn build_present(
+    fn build_present(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        slot: Slot<'_, Self, Self::State>,
         allocator: &mut A,
     ) -> ConstructResult<Built, A> {
-        unsafe { Self::build_step(document, index, place, state, allocator) }
+        Self::build_step(document, index, slot, allocator)
     }
     /// Initialize an omitted map field. Required fields reject omission.
-    ///
-    /// # Safety
-    /// The destination and state satisfy the same requirements as build_step.
-    unsafe fn build_absent(
-        _place: NonNull<MaybeUninit<Self>>,
-        _state: &mut Self::State,
+    fn build_absent(
+        _slot: Slot<'_, Self, Self::State>,
         _allocator: &mut A,
     ) -> ConstructResult<Built, A> {
         Err(crate::bounded::decode::DecodeError::Invalid(
             crate::Error::MissingMapKey,
         ))
     }
-    /// # Safety
-    /// The destination is unique, stable, and paired with this state for its
-    /// entire construction and reclamation lifetime.
-    unsafe fn build_step(
+    /// One unit of construction of the value in `slot` from the document
+    /// node at `index`.
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        slot: Slot<'_, Self, Self::State>,
         allocator: &mut A,
     ) -> ConstructResult<Built, A>;
 }
@@ -324,27 +320,31 @@ macro_rules! integers {
             type State = Written;
             const INITIAL: Written = Written::Empty;
 
-            unsafe fn reclaim_step(
-                _: NonNull<MaybeUninit<Self>>, state: &mut Written, a: &mut A,
+            /// An integer owns nothing, so its one cleanup unit, from either
+            /// state, only marks it empty: repeated, it changes nothing.
+            fn reclaim_step(
+                mut slot: Slot<'_, Self, Written>, a: &mut A,
             ) -> BoundedResult<Reclaimed, A> {
                 STEP.admit(a)?;
-                *state = Written::Empty;
+                *slot.custody() = Written::Empty;
                 Ok(Reclaimed::Done)
             }
 
             /// One call, which is `Done`.
-            unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+            fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
                 1
             }
         }
-        // SAFETY: one admitted scalar write initializes the complete value.
+        // SAFETY: one admitted scalar write initializes the complete value,
+        // only from the empty state.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
             const COST: ConstructionCost = scalar_cost::<$ty>();
 
-            unsafe fn build_step(
+            fn build_step(
                 document: &Document<'_, A::Permit>, index: usize,
-                place: NonNull<MaybeUninit<Self>>, state: &mut Written, a: &mut A,
+                mut slot: Slot<'_, Self, Written>, a: &mut A,
             ) -> ConstructResult<Built, A> {
+                let (place, state) = slot.parts();
                 if *state != Written::Empty { return Err(BoundedError::PlanMismatch.into()); }
                 sized::<Self>().admit(a)?;
                 let number = match node_at(document, index).map(|node| node.kind()) {
@@ -353,8 +353,9 @@ macro_rules! integers {
                     _ => return Err(wrong_type()),
                 };
                 let value = Self::try_from(number).map_err(|_| crate::bounded::decode::DecodeError::Invalid(crate::Error::OutOfRange))?;
-                // SAFETY: caller guarantees unique, aligned scalar storage.
-                unsafe { place.as_ptr().write(MaybeUninit::new(value)) };
+                // SAFETY: the slot pairs the place with this state, which is
+                // empty: nothing to drop, the write admitted above.
+                unsafe { place.write(state, value) };
                 *state = Written::Initialized;
                 Ok(Built::Done)
             }
@@ -369,4 +370,117 @@ integers!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
 /// found by that same write unit.
 pub(crate) const fn scalar_cost<T>() -> ConstructionCost {
     ConstructionCost::fixed(plus(sized::<T>().bound(), STEP_COST))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::reclamation::{Build, Place};
+    use super::*;
+    use crate::bounded::Limits;
+    use crate::bounded::decode::DecodeError;
+    use core::{mem::MaybeUninit, ptr::NonNull};
+
+    fn bound(values: u64, bytes: u64, allocated: u64, peak: u64, retained: u64) -> ResourceBound {
+        ResourceBound {
+            values,
+            bytes,
+            allocated,
+            peak,
+            retained,
+        }
+    }
+
+    /// The cost algebra every binding's `COST` is evaluated by in constants,
+    /// run at run time with exact values: sums and multiples per quantity,
+    /// the larger of each quantity, a unit's one value and its bytes, a held
+    /// allocation, and a cost's children paying each fixed part and a
+    /// rounding unit per byte, in sixty-fourths.
+    #[test]
+    fn the_cost_algebra_sums_scales_and_bounds_each_quantity() {
+        let a = bound(1, 2, 3, 4, 5);
+        let b = bound(10, 1, 30, 2, 50);
+        let zero = ResourceBound::default();
+        assert_eq!(plus(a, b), bound(11, 3, 33, 6, 55));
+        assert_eq!(times(a, 3), bound(3, 6, 9, 12, 15));
+        assert_eq!(larger(a, b), bound(10, 2, 30, 4, 50));
+        assert_eq!(unit(5), bound(1, 5, 0, 0, 0));
+        assert_eq!(held(7), bound(0, 0, 7, 7, 7));
+        let fixed = ConstructionCost::fixed(a);
+        assert_eq!(
+            fixed,
+            ConstructionCost {
+                fixed: a,
+                per_byte: zero
+            }
+        );
+        let per_byte = ConstructionCost::per_byte(b);
+        assert_eq!(
+            per_byte,
+            ConstructionCost {
+                fixed: zero,
+                per_byte: bound(640, 64, 1920, 128, 3200)
+            }
+        );
+        let both = ConstructionCost {
+            fixed: a,
+            per_byte: bound(640, 64, 1920, 128, 3200),
+        };
+        assert_eq!(fixed.plus(per_byte), both);
+        assert_eq!(fixed.larger(per_byte), both);
+        assert_eq!(
+            ConstructionCost::fixed(b).larger(fixed),
+            ConstructionCost::fixed(bound(10, 2, 30, 4, 50))
+        );
+        // Each child's fixed part and one rounding unit, (2, 3, 4, 5, 6),
+        // paid at 64 sixty-fourths a byte beside its own per-byte part.
+        assert_eq!(
+            both.children(),
+            ConstructionCost {
+                fixed: zero,
+                per_byte: bound(768, 256, 2176, 448, 3584)
+            }
+        );
+        // A scalar: one write of its own bytes and one step, nothing held.
+        assert_eq!(
+            scalar_cost::<u64>(),
+            ConstructionCost::fixed(bound(2, 8, 0, 0, 0))
+        );
+        assert_eq!(scalar_cost::<u64>(), <u64 as InPlace<Limits>>::COST);
+    }
+
+    #[test]
+    #[should_panic(expected = "a construction cost exceeds u64")]
+    fn a_cost_sum_beyond_u64_panics() {
+        plus(bound(u64::MAX, 0, 0, 0, 0), bound(1, 0, 0, 0, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "a construction cost exceeds u64")]
+    fn a_cost_multiple_beyond_u64_panics() {
+        times(bound(0, u64::MAX, 0, 0, 0), 2);
+    }
+
+    /// A binding that does not implement absence keeps the default: an
+    /// omitted field is rejected as a missing key, nothing admitted and the
+    /// value left uninitialized.
+    #[test]
+    fn an_omitted_field_of_a_binding_without_absence_is_a_missing_key() {
+        let mut value = MaybeUninit::<u64>::uninit();
+        let mut state = <u64 as Reclaim<Limits>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its
+        // initial state; nothing else reaches either while the slot lives.
+        let slot = unsafe {
+            Slot::new(
+                Place::<u64, Build>::root(NonNull::from(&mut value)),
+                &mut state,
+            )
+        };
+        let mut m = Limits::unlimited().logged();
+        assert!(matches!(
+            <u64 as InPlace<Limits>>::build_absent(slot, &mut m),
+            Err(DecodeError::Invalid(crate::Error::MissingMapKey))
+        ));
+        assert_eq!(state, Written::Empty, "a refused omission initialized");
+        assert_eq!(m.attempts(), 0, "a refused omission admitted work");
+    }
 }

@@ -7,25 +7,27 @@
 //! rate, invisible to the attribution checks when its amounts equal the
 //! first's; this check refuses it and names the site.
 //!
-//! The walk follows the module tree from `src/lib.rs` as the compiler does,
-//! every feature-gated module included, and fails on any source file it does
-//! not reach. Code compiled only under `cfg(test)` is exempt: its probes
-//! build rules of their own. The rule types are `pub(crate)`, so neither
-//! derived code nor another crate can construct one: this crate's source is
-//! the whole domain.
+//! The walk follows the module tree from `src/lib.rs` as the compiler does
+//! (`source_tree`, shared with every source check of this crate), every
+//! feature-gated module included, and fails on any source file it does not
+//! reach. Code compiled only under `cfg(test)` is exempt: its probes build
+//! rules of their own. The rule types are `pub(crate)`, so neither derived
+//! code nor another crate can construct one: this crate's source is the
+//! whole domain.
 
-use std::collections::BTreeSet;
+mod source_tree;
+
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{Spacing, TokenStream, TokenTree};
-use syn::punctuated::Punctuated;
+use source_tree::{Tree, test_only};
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Expr, ExprConst, ExprPath, ExprStruct, ImplItem, ImplItemConst, ImplItemFn, Item,
-    ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemTrait, ItemType, Local, Macro, Meta,
-    TraitItem, TraitItemConst, TraitItemFn, Type, UseRename,
+    ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemTrait, ItemType, Local, Macro, TraitItem,
+    TraitItemConst, TraitItemFn, Type, UseRename,
 };
 
 /// The charge rule types.
@@ -41,69 +43,28 @@ const FIX: &str = "define the rule once as a `const` item (or return it from a `
 /// What an alias or a renamed import of a rule type is reported with.
 const HIDDEN: &str = "hiding its constructions from this check; name the rule type itself";
 
-/// One walk over a module tree: the files it reached, what it found, and how
-/// many constructions it found in constant contexts.
+/// One walk over a module tree: the shared tree, whose faults hold what the
+/// walk could not resolve and every violation found, in the order found, and
+/// how many constructions it found in constant contexts.
 struct Walk {
-    root: PathBuf,
-    reached: BTreeSet<PathBuf>,
-    violations: Vec<String>,
+    tree: Tree,
     defined: usize,
 }
 
 impl Walk {
     fn new(root: PathBuf) -> Self {
         Self {
-            root,
-            reached: BTreeSet::new(),
-            violations: Vec::new(),
+            tree: Tree::new(root),
             defined: 0,
-        }
-    }
-
-    /// `path` relative to the walk's root, as diagnostics name it.
-    fn shown(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.root) {
-            Ok(relative) => relative.display().to_string(),
-            Err(_) => path.display().to_string(),
         }
     }
 
     /// Check the module file at `path`, declared at `scope`.
     fn module_file(&mut self, path: &Path, scope: Vec<String>, exempt: bool) {
-        let shown = self.shown(path);
-        if !self.reached.insert(path.to_path_buf()) {
-            self.violations
-                .push(format!("{shown}: declared as a module twice"));
-            return;
-        }
-        let source = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(error) => {
-                self.violations
-                    .push(format!("{shown}: cannot be read: {error}"));
-                return;
-            }
-        };
-        let file = match syn::parse_file(&source) {
-            Ok(file) => file,
-            Err(error) => {
-                self.violations
-                    .push(format!("{shown}: does not parse: {error}"));
-                return;
-            }
-        };
-        let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) else {
-            self.violations
-                .push(format!("{shown}: has no directory or no name"));
+        let Some(file) = self.tree.load(path) else {
             return;
         };
-        // A `lib.rs`, `main.rs` or `mod.rs` holds its children beside it;
-        // any other module file in the directory of its own name.
-        let module_dir = match path.file_name().and_then(|name| name.to_str()) {
-            Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
-            _ => parent.join(stem),
-        };
-        Checker::new(self, shown, module_dir, scope, exempt).visit_file(&file);
+        Checker::new(self, file.shown, file.module_dir, scope, exempt).visit_file(&file.syntax);
     }
 }
 
@@ -143,20 +104,25 @@ impl<'w> Checker<'w> {
         }
     }
 
-    fn located(&self, what: &str) -> String {
+    /// Where the current node is: its file and the items enclosing it.
+    fn location(&self) -> String {
         let scope = if self.scope.is_empty() {
             "crate root".to_string()
         } else {
             self.scope.join(" > ")
         };
-        format!("{}: {scope}: {what}", self.file)
+        format!("{}: {scope}", self.file)
+    }
+
+    fn located(&self, what: &str) -> String {
+        format!("{}: {what}", self.location())
     }
 
     /// A violation in the code itself, which test-only code may commit.
     fn report(&mut self, what: &str) {
         if !self.exempt {
             let located = self.located(what);
-            self.walk.violations.push(located);
+            self.walk.tree.faults.push(located);
         }
     }
 
@@ -164,7 +130,7 @@ impl<'w> Checker<'w> {
     /// fails to see, it cannot check.
     fn fault(&mut self, what: &str) {
         let located = self.located(what);
-        self.walk.violations.push(located);
+        self.walk.tree.faults.push(located);
     }
 
     /// A rule constructed as `shown`, written directly or `within` the
@@ -239,28 +205,19 @@ impl<'w> Checker<'w> {
         }
     }
 
-    /// The out-of-line module `name`, at exactly one of its two paths.
-    fn declared(&mut self, module: &ItemMod, name: &str) {
-        if module.attrs.iter().any(|attr| attr.path().is_ident("path")) {
-            self.fault(&format!(
-                "`#[path]` on `mod {name}` is not modeled; extend the walk to resolve it"
-            ));
-            return;
-        }
-        let candidates = [
-            self.module_dir.join(format!("{name}.rs")),
-            self.module_dir.join(name).join("mod.rs"),
-        ];
-        let found: Vec<&PathBuf> = candidates.iter().filter(|path| path.is_file()).collect();
-        match found.as_slice() {
-            [path] => {
-                let path = (*path).clone();
-                let scope = self.scope.clone();
-                let exempt = self.exempt;
-                self.walk.module_file(&path, scope, exempt);
-            }
-            [] => self.fault(&format!("`mod {name}` resolves to none of {candidates:?}")),
-            _ => self.fault(&format!("`mod {name}` resolves to both of {candidates:?}")),
+    /// The out-of-line module `module`, at exactly one of its two paths
+    /// ([`Tree::declared`]).
+    fn declared(&mut self, module: &ItemMod) {
+        let location = self.location();
+        let module_dir = self.module_dir.clone();
+        let found = self
+            .walk
+            .tree
+            .declared(&module_dir, module, |what| format!("{location}: {what}"));
+        if let Some(path) = found {
+            let scope = self.scope.clone();
+            let exempt = self.exempt;
+            self.walk.module_file(&path, scope, exempt);
         }
     }
 }
@@ -274,35 +231,6 @@ fn type_name(ty: &Type) -> Option<String> {
             .last()
             .map(|segment| segment.ident.to_string()),
         _ => None,
-    }
-}
-
-/// Whether `attrs` compile their item only under `cfg(test)`: `test`, or
-/// `all(..)` with a predicate that requires it. `not(test)` and
-/// `any(test, ..)` also compile outside tests.
-fn test_only(attrs: &[Attribute]) -> syn::Result<bool> {
-    for attr in attrs {
-        if attr.path().is_ident("cfg") && requires_test(&attr.parse_args::<Meta>()?)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn requires_test(meta: &Meta) -> syn::Result<bool> {
-    match meta {
-        Meta::Path(path) => Ok(path.is_ident("test")),
-        Meta::List(list) if list.path.is_ident("all") => {
-            let nested =
-                list.parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated)?;
-            for meta in &nested {
-                if requires_test(meta)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        Meta::List(_) | Meta::NameValue(_) => Ok(false),
     }
 }
 
@@ -459,7 +387,7 @@ impl<'ast> Visit<'ast> for Checker<'_> {
                 visit::visit_item_mod(this, module);
                 this.module_dir = outer;
             }
-            None => this.declared(module, &name),
+            None => this.declared(module),
         });
     }
 
@@ -584,45 +512,19 @@ impl<'ast> Visit<'ast> for Checker<'_> {
     }
 }
 
-/// Every `.rs` file under `dir`.
-fn sources(dir: &Path, files: &mut BTreeSet<PathBuf>) {
-    let entries = fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
-            .path();
-        if path.is_dir() {
-            sources(&path, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            files.insert(path);
-        }
-    }
-}
-
 /// The walk of the crate at `root` from `src/lib.rs`, every source file under
 /// `src` it did not reach reported.
 fn crate_walk(root: &Path) -> Walk {
     let mut walk = Walk::new(root.to_path_buf());
     walk.module_file(&root.join("src").join("lib.rs"), Vec::new(), false);
-    let mut files = BTreeSet::new();
-    sources(&root.join("src"), &mut files);
-    let unreached: Vec<String> = files
-        .difference(&walk.reached)
-        .map(|file| {
-            format!(
-                "{}: is not reached from src/lib.rs, so this check cannot see what it compiles",
-                walk.shown(file)
-            )
-        })
-        .collect();
-    walk.violations.extend(unreached);
+    walk.tree.unreached();
     walk
 }
 
 #[test]
 fn every_charge_rule_of_this_crate_is_defined_in_a_constant() {
     let walk = crate_walk(Path::new(env!("CARGO_MANIFEST_DIR")));
-    assert!(walk.violations.is_empty(), "{:#?}", walk.violations);
+    assert!(walk.tree.faults.is_empty(), "{:#?}", walk.tree.faults);
     assert!(
         walk.defined > 0,
         "no charge rule was found in a constant: the walk saw none of src/bounded.rs's \
@@ -644,7 +546,7 @@ fn checked(source: &str) -> (Vec<String>, usize) {
         false,
     )
     .visit_file(&file);
-    (walk.violations, walk.defined)
+    (walk.tree.faults, walk.defined)
 }
 
 fn outside(scope: &str, site: &str) -> String {
@@ -786,7 +688,7 @@ fn the_walk_reaches_every_source_file_or_fails() {
     let walk = crate_walk(&root);
     let candidates = [src.join("missing.rs"), src.join("missing").join("mod.rs")];
     assert_eq!(
-        walk.violations,
+        walk.tree.faults,
         vec![
             format!(
                 "src/present.rs: mod present > fn admit: `Unit::new` constructs a charge \

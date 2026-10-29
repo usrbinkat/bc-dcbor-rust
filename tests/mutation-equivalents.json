@@ -1,0 +1,56 @@
+[
+  {
+    "domain": "all-features",
+    "file": "src/bounded/decode/construction/in_place/optional.rs",
+    "mutation": "replace <impl Placeholder for String>::placeholder -> Self with Default::default()",
+    "source": "String::new()",
+    "mutated": "Default::default() /* ~ changed by cargo-mutants ~ */",
+    "rationale": "String's Default is String::new(): the same empty, unallocated value, so no behavior distinguishes the two expressions.",
+    "scope": "The concrete type String; not a claim about new() and Default for other types."
+  },
+  {
+    "domain": "all-features",
+    "file": "src/bounded/decode/construction/in_place/optional.rs",
+    "mutation": "replace <impl Placeholder for Vec<T>>::placeholder -> Self with Default::default()",
+    "source": "Vec::new()",
+    "mutated": "Default::default() /* ~ changed by cargo-mutants ~ */",
+    "rationale": "Vec<T>'s Default is Vec::new(): the same empty, unallocated value, so no behavior distinguishes the two expressions.",
+    "scope": "The concrete type Vec<T>, every T; not a claim about new() and Default for other types."
+  },
+  {
+    "domain": "all-features",
+    "file": "src/bounded/decode/construction/in_place/btree.rs",
+    "mutation": "replace > with >=",
+    "source": "const DISPATCH_DEPTH: usize = if K::DISPATCH_DEPTH > V::DISPATCH_DEPTH {",
+    "mutated": "const DISPATCH_DEPTH: usize = if K::DISPATCH_DEPTH >= /* ~ changed by cargo-mutants ~ */ V::DISPATCH_DEPTH {",
+    "rationale": "The comparison selects which child's depth to add one to; > and >= differ only when the depths are equal, where both branches yield the same depth plus one.",
+    "scope": "BTreeMap<K, V>'s dispatch depth, every K and V."
+  },
+  {
+    "domain": "all-features",
+    "file": "src/bounded/decode/construction/in_place/text.rs",
+    "mutation": "replace - with +",
+    "source": "const COPIED: u64 = COPY.cap() - (char::MAX.len_utf8() as u64 - 1);",
+    "mutated": "const COPIED: u64 = COPY.cap() - (char::MAX.len_utf8() as u64 + /* ~ changed by cargo-mutants ~ */ 1);",
+    "rationale": "COPIED's only use is PER_BYTE_SCALE.div_ceil(COPIED) in buffer_cost; this makes COPIED 59 for 61, and div_ceil(64, c) is 2 for every c from 33 to 63, so the cost is unchanged.",
+    "scope": "COPIED with a 64-byte quantum and PER_BYTE_SCALE of 64; a change to either reopens it."
+  },
+  {
+    "domain": "all-features",
+    "file": "src/bounded/decode/construction/in_place/text.rs",
+    "mutation": "replace - with /",
+    "source": "const COPIED: u64 = COPY.cap() - (char::MAX.len_utf8() as u64 - 1);",
+    "mutated": "const COPIED: u64 = COPY.cap() - (char::MAX.len_utf8() as u64 / /* ~ changed by cargo-mutants ~ */ 1);",
+    "rationale": "COPIED's only use is PER_BYTE_SCALE.div_ceil(COPIED) in buffer_cost; this makes COPIED 60 for 61, and div_ceil(64, c) is 2 for every c from 33 to 63, so the cost is unchanged.",
+    "scope": "COPIED with a 64-byte quantum and PER_BYTE_SCALE of 64; a change to either reopens it."
+  },
+  {
+    "domain": "no_std",
+    "file": "src/bounded/decode/construction/reclamation/owned.rs",
+    "mutation": "replace abort::<impl Drop for Abort>::drop with ()",
+    "source": "panic!(\"dcbor aborted: a scope or cleanup step could not continue\");",
+    "mutated": "() /* ~ changed by cargo-mutants ~ */",
+    "rationale": "Without the inner panic, abort unwinds instead of aborting; it aborts all the same wherever it is reachable. Called from the terminal drain on a refused cleanup, the unwind passes the drain's AbortOnUnwind guard, whose drop calls abort while unwinding, a panic while panicking, which aborts (the abort witness's defective-record child dies of SIGABRT under this mutant). Called from an AbortOnUnwind guard, the drain's or a release observer's (Reservation::drop), it already runs while unwinding. Its other callers are unreachable: release_last's check after the last reference's drain, which runs with no other holder and so cannot leave a record outstanding, and add_reference past isize::MAX live references.",
+    "scope": "The no_std build of the crate's abort; a new caller of abort outside an AbortOnUnwind guard, other than the two unreachable ones, reopens it."
+  }
+]

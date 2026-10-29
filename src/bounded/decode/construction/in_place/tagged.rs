@@ -5,42 +5,35 @@ use crate::bounded::decode::construction::stable::{self, Installed};
 
 /// Generated aligned projections for a tagged schema's untagged payload.
 ///
+/// Each callback receives a [`Slot`] of the tagged value's place and its
+/// untagged payload's state: a caller holding one has nothing to promise.
+///
 /// # Safety
 /// [`Self::UNTAGGED`] must be the payload construction's initial state. The
 /// callbacks must retain the destination and payload state and obey InPlace
-/// and Reclaim respectively. They must not inspect or initialize the outer
-/// tag.
+/// and Reclaim respectively, sound for every call in any order. They must not
+/// inspect or initialize the outer tag.
 pub unsafe trait Payload<A: Allocator>: Sized {
     const TAG: u64;
     /// The construction state of the untagged payload, and its custody.
     type Untagged: Custody;
     /// The untagged payload's state before anything is built.
     const UNTAGGED: Self::Untagged;
-    /// # Safety
-    /// The destination and state obey InPlace::build_step's contract.
-    unsafe fn build_payload(
+    /// One unit of construction of the untagged payload.
+    fn build_payload(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Untagged,
+        slot: Slot<'_, Self, Self::Untagged>,
         a: &mut A,
     ) -> ConstructResult<Built, A>;
-    /// # Safety
-    /// The destination and state are the original payload construction pair.
-    unsafe fn reclaim_payload(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Untagged,
+    /// One unit of cleanup of the untagged payload.
+    fn reclaim_payload(
+        slot: Slot<'_, Self, Self::Untagged>,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A>;
-    /// The calls [`Self::reclaim_payload`] still takes from `state`: the
-    /// untagged payload's [`Reclaim::remaining`].
-    ///
-    /// # Safety
-    /// As [`Self::reclaim_payload`].
-    unsafe fn remaining_payload(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Untagged,
-    ) -> u64;
+    /// The calls [`Self::reclaim_payload`] still takes from the slot's state:
+    /// the untagged payload's [`Reclaim::remaining`].
+    fn remaining_payload(slot: PeekSlot<'_, Self, Self::Untagged>) -> u64;
 }
 
 /// Where a tagged value's construction or cleanup is: the tag inspection,
@@ -160,29 +153,28 @@ pub const fn cost<U, P>(payload: ConstructionCost) -> ConstructionCost {
     .plus(payload)
 }
 
-/// # Safety
-/// The caller provides a unique stable destination and its retained state.
-pub unsafe fn build<T: Payload<A>, A: Allocator>(
+/// One unit of construction of the tagged value in `slot`. Without metadata
+/// the state is `INITIAL`, so construction begins; a completed or released
+/// value is refused.
+pub fn build<T: Payload<A>, A: Allocator>(
     document: &Document<'_, A::Permit>,
     index: usize,
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Untagged, A::Permit>,
+    mut slot: Slot<'_, T, State<T::Untagged, A::Permit>>,
     a: &mut A,
 ) -> ConstructResult<Built, A> {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
-        // SAFETY: every metadata field is written.
+        // SAFETY: the header is the whole metadata, every field written.
         unsafe {
-            stable::install::<Meta<T::Untagged>, A>(
+            stable::install::<Meta<T::Untagged>, Meta<T::Untagged>, A>(
                 &mut state.meta,
                 &mut state.admitted,
-                const { stable::Metadata::whole::<Meta<T::Untagged>, A::Permit>() },
-                |meta| {
-                    meta.write(Meta {
-                        child: T::UNTAGGED,
-                        index,
-                        phase: Phase::Inspect,
-                    })
+                || Meta {
+                    child: T::UNTAGGED,
+                    index,
+                    phase: Phase::Inspect,
                 },
+                |meta| meta,
                 a,
             )?
         };
@@ -209,9 +201,10 @@ pub unsafe fn build<T: Payload<A>, A: Allocator>(
             Ok(Built::Progress)
         }
         Phase::Build => {
-            // SAFETY: only the payload callback uses the payload state.
-            let result =
-                unsafe { T::build_payload(document, meta.index, place, &mut meta.child, a)? };
+            // SAFETY: the tagged value's place and its untagged payload's
+            // state, which only the payload callback uses.
+            let payload = unsafe { Slot::new(place, &mut meta.child) };
+            let result = T::build_payload(document, meta.index, payload, a)?;
             if result == Built::Done {
                 meta.phase = Phase::Complete;
             }
@@ -221,13 +214,13 @@ pub unsafe fn build<T: Payload<A>, A: Allocator>(
     }
 }
 
-/// # Safety
-/// The destination and state must be the pair previously passed to build.
-pub unsafe fn reclaim<T: Payload<A>, A: Allocator>(
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Untagged, A::Permit>,
+/// One unit of cleanup of the tagged value in `slot`. Releasing the metadata
+/// leaves the state `INITIAL`.
+pub fn reclaim<T: Payload<A>, A: Allocator>(
+    mut slot: Slot<'_, T, State<T::Untagged, A::Permit>>,
     a: &mut A,
 ) -> BoundedResult<Reclaimed, A> {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         STEP.admit(a)?;
         return Ok(Reclaimed::Done);
@@ -239,8 +232,10 @@ pub unsafe fn reclaim<T: Payload<A>, A: Allocator>(
             meta.phase = Phase::Release;
         }
         Phase::Build | Phase::Complete => {
-            // SAFETY: the payload state tracks all partial initialization.
-            if unsafe { T::reclaim_payload(place, &mut meta.child, a)? } == Reclaimed::Done {
+            // SAFETY: the payload state tracks all partial initialization of
+            // the payload at this place.
+            let payload = unsafe { Slot::new(place, &mut meta.child) };
+            if T::reclaim_payload(payload, a)? == Reclaimed::Done {
                 meta.phase = Phase::Release;
             }
         }
@@ -254,16 +249,14 @@ pub unsafe fn reclaim<T: Payload<A>, A: Allocator>(
     Ok(Reclaimed::Progress)
 }
 
-/// The calls [`reclaim`] still takes from `state`: no metadata, one; the tag
-/// inspected, one to `Release` and one to release; the payload live, its own
-/// calls, the last of which reaches `Release`, then one; `Release`, one.
-///
-/// # Safety
-/// As [`reclaim`].
-pub unsafe fn remaining<T: Payload<A>, A: Allocator>(
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Untagged, A::Permit>,
+/// The calls [`reclaim`] still takes from the slot's state: no metadata, one;
+/// the tag inspected, one to `Release` and one to release; the payload live,
+/// its own calls, the last of which reaches `Release`, then one; `Release`,
+/// one.
+pub fn remaining<T: Payload<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, T, State<T::Untagged, A::Permit>>,
 ) -> u64 {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         return 1;
     };
@@ -272,8 +265,36 @@ pub unsafe fn remaining<T: Payload<A>, A: Allocator>(
         Phase::Inspect => 2,
         Phase::Build | Phase::Complete => {
             // SAFETY: the payload state tracks the payload at `place`.
-            unsafe { T::remaining_payload(place, &mut meta.child) }.saturating_add(1)
+            T::remaining_payload(unsafe { Slot::new(place, &mut meta.child) }).saturating_add(1)
         }
         Phase::Release => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::Reservation;
+
+    /// A tagged value's cost, evaluated at run time as the derive evaluates
+    /// it in constants, is affine in its payload's: a fixed part (the
+    /// metadata installed, the tag inspected, cleanup's unit before any
+    /// payload, the metadata released), the payload's cost added unchanged,
+    /// it being built in the value's own bytes.
+    #[test]
+    fn a_tagged_values_cost_is_its_own_fixed_part_and_its_payloads() {
+        let bare = cost::<Written, Reservation>(ConstructionCost::ZERO);
+        assert_eq!(bare.per_byte, ConstructionCost::ZERO.per_byte);
+        assert_eq!(
+            bare.fixed.values,
+            stable::install_cost::<Meta<Written>, Reservation>().values
+                + 2 * STEP_COST.values
+                + stable::release_cost::<Reservation>().values,
+            "the install, the inspection, cleanup's unit and the release"
+        );
+        let payload = ConstructionCost::fixed(unit(16)).plus(ConstructionCost::per_byte(unit(3)));
+        let tagged = cost::<Written, Reservation>(payload);
+        assert_eq!(tagged.fixed, plus(bare.fixed, payload.fixed));
+        assert_eq!(tagged.per_byte, payload.per_byte);
     }
 }

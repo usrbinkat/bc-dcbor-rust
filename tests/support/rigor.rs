@@ -19,12 +19,26 @@
 //! The layer is chosen by `DCBOR_RIGOR`; any other value is an error naming
 //! the two. Under Miri the variable reaches the interpreted test only when
 //! forwarded (`-Zmiri-env-forward=DCBOR_RIGOR`).
+//!
+//! Independently, a run carries its witness sizes, chosen by
+//! `DCBOR_WITNESS`: `full`, the default, which the native layers run; or
+//! `minimal`, which the Miri gate and the reach map run
+//! (`tests/miri-owned.sh`, `tests/reach-map.sh`). Miri's evidence is about
+//! the paths and transition classes a test executes, not its data volume, so
+//! a matrix's fixtures are sized ([`sized`]) to reach every class and its
+//! boundaries (empty, one element, each quantum edge, each growth and
+//! relocation step) and no further: the same path, at the size that reaches
+//! it. The choice is made at run time, never by `cfg(miri)`, so the reach map
+//! records exactly the paths Miri executes.
 use std::fmt::Display;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// The variable naming the layer.
 pub const VARIABLE: &str = "DCBOR_RIGOR";
+
+/// The variable naming the witness sizes.
+pub const WITNESS: &str = "DCBOR_WITNESS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rigor {
@@ -44,6 +58,39 @@ pub fn rigor() -> Rigor {
         },
         Err(error) => panic!("{VARIABLE}: {error}"),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witness {
+    /// The native layers' sizes.
+    Full,
+    /// The boundary-minimal size of every class a matrix covers.
+    Minimal,
+}
+
+/// The witness sizes this run carries: `DCBOR_WITNESS` read once, `full`
+/// when unset.
+pub fn witness() -> Witness {
+    static WITNESS_SIZES: OnceLock<Witness> = OnceLock::new();
+    *WITNESS_SIZES.get_or_init(|| match std::env::var(WITNESS) {
+        Err(std::env::VarError::NotPresent) => Witness::Full,
+        Ok(value) => match value.as_str() {
+            "full" => Witness::Full,
+            "minimal" => Witness::Minimal,
+            other => panic!("{WITNESS}={other:?}: the witness sizes are full and minimal"),
+        },
+        Err(error) => panic!("{WITNESS}: {error}"),
+    })
+}
+
+/// `full` in a run of full witnesses, `minimal` in a run of minimal ones: a
+/// fixture's size, its minimal one still reaching every class and boundary
+/// the matrix covers.
+pub fn sized<T>(full: T, minimal: T) -> T {
+    match witness() {
+        Witness::Full => full,
+        Witness::Minimal => minimal,
+    }
 }
 
 /// Emit an exact, address-free class inventory for the native/Miri gate.
@@ -77,7 +124,7 @@ pub struct Progress {
 impl Progress {
     pub fn new(name: impl Display) -> Self {
         let name = name.to_string();
-        eprintln!("[{name}] rigor {:?}", rigor());
+        eprintln!("[{name}] rigor {:?}, witnesses {:?}", rigor(), witness());
         Self {
             name,
             started: Instant::now(),
@@ -145,6 +192,13 @@ fn ratchet(name: &str, costs: &[String]) {
         Ok(mode) if mode == "check" || mode == "record" => mode,
         other => panic!("DCBOR_COST_MODE must be check, record or unset: {other:?}"),
     };
+    // Costs are the native layers' evidence, recorded at full witness sizes:
+    // a minimal run would record another selection under the same identity.
+    assert_eq!(
+        witness(),
+        Witness::Full,
+        "matrix costs are recorded and checked at full witness sizes; unset {WITNESS}"
+    );
     let configuration =
         std::env::var("DCBOR_CONFIGURATION").expect("cost evidence requires DCBOR_CONFIGURATION");
     let variant = std::env::var("DCBOR_COST_VARIANT")

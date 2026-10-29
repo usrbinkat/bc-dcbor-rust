@@ -22,8 +22,8 @@ pub use construct::{
 pub use input::{
     Borrowed, DecodeInput, InputAcquisition, InputBorrow, InputDetail, borrow_bound, copy_bound,
 };
+pub(crate) use operation::{Observed, OperationTerms, Task};
 pub use operation::{Operation, Position};
-pub(crate) use operation::{OperationTerms, Task};
 pub use parse::{DocumentDecoder, OwnedDocument, ParseDetail, ParsePhase, parse_bound};
 pub use reclamation::{
     Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, Reclaim, Reclaimed,
@@ -49,7 +49,8 @@ pub fn next_index(node: Node<'_, '_>) -> usize {
 /// operations' ([`OperationPlace`]), summed over every operation whose
 /// records the run allocates, cleans or releases, and its task's own, within
 /// the operation's task.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::construct::{ConstructPhase, ConstructPlace, ConstructTerms, construct_terms};
     use super::input::{InputPlace, borrow_terms, copy_terms};

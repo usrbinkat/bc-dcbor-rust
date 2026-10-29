@@ -3,9 +3,13 @@ use super::*;
 use core::mem::{MaybeUninit, size_of};
 use core::ptr::{NonNull, addr_of, addr_of_mut};
 use decode::construction::in_place::{InPlace, Transferable};
-use decode::construction::reclamation::{self, Prefix, Reclaim, Reclaimed, ScopeRef};
+// The record destination is named `reclamation::Place` here: the bare name is
+// the accounting trait `bounded::Place`, which `PreparationPlace::ALL` needs.
+// A destination's slot is named `reclamation::Slot` for the same reason: the
+// bare name is this module's entry-cursor storage, [`Slot`].
+use decode::construction::reclamation::{self, PeekSlot, Prefix, Reclaim, Reclaimed, ScopeRef};
 use decode::construction::{
-    DecodeInput, Operation, OperationTerms, OwnedInitialized, Task, TypedValue,
+    DecodeInput, Observed, Operation, OperationTerms, OwnedInitialized, Task, TypedValue,
 };
 use decode::initialization::field;
 use decode::storage::Storage;
@@ -267,6 +271,10 @@ pub const fn tree_moves(len: usize) -> u64 {
     2 * tree_height(len)
 }
 
+/// One open source of a preparation: plain data, references and counts, so
+/// an arena of them is discarded in one admitted unit
+/// (`Storage::reclaim_copy_step`).
+#[derive(Clone, Copy)]
 struct Frame<'a> {
     source: &'a dyn Schema,
     next: usize,
@@ -290,6 +298,7 @@ enum EntryPhase {
     Value,
     Order,
 }
+#[derive(Clone, Copy)]
 enum MapState<'a> {
     Schema {
         fields: u64,
@@ -360,7 +369,10 @@ fn check_entry_next<R>(after: usize, next: usize) -> Result<(), BoundedError<R>>
 }
 
 /// An open map: one element of the open-map arena, which relocates an
-/// element in one admitted unit, so it fits a quantum (`Storage`).
+/// element in one admitted unit, so it fits a quantum (`Storage`). Plain
+/// data, so an arena of them is discarded in one admitted unit
+/// (`Storage::reclaim_copy_step`).
+#[derive(Clone, Copy)]
 struct MapFrame<'a> {
     head: MapHead,
     /// The first gap of the map's own payload, by index.
@@ -684,101 +696,74 @@ impl<'a, P> Preparation<'a, P> {
         }
     }
 
-    /// Initialize one unit of a preparation of `source` in stable storage:
-    /// the same state [`Self::new`] builds, written in admitted units.
-    ///
-    /// # Safety
-    /// The destination is unique, stable and uninitialized; `step` starts at
-    /// zero and is retained. Initialization acquires nothing, so an incomplete
-    /// prefix needs no cleanup.
-    pub(crate) unsafe fn initialize_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
+    /// Initialize one unit of a preparation of `source` in `slot`, its
+    /// stable destination paired with its units initialized: the same state
+    /// [`Self::new`] builds, written in admitted units, each nested arena
+    /// and engine on its own units. Initialization acquires nothing, so an
+    /// incomplete prefix needs no cleanup. Refused once initialized.
+    pub(crate) fn initialize_step<A: Allocator<Permit = P>>(
+        mut slot: reclamation::Slot<'_, Self, usize>,
         source: &'a dyn Schema,
-        step: &mut usize,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
+        use decode::initialization::{init_field, init_part};
         let mut base = 0;
-        // One nested part of `$steps` units, initialized by `$init` on its own
-        // retained sub-step.
+        // One nested part of `$steps` units at field `$field`, initialized
+        // by `$init` over its own slot.
         macro_rules! part {
-            ($steps:expr, |$sub:ident| $init:expr) => {
-                if *step < base + $steps {
-                    let mut $sub = *step - base;
-                    $init;
-                    *step = base + $sub;
+            ($field:ident, $steps:expr, |$part:ident| $init:expr) => {
+                if *slot.custody() < base + $steps {
+                    init_part!(slot, $field, base, |$part| $init);
                     return Ok(false);
                 }
                 base += $steps;
             };
         }
         let storage = Self::STORAGE_STEPS;
-        // SAFETY: each unit writes one uninitialized field of the destination.
-        unsafe {
-            part!(storage, |sub| Storage::initialize_step(
-                addr_of_mut!((*place).frames),
-                &mut sub,
+        part!(frames, storage, |part| Storage::initialize_step(part, a)?);
+        part!(bytes, storage, |part| Storage::initialize_step(part, a)?);
+        part!(holes, storage, |part| Storage::initialize_step(part, a)?);
+        part!(map_frames, storage, |part| Storage::initialize_step(
+            part, a
+        )?);
+        part!(cursors, storage, |part| Storage::initialize_step(part, a)?);
+        part!(text, Self::TEXT_STEPS, |part| {
+            TextContinuation::initialize_step(part, (), a)?
+        });
+        part!(dynamic, dynamic::Dynamic::<P>::INIT_STEPS, |part| {
+            dynamic::Dynamic::initialize_step(part, a)?
+        });
+        match *slot.custody() - base {
+            0 => init_field!(slot, child, || Some(source), a)?,
+            // The staged bytes, a quantum, then their two offsets: the
+            // state `Staged::new` builds.
+            1 => init_field!(
+                slot,
+                staged.bytes,
+                || [0; decode::construction::stable::QUANTUM],
                 a
-            )?);
-            part!(storage, |sub| Storage::initialize_step(
-                addr_of_mut!((*place).bytes),
-                &mut sub,
-                a
-            )?);
-            part!(storage, |sub| Storage::initialize_step(
-                addr_of_mut!((*place).holes),
-                &mut sub,
-                a
-            )?);
-            part!(storage, |sub| Storage::initialize_step(
-                addr_of_mut!((*place).map_frames),
-                &mut sub,
-                a
-            )?);
-            part!(storage, |sub| Storage::initialize_step(
-                addr_of_mut!((*place).cursors),
-                &mut sub,
-                a
-            )?);
-            part!(Self::TEXT_STEPS, |sub| TextContinuation::initialize_step(
-                addr_of_mut!((*place).text),
-                (),
-                &mut sub,
-                a
-            )?);
-            part!(dynamic::Dynamic::<P>::INIT_STEPS, |sub| {
-                dynamic::Dynamic::initialize_step(addr_of_mut!((*place).dynamic), &mut sub, a)?
-            });
-            let staged = addr_of_mut!((*place).staged);
-            match *step - base {
-                0 => field(addr_of_mut!((*place).child), || Some(source), a)?,
-                // The staged bytes, a quantum, then their two offsets: the
-                // state `Staged::new` builds.
-                1 => field(
-                    addr_of_mut!((*staged).bytes),
-                    || [0; decode::construction::stable::QUANTUM],
-                    a,
-                )?,
-                2 => field(addr_of_mut!((*staged).at), || 0, a)?,
-                3 => field(addr_of_mut!((*staged).len), || 0, a)?,
-                4 => field(addr_of_mut!((*place).payload), || &[][..], a)?,
-                5 => field(addr_of_mut!((*place).text_source), || None, a)?,
-                6 => field(addr_of_mut!((*place).text_init), || Self::TEXT_STEPS, a)?,
-                7 => field(addr_of_mut!((*place).normalized), || None, a)?,
-                8 => field(addr_of_mut!((*place).normalized_at), || 0, a)?,
-                9 => field(addr_of_mut!((*place).omitted), || 0, a)?,
-                10 => field(addr_of_mut!((*place).finished), || false, a)?,
-                // An owned plan is emitted in place, gaps skipped, never
-                // published as an arena: it grows uncapped.
-                11 => field(addr_of_mut!((*place).cap), || usize::MAX, a)?,
-                12 => field(addr_of_mut!((*place).inspect), || None, a)?,
-                13 => field(addr_of_mut!((*place).text_check), || None, a)?,
-                #[cfg(feature = "num-bigint")]
-                14 => field(addr_of_mut!((*place).bignum), || None, a)?,
-                _ => return Err(BoundedError::PlanMismatch),
-            }
+            )?,
+            2 => init_field!(slot, staged.at, || 0, a)?,
+            3 => init_field!(slot, staged.len, || 0, a)?,
+            4 => init_field!(slot, payload, || &[][..], a)?,
+            5 => init_field!(slot, text_source, || None, a)?,
+            6 => init_field!(slot, text_init, || Self::TEXT_STEPS, a)?,
+            7 => init_field!(slot, normalized, || None, a)?,
+            8 => init_field!(slot, normalized_at, || 0, a)?,
+            9 => init_field!(slot, omitted, || 0, a)?,
+            10 => init_field!(slot, finished, || false, a)?,
+            // An owned plan is emitted in place, gaps skipped, never
+            // published as an arena: it grows uncapped.
+            11 => init_field!(slot, cap, || usize::MAX, a)?,
+            12 => init_field!(slot, inspect, || None, a)?,
+            13 => init_field!(slot, text_check, || None, a)?,
+            #[cfg(feature = "num-bigint")]
+            14 => init_field!(slot, bignum, || None, a)?,
+            _ => return Err(BoundedError::PlanMismatch),
         }
-        *step += 1;
-        Ok(*step == Self::INIT_STEPS)
+        let units = slot.custody();
+        *units += 1;
+        Ok(*units == Self::INIT_STEPS)
     }
 
     pub fn position(&self) -> Position {
@@ -892,7 +877,10 @@ impl<'a, P> Preparation<'a, P> {
     /// One admitted unit of cleanup: the text normalization, the copied
     /// normalized text, then every arena, a plan kept in place included. The
     /// first part still holding anything spends the call; once none does, the
-    /// call admits the completion it reports as `Done`.
+    /// call admits the completion it reports as `Done`, and drops every
+    /// borrow of the source the traversal still holds: a reclaimed
+    /// preparation refers to nothing, so the source it borrowed may be
+    /// released while the preparation is still observed ([`Planned`]).
     pub fn reclaim_step<A: Allocator<Permit = P>>(
         &mut self,
         a: &mut A,
@@ -905,9 +893,12 @@ impl<'a, P> Preparation<'a, P> {
             // The copied encoding's release was paid for by its request.
             self.normalized = None;
         } else if !self.frames.is_released() {
-            at(cleanup, || self.frames.reclaim_step(a))?;
+            // Frames and open maps are plain data: settled, each arena is
+            // discarded in one unit; cancelled while relocating or staging,
+            // drained per element, which the bound counts.
+            at(cleanup, || self.frames.reclaim_copy_step(a))?;
         } else if !self.map_frames.is_released() {
-            at(cleanup, || self.map_frames.reclaim_step(a))?;
+            at(cleanup, || self.map_frames.reclaim_copy_step(a))?;
         } else if !self.bytes.is_released() {
             at(cleanup, || self.bytes.reclaim_copy_step(a))?;
         } else if !self.holes.is_released() {
@@ -918,9 +909,24 @@ impl<'a, P> Preparation<'a, P> {
             at(cleanup, || self.dynamic.reclaim_step(a))?;
         } else {
             CLEANUP_DONE.admit(a)?;
+            self.release_source();
             return Ok(Reclaimed::Done);
         }
         Ok(Reclaimed::Progress)
+    }
+
+    /// Drop every borrow of the source outside the arenas, which cleanup has
+    /// released: the pending child, the pending payload, the text and its
+    /// quick check, and the bignum being read.
+    fn release_source(&mut self) {
+        self.child = None;
+        self.payload = &[];
+        self.text_source = None;
+        self.text_check = None;
+        #[cfg(feature = "num-bigint")]
+        {
+            self.bignum = None;
+        }
     }
 
     /// The most calls [`Self::reclaim_step`] still takes, the one returning
@@ -1011,15 +1017,21 @@ impl<'a, P> Preparation<'a, P> {
                 return Ok(None);
             }
             if self.text_init < Self::TEXT_STEPS {
-                // SAFETY: the previous text published, so its continuation
-                // holds nothing; each unit rewrites one resource-free field.
-                at(PreparationPlace::Texts, || unsafe {
-                    TextContinuation::initialize_step(
-                        addr_of_mut!(self.text),
-                        (),
+                // SAFETY: the continuation's place is rooted at an exclusive
+                // borrow of this field, valid, aligned and writable for it,
+                // and no place derived from it outlives this call; its units
+                // are `text_init`, which counts exactly the fields rewritten
+                // for this text. The previous text published, so the
+                // continuation holds nothing; each unit rewrites one
+                // resource-free field.
+                let continuation = unsafe {
+                    reclamation::Slot::new(
+                        reclamation::Place::root(NonNull::from(&mut self.text).cast()),
                         &mut self.text_init,
-                        a,
                     )
+                };
+                at(PreparationPlace::Texts, || {
+                    TextContinuation::initialize_step(continuation, (), a)
                 })?;
                 return Ok(None);
             }
@@ -1840,9 +1852,11 @@ fn levels<R>(n: u64) -> Result<u64, BoundedError<R>> {
 /// - each unordered map's completion: three units of at most a frame's
 ///   bytes;
 /// - cleanup: an interrupted text's continuation's own cleanup, its arenas
-///   drained and its output released; the copied text, each frame and open
-///   map drained, each of eight arenas truncated and released, the record's
-///   transition and the completion.
+///   drained and its output released; the copied text; each of eight arenas
+///   of plain data truncated in one unit and released, or, the one arena
+///   cancelled while it stages a growth or relocates (the exclusion the
+///   peak rests on), drained one element per unit, charged at the most of
+///   any arena's elements; the record's transition and the completion.
 ///
 /// The plan's byte and gap arenas are what publication retains. The peak is
 /// every kept arena at its held capacity and the largest of what one phase
@@ -2008,7 +2022,11 @@ struct PreparationTerms {
     /// allocates nothing. So the peak is every kept arena's held capacity,
     /// and the largest of: one arena's old allocation beside its new one, a
     /// text's normalization peak, a normalized encoding beside the plan's
-    /// relocation, and the bitmap at its own peak.
+    /// relocation, and the bitmap at its own peak. That at most one arena, of
+    /// the preparation's and its text continuation's, is ever staging a
+    /// growth, relocating or relocated is checked at every boundary of every
+    /// attribution run (`bound_tests::attribution::draining`); cleanup's
+    /// drain rests on it too.
     peak: u64,
 }
 
@@ -2282,19 +2300,42 @@ impl PreparationTerms {
             ),
         );
         // Cleanup ([`Preparation::reclaim_step`]): an interrupted text's
-        // continuation's own cleanup, its arenas drained; each frame and
-        // open map drained; each of the eight arenas (frames, open maps,
-        // bytes, gaps, cursors, entries, the ordering scratch and the bitmap)
-        // truncated and cleaned up; the record's transition and the
-        // completion. Every release, the copied encoding's and each arena
-        // allocation's, was admitted by its acquisition.
+        // continuation's own cleanup, its arenas drained; each of the eight
+        // arenas (frames, open maps, bytes, gaps, cursors, entries, the
+        // ordering scratch and the bitmap) truncated and cleaned up; the
+        // record's transition and the completion. Every arena is plain data
+        // reclaimed by `Storage::reclaim_copy_step`: settled with no growth
+        // staged, discarded in one unit; cancelled while staging a growth,
+        // relocating or relocated, drained one element per unit. Of these
+        // eight and the text continuation's two, at most one is ever in one
+        // of those stages (the exclusion the peak rests on,
+        // [`PreparationTerms`], checked at every boundary of every
+        // attribution run), so cleanup drains at most one arena one element
+        // per unit: charged at the most of any one arena's elements, in
+        // values and in bytes apart. The text's own drain is its interrupted
+        // cleanup's. The descriptors and the merge scratch are both arenas of
+        // at most `entries + 1` descriptors, one entry below. Every release,
+        // the copied encoding's and each arena allocation's, was admitted by
+        // its acquisition.
         const ARENAS: u64 = 8;
+        let drained = [
+            Storage::<Frame<'static>, ()>::element_work(held)?,
+            Storage::<MapFrame<'static>, ()>::element_work(held)?,
+            Storage::<u8, ()>::element_work(add(appended, 1)?)?,
+            Storage::<(usize, usize), ()>::element_work(add(maps, 1)?)?,
+            Storage::<(&'static dyn Entries, Slot), ()>::element_work(held)?,
+            Storage::<maps::order::Entry, ()>::element_work(add(entries, 1)?)?,
+            Storage::<u8, ()>::element_work(add(largest, 1)?)?,
+        ]
+        .into_iter()
+        .fold(WriteWork::default(), |most, arena| {
+            WriteWork::new(most.values.max(arena.values), most.bytes.max(arena.bytes))
+        });
         set(
             PreparationPlace::Cleanup,
             work(
                 text_cursor::interrupted::<R>(longest_text)?
-                    .then(Storage::<Frame<'static>, ()>::element_work(held)?)?
-                    .then(Storage::<MapFrame<'static>, ()>::element_work(held)?)?
+                    .then(drained)?
                     .then(step(ARENAS)?)?
                     .then(Storage::<u8, ()>::cleanup_work(true)?.times(ARENAS)?)?
                     .then(PLAN_TRANSITION.times(1)?)?
@@ -2533,6 +2574,41 @@ where
 impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Planned<'s, I, T, A> {
     const INIT_STEPS: usize = 2 + Preparation::<'s, A::Permit>::INIT_STEPS;
 
+    /// The record's whole custody, for as long as the slot is borrowed:
+    /// every field of the record is its own custody (the source handle, the
+    /// phase, the preparation); the source value lives in its own record,
+    /// behind the handle. Refused unless the slot's progress records every
+    /// field initialized.
+    fn custody<'p, M: reclamation::Mode, R>(
+        slot: &'p mut reclamation::Slot<'_, Self, Prefix, M>,
+    ) -> Result<&'p mut Self, BoundedError<R>> {
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() < Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
+        // SAFETY: the slot pairs the record's place with its progress, which
+        // records every field initialized; the whole record is custody, no
+        // place lies within it, and the source value it holds lies in its own
+        // record.
+        Ok(unsafe { place.custody(prefix, |record| record) })
+    }
+
+    /// The source slot alone, for as long as the slot is borrowed: what the
+    /// record holds before its other fields are initialized; `None` before
+    /// the source field is.
+    fn source<'p, M: reclamation::Mode>(
+        slot: &'p mut reclamation::Slot<'_, Self, Prefix, M>,
+    ) -> Option<&'p mut Option<TypedValue<'s, I, T, A>>> {
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() == 0 {
+            return None;
+        }
+        // SAFETY: the slot pairs the record's place with its progress, which
+        // records the source field initialized; the projection reaches that
+        // field alone.
+        Some(unsafe { place.custody(prefix, |record| addr_of_mut!((*record).source)) })
+    }
+
     /// The plan of a published record.
     fn plan(&self) -> PlanView<'_> {
         match self.preparation.view() {
@@ -2545,6 +2621,9 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Planned<'s, I, T, A> {
 // SAFETY: the prefix is the source handle and the phase, then the
 // preparation's resource-free prefix, which needs no cleanup. Cleanup releases
 // the preparation's arenas, then the source value, in place; no destructor runs.
+// The preparation's `Done` drops every borrow of the source it still holds
+// (`Preparation::release_source`), so from `ReclaimSource` on an observation
+// of the record reads no reference into the value being released.
 unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     for Planned<'s, I, T, A>
 {
@@ -2552,43 +2631,42 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        prefix: &mut Prefix,
+    fn reclaim_step(
+        mut slot: reclamation::Slot<'_, Self, Prefix>,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
-        let raw = place.as_ptr().cast::<Self>();
-        if prefix.initialized() < Self::INIT_STEPS {
-            if prefix.initialized() > 0 {
-                // SAFETY: a nonempty prefix includes the source field.
-                let source = unsafe { &mut *addr_of_mut!((*raw).source) };
-                if source.is_some() {
-                    TypedValue::reclaim_step(source, a)?;
-                    return Ok(Reclaimed::Progress);
-                }
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            if let Some(source) = Self::source(&mut slot)
+                && source.is_some()
+            {
+                TypedValue::reclaim_step(source, a)?;
+                return Ok(Reclaimed::Progress);
             }
             PLAN_TRANSITION.admit(a)?;
-            *prefix = Prefix::EMPTY;
+            *slot.custody() = Prefix::EMPTY;
             return Ok(Reclaimed::Done);
         }
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *raw };
-        match state.phase {
+        let Planned {
+            source,
+            phase,
+            preparation,
+        } = Self::custody(&mut slot)?;
+        match *phase {
             PlanPhase::ReclaimPreparation => {
-                if state.preparation.reclaim_step(a)? == Reclaimed::Done {
-                    state.phase = PlanPhase::ReclaimSource;
+                if preparation.reclaim_step(a)? == Reclaimed::Done {
+                    *phase = PlanPhase::ReclaimSource;
                 }
             }
             PlanPhase::ReclaimSource => {
-                if TypedValue::reclaim_step(&mut state.source, a)? == Reclaimed::Done {
-                    state.phase = PlanPhase::Done;
+                if TypedValue::reclaim_step(source, a)? == Reclaimed::Done {
+                    *phase = PlanPhase::Done;
                     return Ok(Reclaimed::Done);
                 }
             }
             PlanPhase::Done => return Ok(Reclaimed::Done),
             PlanPhase::Prepare | PlanPhase::Published => {
                 PLAN_TRANSITION.admit(a)?;
-                state.phase = PlanPhase::ReclaimPreparation;
+                *phase = PlanPhase::ReclaimPreparation;
             }
         }
         Ok(Reclaimed::Progress)
@@ -2598,24 +2676,27 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     /// one releasing the record. After it: the transition into cleanup
     /// unless it has begun, the preparation's own count and the source
     /// slot's.
-    unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, prefix: &mut Prefix) -> u64 {
-        let raw = place.as_ptr().cast::<Self>();
-        if prefix.initialized() < Self::INIT_STEPS {
-            if prefix.initialized() == 0 {
-                return 1;
-            }
-            // SAFETY: a nonempty prefix includes the source field.
-            let source = unsafe { &mut *addr_of_mut!((*raw).source) };
-            return match source {
-                Some(_) => TypedValue::remaining(source).saturating_add(1),
-                None => 1,
+    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> u64 {
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            return match Self::source(&mut slot) {
+                Some(source) if source.is_some() => TypedValue::remaining(source).saturating_add(1),
+                _ => 1,
             };
         }
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *raw };
-        let source = TypedValue::remaining(&mut state.source);
-        let preparation = state.preparation.reclaim_remaining().saturating_add(source);
-        match state.phase {
+        // The source value lives in its own record, behind the handle, and
+        // is reached only through that record's count.
+        let Ok(Planned {
+            source,
+            phase,
+            preparation,
+        }) = Self::custody::<_, ()>(&mut slot)
+        else {
+            return 1;
+        };
+        let phase = *phase;
+        let source = TypedValue::remaining(source);
+        let preparation = preparation.reclaim_remaining().saturating_add(source);
+        match phase {
             PlanPhase::Done => 1,
             PlanPhase::ReclaimSource => source,
             PlanPhase::ReclaimPreparation => preparation,
@@ -2665,55 +2746,71 @@ where
         prefix.initialized()
     }
 
-    unsafe fn initialize(
+    fn initialize(
         &mut self,
-        place: *mut Self::State,
-        prefix: &mut Prefix,
+        mut slot: reclamation::Slot<'_, Self::State, Prefix>,
         a: &mut A,
     ) -> Result<(), Self::Error> {
-        // SAFETY: each unit writes one uninitialized part of the destination.
-        unsafe {
-            match prefix.initialized() {
-                0 => field(addr_of_mut!((*place).source), || self.source.take(), a)?,
-                1 => field(addr_of_mut!((*place).phase), || PlanPhase::Prepare, a)?,
-                n => {
-                    let source = (*addr_of!((*place).source))
+        let (place, prefix) = slot.parts();
+        if prefix.initialized() >= Self::INIT_STEPS {
+            return Err(BoundedError::PlanMismatch);
+        }
+        let raw = place.as_ptr(prefix);
+        match prefix.initialized() {
+            // SAFETY: the slot pairs the record's place with its progress,
+            // so the field the progress names next is a field of the
+            // record's valid destination, reached by field syntax.
+            0 => unsafe { field(addr_of_mut!((*raw).source), || self.source.take(), a)? },
+            // SAFETY: as above.
+            1 => unsafe { field(addr_of_mut!((*raw).phase), || PlanPhase::Prepare, a)? },
+            n => {
+                // SAFETY: a progress past its first unit records the source
+                // field initialized, read through a shared view of it alone.
+                // The value lives at a stable address in its own record,
+                // which this record holds until the preparation is
+                // reclaimed; the borrow never outlives that.
+                let source: &'s dyn Schema = unsafe {
+                    let source = (*addr_of!((*raw).source))
                         .as_ref()
                         .ok_or(BoundedError::PlanMismatch)?
                         .value();
-                    // The value lives at a stable address in its own record,
-                    // which this record holds until the preparation is
-                    // reclaimed; the borrow never outlives that.
-                    let source: &'s dyn Schema = &*(source as *const T);
-                    let mut sub = n - 2;
-                    Preparation::initialize_step(
-                        addr_of_mut!((*place).preparation),
-                        source,
-                        &mut sub,
-                        a,
-                    )?;
-                    prefix.set(sub + 2);
-                    return Ok(());
-                }
+                    &*(source as *const T)
+                };
+                let mut units = n - 2;
+                // SAFETY: the preparation's place is a field of the record's
+                // destination, by field syntax; its units are its own: the
+                // record's units are initialized in order, so its progress
+                // less the two fields before it is what the preparation
+                // holds.
+                let preparation = unsafe {
+                    reclamation::Slot::new(
+                        place.project(|record| addr_of_mut!((*record).preparation)),
+                        &mut units,
+                    )
+                };
+                Preparation::initialize_step(preparation, source, a)?;
+                prefix.set(units + 2);
+                return Ok(());
             }
         }
         prefix.advance();
         Ok(())
     }
 
-    unsafe fn advance(
+    fn advance(
         &mut self,
-        place: NonNull<MaybeUninit<Self::State>>,
-        _: &mut Prefix,
+        mut slot: reclamation::Slot<'_, Self::State, Prefix>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
-        // SAFETY: initialization is complete.
-        let state = unsafe { &mut *place.as_ptr().cast::<Self::State>() };
-        if state.phase != PlanPhase::Prepare {
+        // The custody is refused until initialization is complete.
+        let Planned {
+            phase, preparation, ..
+        } = Planned::custody(&mut slot)?;
+        if *phase != PlanPhase::Prepare {
             return Err(BoundedError::PlanMismatch);
         }
-        if state.preparation.prepare_step::<Kept, A>(a)?.is_some() {
-            state.phase = PlanPhase::Published;
+        if preparation.prepare_step::<Kept, A>(a)?.is_some() {
+            *phase = PlanPhase::Published;
             return Ok(true);
         }
         Ok(false)
@@ -2727,29 +2824,42 @@ where
         TypedValue::reclaim_step(&mut self.source, a)
     }
 
-    unsafe fn detail(
-        &self,
-        record: Option<(&mut MaybeUninit<Self::State>, &mut Prefix)>,
-    ) -> PlanDetail {
-        // The record takes the source with its first prefix unit; before
-        // that, and when no record exists, the task holds it.
-        let source = match &record {
-            Some((storage, prefix)) if prefix.initialized() > 0 => {
-                // SAFETY: a nonempty prefix includes the source field, read in
-                // place without forming a reference to the rest.
-                unsafe { (*addr_of!((*storage.as_ptr()).source)).is_some() }
-            }
-            _ => self.source.is_some(),
-        };
-        let complete = record
-            .filter(|(_, prefix)| prefix.initialized() >= Self::INIT_STEPS)
-            // SAFETY: a complete prefix initializes the source, the phase and
-            // the preparation's resource-free prefix.
-            .map(|(storage, _)| unsafe { storage.assume_init_ref() });
-        PlanDetail {
-            phase: complete.map(|state| state.phase),
-            preparation: complete.map(|state| state.preparation.position()),
+    fn detail(&self, record: Observed<'_, 's, Self, A>) -> PlanDetail {
+        // Before the record is complete only whether the source is held is
+        // known: the record takes it with its first prefix unit; before that,
+        // and when no record exists, the task holds it.
+        let incomplete = |source| PlanDetail {
+            phase: None,
+            preparation: None,
             source,
+        };
+        let Some(mut slot) = record else {
+            return incomplete(self.source.is_some());
+        };
+        let (place, prefix) = slot.parts();
+        let initialized = prefix.initialized();
+        if initialized < Self::INIT_STEPS {
+            return incomplete(if initialized > 0 {
+                // SAFETY: a nonempty prefix includes the source field, read
+                // through a view of that field alone.
+                unsafe {
+                    place
+                        .project(|record| addr_of_mut!((*record).source))
+                        .get(&*prefix)
+                        .is_some()
+                }
+            } else {
+                self.source.is_some()
+            });
+        }
+        // SAFETY: a complete prefix initializes the source, the phase and the
+        // preparation's resource-free prefix, read through one shared view of
+        // the record.
+        let planned = unsafe { place.get(&*prefix) };
+        PlanDetail {
+            phase: Some(planned.phase),
+            preparation: Some(planned.preparation.position()),
+            source: planned.source.is_some(),
         }
     }
 }
@@ -2871,6 +2981,151 @@ mod bound_tests {
             retired.reclaim_step(&mut acquisition).unwrap(),
             Reclaimed::Done
         );
+    }
+
+    /// A preparation whose cleanup reports `Done` holds no borrow of its
+    /// source: an owned preparation's record releases the source right
+    /// after, while the record is still observed, so a payload pending when
+    /// cleanup began is neither reported nor read once the preparation is
+    /// reclaimed.
+    #[test]
+    fn a_reclaimed_preparation_holds_no_borrow_of_its_source() {
+        let source = crate::ByteString::from(vec![0x5a; 200]);
+        let bound = prepare_bound::<Reservation, ()>(
+            Shape::of(&source, &mut Limits::unlimited()).expect("a byte string has a shape"),
+        )
+        .expect("the bound of a byte string fits in u64");
+        let mut limits = Limits::unlimited();
+        let mut preparation = Preparation::<Reservation>::new(&source);
+        // Prepared until the payload is pending past its head: more bytes
+        // pending than any staged head holds.
+        within("preparation to its pending payload", bound, || {
+            if preparation.position().pending_bytes > MAX_HEAD_LEN {
+                return ControlFlow::Break(());
+            }
+            match preparation.step(&mut limits).unwrap() {
+                Step::Progress => ControlFlow::Continue(()),
+                Step::Complete(_) | Step::Finished => {
+                    panic!("published before its payload was pending")
+                }
+            }
+        });
+        within("cleanup of a pending payload", bound, || match preparation
+            .reclaim_step(&mut limits)
+            .unwrap()
+        {
+            Reclaimed::Done => ControlFlow::Break(()),
+            Reclaimed::Progress | Reclaimed::Waiting => ControlFlow::Continue(()),
+        });
+        let position = preparation.position();
+        assert_eq!(
+            position.pending_bytes, 0,
+            "a reclaimed preparation still holds its source's payload"
+        );
+        assert!(
+            !position.child,
+            "a reclaimed preparation still holds a child"
+        );
+        assert!(
+            !position.normalizing,
+            "a reclaimed preparation still holds a text"
+        );
+        assert_eq!(limits.live_bytes(), 0);
+    }
+
+    /// A preparation capped below what its source appends is refused at the
+    /// growth that would pass the cap; one capped at exactly what its source
+    /// appends grows its plan's arena to the cap and no further, so the
+    /// encoding it publishes holds exactly the encoded bytes.
+    #[test]
+    fn a_capped_preparation_grows_its_plan_to_its_cap_and_no_further() {
+        let source = crate::ByteString::from(vec![0x5a; 200]);
+        let shape =
+            Shape::of(&source, &mut Limits::unlimited()).expect("a byte string has a shape");
+        let appended = usize::try_from(shape.appended::<()>().expect("the extent fits in u64"))
+            .expect("the extent fits in usize");
+        // A two-byte head and 200 bytes; no map, so no gap.
+        assert_eq!(appended, 202);
+        let bound = prepare_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+        let mut limits = Limits::unlimited();
+        let mut short = Preparation::<Reservation>::capped(&source, appended - 1);
+        assert_eq!(short.position().capacity_limit, appended - 1);
+        let refused = within("preparation capped short", bound, || {
+            match short.step(&mut limits) {
+                Ok(Step::Progress) => ControlFlow::Continue(()),
+                Ok(Step::Complete(_)) => panic!("a plan grew past its cap"),
+                Ok(Step::Finished) => panic!("finished without a plan"),
+                Err(error) => ControlFlow::Break(error),
+            }
+        });
+        assert_eq!(refused, BoundedError::PlanMismatch);
+        drop(short);
+        assert_eq!(limits.live_bytes(), 0);
+        let mut exact = Preparation::<Reservation>::capped(&source, appended);
+        assert_eq!(exact.position().capacity_limit, appended);
+        let plan = within("preparation capped exactly", bound, || {
+            match exact.step(&mut limits) {
+                Ok(Step::Progress) => ControlFlow::Continue(()),
+                Ok(Step::Complete(plan)) => ControlFlow::Break(plan),
+                Ok(Step::Finished) => panic!("finished without a plan"),
+                Err(error) => panic!("an exact cap was refused: {error:?}"),
+            }
+        });
+        drop(exact);
+        assert_eq!(plan.len(), appended);
+        let encoded = plan
+            .publish(&mut limits)
+            .expect("an unlimited policy admits publication");
+        assert_eq!(encoded.as_ref().len(), appended);
+        assert_eq!(
+            limits.live_bytes(),
+            appended as u64,
+            "the published encoding holds more than its capped arena"
+        );
+        drop(encoded);
+        assert_eq!(limits.live_bytes(), 0);
+    }
+
+    /// Publication releases the plan's gap records and keeps its bytes as
+    /// the encoding, so an encoding retains less than the plan it
+    /// publishes, measured and bounded alike: a bound of the encoding that
+    /// also retained the gaps would overstate what `encode` keeps.
+    #[test]
+    fn an_encoding_retains_less_than_the_plan_it_publishes() {
+        let source = Pairs((0..32u64).rev().map(|n| (n, vec![n; 4])).collect());
+        let shape = Shape::of(&source, &mut Limits::unlimited()).expect("a map has a shape");
+        let planned_bound = prepare_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+        let encoded_bound = encode_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+        let mut limits = Limits::unlimited();
+        let plan =
+            crate::bounded::prepare(&source, &mut limits).expect("an unlimited policy prepares");
+        let planned = limits.live_bytes();
+        let encoded = plan
+            .publish(&mut limits)
+            .expect("an unlimited policy admits publication");
+        let kept = limits.live_bytes();
+        assert!(
+            kept < planned,
+            "publication released nothing: plan {planned}, encoding {kept}"
+        );
+        assert!(
+            planned <= planned_bound.retained,
+            "plan {planned} beyond its bound {}",
+            planned_bound.retained
+        );
+        assert!(
+            kept <= encoded_bound.retained,
+            "encoding {kept} beyond its bound {}",
+            encoded_bound.retained
+        );
+        assert!(
+            encoded_bound.retained < planned_bound.retained,
+            "the encoding's bound retains {} and its plan's {}: the gaps publication releases are still counted",
+            encoded_bound.retained,
+            planned_bound.retained
+        );
+        drop(encoded);
+        assert_eq!(limits.live_bytes(), 0);
     }
 
     struct InvalidProtocol(u8);
@@ -3072,6 +3327,35 @@ mod bound_tests {
         covered(&nested);
     }
 
+    /// Keys holding gapped maps are compacted in place before they are
+    /// compared: compaction opens at a key's first gap, moves the bytes up to
+    /// the next gap, removes each gap, then truncates the plan's bytes and
+    /// the key's gap records to the compacted key. Only compacted keys order
+    /// canonically: `[{}, 1]` (`82 a0 01`) before `[{}, {}]` (`82 a0 a0`),
+    /// where the gaps' bytes left in place would put the second key first.
+    /// The plan publishes the canonical map exactly, within the bound of its
+    /// shape. The smallest source taking each step of compaction, and no other
+    /// engine path, so light enough to run under Miri (`tests/miri-suites.txt`).
+    #[test]
+    fn keys_holding_gapped_maps_are_compacted_before_they_are_ordered() {
+        let one: Vec<Box<dyn Schema>> = vec![Box::new(Empty), Box::new(1u64)];
+        let two: Vec<Box<dyn Schema>> = vec![Box::new(Empty), Box::new(Empty)];
+        let source = Pairs(vec![(two, 0u64), (one, 1u64)]);
+        covered(&source);
+        let mut limits = Limits::unlimited();
+        let plan =
+            crate::bounded::prepare(&source, &mut limits).expect("an unlimited policy prepares");
+        let encoded = plan
+            .publish(&mut limits)
+            .expect("an unlimited policy admits publication");
+        assert_eq!(
+            encoded.as_ref(),
+            [0xa2, 0x82, 0xa0, 0x01, 0x01, 0x82, 0xa0, 0xa0, 0x00]
+        );
+        drop(encoded);
+        assert_eq!(limits.live_bytes(), 0);
+    }
+
     /// The composed peak covers a text normalized and copied beside every
     /// arena a permuted map grew, and is at most every place's peak summed:
     /// phases that exclude one another are not counted at once.
@@ -3210,6 +3494,70 @@ mod bound_tests {
         type LedgeredPlan = (places::Ledgered, Shape, Option<Prepared<places::Permit>>);
         type LedgeredError = (String, Box<Position>);
 
+        /// Where a preparation is cancelled into its cleanup.
+        #[derive(Clone, Copy, Debug)]
+        enum Cancel {
+            /// After this many steps.
+            After(usize),
+            /// At the first boundary the condition holds of: an arena
+            /// relocating, which cleanup then drains one element per unit,
+            /// as its term charges; settled, it is discarded in one.
+            Draining(fn(&Position) -> bool),
+        }
+
+        /// Whether `arena` is relocating at least `least` elements.
+        fn relocates(
+            arena: crate::bounded::decode::storage::StoragePosition,
+            least: usize,
+        ) -> bool {
+            arena.stage == crate::bounded::decode::storage::StorageStage::Relocating
+                && arena.relocating_remaining >= least
+        }
+
+        /// Every arena a preparation holds at `position`: its eight, and its
+        /// text continuation's two once initialized.
+        fn arenas(
+            position: &Position,
+        ) -> impl Iterator<Item = crate::bounded::decode::storage::StoragePosition> {
+            let text = position
+                .normalization
+                .map(|text| [text.characters, text.ordering_state.scratch]);
+            [
+                position.frames,
+                position.bytes,
+                position.holes,
+                position.maps,
+                position.cursor_storage,
+                position.dynamic.entry_storage,
+                position.dynamic.merge_storage,
+                position.dynamic.bitmap_storage,
+            ]
+            .into_iter()
+            .chain(text.into_iter().flatten())
+        }
+
+        /// How many of the preparation's arenas, and its text continuation's,
+        /// a cancellation would drain one element per unit: staging a
+        /// growth whose acquisition was refused (`Storage::reclaim_settled`),
+        /// relocating, or relocated and not yet settled; a settled arena
+        /// with no growth staged is discarded in one unit
+        /// (`Storage::reclaim_copy_step`). [`PreparationTerms`] charges its
+        /// peak, and its cleanup's drain, for at most one; every attribution
+        /// run checks it at every boundary ([`ledgered`]).
+        fn draining(position: &Position) -> usize {
+            use crate::bounded::decode::storage::StorageStage;
+            arenas(position)
+                .filter(|arena| {
+                    matches!(
+                        arena.stage,
+                        StorageStage::Staging(_)
+                            | StorageStage::Relocating
+                            | StorageStage::Relocated
+                    )
+                })
+                .count()
+        }
+
         /// `source` prepared under a ledgered policy, then, when `cleanup`,
         /// cancelled after `cleanup` steps and its cleanup stepped to `Done`: the
         /// policy, the source's shape and the published plan, held for the check.
@@ -3220,7 +3568,7 @@ mod bound_tests {
         /// (`shape_and_preparation_reject_the_same_invalid_map_protocols`).
         fn ledgered(
             source: &dyn Schema,
-            cleanup: Option<usize>,
+            cleanup: Option<Cancel>,
         ) -> Result<LedgeredPlan, LedgeredError> {
             let mut policy = places::Ledgered::new();
             let mut preparation = Preparation::<places::Permit>::new(source);
@@ -3240,7 +3588,20 @@ mod bound_tests {
             let mut steps = 0usize;
             let plan =
                 within("ledgered preparation", bound, || {
-                    if cleanup == Some(steps) {
+                    let position = preparation.position();
+                    let arenas = draining(&position);
+                    if arenas > 1 {
+                        return ControlFlow::Break(Err((
+                            format!("{arenas} arenas staging or relocating at once"),
+                            Box::new(position),
+                        )));
+                    }
+                    let cancelled = match cleanup {
+                        Some(Cancel::After(after)) => after == steps,
+                        Some(Cancel::Draining(condition)) => condition(&position),
+                        None => false,
+                    };
+                    if cancelled {
                         return ControlFlow::Break(within("ledgered cleanup", bound, || {
                             match preparation.reclaim_step(&mut policy) {
                                 Ok(Reclaimed::Done) => ControlFlow::Break(Ok(None)),
@@ -3283,12 +3644,76 @@ mod bound_tests {
             }
         }
 
-        /// A source whose preparation charges `place`, and the step after which
-        /// it is cancelled into its cleanup, if it is: a place without a witness
+        /// Under a policy refusing every admission once, a growth stages: its
+        /// block's write is admitted on the retry and its release refused next
+        /// (`stable::acquire`), leaving the arena `Staging`, which cleanup
+        /// drains one element per unit (`Storage::reclaim_settled`). The
+        /// attribution runs refuse nothing, so they never stage; here every
+        /// staging arena of a map's and a text's preparation is counted by
+        /// [`draining`], and at most one arena stages or relocates at any
+        /// boundary.
+        #[test]
+        fn a_refused_growth_stages_one_arena_and_is_counted_draining() {
+            use crate::bounded::decode::storage::StorageStage;
+            let sources: [(&str, Box<dyn Schema>); 2] = [
+                (
+                    "permuted map",
+                    Box::new(vec![Pairs(
+                        (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
+                    )]),
+                ),
+                (
+                    "disordered text",
+                    Box::new(format!("q{}", "\u{301}\u{316}".repeat(64))),
+                ),
+            ];
+            for (name, source) in sources {
+                let mut limits = Limits::unlimited().refusing_each();
+                let mut preparation = Preparation::<Reservation>::new(source.as_ref());
+                let mut staged = 0usize;
+                let mut published = false;
+                for _ in 0..1_000_000 {
+                    let position = preparation.position();
+                    let staging = arenas(&position)
+                        .filter(|arena| matches!(arena.stage, StorageStage::Staging(_)))
+                        .count();
+                    let counted = draining(&position);
+                    assert!(
+                        counted <= 1,
+                        "{name}: {counted} arenas staging or relocating at once: {position:?}"
+                    );
+                    if staging > 0 {
+                        staged += 1;
+                        assert_eq!(
+                            counted, staging,
+                            "{name}: a staging arena not counted draining: {position:?}"
+                        );
+                    }
+                    match preparation.step(&mut limits) {
+                        Ok(Step::Complete(plan)) => {
+                            drop(plan);
+                            published = true;
+                            break;
+                        }
+                        Ok(Step::Progress) => {}
+                        Ok(Step::Finished) => panic!("{name}: finished without a plan"),
+                        Err(error) if error.refused() => {}
+                        Err(error) => panic!("{name}: {error:?}"),
+                    }
+                }
+                assert!(published, "{name}: not published in a million steps");
+                assert!(staged > 0, "{name}: no growth staged under refusals");
+                drop(preparation);
+                assert_eq!(limits.live_bytes(), 0, "{name}");
+            }
+        }
+
+        /// A source whose preparation charges `place`, and where it is
+        /// cancelled into its cleanup, if it is: a place without a witness
         /// does not compile. `None` only for a place this build never charges.
         fn witness(
             place: PreparationPlace,
-        ) -> Option<(&'static str, Box<dyn Schema>, Option<usize>)> {
+        ) -> Option<(&'static str, Box<dyn Schema>, Option<Cancel>)> {
             Some(match place {
                 PreparationPlace::Instructions
                 | PreparationPlace::Pushes
@@ -3333,12 +3758,21 @@ mod bound_tests {
                     )]),
                     None,
                 ),
+                // Cancelled while its plan's bytes relocate their last
+                // growth, so cleanup drains them one per unit, as its term
+                // charges. The plan's arena holds 594 bytes: an array head,
+                // the map's gap of the widest head (`MAX_HEAD_LEN`, nine
+                // bytes, its two-byte head written into it at the end), and
+                // per entry a key, an array head and four values, the key
+                // and each value one byte below 24 and two from 24 (24
+                // entries of 6 bytes, 40 of 11). It fills a capacity of 512
+                // and relocates all 512.
                 PreparationPlace::Cleanup => (
                     "cancelled map",
                     Box::new(vec![Pairs(
                         (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
                     )]),
-                    Some(2000),
+                    Some(Cancel::Draining(|position| relocates(position.bytes, 512))),
                 ),
                 // Bignums of many digits each: both passes over every digit,
                 // in full units of a quantum but for each pass's last.
@@ -3422,7 +3856,7 @@ mod bound_tests {
             let mut plans = Vec::new();
             for index in 0..300usize {
                 let source = generated(&mut generator, 4);
-                let cancel = (index % 4 == 0).then_some(index % 40 + 1);
+                let cancel = (index % 4 == 0).then_some(Cancel::After(index % 40 + 1));
                 let (policy, shape, plan) =
                     ledgered(source.as_ref(), cancel).unwrap_or_else(|failure| {
                         panic!("generated {index}, cancelled after {cancel:?}: {failure:?}")
@@ -3465,7 +3899,8 @@ mod bound_tests {
                 >,
             >() as u64;
             assert_eq!(measured.allocated, (4 + 8 + 16) * element + 3 * block);
-            let (cancelled, cancelled_shape, cancelled_plan) = ledgered(&source, Some(1)).unwrap();
+            let (cancelled, cancelled_shape, cancelled_plan) =
+                ledgered(&source, Some(Cancel::After(1))).unwrap();
             assert!(
                 cancelled_plan.is_none(),
                 "cancelled scratch fixture published"
@@ -3489,12 +3924,12 @@ mod bound_tests {
         }
 
         /// A prepared source: its name, the place it witnesses if any, and
-        /// the step after which it is cancelled into its cleanup if it is.
+        /// where it is cancelled into its cleanup if it is.
         struct Source {
             name: String,
             witnesses: Option<PreparationPlace>,
             schema: Box<dyn Schema>,
-            cancel_after: Option<usize>,
+            cancel_after: Option<Cancel>,
         }
 
         /// Every place a preparation charges is within its term on every engine
@@ -3601,6 +4036,24 @@ mod bound_tests {
                     cancel_after: None,
                 });
             }
+            // Cleanup's term charges the most any one arena drains, in values
+            // and in bytes apart: its witness drains the plan's bytes, the
+            // most elements; the descriptors, 32 bytes each, are the most
+            // bytes. Cancelled while they relocate their last growth: an
+            // uncounted map reserves a descriptor's slot before asking for
+            // each instruction after its scan began, so the reservation
+            // before its `End` grows the full arena of 64 and relocates all
+            // 64.
+            sources.push(Source {
+                name: "cancelled descriptors".into(),
+                witnesses: None,
+                schema: Box::new(vec![Pairs(
+                    (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
+                )]),
+                cancel_after: Some(Cancel::Draining(|position| {
+                    relocates(position.dynamic.entry_storage, 64)
+                })),
+            });
             let mut runs = Vec::new();
             let mut witnesses = Vec::new();
             let mut plans = Vec::new();
@@ -3830,6 +4283,93 @@ mod bound_tests {
                 "{moves} moves"
             );
         }
+    }
+
+    /// An integer whose source inspects as many values before its head: no
+    /// map and no cursor, so no unit but the inspection's admits several
+    /// values and no bytes.
+    struct Inspected(u64);
+
+    impl Schema for Inspected {
+        fn instruction(&self, index: usize) -> Instruction<'_> {
+            match index {
+                0 => Instruction::Inspect(self.0),
+                1 => Instruction::Head(MajorType::Unsigned, Argument::Shortest(self.0)),
+                _ => Instruction::End,
+            }
+        }
+    }
+
+    /// A preparation admits an announced inspection of more values than a
+    /// turn holds in units of at most a turn's values, the remainder kept
+    /// between them: seven values as three, three and one, consecutively,
+    /// before the instruction that follows; then the integer encodes exactly.
+    #[test]
+    fn a_preparation_admits_a_wide_inspection_a_turn_at_a_time() {
+        let source = Inspected(7);
+        let shape = Shape::of(&source, &mut Limits::unlimited()).expect("an integer has a shape");
+        let bound = prepare_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+        let mut limits = Limits::unlimited().logged();
+        let mut preparation = Preparation::<Reservation>::new(&source);
+        let plan = within(
+            "a wide inspection's preparation",
+            bound,
+            || match preparation.step(&mut limits).unwrap() {
+                Step::Progress => ControlFlow::Continue(()),
+                Step::Complete(plan) => ControlFlow::Break(plan),
+                Step::Finished => panic!("finished without a plan"),
+            },
+        );
+        limits.assert_units(TURN);
+        let unit = |values| Call::Work { values, bytes: 0 };
+        assert!(
+            limits
+                .calls()
+                .windows(3)
+                .any(|calls| calls == [unit(3), unit(3), unit(1)]),
+            "seven inspected values not admitted as 3, 3, 1: {:?}",
+            limits.calls()
+        );
+        let mut bytes = vec![0; plan.len()];
+        plan.encode_into(&mut bytes, &mut Limits::unlimited())
+            .expect("an unlimited policy admits the write");
+        assert_eq!(bytes, [0x07]);
+    }
+
+    /// A bignum being prepared is observed through the preparation's
+    /// position: the digits its scan has read, a quantum's eight at a time,
+    /// then, its head staged, the digits its emission has read, from none
+    /// again; and nothing once its bytes are staged.
+    #[cfg(feature = "num-bigint")]
+    #[test]
+    fn a_bignums_passes_are_observed_digit_unit_by_digit_unit() {
+        // 2^4095: 64 digits, eight units per pass.
+        let source = num_bigint::BigUint::from(1u8) << 4095usize;
+        let shape = Shape::of(&source, &mut Limits::unlimited()).expect("a bignum has a shape");
+        let bound = prepare_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+        let mut limits = Limits::unlimited();
+        let mut preparation = Preparation::<Reservation>::new(&source);
+        let mut observed: Vec<(usize, bool)> = Vec::new();
+        let plan = within("a bignum's preparation", bound, || {
+            if let Some(position) = preparation.position().bignum
+                && observed.last() != Some(&position)
+            {
+                observed.push(position);
+            }
+            match preparation.step(&mut limits).unwrap() {
+                Step::Progress => ControlFlow::Continue(()),
+                Step::Complete(plan) => ControlFlow::Break(plan),
+                Step::Finished => panic!("finished without a plan"),
+            }
+        });
+        assert_eq!(preparation.position().bignum, None);
+        let expected: Vec<(usize, bool)> = [false, true]
+            .into_iter()
+            .flat_map(|emitting| (0..64).step_by(8).map(move |read| (read, emitting)))
+            .collect();
+        assert_eq!(observed, expected);
+        // Tag 2, a byte string of 512 bytes: a one, then zeros.
+        assert_eq!(plan.len(), 1 + 3 + 512);
     }
 
     #[test]

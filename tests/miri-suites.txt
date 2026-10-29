@@ -1,0 +1,105 @@
+# The Miri gate's selection (tests/miri-owned.sh), which the reach map
+# (tests/reach-map.sh) instruments and the mutation campaign's Miri layer
+# judges on: one line per suite, its mutation domain (`all-features` or
+# `no_std`, whose features tests/gate-common.sh's `domain_features` names), a
+# target kind, the suite, and an optional test-name filter.
+#
+# `lib` selects the library's test binary by the module path it names;
+# `test` an integration test binary; `abort` an integration test binary whose
+# ignored tests each end their own process by aborting, run one at a time
+# and required to abort (natively by SIGABRT, under Miri by its abnormal
+# termination, with no undefined behavior reported). A filter is libtest's:
+# it selects every test whose name contains it.
+#
+# The filters keep the resumable suite to the code whose unsafe operations
+# are under test: the Slot cursors of BTreeMap, Map and symbolic CBOR; and
+# the retained arena's staged growth, whose block is acquired, vacated into
+# the arena and freed, refused at every admission and cancelled at every
+# partial relocation. Fixed arrays are qualified by reclamation_owner, owned
+# preparation by the owned suites. The decode scope's abort is witnessed in
+# both domains: with std it is `std::process::abort`, without it a panic
+# while panicking, code the all-features build never compiles.
+all-features lib bounded::decode::construction::in_place
+all-features test owned_input
+all-features test owned_inspection
+all-features test owned_decode
+all-features test owned_physical_failure terminal_tree_cleanup
+all-features test owned_btree
+all-features test owned_lifecycle_matrix
+all-features test owned_pipeline_matrix
+all-features test owned_pipeline_interleavings
+all-features test owned_public_contract
+all-features test owner_concurrency
+all-features test optional_admission
+all-features test reclamation_owner
+all-features test typed_lifecycle_floor
+all-features test typed_error_custody
+all-features test resumable_contract schema_encoding::ordered
+all-features test resumable_contract storage_cursor::
+all-features abort abort_witness
+no_std abort abort_witness
+#
+# The reach map's standing target: every function of a module holding
+# `unsafe`, outside test code, reached by a test run under Miri. Below, the
+# fewest-cost tests reaching what the suites above do not, chosen by a
+# weighted set cover over each test's own native coverage at minimal
+# witness sizes, its cost its native duration; a module filter where every
+# test of the module was chosen, or all but trivially cheap ones.
+all-features lib bounded::policy::tests::
+all-features lib bounded::tests::charge_rules::
+all-features lib bounded::tests::integers_match_the_symbolic_encoding_at_every_width
+all-features lib bounded::tests::a_tree_iterators_steps_compare_no_keys
+all-features lib bounded::decode::construction::reclamation::tests::
+all-features lib bounded::decode::construction::reclamation::owned::tests::the_defaults_hold_nothing
+all-features lib bounded::decode::construction::input::tests::
+all-features lib bounded::decode::storage::tests::the_default_arena_is_empty_and_settled
+all-features lib bounded::decode::header::attribution::every_place_of_a_head_is_within_its_term
+all-features lib bounded::decode::terms_tests::quick_only_text_costs_its_quick_check_alone
+all-features lib bounded::decode::terms_tests::the_stack_term_covers_nesting
+all-features lib bounded::encoding::buckets::attribution::
+all-features lib bounded::encoding::bound_tests::a_bignums_passes_are_observed_digit_unit_by_digit_unit
+all-features lib bounded::encoding::bound_tests::a_preparation_admits_a_wide_inspection_a_turn_at_a_time
+all-features lib bounded::encoding::bound_tests::retired_plan_consumes_prepaid_releases_before_admitted_completion
+all-features lib bounded::encoding::bound_tests::shape_and_preparation_reject_the_same_invalid_map_protocols
+all-features lib bounded::encoding::bound_tests::keys_holding_gapped_maps_are_compacted_before_they_are_ordered
+all-features lib bounded::text::tests::combining_pressure_is_refused_within_its_allowance
+all-features lib bounded::text_cursor::tests::the_joint_worst_bound_is_total
+all-features lib bounded::text_cursor::tests::every_part_sorted_in_pairs_is_the_most_any_runs_charge
+all-features test public_api
+all-features test physical_copy_failure
+all-features test derive bounded_maps_match_the_symbolic_encoding_with_options_both_ways
+all-features test derive bounded_derive_accepts_user_names_and_generic_fields
+all-features test bounded_extended strict_decoder_rejects_literal_invalid_inputs
+all-features test bounded_extended new_representations_have_literal_wire_contracts
+all-features test bounded_extended sparse_hash_map_iteration_is_admitted
+all-features test bounded_extended borrowed_document_exposes_immediate_children_and_original_payloads
+all-features test bounded_extended bignums_have_literal_zero_and_borrow_boundary_encodings
+all-features test bounded_adversarial pointer_forwarding_writes_without_cloning_or_allocating
+all-features test bounded_adversarial reservation_growth_holds_old_permit_until_replacement_succeeds
+all-features test bounded_adversarial absent_fields_are_inspected_in_preparation_and_not_when_written
+all-features test bounded_bounds an_unrepresentable_bound_is_refused
+all-features test encode convert_hash_map
+all-features test encode convert_btree_map
+all-features test encode encode_map
+all-features test format format_map
+all-features test numeric_profile noncanonical_nan_payloads_encode_as_the_canonical_nan
+all-features test resumable_contract schedules::writer_refusals_preserve_literal_prefix_guards_and_plan_ownership
+all-features test resumable_contract repeated::typed_fields_survive_successive_refusals_with_output_ownership
+all-features test resumable_contract repeated::normalization_and_emission_survive_successive_refusals_without_replay
+all-features test resumable_contract bindings::shared_driver_resumes_a_real_header_cursor_with_production_offsets
+all-features test resumable_contract comparison_cursor::production_comparison_retains_exact_offsets_across_every_refusal
+all-features test resumable_contract deadlines::expired_before_first_admission_executes_no_work_and_allocates_nothing
+all-features test resumable_contract deadlines::expiration_between_admissions_preserves_paid_work_and_can_resume
+all-features test resumable_contract ownership::split_merge_zero_and_refused_transfers_preserve_exact_capacity
+all-features test resumable_contract dynamic_maps::long_key_comparison_retains_exact_offset_across_repeated_refusal
+all-features test resumable_contract tests::real_capacity_exhaustion_is_distinct_from_work_and_invalid_input
+all-features test resumable_contract derive::derived_unit_and_newtype_resume_without_schema_replay
+all-features test resumable_contract derive::derived_nested_fields_resume_at_every_admission_without_reconstruction
+all-features test resumable_contract hash_map_schema::hash_map_deleted_buckets_encode_literal_output_after_every_refusal
+all-features test resumable_contract schema_encoding::many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes
+all-features test resumable_contract text_progress::actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_point
+# Code the all-features build never compiles: the stock collections' entry
+# cursors, for `Map` and for a standard tree, and `ranged`, reached by
+# encoding each without std.
+no_std lib bounded::tests::a_maps_iteration_order_is_its_encoded_key_order
+no_std lib bounded::tests::a_trees_entries_take_canonical_key_order_not_tree_order

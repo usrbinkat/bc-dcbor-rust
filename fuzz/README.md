@@ -8,8 +8,8 @@ From the repository root:
 nix develop -c bash fuzz/qualify.sh
 ```
 
-This builds all eight existing targets and runs each for 600 seconds (about
-80 minutes total, plus compilation and corpus initialization). Each target uses
+This builds all nine existing targets and runs each for 600 seconds (about
+90 minutes total, plus compilation and corpus initialization). Each target uses
 seed 20261019, its own input-size ceiling, a 30-second per-input timeout, and a
 4096 MiB RSS limit. Existing corpora and crash artifacts are retained.
 
@@ -23,43 +23,17 @@ directory; an existing campaign's results are never overwritten.
 FUZZ_SECONDS=60 FUZZ_SEED=42 nix develop -c bash fuzz/qualify.sh
 ```
 
-This campaign covers the existing targets described below. It does not add an
-owner-backed typed-decoder lifecycle target or establish coverage of that API.
+This campaign covers every target described below.
 
-For Nix-managed Rust without rustup, use local `nixpkgs` and `rust-overlay`
-checkouts. This avoids GitHub registry resolution; uncached toolchain archives
-and packages still require downloads. Substitute your checkout paths:
-
-```sh
-nix-shell fuzz/shell.nix \
-  -I nixpkgs=/workspace/usrbinkat/github.com/NixOS/nixpkgs \
-  --arg nixpkgsPath /workspace/usrbinkat/github.com/NixOS/nixpkgs \
-  --arg rustOverlayPath /workspace/usrbinkat/github.com/oxalica/rust-overlay \
-  --run 'env -u RUSTC -u RUSTDOC bash fuzz/smoke.sh'
-```
-
-The `-I` option also directs nix-shell's own `<nixpkgs>` lookup for
-`bashInteractive` to the local checkout; `--arg nixpkgsPath` alone does not.
-The shell supplies nightly Rust and `cargo-fuzz`. `smoke.sh` builds all targets
-and runs the eight smoke checks, stopping on the first failure. Clearing inherited
-`RUSTC` and `RUSTDOC` overrides ensures Cargo uses the shell's nightly compiler.
-Toolchain selection
-follows the supplied checkouts; pin their revisions in reproducible CI setups.
-
-Run with `cargo-fuzz` available on PATH and a rustup-installed nightly Rust
-toolchain from the repository root. Explicit `rustup run` also works when the
-default `cargo` on PATH is a standalone executable rather than a rustup proxy:
+The flake's shell supplies everything fuzzing runs: its pinned nightly, built
+against the forked standard library every other gate uses, and `cargo-fuzz`.
+Its inputs are locked, so once the shell has been realized it starts without
+network access (`nix develop --offline`); nothing is resolved from GitHub.
+`smoke.sh` builds all targets and runs a short check of each, stopping on the
+first failure:
 
 ```sh
-rustup run nightly cargo fuzz build
-rustup run nightly cargo fuzz run numeric -- -runs=1000 -max_len=8
-rustup run nightly cargo fuzz run text -- -runs=1000 -max_len=4096
-rustup run nightly cargo fuzz run nested -- -runs=1000 -max_len=32
-rustup run nightly cargo fuzz run refusals -- -runs=1000 -max_len=66
-rustup run nightly cargo fuzz run decode -- -runs=1000 -max_len=4096
-rustup run nightly cargo fuzz run decode_schedule -- -runs=1000 -max_len=4096
-rustup run nightly cargo fuzz run schema_schedule -- -runs=1000 -max_len=1024
-rustup run nightly cargo fuzz run representations -- -runs=1000 -max_len=256
+nix develop -c bash fuzz/smoke.sh
 ```
 
 Input sizes and nesting are explicitly bounded. The shared runner checks exact
@@ -94,11 +68,26 @@ symbolic map oracle.
 `representations` exercises sorted dynamic maps, symbolic values, explicit tags,
 standalone options, and positive/negative bignums. Both cap input size inside the
 target, independently of libFuzzer arguments.
+`owned_lifecycle` drives, through the shared driver (`dcbor-test-support`'s
+`pipeline`), the owned typed decode of a custom input over arbitrary bytes and
+then, for inputs of at most 1024 bytes, the owned pipeline (acquisition,
+decoding, owned preparation and emission). The input's first two bytes select
+each schedule, a `pipeline::Schedule`: one admission refused and resumed, its
+accounting compared with the unobstructed run's (no replay); in the pipeline,
+one physical request failed; and one stop at an observed boundary, a cancel in
+the decode and a retire or cancel, as the input's fourth byte selects, in the
+pipeline. Each run is a single schedule, never grouped with another, so its
+boundaries are unclassified (`Classes::none()`); class reduction and its checks
+belong to the deterministic matrices. Under normalizing options the decoded
+text must equal the symbolic decoder's, and the pipeline must publish exactly
+when the input is canonical text. libFuzzer aborts before any unwind, so
+unwinding stops are qualified by `tests/owned_pipeline_matrix.rs`.
 
-For a stable-toolchain source compilation check (not a fuzz execution):
+For a stable-toolchain source compilation check (not a fuzz execution), in
+the flake's stable shell:
 
 ```sh
-cargo check --manifest-path fuzz/Cargo.toml --bins
+nix develop .#stable -c cargo check --manifest-path fuzz/Cargo.toml --bins
 ```
 
 These targets are operational only after their build and smoke runs succeed on

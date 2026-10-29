@@ -150,7 +150,8 @@ macro_rules! places {
         impl $crate::bounded::Place for $name {
             const ALL: &'static [Self] = &[$(Self::$variant),+];
 
-            #[cfg(all(test, feature = "std"))]
+            #[cfg(test)]
+            #[cfg(feature = "std")]
             fn index(self) -> usize {
                 self as usize
             }
@@ -165,7 +166,8 @@ pub(crate) trait Place: Copy + PartialEq + fmt::Debug + 'static {
     const ALL: &'static [Self];
     /// This place's position in [`Self::ALL`]: how the attribution ledger of
     /// this crate's test builds keys it.
-    #[cfg(all(test, feature = "std"))]
+    #[cfg(test)]
+    #[cfg(feature = "std")]
     fn index(self) -> usize;
 }
 
@@ -179,7 +181,8 @@ pub(crate) struct Caller;
 impl Place for Caller {
     const ALL: &'static [Self] = &[Caller];
 
-    #[cfg(all(test, feature = "std"))]
+    #[cfg(test)]
+    #[cfg(feature = "std")]
     fn index(self) -> usize {
         0
     }
@@ -191,7 +194,8 @@ impl Place for Caller {
 /// their own places: exactly the admissions of this one call.
 #[inline(always)]
 pub(crate) fn at<P: Place, T>(place: P, f: impl FnOnce() -> T) -> T {
-    #[cfg(all(test, feature = "std"))]
+    #[cfg(test)]
+    #[cfg(feature = "std")]
     let _entered = places::enter(place);
     #[cfg(not(all(test, feature = "std")))]
     let _ = place;
@@ -211,7 +215,8 @@ fn admit_at<P: Place, B: Budget>(
     values: u64,
     bytes: u64,
 ) -> BoundedResult<(), B> {
-    #[cfg(all(test, feature = "std"))]
+    #[cfg(test)]
+    #[cfg(feature = "std")]
     let _routed = places::route();
     at(place, || budget.traverse(values, bytes)).map_err(BoundedError::Refused)
 }
@@ -1258,7 +1263,8 @@ pub(crate) fn within_steps<T>(
 /// each admission ([`at`]), a policy that records what is admitted, requested
 /// and held at the innermost entered place of every kind, and the check that
 /// every place is within its term.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 pub(crate) mod places {
     use super::*;
     use core::any::TypeId;

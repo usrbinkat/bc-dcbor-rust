@@ -72,9 +72,41 @@ Each is its own test binary under `tests/`, driven by `dcbor-test-support`.
   `prepare_turns` with `shape`, `emit_turns` and `text_emit_turns`. The owned
   pipeline driver takes its phases' limits from `copy_bound`, `parse_bound`,
   `typed_decode_bound` and `owned_prepare_bound`.
-- `support::pipeline` is the one observed owned-pipeline driver: acquisition,
-  inspection and typed encoding, with refusal, physical failure, and retire,
-  unwind or cancel stops at every observed boundary.
+- One matrix seam drives every fault schedule, in the layer `DCBOR_RIGOR`
+  selects (`CONTRACT.md`, Test independence): `refusal_matrix` for a single
+  resumable operation, `synchronous_matrix` for one that ends at its first
+  refusal, `physical_matrix` and `stop_matrix`, and `support::pipeline`'s
+  `matrix` for the owned pipeline (acquisition, inspection, typed decoding,
+  owned preparation and chunked emission), with refusal, physical failure,
+  and retire, unwind or cancel stops at every observed boundary. No test
+  holds a fault loop of its own; `repeated_refusal` and `reason_matrix` are
+  the seam's stages for repeated refusal of one unit and for refusal
+  reasons.
+- Stop classes (`tests/support/classes.rs`) reduce the fast layer's stops: a
+  boundary's class is its state's cleanup obligation, every count cleanup
+  never reads dropped, each arena by its growth stage, its permits and
+  whether it holds anything (its elements only while staging or
+  relocating, where cleanup drains per element). The exhaustive layer
+  requires every member of a class to clean up with exactly its first
+  member's calls (`support::agree`); a planted class merging different
+  custody is rejected (`owned_inspection.rs`). Unclassified, so every stop
+  runs in both layers: the scope boundary, before anything is held; the
+  published plan, which only retires; every emission boundary, no cleanup
+  argument covering a writer's states; and a container's construction
+  boundaries (`classes::parsed`), since containers declare no reduction.
+- Binding observations and reductions are checked by the observed
+  construction driver (`support::construction`, `tests/reclamation_owner.rs`,
+  `tests/reclamation/schema.rs`, `tests/owned_btree.rs`): observing twice
+  equal, admitting and allocating nothing (`observe_custody`); observation
+  complete for custody on every reached state (`support::observation`);
+  every declared reduction a simulation of cleanup (`support::certified`,
+  for `String`, `ByteString`, native and stable options and derived tagged
+  values); every transition in the binding's successor relations, with the
+  exact remaining cleanup and the live permits and physical allocations
+  witnessed (`support::legal`, `tests/support/legality.rs`, and the tree's
+  in `tests/owned_btree.rs`); planted reductions and planted observers each
+  rejected; and properties across counts and lengths
+  (`properties_hold_across_counts_and_lengths`).
 - `tests/support/heap.rs` observes physical requested allocations and injects
   allocation failures.
 - `native_harness.rs` holds the suite policy and the preparation matrices,
@@ -116,10 +148,17 @@ run every target. Toolchain and execution commands are in `fuzz/README.md`.
 
 ## Miri
 
-`../miri-owned.sh` runs the owned suites, `reclamation_owner`, and the
-ordered-collection schemas of `resumable_contract` under Miri with every
-feature enabled: the engine's cursor `Slot`, staged preparation
-initialization, owned plans held across threads, and in-place construction.
+`../miri-owned.sh` runs the selection in `../miri-suites.txt` under Miri,
+each test in a Miri process of its own, under strict provenance and both
+Stacked and Tree Borrows: the owned suites, `reclamation_owner`, the
+ordered-collection schemas and storage cursor of `resumable_contract`, the
+abort witnesses in both domains, and the tests chosen to reach what those
+do not. The union of the classes each model's runs reach must equal the
+native run's: a class the native run reaches and Miri does not is a missed
+unsafe transition. `../reach-map.sh` holds the selection to its target:
+every function of a module holding `unsafe`, outside test code, reached by
+some test Miri runs, and the minimal witness sizes Miri runs executing every
+region the full sizes do.
 
 ## Resource bounds
 

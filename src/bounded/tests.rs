@@ -514,6 +514,22 @@ fn a_maps_iteration_order_is_its_encoded_key_order() {
     check(&map, &CBOR::from(map.clone()).to_cbor_data());
 }
 
+/// A standard tree's entries take canonical key order, not the tree's own:
+/// Rust orders the text keys `"aa"` before `"z"`, their encodings the other
+/// way round (`0x617a` before `0x626161`). The tree is walked by its stepped
+/// cursor on the bounded-collection standard library and by its standard
+/// iterator elsewhere, and the encoding is the symbolic conversion's.
+#[test]
+fn a_trees_entries_take_canonical_key_order_not_tree_order() {
+    let mut tree = BTreeMap::new();
+    tree.insert(String::from("aa"), 1u64);
+    tree.insert(String::from("z"), 2u64);
+    assert_eq!(
+        check(&tree, &CBOR::from(tree.clone()).to_cbor_data()),
+        [0xa2, 0x61, b'z', 0x02, 0x62, b'a', b'a', 0x01]
+    );
+}
+
 /// The stable walk of a tree, its whole range created and stepped, compares
 /// no keys at any height from a single leaf to several levels, and yields
 /// every entry once: its cost is its node moves alone, which
@@ -560,4 +576,195 @@ fn a_tree_iterators_steps_compare_no_keys() {
     assert_eq!(encoding::tree_height(70), 2);
     assert_eq!(encoding::tree_height(71), 3);
     assert_eq!(encoding::tree_moves(71), 6);
+}
+
+/// The charge rules every admission goes through, their errors' text, and
+/// the storage primitives beside them, with exact values: what each rule
+/// reports as a bound and what it admits through a real policy. Light enough
+/// to run under Miri (`tests/miri-suites.txt`), where the float and integer
+/// sweeps above are not.
+///
+/// Every rule is built with `let`, at run time: in a constant its
+/// constructor would run only in the compiler, where neither the reach map's
+/// coverage nor Miri's interpretation of the test sees it.
+mod charge_rules {
+    use super::*;
+
+    #[test]
+    fn a_unit_admits_exactly_its_values_and_bytes() {
+        let unit = Unit::new(Caller, 2, 9);
+        assert_eq!((unit.values(), unit.bytes()), (2, 9));
+        assert_eq!(
+            unit.bound(),
+            ResourceBound {
+                values: 2,
+                bytes: 9,
+                allocated: 0,
+                peak: 0,
+                retained: 0
+            }
+        );
+        let mut limits = Limits::unlimited();
+        unit.admit(&mut limits).unwrap();
+        assert_eq!(limits.used(), WriteWork::new(2, 9));
+    }
+
+    /// A capped unit admits its values and the bytes it covers, at most its
+    /// cap: one beyond is a defect of the engine, refused before admission.
+    #[test]
+    fn a_capped_unit_admits_at_most_its_cap() {
+        let capped = Capped::new(Caller, 1, 64);
+        assert_eq!((capped.values(), capped.cap()), (1, 64));
+        let mut limits = Limits::unlimited();
+        assert_eq!(
+            capped.admit(&mut limits, 65),
+            Err(BoundedError::PlanMismatch)
+        );
+        assert_eq!(limits.attempts(), 0, "a defect admits nothing");
+        capped.admit(&mut limits, 64).unwrap();
+        assert_eq!(limits.used(), WriteWork::new(1, 64));
+        // 130 bytes in units of at most 64: three, and one more for the last
+        // partial unit of one item.
+        assert_eq!(capped.covering::<()>(130, 1), Ok(WriteWork::new(4, 130)));
+        assert_eq!(capped.times::<()>(2), Ok(WriteWork::new(2, 128)));
+    }
+
+    #[test]
+    fn a_scan_admits_its_values_and_every_byte_it_spans() {
+        let scan = Scan::new(Caller, 2);
+        assert_eq!(scan.values(), 2);
+        assert_eq!(scan.units::<()>(3, 50), Ok(WriteWork::new(6, 50)));
+        let mut limits = Limits::unlimited();
+        scan.admit(&mut limits, 7).unwrap();
+        assert_eq!(limits.used(), WriteWork::new(2, 7));
+    }
+
+    /// A rate admits its base once and its work per element; over several
+    /// admissions the base is paid per admission.
+    #[test]
+    fn a_rate_admits_its_base_and_its_work_per_element() {
+        let per = Rate::new(Caller, 1, 8);
+        let based = Rate::based(Caller, WriteWork::new(2, 4), WriteWork::new(1, 8));
+        assert_eq!(per.of::<()>(3), Ok(WriteWork::new(3, 24)));
+        assert_eq!(based.of::<()>(3), Ok(WriteWork::new(5, 28)));
+        assert_eq!(based.over::<()>(2, 3), Ok(WriteWork::new(7, 32)));
+        let mut limits = Limits::unlimited();
+        based.admit(&mut limits, 3).unwrap();
+        assert_eq!(limits.used(), WriteWork::new(5, 28));
+    }
+
+    /// Every integer width encodes as the symbolic conversion encodes it,
+    /// at its own extremes, through each width's own schema.
+    #[test]
+    fn every_integer_width_matches_the_symbolic_encoding() {
+        check(&u16::MAX, &CBOR::from(u16::MAX).to_cbor_data());
+        check(&u32::MAX, &CBOR::from(u32::MAX).to_cbor_data());
+        check(&usize::MAX, &CBOR::from(usize::MAX).to_cbor_data());
+        check(&i16::MIN, &CBOR::from(i16::MIN).to_cbor_data());
+        check(&i32::MIN, &CBOR::from(i32::MIN).to_cbor_data());
+        check(&i16::MAX, &CBOR::from(i16::MAX).to_cbor_data());
+        check(&i32::MAX, &CBOR::from(i32::MAX).to_cbor_data());
+    }
+
+    /// A policy borrowed mutably is a policy: admissions and allocations
+    /// through the borrow reach the policy it borrows.
+    #[test]
+    fn a_borrowed_policy_admits_and_allocates_for_its_owner() {
+        let mut limits = Limits::unlimited();
+        let mut borrowed = &mut limits;
+        Unit::new(Caller, 1, 3).admit(&mut borrowed).unwrap();
+        let permit = <&mut Limits as Allocator>::allocate(&mut borrowed, 5).unwrap();
+        assert_eq!(limits.used(), WriteWork::new(1, 3));
+        assert_eq!(limits.live_bytes(), 5);
+        drop(permit);
+        assert_eq!(limits.live_bytes(), 0);
+    }
+
+    #[test]
+    fn errors_name_their_cause() {
+        let shown = |error: BoundedError<LimitRefusal>| format!("{error}");
+        assert_eq!(
+            shown(BoundedError::Refused(LimitRefusal::Work)),
+            "bounded encoding refused: work limit"
+        );
+        assert_eq!(
+            shown(BoundedError::Overflow),
+            "encoded length or work exceeds u64"
+        );
+        assert_eq!(
+            shown(BoundedError::OutOfRange),
+            "value is outside the dCBOR profile"
+        );
+        assert_eq!(
+            shown(BoundedError::DuplicateKey),
+            "duplicate canonical map key"
+        );
+        assert_eq!(
+            shown(BoundedError::DepthLimit),
+            "symbolic encoding nesting limit exceeded"
+        );
+        assert_eq!(
+            shown(BoundedError::Allocation { bytes: 12 }),
+            "an allocation of 12 bytes failed"
+        );
+        assert_eq!(
+            shown(BoundedError::OutputSize {
+                measured: 3,
+                provided: 5
+            }),
+            "bounded encoding measured 3 bytes, given an output of 5"
+        );
+        assert_eq!(
+            shown(BoundedError::PlanMismatch),
+            "bounded encoding diverged from its plan"
+        );
+    }
+
+    /// An insertion shifts the elements after it, admitting each one's
+    /// move; a position past the end is refused before anything is admitted.
+    #[test]
+    fn an_insertion_admits_the_move_of_every_element_after_it() {
+        let mut limits = Limits::unlimited();
+        let mut owned = Owned::<u64, Reservation>::new();
+        owned.push(1, &mut limits).unwrap();
+        owned.push(3, &mut limits).unwrap();
+        let before = limits.used();
+        owned.insert(1, 2, &mut limits).unwrap();
+        assert_eq!(owned.as_slice(), [1, 2, 3]);
+        assert_eq!(
+            limits.used(),
+            WriteWork::new(before.values, before.bytes + 8),
+            "one shifted element of eight bytes, no growth"
+        );
+        let attempts = limits.attempts();
+        assert_eq!(owned.insert(5, 9, &mut limits), Err(BoundedError::Overflow));
+        assert_eq!(limits.attempts(), attempts);
+        assert_eq!(owned.as_slice(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn growths_sum_every_quantity_refused_on_overflow() {
+        let growth = Growth {
+            copied: 1,
+            allocations: 2,
+            allocated: 3,
+            held: 4,
+            peak: 5,
+        };
+        assert_eq!(
+            growth.plus::<()>(growth),
+            Ok(Growth {
+                copied: 2,
+                allocations: 4,
+                allocated: 6,
+                held: 8,
+                peak: 10,
+            })
+        );
+        let most = Growth {
+            peak: u64::MAX,
+            ..Growth::default()
+        };
+        assert_eq!(growth.plus::<()>(most), Err(BoundedError::Overflow));
+    }
 }

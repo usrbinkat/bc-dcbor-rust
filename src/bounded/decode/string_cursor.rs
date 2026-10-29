@@ -267,7 +267,8 @@ impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for StringDecoder<'a, P> {
 
 /// Place attribution of a string decode, which this crate's tests record
 /// under `std`.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::*;
     use crate::CBOR;

@@ -15,6 +15,7 @@ use core::marker::PhantomData;
 use core::mem::{MaybeUninit, size_of};
 use core::ptr::{self, NonNull};
 
+use super::reclamation::Place;
 use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Caller, Capped, ResourceBound, TURN, Unit,
 };
@@ -58,31 +59,39 @@ pub enum Admitted {
 }
 
 /// The bytes a block's acquisition writes, established when its type is
-/// instantiated: at most a quantum, so the write is one admitted unit, of a
-/// block that occupies memory. Every caller constructs it in a constant
-/// (`const { .. }` or an associated constant), so a block that cannot be
-/// written in one unit fails to compile where its type is used, and
-/// [`acquire`] holds no run-time check of either bound.
+/// instantiated: its permit and its header, one typed value written whole,
+/// at most a quantum together, so the write is one admitted unit, of a block
+/// that occupies memory. The header's type is the one [`acquire`] writes, so
+/// the charge is that type's size and nothing written goes uncharged. Every
+/// caller constructs it in a constant (`const { .. }` or an associated
+/// constant), so a block that cannot be written in one unit fails to compile
+/// where its type is used, and [`acquire`] holds no run-time check of either
+/// bound. Padding the writes do not reach, between the value and the permit
+/// or past the header, is storage the block holds, not bytes written.
 #[derive(Clone, Copy)]
 pub(crate) struct Metadata {
     bytes: usize,
 }
 
 impl Metadata {
-    /// `written` bytes of a block of `M` with permits of `P`.
-    pub(crate) const fn new<M, P>(written: usize) -> Self {
+    /// A block of `M` with permits of `P` whose acquisition writes the
+    /// permit and a header of `W`, whole.
+    pub(crate) const fn header<W, M, P>() -> Self {
         assert!(
             size_of::<Held<M, P>>() > 0,
             "a stable block occupies memory"
         );
         Self {
-            bytes: crate::bounded::write_extent(written) as usize,
+            bytes: crate::bounded::write_extent(
+                size_of::<W>() + crate::bounded::permit_bytes::<P>(),
+            ) as usize,
         }
     }
 
-    /// The whole block of `M` with permits of `P`, written.
+    /// A block of `M` with permits of `P` whose acquisition writes the whole
+    /// value and the permit.
     pub(crate) const fn whole<M, P>() -> Self {
-        Self::new::<M, P>(size_of::<Held<M, P>>())
+        Self::header::<M, M, P>()
     }
 
     /// The bytes written.
@@ -124,24 +133,30 @@ impl<M, P> Held<M, P> {
     }
 }
 
-/// Acquire one stable block. `metadata` is what `init` writes, established
-/// at compile time ([`Metadata`]). The write, then the block's release, are
-/// each admitted once, before the allocation is requested; `admitted` keeps
-/// what was admitted across a refused or failed allocation. `open` is
-/// consulted after the permit is granted and before memory is touched,
-/// because allocator callbacks may close the owning scope.
+/// Acquire one stable block of `M` whose acquisition writes the permit and
+/// the header `head` makes, a `W` written whole at the place `project` names
+/// in the value. Its write, charged by the header's type ([`Metadata::header`],
+/// evaluated in a constant), then the block's release, are each admitted
+/// once, before the allocation is requested; `admitted` keeps what was
+/// admitted across a refused or failed allocation. `open` is consulted after
+/// the permit is granted and before memory is touched, because allocator
+/// callbacks may close the owning scope. The header is made only once the
+/// block exists.
 ///
 /// # Safety
-/// `init` must initialize every part of the value that later code reads,
-/// without unwinding, allocating, or reading uninitialized memory.
-/// `metadata` was established for this `M` and `A::Permit`.
-pub(crate) unsafe fn acquire<M, A: Allocator>(
+/// `project` must return the address of a `W` within the value it is given,
+/// aligned for `W`, without reading or writing memory. The header must be
+/// every part of the value that later code reads before initializing more
+/// in admitted units of its own. Neither `head` nor `project` may unwind,
+/// allocate, or read uninitialized memory.
+pub(crate) unsafe fn acquire<M, W, A: Allocator>(
     admitted: &mut Admitted,
-    metadata: Metadata,
     open: impl Fn() -> bool,
-    init: impl FnOnce(*mut M),
+    head: impl FnOnce() -> W,
+    project: impl FnOnce(*mut M) -> *mut W,
     a: &mut A,
 ) -> BoundedResult<NonNull<Held<M, A::Permit>>, A> {
+    let metadata = const { Metadata::header::<W, M, A::Permit>() };
     let layout = Layout::new::<Held<M, A::Permit>>();
     let bytes = u64::try_from(layout.size()).map_err(|_| BoundedError::Overflow)?;
     if !open() {
@@ -165,10 +180,11 @@ pub(crate) unsafe fn acquire<M, A: Allocator>(
     let raw = NonNull::new(unsafe { alloc(layout) }.cast::<Held<M, A::Permit>>())
         .ok_or(BoundedError::Allocation { bytes })?;
     // SAFETY: the block is unique and aligned. The permit is written before
-    // the value, so the block is always releasable once `init` returns.
+    // the header, so the block is always releasable once the header is; the
+    // caller guarantees `project` names an aligned `W` within the value.
     unsafe {
         ptr::addr_of_mut!((*raw.as_ptr()).permit).write(permit);
-        init(ptr::addr_of_mut!((*raw.as_ptr()).value));
+        project(ptr::addr_of_mut!((*raw.as_ptr()).value)).write(head());
     }
     *admitted = Admitted::Nothing;
     Ok(raw)
@@ -197,9 +213,10 @@ pub(crate) unsafe fn free<M, P>(held: NonNull<Held<M, P>>) {
 /// module can mint one or duplicate it: holding the handle is holding the
 /// block. The block's address is held as a pointer throughout, never as an
 /// integer, so its provenance survives every suspension. The only other
-/// pointers to the block are views ([`Self::view`]) its owner publishes for
-/// shared reads, whose use the custody protocol ends before the block is
-/// accessed mutably again or uninstalled.
+/// pointers into the block derive from its value's place ([`Self::place`]),
+/// whose every access borrows this handle, and from the views its owner
+/// publishes from that place for shared reads, whose use the custody protocol
+/// ends before the block is accessed mutably again or uninstalled.
 pub struct Installed<M, P> {
     block: NonNull<Held<M, P>>,
     /// Owns a `Held<M, P>`, for variance and auto-trait purposes.
@@ -212,17 +229,36 @@ pub struct Installed<M, P> {
 // moves the only mutable access. Sending it sends an `M` and a `P`, so it is
 // `Send` exactly when both are.
 unsafe impl<M: Send, P: Send> Send for Installed<M, P> {}
-// SAFETY: shared access through `&Installed` yields only `&M` (`peek`) and a
-// copy of the pointer (`view`); the permit is never reached. As for a `Box`,
-// sharing the handle shares an `M`, so it is `Sync` exactly when `M` is.
+// SAFETY: shared access through `&Installed` yields only `&M` (`peek`); the
+// permit is never reached. As for a `Box`, sharing the handle shares an `M`,
+// so it is `Sync` exactly when `M` is.
 unsafe impl<M: Sync, P> Sync for Installed<M, P> {}
 
 impl<M, P> Installed<M, P> {
     /// The installed metadata, borrowed for as long as the handle is.
     pub(crate) fn get(&mut self) -> &mut M {
+        let value = self.place().as_ptr(self);
         // SAFETY: the handle owns its live, initialized block exclusively;
         // the borrow of `self` bounds the returned reference.
-        unsafe { &mut (*self.block.as_ptr()).value }
+        unsafe { &mut *value }
+    }
+
+    /// The installed value's place, the root of its provenance for the
+    /// block's life ([`Place::root`]), reborrowing none of it: for a holder
+    /// that reaches one part of the value exclusively while a reader may
+    /// hold another part borrowed, as a stable option's state counts its
+    /// payload's cleanup beside the payload a reader borrows. Every use ends
+    /// before the block is uninstalled. Its custody, the token every access
+    /// through it borrows ([`Place`]), is this handle.
+    pub(crate) fn place(&mut self) -> Place<M> {
+        // SAFETY: the block is live and owned by this handle; the projection
+        // forms no reference, and every access to the value is through this
+        // place or `get`, whose borrow `&mut self` bounds.
+        unsafe {
+            Place::root(NonNull::new_unchecked(
+                ptr::addr_of_mut!((*self.block.as_ptr()).value).cast::<MaybeUninit<M>>(),
+            ))
+        }
     }
 
     /// The installed metadata, read through a shared borrow of the handle:
@@ -231,14 +267,6 @@ impl<M, P> Installed<M, P> {
         // SAFETY: the handle owns its live, initialized block; `get` needs
         // `&mut self`, so no mutable borrow coexists with this one.
         unsafe { &(*self.block.as_ptr()).value }
-    }
-
-    /// The block's address, for a view the owner publishes for shared reads:
-    /// a copy of the handle's own pointer, so it carries the block's
-    /// provenance. The owner must end every use of the view before the block
-    /// is next accessed through [`Self::get`] or uninstalled.
-    pub(crate) fn view(&self) -> NonNull<Held<M, P>> {
-        self.block
     }
 
     /// Move the value out, leaving the block holding nothing: the handle
@@ -298,45 +326,45 @@ impl<M, P> Installed<MaybeUninit<M>, P> {
     }
 }
 
-/// Acquire a block of `M`, `init` writing `metadata` of it, admissions kept
-/// in `admitted` across a refused or failed allocation; the handle that
-/// owns it.
+/// Acquire a block of `M` whose acquisition writes the header `head` makes
+/// at the place `project` names, admissions kept in `admitted` across a
+/// refused or failed allocation; the handle that owns it.
 ///
 /// # Safety
 /// As [`acquire`].
-pub(crate) unsafe fn installed<M, A: Allocator>(
+pub(crate) unsafe fn installed<M, W, A: Allocator>(
     admitted: &mut Admitted,
-    metadata: Metadata,
-    init: impl FnOnce(*mut M),
+    head: impl FnOnce() -> W,
+    project: impl FnOnce(*mut M) -> *mut W,
     a: &mut A,
 ) -> BoundedResult<Installed<M, A::Permit>, A> {
     // SAFETY: forwarded from the caller.
-    let block = unsafe { acquire::<M, A>(admitted, metadata, || true, init, a)? };
+    let block = unsafe { acquire::<M, W, A>(admitted, || true, head, project, a)? };
     Ok(Installed {
         block,
         marker: PhantomData,
     })
 }
 
-/// Acquire a block of `M` into the empty `slot`, `init` writing `metadata`
-/// of it, admissions kept in `admitted` across a refused or failed
-/// allocation.
+/// Acquire a block of `M` into the empty `slot`, its acquisition writing the
+/// header `head` makes at the place `project` names, admissions kept in
+/// `admitted` across a refused or failed allocation.
 ///
 /// # Safety
 /// As [`acquire`]. A `slot` already holding a block is a plan mismatch and
 /// acquires nothing.
-pub(crate) unsafe fn install<M, A: Allocator>(
+pub(crate) unsafe fn install<M, W, A: Allocator>(
     slot: &mut Option<Installed<M, A::Permit>>,
     admitted: &mut Admitted,
-    metadata: Metadata,
-    init: impl FnOnce(*mut M),
+    head: impl FnOnce() -> W,
+    project: impl FnOnce(*mut M) -> *mut W,
     a: &mut A,
 ) -> BoundedResult<(), A> {
     if slot.is_some() {
         return Err(BoundedError::PlanMismatch);
     }
     // SAFETY: forwarded from the caller.
-    *slot = Some(unsafe { installed::<M, A>(admitted, metadata, init, a)? });
+    *slot = Some(unsafe { installed::<M, W, A>(admitted, head, project, a)? });
     Ok(())
 }
 
@@ -406,13 +434,13 @@ impl<S, P> Stack<S, P> {
         a: &mut A,
     ) -> BoundedResult<(), A> {
         let previous = self.head;
-        // SAFETY: every field of Child is written by the initializer.
+        // SAFETY: the header is the whole record, every field written.
         let held = unsafe {
-            acquire::<Child<S, P>, A>(
+            acquire::<Child<S, P>, Child<S, P>, A>(
                 &mut self.admitted,
-                const { Metadata::whole::<Child<S, P>, P>() },
                 || true,
-                |child| child.write(Child { state, previous }),
+                || Child { state, previous },
+                |child| child,
                 a,
             )?
         };
@@ -457,5 +485,43 @@ impl<S, P> Stack<S, P> {
         }
         self.len -= 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::Reservation;
+
+    /// A block's write, evaluated at run time as every caller evaluates it
+    /// in a constant: the header's bytes and the permit's, whatever the rest
+    /// of the value; a whole value is its own header; acquiring or
+    /// installing admits one value and those bytes.
+    #[test]
+    fn a_blocks_write_is_its_header_and_its_permit() {
+        let permit = size_of::<Reservation>();
+        assert_eq!(
+            Metadata::header::<u32, [u64; 4], Reservation>().bytes(),
+            4 + permit
+        );
+        assert_eq!(Metadata::whole::<u64, Reservation>().bytes(), 8 + permit);
+        let written = ResourceBound {
+            values: 1,
+            bytes: (8 + permit) as u64,
+            ..ResourceBound::default()
+        };
+        assert_eq!(install_cost::<u64, Reservation>(), written);
+        assert_eq!(
+            acquire_cost(Metadata::header::<u64, [u64; 4], Reservation>()),
+            written
+        );
+        assert_eq!(
+            release_cost::<Reservation>(),
+            ResourceBound {
+                values: 1,
+                bytes: permit as u64,
+                ..ResourceBound::default()
+            }
+        );
     }
 }

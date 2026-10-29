@@ -23,14 +23,14 @@ failing requirement, not a passing compile-fail test. No contract is ignored.
 | Terminal shutdown | `owned_decode`: closing cannot reopen initialization |
 | Admission retention | `optional_admission`: repeated allocation refusal cannot change successful work trace |
 | Lifecycle refusal | `owned_lifecycle_matrix`: inject at each observed callback, positively observe refusal, compare successful trace |
-| Cancellation matrix | Discover successful turn count first, cancel at every preceding turn |
+| Cancellation matrix | The shared pipeline matrix (`dcbor-test-support`): retire, unwind and cancel at the first boundary of each certified cleanup class and at every unclassified boundary (fast layer), at every boundary with each class's members cleaning up alike (exhaustive layer) |
 | Physical failure | `owned_physical_failure`: return null at each real decoder allocation following admission |
 | Lifetimes | `owned_lifetimes`: positive import/borrow control plus escaping-reference, use-after-retirement, and mutation compile failures |
 | Fuzz | `owned_lifecycle`: symbolic String oracle, observed refusal, trace conservation, cancellation, drain |
-| Memory model | `miri-owned.sh`: explicit cargo-miri suites with separate logs and failure status |
+| Memory model | `miri-owned.sh`: each selected test (`miri-suites.txt`) in a Miri process of its own, strict provenance, Stacked and Tree Borrows, its log, verdict and class inventory per run, every model's classes equal to the native run's |
 | Safe pipeline failure matrix | `owned_pipeline_matrix`: every observed work/allocation callback refuses; every observed physical acquisition returns null, from scope setup through safe acquisition, decode, preparation and emission |
 | Plan and controller retirement | `owned_pipeline_matrix`: drop/unwind at every discovered phase boundary, including published plan; no synchronous reservation release, no retirement allocation, allocation-free drain |
-| Interleaved operations | `owned_pipeline_interleavings`: retire A at each preparation boundary under 16 advancement schedules while B completes with literal output |
+| Interleaved operations | `owned_pipeline_interleavings`: retire A at each preparation boundary under four named interleavings (A's retirement before B begins, after B publishes, and while B is in flight with either leading) while B completes with literal output |
 | Concurrent retirement | `owned_pipeline_interleavings`: two workers retire plans while the owner closes and drains; both retirement orders, joins and exact final recovery |
 
 `owned_public_contract.rs` is the safe consumer path, `forbid(unsafe_code)`:
@@ -49,16 +49,34 @@ Interleaving tests enumerate bounded schedules and race retirement with
 cleanup; they are not an exhaustive model check of every possible concurrent
 execution.
 
-Run the independent runtime/compile suites and lifetime fixtures with:
+A custom binding, an implementation of `InPlace` and `Reclaim`, is held to
+the contract the built-in ones are:
+
+- `Custody` is required: its state's observation, a projection of the one
+  state construction and cleanup use, distinguishing every state whose
+  cleanup differs, with no default.
+- `Reclaim::remaining` is required: the most cleanup calls the state can
+  still take, completion included. The scope enforces it; a call beyond it
+  is a defect, and overstating is sound.
+- `Reduction` is optional, with no default: a class map that is a
+  simulation of cleanup, its argument stated at its definition. A binding
+  without one is never reduced, and every stop over its states runs.
+
+All three are checked as the built-in bindings' are, by the observed
+construction driver (`support::construction`, `support::certified`,
+`support::legal`; `resumable/COVERAGE.md`, Harness and observations).
+
+Run the independent runtime/compile suites, the recorded-evidence checks and
+the lifetime fixtures in the fork shell, where the evidence was recorded:
 
 ```sh
-nix develop -c bash tests/run-contribution-contracts.sh
+nix develop .#custom-std -c bash tests/run-contribution-contracts.sh
 ```
 
-Run memory-model checks in a matching Miri-equipped environment with:
+Run the memory-model checks in the same shell, whose toolchain carries Miri:
 
 ```sh
-bash tests/miri-owned.sh
+nix develop .#custom-std -c bash tests/miri-owned.sh
 ```
 
 The recorded fuzz campaign includes `owned_lifecycle` and hashes its shared

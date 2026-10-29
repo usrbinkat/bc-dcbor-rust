@@ -20,13 +20,13 @@ mod destination;
 mod scoped;
 
 use dcbor::bounded::decode::construction::in_place::Transferable;
-use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reclaimed};
+use dcbor::bounded::decode::construction::reclamation::{
+    Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+};
 use dcbor::bounded::decode::construction::{Acquisition, Construction};
 use dcbor::bounded::decode::{DecodeError, Options};
 use dcbor::bounded::{BoundedError, BoundedResult, Budget, Limits, Step};
 use std::cell::Cell;
-use std::mem::MaybeUninit;
-use std::ptr::NonNull;
 use support::{document, drain, scope};
 
 thread_local! {
@@ -37,6 +37,146 @@ thread_local! {
 /// The policy of these gates: logged and strict.
 fn meter() -> Limits {
     Limits::unlimited().logged().strict()
+}
+
+/// An operation reports the scope's outstanding records exactly as the
+/// scope's authority counts them (`ScopeRef::outstanding` against
+/// `DecodeOwner::position`, two paths to one count), at every step and
+/// while more than one record is live; and the authority reports the scope
+/// closed from the moment shutdown closes its queue, before shutdown can
+/// complete, a published value still live.
+#[test]
+fn an_operation_reports_the_scope_count_and_a_closing_scope_reports_closed() {
+    let wire = [0x82, 0x01, 0x02];
+    let mut m = Limits::unlimited();
+    let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
+    let mut operation = Construction::<_, Vec<u64>, Limits>::construct(document);
+    let mut reported = Vec::new();
+    let mut value = None;
+    for _ in 0..support::typed_turns::<Vec<u64>>(wire.len()) {
+        let outstanding = operation.position().outstanding;
+        assert_eq!(
+            outstanding,
+            owner.outstanding(),
+            "the operation's count against the authority's"
+        );
+        reported.push(outstanding);
+        m.fresh();
+        match operation.step(&mut m) {
+            Ok(Step::Progress) => {}
+            Ok(Step::Complete(built)) => {
+                value = Some(built);
+                break;
+            }
+            // A unit beyond the turn's quantum: the next turn admits it.
+            Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
+            Ok(Step::Finished) => panic!("finished before publishing"),
+            Err(error) => panic!("the vector failed to build: {error:?}"),
+        }
+    }
+    let value = value.expect("the vector published within its turns");
+    assert_eq!(value.value(), &[1, 2]);
+    assert!(
+        reported.iter().any(|count| *count >= 2),
+        "no step had more than one record live: {reported:?}"
+    );
+    // The value holds its record and a scope reference, so shutdown can only
+    // close the queue and wait.
+    assert!(!owner.position().closed, "a scope closed before shutdown");
+    m.fresh();
+    assert_ne!(owner.shutdown_step(&mut m).unwrap(), Reclaimed::Done);
+    assert!(
+        owner.position().closed,
+        "a scope whose shutdown closed its queue reports open"
+    );
+    drop(value);
+    drop(operation);
+    drain(&mut owner, &mut m);
+    assert_eq!(owner.outstanding(), 0);
+    assert_eq!(m.live_bytes(), 0);
+}
+
+/// A built tree's cleanup never takes more calls than its state declares,
+/// and the declaration falls by at least one with every call: it is the
+/// most calls cleanup can still take, so no phase may declare more than the
+/// phase before it left. Trees of no entry, one, a full leaf, and one and
+/// two past it (a root over two leaves) take every cleanup phase: entering
+/// cleanup, each entry's value, key and removal, the nodes, the arenas and
+/// the metadata.
+#[cfg(feature = "custom-std-collections")]
+#[test]
+fn a_tree_declares_no_less_cleanup_than_it_takes() {
+    use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
+    use dcbor::bounded::decode::construction::reclamation::Place;
+    use std::collections::BTreeMap;
+    use std::mem::MaybeUninit;
+    use std::ptr::NonNull;
+    for count in [0u64, 1, 11, 12, 13] {
+        let mut symbolic = dcbor::Map::new();
+        for n in 0..count {
+            symbolic.insert(n, n);
+        }
+        let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
+        let mut parser = Limits::unlimited();
+        let document = dcbor::bounded::decode::decode(&wire, 8, &mut parser).unwrap();
+        let mut a = Limits::unlimited();
+        let mut value = MaybeUninit::<BTreeMap<u64, u64>>::uninit();
+        let mut state = <BTreeMap<u64, u64> as Reclaim<Limits>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its initial
+        // state; every access to either is through this slot for the rest of
+        // the iteration.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+        let mut built = false;
+        // The map's own cost bounds its build steps; the unlimited policy
+        // never refuses, so no refusal allowance is added.
+        let steps = support::turns(
+            <BTreeMap<u64, u64> as InPlace<Limits>>::COST
+                .bound::<()>(wire.len() as u64)
+                .expect("the cost of a fixture fits in u64"),
+        );
+        for _ in 0..steps {
+            let step = <BTreeMap<u64, u64> as InPlace<Limits>>::build_step(
+                &document,
+                0,
+                slot.reborrow(),
+                &mut a,
+            )
+            .expect("the tree builds");
+            if step == Built::Done {
+                built = true;
+                break;
+            }
+        }
+        assert!(built, "a tree of {count} entries was not built");
+        let (place, state) = slot.parts();
+        // SAFETY: construction returned Done, so the map is initialized.
+        assert_eq!(unsafe { place.get(&*state) }.len() as u64, count);
+        let first = <BTreeMap<u64, u64> as Reclaim<Limits>>::remaining(slot.observe());
+        let mut declared = first;
+        let mut taken = 0u64;
+        loop {
+            taken += 1;
+            assert!(
+                taken <= first,
+                "a tree of {count} entries took more than the {first} calls it declared"
+            );
+            let reclaimed =
+                <BTreeMap<u64, u64> as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a)
+                    .unwrap();
+            match reclaimed {
+                Reclaimed::Done => break,
+                Reclaimed::Progress => {}
+                Reclaimed::Waiting => panic!("a tree's own cleanup never waits"),
+            }
+            let next = <BTreeMap<u64, u64> as Reclaim<Limits>>::remaining(slot.observe());
+            assert!(
+                next < declared,
+                "a tree of {count} entries declared {next} calls after a call, from {declared}"
+            );
+            declared = next;
+        }
+        assert_eq!(a.live_bytes(), 0, "a tree of {count} entries left storage");
+    }
 }
 
 /// The fault matrix of constructing `T` from `wire`, parsing being setup
@@ -541,11 +681,11 @@ unsafe impl Reclaim<Limits> for Payload {
         clippy::disallowed_methods,
         reason = "a custom resource binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut PayloadState,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, PayloadState>,
         a: &mut Limits,
     ) -> BoundedResult<Reclaimed, Limits> {
+        let state = slot.custody();
         let bytes = state.initialized.min(64);
         a.traverse(1, bytes as u64).map_err(BoundedError::Refused)?;
         state.initialized -= bytes;
@@ -559,8 +699,8 @@ unsafe impl Reclaim<Limits> for Payload {
 
     /// One call per 64-byte chunk still initialized, and one for an empty
     /// prefix, whose call reports `Done` at once.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut PayloadState) -> u64 {
-        (state.initialized.div_ceil(64) as u64).max(1)
+    fn remaining(mut slot: PeekSlot<'_, Self, PayloadState>) -> u64 {
+        (slot.custody().initialized.div_ceil(64) as u64).max(1)
     }
 }
 
@@ -584,18 +724,19 @@ fn payload<'s>(
     for _ in 0..chunks {
         m.fresh();
         m.traverse(1, 64).unwrap();
+        let mut slot = record.destination();
+        let (place, state) = slot.parts();
+        let raw = place.as_ptr(state);
+        construction_address = raw as usize;
         // SAFETY: byte-only payload; each admitted chunk initializes the
-        // next prefix and records it before cancellation can occur.
+        // next prefix, within the payload's 192 bytes, and records it before
+        // cancellation can occur.
         unsafe {
-            let (place, state) = record.destination();
-            construction_address = place.as_ptr() as usize;
-            place
-                .as_ptr()
-                .cast::<u8>()
+            raw.cast::<u8>()
                 .add(state.initialized)
                 .write_bytes(0x5a, 64);
-            state.initialized += 64;
         }
+        state.initialized += 64;
     }
     (record, construction_address)
 }
@@ -631,8 +772,10 @@ fn stable_publication_and_every_cleanup_admission_refusal() {
                         (progress, 1, held),
                         3,
                         |m| {
-                            let result =
-                                support::checked(m, |m| owner.shutdown_step(m)).map(|_| ());
+                            let result = support::scope_checked(m, &mut owner, |owner, m| {
+                                owner.shutdown_step(m)
+                            })
+                            .map(|_| ());
                             ((CLEANED.get(), owner.outstanding(), m.live_bytes()), result)
                         },
                     );
@@ -664,64 +807,16 @@ fn stable_publication_and_every_cleanup_admission_refusal() {
     );
 }
 
-/// A planted binding understating its cleanup: it declares one call but
-/// takes one per unit `left`, then its `Done`.
-struct Understated;
-
-/// The cleanup units an [`Understated`] still takes before its `Done`.
-struct UnderstatedState {
-    left: usize,
-}
-
-/// The units left are the binding's whole custody.
-impl Custody for UnderstatedState {
-    type Observation = usize;
-
-    fn observe(&mut self) -> usize {
-        self.left
-    }
-}
-
-// SAFETY: the binding owns nothing; its cleanup only counts down. Its
-// declared count deliberately understates, the defect the scope must refuse.
-unsafe impl Reclaim<Limits> for Understated {
-    type State = UnderstatedState;
-    const INITIAL: UnderstatedState = UnderstatedState { left: 0 };
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a custom resource binding admits its own cleanup, as `Reclaim` documents"
-    )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut UnderstatedState,
-        a: &mut Limits,
-    ) -> BoundedResult<Reclaimed, Limits> {
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
-        if state.left == 0 {
-            return Ok(Reclaimed::Done);
-        }
-        state.left -= 1;
-        Ok(Reclaimed::Progress)
-    }
-
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut UnderstatedState) -> u64 {
-        1
-    }
-}
-
 /// The scope holds a queued record to the cleanup count it declared when its
-/// cleanup began: a record understating it is refused as a defect at the
-/// first call beyond it, so no drain runs on unbounded. The first step
-/// removes the record, the second spends its one declared call, the third
-/// is refused.
+/// cleanup began: a record understating it
+/// ([`support::Understated`]) is refused as a defect at the first
+/// call beyond it, so no drain runs on unbounded. The first step removes the
+/// record, the second spends its one declared call, the third is refused.
 #[test]
 fn a_record_cleaning_up_beyond_its_declared_count_is_a_defect() {
     let mut m = meter();
     let owner = scope(&mut m);
-    let mut record = support::acquire::<Understated>(&owner, &mut m, &mut Acquisition::new());
-    // SAFETY: the binding owns nothing; the state is its only custody.
-    unsafe { record.destination().1.left = 2 };
+    let record = support::understated(&owner, &mut m, 2);
     drop(record);
     for step in ["removal", "declared call"] {
         m.fresh();
@@ -736,8 +831,16 @@ fn a_record_cleaning_up_beyond_its_declared_count_is_a_defect() {
     assert_eq!(owner.outstanding(), 1);
     // The defect leaves custody its contract no longer describes: stepping
     // on, or the terminal drain dropping the owner would start, aborts by
-    // design. The scope is deliberately leaked to end the test.
-    std::mem::forget(owner);
+    // design. The scope is kept for the process's life in a static, never
+    // dropped: the leak is declared, and Miri does not report memory
+    // reachable from a static, so the test keeps its Miri coverage.
+    static DEFECTIVE: std::sync::Mutex<
+        Vec<dcbor::bounded::decode::construction::DecodeOwner<'static, Limits>>,
+    > = std::sync::Mutex::new(Vec::new());
+    DEFECTIVE
+        .lock()
+        .expect("no holder of the defective scopes panicked")
+        .push(owner);
 }
 
 #[test]
@@ -805,7 +908,8 @@ fn retired_text(wire: &[u8], stop: usize) -> Option<usize> {
     let mut previous = held;
     let mut drained = false;
     for _ in 0..bound {
-        let result = support::checked(&mut m, |m| owner.shutdown_step(m)).unwrap();
+        let result =
+            support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).unwrap();
         let live = m.live_bytes();
         assert!(live <= previous, "reclamation acquired new storage");
         previous = live;

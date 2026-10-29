@@ -21,7 +21,12 @@ if [[ -e $logs/results.txt ]]; then
 fi
 printf 'Campaign logs: %s\n' "$logs"
 printf 'STARTED\n' >"$logs/results.txt"
-trap 'status=$?; printf "EXIT %s\n" "$status" >> "$logs/results.txt"' EXIT
+# The exit status every campaign ends with, recorded beside its results.
+finished() {
+	local status=$?
+	printf 'EXIT %s\n' "$status" >>"$logs/results.txt"
+}
+trap finished EXIT
 
 snapshot() {
 	for file in flake.nix flake.lock Cargo.toml Cargo.lock fuzz/Cargo.toml fuzz/Cargo.lock; do

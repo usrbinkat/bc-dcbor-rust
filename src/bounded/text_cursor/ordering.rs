@@ -13,6 +13,7 @@
 //! stable scatters into the scratch and `r` copies back: `4` table units and
 //! `6r` part units, linear in the run whatever its length.
 use super::*;
+use crate::bounded::decode::construction::reclamation::Slot;
 use crate::bounded::decode::storage::StoragePosition;
 
 /// Copying one character into the scratch the passes scatter into.
@@ -99,36 +100,35 @@ pub(super) struct Ordering<P> {
 impl<P> Ordering<P> {
     pub(super) const INIT_STEPS: usize = Storage::<char, P>::INIT_STEPS + 6;
 
-    /// # Safety
-    /// Stable uninitialized destination; retained step begins at zero. Every
-    /// initialized field is resource-free until the complete ordering is used.
-    pub(super) unsafe fn initialize_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        step: &mut usize,
+    /// Initialize one unit of the ordering [`Self::new`] builds in `slot`,
+    /// its destination paired with its units initialized: the scratch arena,
+    /// then one scalar field per unit. Every initialized field is
+    /// resource-free until the complete ordering is used. Refused once
+    /// initialized.
+    pub(super) fn initialize_step<A: Allocator<Permit = P>>(
+        mut slot: Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        use crate::bounded::decode::initialization::field;
-        use core::ptr::addr_of_mut;
+        use crate::bounded::decode::initialization::{init_field, init_part};
         let storage_steps = Storage::<char, P>::INIT_STEPS;
-        if *step < storage_steps {
-            unsafe {
-                Storage::initialize_step(addr_of_mut!((*place).scratch), step, a)?;
-            }
+        if *slot.custody() < storage_steps {
+            init_part!(slot, scratch, 0, |scratch| Storage::initialize_step(
+                scratch, a
+            )?);
             return Ok(false);
         }
-        unsafe {
-            match *step - storage_steps {
-                0 => field(addr_of_mut!((*place).phase), || OrderingPhase::Copy, a)?,
-                1 => field(addr_of_mut!((*place).start), || 0, a)?,
-                2 => field(addr_of_mut!((*place).end), || 0, a)?,
-                3 => field(addr_of_mut!((*place).pass), || 0, a)?,
-                4 => field(addr_of_mut!((*place).at), || 0, a)?,
-                5 => field(addr_of_mut!((*place).counts), || [0; DIGITS], a)?,
-                _ => return Err(BoundedError::PlanMismatch),
-            }
+        match *slot.custody() - storage_steps {
+            0 => init_field!(slot, phase, || OrderingPhase::Copy, a)?,
+            1 => init_field!(slot, start, || 0, a)?,
+            2 => init_field!(slot, end, || 0, a)?,
+            3 => init_field!(slot, pass, || 0, a)?,
+            4 => init_field!(slot, at, || 0, a)?,
+            5 => init_field!(slot, counts, || [0; DIGITS], a)?,
+            _ => return Err(BoundedError::PlanMismatch),
         }
-        *step += 1;
-        Ok(*step == Self::INIT_STEPS)
+        let units = slot.custody();
+        *units += 1;
+        Ok(*units == Self::INIT_STEPS)
     }
 
     pub(super) const fn new() -> Self {
@@ -147,11 +147,15 @@ impl<P> Ordering<P> {
         self.at
     }
 
+    /// One unit of the scratch's cleanup. Its characters are plain data: a
+    /// settled scratch is discarded in one unit, whatever it holds; one
+    /// cancelled while relocating or staging drains per element, which the
+    /// bound counts.
     pub(super) fn reclaim_step<A: Allocator<Permit = P>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
-        self.scratch.reclaim_step(allocator)
+        self.scratch.reclaim_copy_step(allocator)
     }
 
     /// The most calls [`Self::reclaim_step`] still takes, the one reporting

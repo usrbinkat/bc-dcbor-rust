@@ -1,26 +1,39 @@
 use super::*;
+use crate::bounded::decode::construction::reclamation::Slot;
 use core::ptr::addr_of_mut;
 
+/// What a record holds of its document arena, the arena's custody: the
+/// ownership parts transferred into it from the parser and the parts
+/// released, each counted in order. A slot pairs the arena's place with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArenaParts {
+    pub(crate) transferred: usize,
+    pub(crate) released: usize,
+}
+
 impl<I, P> ParserContinuation<I, P> {
-    /// Transfer the validated arena into its retained destination one
-    /// ownership field per admitted unit. `initialized` counts the parts.
-    ///
-    /// # Safety
-    /// The destination is stable uninitialized arena storage, `initialized`
-    /// starts at zero, and the parser is ready to publish.
-    pub(crate) unsafe fn publish_arena_step<A: Allocator<Permit = P>>(
+    /// Transfer the validated arena into `arena`, its retained destination
+    /// paired with its parts, one ownership field per admitted unit. Refused
+    /// unless the parser is ready to publish, and once the arena's release
+    /// has begun.
+    pub(crate) fn publish_arena_step<A: Allocator<Permit = P>>(
         &mut self,
-        place: *mut DocumentArena<P>,
-        initialized: &mut usize,
+        mut arena: Slot<'_, DocumentArena<P>, ArenaParts>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        if !self.ready_to_publish() {
+        if !self.ready_to_publish() || arena.custody().released > 0 {
             return Err(BoundedError::PlanMismatch);
         }
-        let done = unsafe {
-            self.entries
-                .transfer_step(addr_of_mut!((*place).entries), initialized, a)?
+        // SAFETY: the arena's one field is its node storage, projected by
+        // field syntax, and the parts transferred are exactly that storage's
+        // units written.
+        let entries = unsafe {
+            arena.child(
+                |arena| addr_of_mut!((*arena).entries),
+                |parts| &mut parts.transferred,
+            )
         };
+        let done = self.entries.transfer_step(entries, a)?;
         if done {
             self.phase = Phase::Finished;
         }
@@ -51,36 +64,44 @@ impl<P> DocumentArena<P> {
         Self::ITEMS.times(1)?.then(Self::PERMIT.times(1)?)
     }
 
-    /// Release one transferred part per admitted unit.
-    ///
-    /// # Safety
-    /// `place` and `initialized` describe the destination of
-    /// `publish_arena_step`; `released` starts at zero and is retained. No
-    /// document views may remain live.
-    pub(crate) unsafe fn release_parts_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        initialized: usize,
-        released: &mut usize,
+    /// Release one transferred part of the arena in `arena`, its place
+    /// paired with its parts, per admitted unit: the node vector if it was
+    /// transferred, then the permit if it was. The caller holds the arena
+    /// past every document view of it.
+    pub(crate) fn release_parts_step<A: Allocator<Permit = P>>(
+        mut arena: Slot<'_, Self, ArenaParts>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        match *released {
+        let (place, parts) = arena.parts();
+        let ArenaParts {
+            transferred,
+            released,
+        } = *parts;
+        let raw = place.as_ptr(parts);
+        match released {
             0 => {
                 Self::ITEMS.admit(a)?;
-                if initialized >= 1 {
-                    unsafe { core::ptr::drop_in_place(addr_of_mut!((*place).entries.items)) };
+                if transferred >= 1 {
+                    // SAFETY: the parts pair with the arena's place, and a
+                    // first part transferred is the node vector written,
+                    // reached by field syntax and dropped once: the parts
+                    // released advance past it below.
+                    unsafe { core::ptr::drop_in_place(addr_of_mut!((*raw).entries.items)) };
                 }
             }
             1 => {
                 Self::PERMIT.admit(a)?;
-                if initialized == 3 {
-                    unsafe { core::ptr::drop_in_place(addr_of_mut!((*place).entries.permit)) };
+                if transferred == 3 {
+                    // SAFETY: as above, the third part transferred is the
+                    // permit written.
+                    unsafe { core::ptr::drop_in_place(addr_of_mut!((*raw).entries.permit)) };
                 }
             }
             2 => return Ok(true),
             _ => return Err(BoundedError::PlanMismatch),
         }
-        *released += 1;
-        Ok(*released == 2)
+        parts.released += 1;
+        Ok(parts.released == 2)
     }
 
     /// The most calls [`Self::release_parts_step`] still takes after

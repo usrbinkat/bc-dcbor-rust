@@ -1,8 +1,8 @@
 #	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
 1212	1204	measured	published	ascii text (Utf8): Utf8 bytes
 303	301	measured	published	ascii text (Utf8): Utf8 values
-29600	14688	measured	cancelled	cancelled text (Cleanup): Cleanup bytes
-1843	342	measured	cancelled	cancelled text (Cleanup): Cleanup values
+29600	1088	measured	cancelled	cancelled text (Cleanup): Cleanup bytes
+1843	266	measured	cancelled	cancelled text (Cleanup): Cleanup values
 49472	49472	measured	published	flat array (Arena): Arena allocated
 27456	26752	measured	published	flat array (Arena): Arena bytes
 36928	36928	measured	published	flat array (Arena): Arena peak
@@ -20,8 +20,8 @@
 1549635	787264	joint	published	large flat array: total allocated
 590080	590080	joint	published	large flat array: total peak
 393216	393216	joint	published	large flat array: total retained
-4671322	259355	joint	published	long undecided run: total bytes
-321694	62337	joint	published	long undecided run: total values
+4671322	243347	joint	published	long undecided run: total bytes
+321694	58337	joint	published	long undecided run: total values
 3723	2717	measured	published	many keys (Keys): Keys bytes
 1920	999	measured	published	many keys (Keys): Keys values
 24	23	measured	published	nested arrays (Attach): Attach values
@@ -30,11 +30,11 @@
 2368	2368	measured	published	nested arrays (Stack): Stack peak
 76	74	measured	published	nested arrays (Stack): Stack values
 79414	5364	measured	published	undecided run (Normalization): Normalization allocated
-380170	28955	measured	published	undecided run (Normalization): Normalization bytes
+380170	27347	measured	published	undecided run (Normalization): Normalization bytes
 10304	2624	measured	published	undecided run (Normalization): Normalization peak
-24344	6213	measured	published	undecided run (Normalization): Normalization values
-485690	30795	joint	published	undecided run (Normalization): total bytes
-33064	6461	joint	published	undecided run (Normalization): total values
+24344	5813	measured	published	undecided run (Normalization): Normalization values
+485690	29187	joint	published	undecided run (Normalization): total bytes
+33064	6061	joint	published	undecided run (Normalization): total values
 115584	111900	measured	published	undecided texts (NormalizerInit): NormalizerInit bytes
 7525	7500	measured	published	undecided texts (NormalizerInit): NormalizerInit values
 903	900	measured	published	undecided texts (TextCheck): TextCheck bytes

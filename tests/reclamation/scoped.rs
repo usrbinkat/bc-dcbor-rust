@@ -1,5 +1,4 @@
 use super::*;
-use dcbor::bounded::decode::construction::reclamation::Custody;
 
 struct Borrowing<'a>(&'a [u8]);
 
@@ -33,22 +32,25 @@ unsafe impl Reclaim<Limits> for Borrowing<'_> {
         clippy::disallowed_methods,
         reason = "a custom resource binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut BorrowingState,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, BorrowingState>,
         a: &mut Limits,
     ) -> BoundedResult<Reclaimed, Limits> {
+        let (place, state) = slot.parts();
         if !state.initialized {
             a.traverse(1, 0).map_err(BoundedError::Refused)?;
             return Ok(Reclaimed::Done);
         }
         a.traverse(1, 1).map_err(BoundedError::Refused)?;
         // SAFETY: the state is committed only after the reference is
-        // initialized.
-        let value = unsafe { place.as_ref().assume_init_ref() };
-        assert_eq!(value.0[state.checked], b'x');
+        // initialized; the shared read ends before the state advances.
+        let (byte, len) = {
+            let value = unsafe { place.get(&*state) };
+            (value.0[state.checked], value.0.len())
+        };
+        assert_eq!(byte, b'x');
         state.checked += 1;
-        if state.checked == value.0.len() {
+        if state.checked == len {
             state.initialized = false;
             Ok(Reclaimed::Done)
         } else {
@@ -58,13 +60,14 @@ unsafe impl Reclaim<Limits> for Borrowing<'_> {
 
     /// One call per borrowed byte not yet checked, the last reporting
     /// `Done`; one before the reference is initialized.
-    unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, state: &mut BorrowingState) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, BorrowingState>) -> u64 {
+        let (place, state) = slot.parts();
         if !state.initialized {
             return 1;
         }
         // SAFETY: the state is committed only after the reference is
-        // initialized.
-        let value = unsafe { place.as_ref().assume_init_ref() };
+        // initialized, and nothing writes it while it is counted.
+        let value = unsafe { place.get(&*state) };
         (value.0.len().saturating_sub(state.checked) as u64).max(1)
     }
 }
@@ -84,13 +87,13 @@ fn queued_cleanup_keeps_the_input_scope_live() {
     m.fresh();
     m.traverse(1, std::mem::size_of::<Borrowing<'_>>() as u64)
         .unwrap();
-    // SAFETY: input outlives the scope, and its borrow remains immutable
-    // through queued cleanup. Initialization is committed after the write.
-    unsafe {
-        let (place, state) = record.destination();
-        place.as_ptr().write(MaybeUninit::new(Borrowing(&input)));
-        state.initialized = true;
-    }
+    let mut slot = record.destination();
+    let (place, state) = slot.parts();
+    // SAFETY: the record's empty destination; input outlives the scope, and
+    // its borrow remains immutable through queued cleanup.
+    unsafe { place.write(state, Borrowing(&input)) };
+    // Initialization is committed after the write.
+    state.initialized = true;
     let held = m.live_bytes();
     drop(record);
     assert_eq!(m.live_bytes(), held);

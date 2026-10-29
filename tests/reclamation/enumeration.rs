@@ -97,7 +97,9 @@ fn retired<T: Transferable<Limits> + 'static>(wire: &[u8], stop: usize) -> Optio
                 other => panic!("unexpected cleanup: {other:?}"),
             }
         }
-        if support::checked(&mut m, |m| owner.shutdown_step(m)).unwrap() == Reclaimed::Done {
+        if support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).unwrap()
+            == Reclaimed::Done
+        {
             drained = true;
             break;
         }

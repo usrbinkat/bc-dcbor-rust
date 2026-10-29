@@ -551,7 +551,9 @@ mod tests {
     /// A plan of empty maps passes a gap before every head byte, the most
     /// boundaries per byte a plan can have, each cutting a segment short;
     /// written to a caller's own storage, every byte is also initialized.
-    /// Only publication releases the gap records at its completion.
+    /// Only publication releases the gap records at its completion. Its one
+    /// caller is the `std` attribution test.
+    #[cfg(feature = "std")]
     fn witness(place: EmitPlace) -> (Box<dyn Schema>, Emission) {
         match place {
             EmitPlace::Bytes | EmitPlace::Boundaries | EmitPlace::Initialization => (

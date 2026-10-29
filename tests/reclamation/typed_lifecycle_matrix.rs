@@ -84,23 +84,23 @@ unsafe impl<A: Allocator, const D: usize> Reclaim<A> for Declared<D> {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Written>,
         a: &mut A,
     ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
         a.traverse(1, 0).map_err(BoundedError::Refused)?;
-        *state = Written::Empty;
+        *slot.custody() = Written::Empty;
         Ok(Reclaimed::Done)
     }
 
     /// One call, which is `Done`.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut Written) -> u64 {
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
         1
     }
 }
 
-// SAFETY: one admitted unit initializes the zero-sized value.
+// SAFETY: one admitted unit initializes the zero-sized value, only from the
+// empty state.
 unsafe impl<A: Allocator, const D: usize> InPlace<A> for Declared<D> {
     // One build unit and one cleanup unit.
     const COST: ConstructionCost = ConstructionCost::fixed(plus(unit(0), unit(0)));
@@ -109,14 +109,17 @@ unsafe impl<A: Allocator, const D: usize> InPlace<A> for Declared<D> {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own construction, as `InPlace` documents"
     )]
-    unsafe fn build_step(
+    fn build_step(
         _: &Document<'_, A::Permit>,
         _: usize,
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Written,
+        mut slot: Slot<'_, Self, Written>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
         const { assert!(D >= 1, "a declared depth below the true depth of 1") };
+        let state = slot.custody();
+        if *state != Written::Empty {
+            return Err(BoundedError::PlanMismatch.into());
+        }
         a.traverse(1, 0).map_err(BoundedError::Refused)?;
         *state = Written::Initialized;
         Ok(Built::Done)

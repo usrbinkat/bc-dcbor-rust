@@ -2,10 +2,12 @@
 use super::*;
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
 use crate::bounded::decode::construction::stable::{self, Installed, Stack};
-use core::mem::MaybeUninit;
-use core::ptr::NonNull;
 
 /// Compiler-generated field projections, indexed by ascending integer wire key.
+///
+/// Each callback receives a [`Slot`] of the record's root place and one
+/// field's state, which names the field it belongs to: a caller holding one
+/// has nothing to promise.
 ///
 /// # Safety
 /// Keys must be unique and strictly increasing. Every payload field must occur
@@ -15,8 +17,10 @@ use core::ptr::NonNull;
 /// below COUNT, a [`Self::Field`] naming that field and holding its type's
 /// [`Reclaim::INITIAL`] state, and must neither allocate nor unwind. Each
 /// field callback must delegate to the field its state names, with that
-/// field's InPlace/Reclaim implementation, the same stable address and the
-/// state it carries.
+/// field's InPlace/Reclaim implementation, the state it carries, and the
+/// field's place projected from the record's ([`Slot::child`]) by one
+/// expression shared by construction, cleanup and the count; each is sound
+/// for every call, in any order, as its field's own methods are.
 pub unsafe trait Fields<A: Allocator>: Sized {
     const COUNT: usize;
     const TAG: Option<u64> = None;
@@ -31,37 +35,22 @@ pub unsafe trait Fields<A: Allocator>: Sized {
     /// The initial state of the field of dense index `field`, or `None` for
     /// an index past the last field.
     fn start(field: usize) -> Option<Self::Field>;
-    /// # Safety
-    /// Initializes only the field `state` names, which is omitted, and
-    /// retains its cleanup state.
-    unsafe fn missing_field(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Field,
-        a: &mut A,
-    ) -> ConstructResult<Built, A>;
-    /// # Safety
-    /// The root destination and field state satisfy InPlace's preconditions.
-    unsafe fn build_field(
+    /// Initializes only the field the slot's state names, which is omitted,
+    /// and retains its cleanup state.
+    fn missing_field(slot: Slot<'_, Self, Self::Field>, a: &mut A) -> ConstructResult<Built, A>;
+    /// One unit of construction of the field the slot's state names.
+    fn build_field(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Field,
+        slot: Slot<'_, Self, Self::Field>,
         a: &mut A,
     ) -> ConstructResult<Built, A>;
-    /// # Safety
-    /// The state tracks exactly the initialized parts of the field it names.
-    unsafe fn reclaim_field(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::Field,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A>;
-    /// The calls [`Self::reclaim_field`] still takes from `state`: the
-    /// [`Reclaim::remaining`] of the field it names, at that field's place,
-    /// with its own state.
-    ///
-    /// # Safety
-    /// As [`Self::reclaim_field`].
-    unsafe fn remaining_field(place: NonNull<MaybeUninit<Self>>, state: &mut Self::Field) -> u64;
+    /// One unit of cleanup of the field the slot's state names.
+    fn reclaim_field(slot: Slot<'_, Self, Self::Field>, a: &mut A) -> BoundedResult<Reclaimed, A>;
+    /// The calls [`Self::reclaim_field`] still takes from the slot's state:
+    /// the [`Reclaim::remaining`] of the field it names, at that field's
+    /// place, with its own state.
+    fn remaining_field(slot: PeekSlot<'_, Self, Self::Field>) -> u64;
 }
 
 /// Where a field map's construction or cleanup is: the tag and map
@@ -249,31 +238,34 @@ pub const fn entries(count: usize) -> ConstructionCost {
     }
 }
 
-/// # Safety
-/// Called with the stable root destination and its original state.
-pub unsafe fn build<T: Fields<A>, A: Allocator>(
+/// One unit of construction of the record in `slot`. Without metadata the
+/// state is `INITIAL` (every cleanup that releases the metadata restores it),
+/// so construction begins; any phase past construction is refused.
+pub fn build<T: Fields<A>, A: Allocator>(
     document: &Document<'_, A::Permit>,
     index: usize,
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Field, A::Permit>,
+    mut slot: Slot<'_, T, State<T::Field, A::Permit>>,
     a: &mut A,
 ) -> ConstructResult<Built, A> {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
-        // SAFETY: initialize only fixed-size metadata, never a schema-sized tuple.
+        if state.phase != Phase::Inspect || state.position != 0 {
+            return Err(BoundedError::PlanMismatch.into());
+        }
+        // SAFETY: the header is the whole fixed-size metadata, never a
+        // schema-sized tuple, every field written.
         unsafe {
-            stable::install::<Meta<T::Field, A::Permit>, A>(
+            stable::install::<Meta<T::Field, A::Permit>, Meta<T::Field, A::Permit>, A>(
                 &mut state.meta,
                 &mut state.admitted,
-                const { stable::Metadata::whole::<Meta<T::Field, A::Permit>, A::Permit>() },
-                |meta| {
-                    meta.write(Meta {
-                        next: index,
-                        end: 0,
-                        low: 0,
-                        high: 0,
-                        children: Stack::new(),
-                    })
+                || Meta {
+                    next: index,
+                    end: 0,
+                    low: 0,
+                    high: 0,
+                    children: Stack::new(),
                 },
+                |meta| meta,
                 a,
             )?
         };
@@ -389,7 +381,10 @@ pub unsafe fn build<T: Fields<A>, A: Allocator>(
         }
         Phase::Missing => {
             let child = meta.children.top().ok_or(BoundedError::PlanMismatch)?;
-            if unsafe { T::missing_field(place, &mut child.state, a)? } == Built::Done {
+            // SAFETY: the record's root place, and the state of the field
+            // its record names, started for that field by `T::start`.
+            let field = unsafe { Slot::new(place, &mut child.state) };
+            if T::missing_field(field, a)? == Built::Done {
                 state.phase = Phase::AdvanceMissing;
             }
         }
@@ -411,20 +406,14 @@ pub unsafe fn build<T: Fields<A>, A: Allocator>(
             // Allocate pushed the active child; its exact projection and
             // state remain unchanged throughout suspension and cleanup.
             let child = meta.children.top().ok_or(BoundedError::PlanMismatch)?;
-            if unsafe {
-                T::build_field(
-                    document,
-                    if T::POSITIONAL {
-                        meta.next
-                    } else {
-                        super::super::next_index(key)
-                    },
-                    place,
-                    &mut child.state,
-                    a,
-                )?
-            } == Built::Done
-            {
+            let index = if T::POSITIONAL {
+                meta.next
+            } else {
+                super::super::next_index(key)
+            };
+            // SAFETY: as in `Missing`.
+            let field = unsafe { Slot::new(place, &mut child.state) };
+            if T::build_field(document, index, field, a)? == Built::Done {
                 state.phase = Phase::Advance;
             }
         }
@@ -448,13 +437,14 @@ pub unsafe fn build<T: Fields<A>, A: Allocator>(
     Ok(Built::Progress)
 }
 
-/// # Safety
-/// Root and state must come from build, and all external value borrows must end.
-pub unsafe fn reclaim<T: Fields<A>, A: Allocator>(
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Field, A::Permit>,
+/// One unit of cleanup of the record in `slot`. The slot's custody excludes
+/// every borrow of the value. Releasing the metadata restores `INITIAL`, so
+/// a later step reports `Done` and a later build begins anew.
+pub fn reclaim<T: Fields<A>, A: Allocator>(
+    mut slot: Slot<'_, T, State<T::Field, A::Permit>>,
     a: &mut A,
 ) -> BoundedResult<Reclaimed, A> {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         STEP.admit(a)?;
         return Ok(Reclaimed::Done);
@@ -467,12 +457,17 @@ pub unsafe fn reclaim<T: Fields<A>, A: Allocator>(
                 // freed. The metadata's release was paid for by its
                 // installation.
                 unsafe { stable::uninstall(&mut state.meta) };
+                state.phase = Phase::Inspect;
+                state.position = 0;
                 return Ok(Reclaimed::Done);
             };
             // The top record retains either an initialized or a partial
             // field. Once it is reclaimed completely its record is freed in
             // the same step, a release its push paid for.
-            if unsafe { T::reclaim_field(place, &mut child.state, a)? } == Reclaimed::Done {
+            // SAFETY: the record's root place, and the state of the field its
+            // record names.
+            let field = unsafe { Slot::new(place, &mut child.state) };
+            if T::reclaim_field(field, a)? == Reclaimed::Done {
                 meta.children.pop();
             }
         }
@@ -484,16 +479,13 @@ pub unsafe fn reclaim<T: Fields<A>, A: Allocator>(
     Ok(Reclaimed::Progress)
 }
 
-/// The calls [`reclaim`] still takes from `state`: no metadata, one; in
-/// `Reclaim`, every field record's own calls, then the metadata's release;
+/// The calls [`reclaim`] still takes from the slot's state: no metadata, one;
+/// in `Reclaim`, every field record's own calls, then the metadata's release;
 /// before it, one more to enter `Reclaim`.
-///
-/// # Safety
-/// As [`reclaim`].
-pub unsafe fn remaining<T: Fields<A>, A: Allocator>(
-    place: NonNull<MaybeUninit<T>>,
-    state: &mut State<T::Field, A::Permit>,
+pub fn remaining<T: Fields<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, T, State<T::Field, A::Permit>>,
 ) -> u64 {
+    let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         return 1;
     };
@@ -501,7 +493,7 @@ pub unsafe fn remaining<T: Fields<A>, A: Allocator>(
     installed.get().children.for_each(|child| {
         // SAFETY: each record's state names its own field, which the
         // callback projects from the root.
-        drain = drain.saturating_add(unsafe { T::remaining_field(place, child) });
+        drain = drain.saturating_add(T::remaining_field(unsafe { Slot::new(place, child) }));
     });
     let reclaiming = drain.saturating_add(1);
     match state.phase {
@@ -510,7 +502,8 @@ pub unsafe fn remaining<T: Fields<A>, A: Allocator>(
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use super::super::text::BufferState;
     use super::*;
@@ -532,5 +525,43 @@ mod tests {
         layouts::<Written, [u8; 16]>();
         layouts::<Written, u128>();
         layouts::<State<Written, u128>, u128>();
+    }
+
+    /// A record's cost, evaluated at run time as the derive evaluates it in
+    /// constants: every field, present or omitted, adds the same fixed part
+    /// (its custody record pushed, held and released, its advance, its own
+    /// fixed cost and a rounding unit); positional fields are found by one
+    /// step each where keyed ones are paid as entries per byte; and the
+    /// fields' per-byte parts do not add, their subtrees partitioning the
+    /// record's bytes, so the record takes the largest.
+    #[test]
+    fn a_records_cost_adds_each_fields_fixed_part_and_the_largest_per_byte_part() {
+        type Child = stable::Child<Written, Reservation>;
+        let field = ConstructionCost::fixed(unit(4)).plus(ConstructionCost::per_byte(unit(1)));
+        let keyed = |fields: &[ConstructionCost]| cost::<Written, Reservation>(false, fields);
+        let positional = |fields: &[ConstructionCost]| cost::<Written, Reservation>(true, fields);
+        let (none, one, two) = (keyed(&[]), keyed(&[field]), keyed(&[field, field]));
+        let each = stable::install_cost::<Child, Reservation>().values
+            + STEP_COST.values
+            + stable::release_cost::<Reservation>().values
+            + field.fixed.values
+            + ROUNDING.values;
+        assert_eq!(one.fixed.values - none.fixed.values, each);
+        assert_eq!(two.fixed.values - one.fixed.values, each);
+        assert_eq!(none.per_byte, entries(0).per_byte);
+        assert_eq!(one.per_byte, plus(field.per_byte, entries(1).per_byte));
+        assert_eq!(
+            two.per_byte,
+            plus(field.per_byte, entries(2).per_byte),
+            "two fields' per-byte parts are the larger, not the sum"
+        );
+        let found = positional(&[field]);
+        assert_eq!(
+            found.fixed.values - one.fixed.values,
+            STEP_COST.values,
+            "a positional field is found by one step"
+        );
+        assert_eq!(found.per_byte, field.per_byte, "no entry is searched");
+        assert_eq!(positional(&[]).per_byte, ConstructionCost::ZERO.per_byte);
     }
 }

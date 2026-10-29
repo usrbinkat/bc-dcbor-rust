@@ -117,43 +117,53 @@ pub(super) fn expand_fields(
                 <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::INITIAL
             ))
         });
-        let project = quote! {
-            // SAFETY: compiler-provided aligned field projection, with no
-            // reference to an uninitialized enclosing struct.
-            let child = unsafe { core::ptr::NonNull::new_unchecked(
-                core::ptr::addr_of_mut!((*place.as_ptr().cast::<Self>()).#ident)
-                    .cast::<core::mem::MaybeUninit<#ty>>()
-            ) };
+        // The field's slot: its place from the root's, in the root place's
+        // mode, by compiler-provided aligned field projection alone, with no
+        // reference to the enclosing struct, initialized or not; and the
+        // field's own state, which this variant carries. Construction, cleanup
+        // and the cleanup count all project the field through this one
+        // expression.
+        let child = quote! {
+            // SAFETY: the compiler's projection of this field from the
+            // record's place, by raw pointer alone, paired with the field's own
+            // state, which this variant carries.
+            unsafe {
+                dcbor::bounded::decode::construction::reclamation::Slot::new(
+                    place.project(|value| core::ptr::addr_of_mut!((*value).#ident)),
+                    state,
+                )
+            }
         };
-        builds.push(quote! { #state_name::#variant(state) => {
-            #project
-            unsafe { <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::#build_method(
-                document, index, child, state, allocator
-            ) }
-        } });
-        reclaims.push(quote! { #state_name::#variant(state) => {
-            #project
-            unsafe { <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::reclaim_step(
-                child, state, allocator
-            ) }
-        } });
-        remainings.push(quote! { #state_name::#variant(state) => {
-            #project
-            unsafe { <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::remaining(
-                child, state
-            ) }
-        } });
-        missing.push(quote! { #state_name::#variant(state) => {
-            #project
-            unsafe { <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::build_absent(
-                child, state, allocator
-            ) }
-        } });
+        builds.push(quote! { #state_name::#variant(state) =>
+            <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::#build_method(
+                document, index, #child, allocator
+            )
+        });
+        reclaims.push(quote! { #state_name::#variant(state) =>
+            <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::reclaim_step(
+                #child, allocator
+            )
+        });
+        remainings.push(quote! { #state_name::#variant(state) =>
+            <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::remaining(#child)
+        });
+        missing.push(quote! { #state_name::#variant(state) =>
+            <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::build_absent(
+                #child, allocator
+            )
+        });
     }
     // The uninhabited marker variant uses every generic parameter, including
     // any the fields leave unused, and can never be constructed.
     let marker = quote! {
         #state_name::__Marker(never, _) => match *never {}
+    };
+    // A record of no fields matches only the marker, which never reads the
+    // place.
+    let unused_place = if count == 0 {
+        quote!(let _ = place;)
+    } else {
+        quote!()
     };
     let phantom = quote!(core::marker::PhantomData<fn() -> (#name #tg, #a)>);
     let custody = super::custody(
@@ -189,32 +199,36 @@ pub(super) fn expand_fields(
             fn start(field: usize) -> Option<Self::Field> {
                 match field { #(#starts,)* _ => None }
             }
-            unsafe fn missing_field(
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::Field,
+            fn missing_field(
+                slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
                 allocator: &mut #a,
             ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
+                let (place, state) = slot.into_parts();
+                #unused_place
                 match state { #(#missing,)* #marker }
             }
-            unsafe fn build_field(
+            fn build_field(
                 document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::Field,
+                slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
                 allocator: &mut #a,
             ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
+                let (place, state) = slot.into_parts();
+                #unused_place
                 match state { #(#builds,)* #marker }
             }
-            unsafe fn reclaim_field(
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::Field,
+            fn reclaim_field(
+                slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
                 allocator: &mut #a,
             ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
+                let (place, state) = slot.into_parts();
+                #unused_place
                 match state { #(#reclaims,)* #marker }
             }
-            unsafe fn remaining_field(
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::Field,
+            fn remaining_field(
+                slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::Field>,
             ) -> u64 {
+                let (place, state) = slot.into_parts();
+                #unused_place
                 match state { #(#remainings,)* #marker }
             }
         }
@@ -241,12 +255,11 @@ pub(super) fn expand_fields(
             unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
                 const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost = #cost;
 
-                unsafe fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State,
+                fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
                     allocator: &mut #a,
                 ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
-                    unsafe { dcbor::bounded::decode::construction::in_place::fields::build(document, index, place, state, allocator) }
+                    dcbor::bounded::decode::construction::in_place::fields::build(document, index, slot, allocator)
                 }
             }
             // SAFETY: no whole-value Drop; generated field callbacks retain the
@@ -258,16 +271,16 @@ pub(super) fn expand_fields(
                     <#a as dcbor::bounded::Allocator>::Permit,
                 >;
                 const INITIAL: Self::State = dcbor::bounded::decode::construction::in_place::fields::State::INITIAL;
-                unsafe fn reclaim_step(place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State,
+                fn reclaim_step(
+                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
                     allocator: &mut #a,
                 ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
-                    unsafe { dcbor::bounded::decode::construction::in_place::fields::reclaim(place, state, allocator) }
+                    dcbor::bounded::decode::construction::in_place::fields::reclaim(slot, allocator)
                 }
-                unsafe fn remaining(place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::State,
+                fn remaining(
+                    slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::State>,
                 ) -> u64 {
-                    unsafe { dcbor::bounded::decode::construction::in_place::fields::remaining::<Self, #a>(place, state) }
+                    dcbor::bounded::decode::construction::in_place::fields::remaining::<Self, #a>(slot)
                 }
             }
         };

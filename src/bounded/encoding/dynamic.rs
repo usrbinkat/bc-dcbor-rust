@@ -88,51 +88,47 @@ impl<P> Dynamic<P> {
         + permutation::Permutation::<P>::INIT_STEPS
         + 4;
 
-    /// Initialize one unit of the empty engine [`Self::new`] builds.
-    ///
-    /// # Safety
-    /// The destination is unique, stable and uninitialized; `step` starts at
-    /// zero and is retained. An incomplete prefix owns nothing.
-    pub(super) unsafe fn initialize_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        step: &mut usize,
+    /// Initialize one unit of the empty engine [`Self::new`] builds in
+    /// `slot`, its destination paired with its units initialized: the entry
+    /// arena, the ordering and the permutation, each on its own units, then
+    /// one scalar field per unit. An incomplete prefix owns nothing.
+    /// Refused once initialized.
+    pub(super) fn initialize_step<A: Allocator<Permit = P>>(
+        mut slot: reclamation::Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
+        use decode::initialization::{init_field, init_part};
         let storage = Storage::<Entry, P>::INIT_STEPS;
         let order = Order::<P>::INIT_STEPS;
         let permutation = permutation::Permutation::<P>::INIT_STEPS;
-        // SAFETY: each unit writes one uninitialized field of the destination.
-        unsafe {
-            if *step < storage {
-                Storage::initialize_step(addr_of_mut!((*place).entries), step, a)?;
-                return Ok(false);
-            }
-            if *step < storage + order {
-                let mut sub = *step - storage;
-                Order::initialize_step(addr_of_mut!((*place).order), &mut sub, a)?;
-                *step = storage + sub;
-                return Ok(false);
-            }
-            if *step < storage + order + permutation {
-                let mut sub = *step - storage - order;
-                permutation::Permutation::initialize_step(
-                    addr_of_mut!((*place).permutation),
-                    &mut sub,
-                    a,
-                )?;
-                *step = storage + order + sub;
-                return Ok(false);
-            }
-            match *step - storage - order - permutation {
-                0 => field(addr_of_mut!((*place).compact), || None, a)?,
-                1 => field(addr_of_mut!((*place).phase), || DynamicPhase::Order, a)?,
-                2 => field(addr_of_mut!((*place).entry), || 0, a)?,
-                3 => field(addr_of_mut!((*place).byte), || 0, a)?,
-                _ => return Err(BoundedError::PlanMismatch),
-            }
+        if *slot.custody() < storage {
+            init_part!(slot, entries, 0, |entries| Storage::initialize_step(
+                entries, a
+            )?);
+            return Ok(false);
         }
-        *step += 1;
-        Ok(*step == Self::INIT_STEPS)
+        if *slot.custody() < storage + order {
+            init_part!(slot, order, storage, |part| Order::initialize_step(
+                part, a
+            )?);
+            return Ok(false);
+        }
+        if *slot.custody() < storage + order + permutation {
+            init_part!(slot, permutation, storage + order, |part| {
+                permutation::Permutation::initialize_step(part, a)?
+            });
+            return Ok(false);
+        }
+        match *slot.custody() - storage - order - permutation {
+            0 => init_field!(slot, compact, || None, a)?,
+            1 => init_field!(slot, phase, || DynamicPhase::Order, a)?,
+            2 => init_field!(slot, entry, || 0, a)?,
+            3 => init_field!(slot, byte, || 0, a)?,
+            _ => return Err(BoundedError::PlanMismatch),
+        }
+        let units = slot.custody();
+        *units += 1;
+        Ok(*units == Self::INIT_STEPS)
     }
 
     /// Whether the entry descriptors and both scratch arenas hold nothing.

@@ -21,11 +21,12 @@ use crate::bounded::{Allocator, BoundedError, BoundedResult, at};
 mod owned;
 /// Admissions held toward a block, as custody observations report them.
 pub use super::stable::Admitted;
+pub(crate) use owned::{AbortOnUnwind, EMPTIED, ScopeRef, slot_place};
 pub use owned::{
     Acquisition, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition, scope_bound,
 };
-pub(crate) use owned::{EMPTIED, ScopeRef, slot_place};
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 pub(crate) use owned::{ScopePlace, ScopeTerms};
 
 /// What one cleanup step reached.
@@ -176,6 +177,419 @@ impl Reduction for Prefix {
     }
 }
 
+/// What a [`Place`] may do: build and clean up the value ([`Build`]), or
+/// observe it ([`Observe`]). Sealed: the two modes are the only ones.
+pub trait Mode: sealed::Sealed {}
+
+/// A place's mode for construction and cleanup: it may write the value,
+/// drop it in place and project raw pointers for a binding's own writes.
+pub enum Build {}
+
+/// A place's mode for observation, the only mode a cleanup count
+/// ([`Reclaim::remaining`]) and an operation's detail receive: shared reads
+/// and projection of the value, no write to it and no exclusive access to
+/// any of its bytes. The one exclusive access it keeps is to a record's own
+/// custody ([`Place::custody`]): a phase, a handle, a child's construction
+/// state, which no reader of a published value borrows and no place lies
+/// within.
+pub enum Observe {}
+
+impl Mode for Build {}
+impl Mode for Observe {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Build {}
+    impl Sealed for super::Observe {}
+}
+
+/// A stable destination of a `T`, with the provenance of the allocation it
+/// lies in for that allocation's whole life.
+///
+/// A place is issued only where provenance is rooted ([`Place::root`]): a
+/// record's block, a metadata block's value, a container's buffer, a tree's
+/// node. Every place within it is a raw projection from it ([`Self::project`],
+/// [`Self::cast`]), so every place derived from one root, in any step of
+/// construction or cleanup, or in any observation, stays valid as long as
+/// the allocation does. No operation of a place reborrows the value
+/// exclusively and lets the borrow outlive it: under the aliasing model such a
+/// reborrow, even one that writes nothing, invalidates every place derived
+/// before it from the bytes it covers, which is how a binding that keeps a
+/// child's place across steps (`Option<T>`'s payload) would lose it, and how
+/// a count read while the value is borrowed elsewhere (a published value a
+/// preparation traverses) would invalidate the borrow. A place cannot be
+/// made to reborrow its value without a new unsafe cast of its own.
+///
+/// A place is `Copy`, so a place alone cannot exclude a second access
+/// through a copy of it. Every operation that reads, writes or borrows the
+/// value therefore takes a borrow of the custody paired with the place: the
+/// state construction and cleanup thread beside it (a binding's
+/// [`Reclaim::State`], a record's progress, a block's handle), which its
+/// holder has exclusively. A shared read ([`Self::get`]) holds that custody
+/// shared for as long as the read is live, and every write, exclusive borrow
+/// or custody access holds it exclusively, so the borrow checker refuses a
+/// write, a second exclusive borrow or a second custody access while either
+/// is live: two aliasing `&mut`, or a write under a live `&`, cannot be
+/// written through a place. Pairing a place with its own custody remains
+/// the caller's obligation, as every place's provenance is.
+///
+/// A write under a live read does not compile, even through a copy of the
+/// place:
+/// ```compile_fail,E0502
+/// use core::{mem::MaybeUninit, ptr::NonNull};
+/// use dcbor::bounded::decode::construction::reclamation::{Place, Written};
+/// let mut slot = MaybeUninit::<u64>::uninit();
+/// let mut state = Written::Empty;
+/// let place = unsafe { Place::root(NonNull::from(&mut slot)) };
+/// let copy = place;
+/// unsafe { place.write(&mut state, 1) };
+/// let read = unsafe { place.get(&state) };
+/// unsafe { copy.write(&mut state, 2) };
+/// assert_eq!(*read, 1);
+/// ```
+///
+/// `M` is what the place may do: [`Build`] or [`Observe`] ([`Peek`]).
+pub struct Place<T, M: Mode = Build> {
+    place: NonNull<MaybeUninit<T>>,
+    mode: PhantomData<M>,
+}
+
+/// A place in its observing mode ([`Observe`]).
+pub type Peek<T> = Place<T, Observe>;
+
+impl<T, M: Mode> Clone for Place<T, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T, M: Mode> Copy for Place<T, M> {}
+
+impl<T, M: Mode> Place<T, M> {
+    /// The place of a destination whose provenance is rooted at `place`: a
+    /// record's block, a metadata block's value, a container's buffer, a
+    /// tree's node, or a destination a driver owns outright.
+    ///
+    /// # Safety
+    /// `place` is stable and suitably aligned for a `T`, and every access
+    /// to the destination for the rest of its life is through `place` or a
+    /// place derived from it: nothing reborrows the destination otherwise.
+    pub const unsafe fn root(place: NonNull<MaybeUninit<T>>) -> Self {
+        Self {
+            place,
+            mode: PhantomData,
+        }
+    }
+
+    /// The place `project` computes within this one: a field, a variant's
+    /// payload or an element, in this place's mode. Construction, cleanup
+    /// and counting of one value project its parts through one expression,
+    /// so a part's count is read at exactly the place its cleanup steps.
+    ///
+    /// # Safety
+    /// `project` computes a place within the value from the value's
+    /// pointer by raw projection alone (`addr_of_mut!`, pointer arithmetic
+    /// or a cast), forming no reference to any part of the value.
+    pub unsafe fn project<F>(self, project: impl FnOnce(*mut T) -> *mut F) -> Place<F, M> {
+        Place {
+            // SAFETY: forwarded from the caller: a projection within a
+            // nonnull, stable destination.
+            place: unsafe {
+                NonNull::new_unchecked(project(self.place.as_ptr().cast::<T>()).cast())
+            },
+            mode: PhantomData,
+        }
+    }
+
+    /// This place as a place of a `U` laid out at its start.
+    ///
+    /// # Safety
+    /// A `U` is laid out at the start of the value: a transparent wrapper's
+    /// field, a representation's first member.
+    pub const unsafe fn cast<U>(self) -> Place<U, M> {
+        Place {
+            place: self.place.cast(),
+            mode: PhantomData,
+        }
+    }
+
+    /// The place `count` values of `T` past this one: an element of the
+    /// array or buffer this place lies in.
+    ///
+    /// # Safety
+    /// The result lies within the same allocation.
+    pub const unsafe fn add(self, count: usize) -> Self {
+        Place {
+            // SAFETY: forwarded from the caller.
+            place: unsafe { self.place.add(count) },
+            mode: PhantomData,
+        }
+    }
+
+    /// The value, read through a shared borrow, which coexists with every
+    /// other shared borrow and with every place derived before it, for as
+    /// long as `custody`, the custody paired with this place, is borrowed
+    /// shared: no write through a place can be made meanwhile.
+    ///
+    /// # Safety
+    /// The value is initialized, and `custody` is this place's own.
+    pub unsafe fn get<C: ?Sized>(self, custody: &C) -> &T {
+        let _ = custody;
+        // SAFETY: forwarded from the caller; the custody borrow bounds the
+        // read.
+        unsafe { self.place.as_ref().assume_init_ref() }
+    }
+
+    /// A record's own custody, exclusively, for as long as `custody`, the
+    /// progress paired with the record's place, is borrowed exclusively: a
+    /// second custody access, or any write through a place, cannot be made
+    /// meanwhile. The custody is one field of the record grouping
+    /// everything the record holds besides its published value (its
+    /// handles, its phase, its children's construction states), so one call
+    /// yields all of it and its fields borrow disjointly. Available in both
+    /// modes: a cleanup count reads a record's phase and steps its
+    /// children's counts through their states, which take `&mut`; the
+    /// value's own bytes stay unborrowed.
+    ///
+    /// # Safety
+    /// `custody` is this place's own; `project` computes the custody
+    /// field's place by raw projection alone; the field is initialized, no
+    /// place lies within it, and no reader of a published value borrows it.
+    pub(crate) unsafe fn custody<C: ?Sized, F>(
+        self,
+        custody: &mut C,
+        project: impl FnOnce(*mut T) -> *mut F,
+    ) -> &mut F {
+        let _ = custody;
+        // SAFETY: forwarded from the caller; the projection forms no
+        // reference beyond the field itself, and the custody borrow bounds
+        // the result.
+        unsafe { &mut *project(self.place.as_ptr().cast::<T>()) }
+    }
+}
+
+impl<T> Place<T, Build> {
+    /// Write the whole value, without reading or dropping what was there,
+    /// `custody`, this place's own, borrowed exclusively for the write.
+    ///
+    /// # Safety
+    /// The destination holds nothing that needs dropping, the write is
+    /// admitted, and `custody` is this place's own.
+    pub unsafe fn write<C: ?Sized>(self, custody: &mut C, value: T) {
+        let _ = custody;
+        // SAFETY: forwarded from the caller; the place is stable and aligned.
+        unsafe { self.place.as_ptr().cast::<T>().write(value) }
+    }
+
+    /// Drop the value in place, `custody`, this place's own, borrowed
+    /// exclusively for the drop.
+    ///
+    /// # Safety
+    /// The value is initialized, owns nothing a cleanup step has not
+    /// released or accounted, and is not used again; `custody` is this
+    /// place's own.
+    pub unsafe fn drop_in_place<C: ?Sized>(self, custody: &mut C) {
+        let _ = custody;
+        // SAFETY: forwarded from the caller.
+        unsafe { core::ptr::drop_in_place(self.place.as_ptr().cast::<T>()) }
+    }
+
+    /// The value's raw pointer, for a binding's own writes of its parts by
+    /// raw projection, `custody`, this place's own, borrowed exclusively to
+    /// obtain it: never to reborrow the value, which [`Place`]'s contract
+    /// forbids.
+    pub fn as_ptr<C: ?Sized>(self, custody: &mut C) -> *mut T {
+        let _ = custody;
+        self.place.as_ptr().cast()
+    }
+
+    /// The value, borrowed exclusively for `use_value` alone, `custody`,
+    /// this place's own, borrowed exclusively for as long: how a binding
+    /// calls the methods of a value that needs `&mut` (a vector's header
+    /// reserving its buffer or recording its length). The borrow ends with
+    /// the call.
+    ///
+    /// # Safety
+    /// The value is initialized, `custody` is this place's own, and no place
+    /// derived from this one lies within the value's own bytes: an exclusive
+    /// reborrow would invalidate it. Places within a separate allocation the
+    /// value owns (a buffer it points to) are unaffected.
+    pub unsafe fn with_mut<C: ?Sized, R>(
+        self,
+        custody: &mut C,
+        use_value: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let _ = custody;
+        // SAFETY: forwarded from the caller; the borrow ends with the call.
+        use_value(unsafe { self.place.as_ptr().cast::<T>().as_mut_unchecked() })
+    }
+
+    /// The place of a part of the value reached through the value itself,
+    /// for a part whose position only the value's own methods know (an
+    /// option's payload): `reach` finds it through an exclusive borrow that
+    /// ends with the call, and the part's place keeps the provenance of
+    /// that borrow, a child of this place's.
+    ///
+    /// # Safety
+    /// As [`Self::with_mut`], and the part `reach` returns lies within the
+    /// value. While the part's place is in use, a place now lies within the
+    /// value's bytes, so this place is not borrowed exclusively again
+    /// ([`Self::with_mut`], [`Self::reach`]) and does not write the value;
+    /// shared reads ([`Self::get`]) leave the part's place valid.
+    pub unsafe fn reach<C: ?Sized, F>(
+        self,
+        custody: &mut C,
+        reach: impl FnOnce(&mut T) -> Option<&mut F>,
+    ) -> Option<Place<F>> {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            self.with_mut(custody, |value| {
+                reach(value).map(|part| Place::root(NonNull::from(part).cast()))
+            })
+        }
+    }
+
+    /// This place in its observing mode.
+    pub const fn observe(self) -> Peek<T> {
+        Place {
+            place: self.place,
+            mode: PhantomData,
+        }
+    }
+}
+
+/// A value's [`Place`] together with the custody paired with it, borrowed
+/// exclusively for `'c`: the one form in which construction, cleanup and
+/// counting receive a destination.
+///
+/// The pairing is carried by the type. A slot is minted only where a place's
+/// provenance is rooted and its custody lives beside it (a scope record's
+/// block, an installed block's value, a container's element under its
+/// record, a driver's own destination), through [`Slot::new`], whose
+/// obligation is that pairing; every other slot is a child projected from
+/// one ([`Slot::child`]). So a caller holding a slot has no obligation left:
+/// [`Reclaim`], [`InPlace`](super::in_place::InPlace) and their callbacks
+/// take slots through safe signatures, and their implementations, under
+/// their `unsafe trait` contracts, must be sound for every call a slot's
+/// holder can make, in any order: a step after `Done`, a build after
+/// cleanup began, a count at any point.
+///
+/// A slot is not `Copy`: while one is live its custody is borrowed, so a
+/// second slot of the same destination cannot be formed from it, only a
+/// reborrow for the length of a call ([`Self::reborrow`], [`Self::observe`]).
+///
+/// Two reborrows of one slot are not live at once:
+/// ```compile_fail,E0499
+/// use core::{mem::MaybeUninit, ptr::NonNull};
+/// use dcbor::bounded::decode::construction::reclamation::{Build, Place, Slot, Written};
+/// let mut value = MaybeUninit::<u64>::uninit();
+/// let mut state = Written::Empty;
+/// let place = unsafe { Place::<u64, Build>::root(NonNull::from(&mut value)) };
+/// let mut slot = unsafe { Slot::new(place, &mut state) };
+/// let first = slot.reborrow();
+/// let second = slot.reborrow();
+/// drop((first, second));
+/// ```
+///
+/// A slot is minted only under the pairing obligation:
+/// ```compile_fail,E0133
+/// use core::{mem::MaybeUninit, ptr::NonNull};
+/// use dcbor::bounded::decode::construction::reclamation::{Build, Place, Slot, Written};
+/// let mut value = MaybeUninit::<u64>::uninit();
+/// let mut state = Written::Empty;
+/// let place = unsafe { Place::<u64, Build>::root(NonNull::from(&mut value)) };
+/// let slot = Slot::new(place, &mut state);
+/// drop(slot);
+/// ```
+pub struct Slot<'c, T, S: ?Sized, M: Mode = Build> {
+    place: Place<T, M>,
+    custody: &'c mut S,
+}
+
+/// A slot in its observing mode ([`Observe`]): what a cleanup count and an
+/// operation's detail receive.
+pub type PeekSlot<'c, T, S> = Slot<'c, T, S, Observe>;
+
+impl<'c, T, S: ?Sized, M: Mode> Slot<'c, T, S, M> {
+    /// The slot of `place` and `custody`.
+    ///
+    /// # Safety
+    /// `custody` is `place`'s own: it records exactly what is initialized
+    /// and acquired at `place`, and every access to the destination for the
+    /// rest of its life is through this slot, a slot derived from it, or a
+    /// slot minted again from the same place and the same custody.
+    pub const unsafe fn new(place: Place<T, M>, custody: &'c mut S) -> Self {
+        Self { place, custody }
+    }
+
+    /// This slot for the length of a borrow of it.
+    pub fn reborrow(&mut self) -> Slot<'_, T, S, M> {
+        Slot {
+            place: self.place,
+            custody: self.custody,
+        }
+    }
+
+    /// This slot, observing, for the length of a borrow of it.
+    pub fn observe(&mut self) -> PeekSlot<'_, T, S> {
+        Slot {
+            place: Place {
+                place: self.place.place,
+                mode: PhantomData,
+            },
+            custody: self.custody,
+        }
+    }
+
+    /// This slot, observing, for the rest of its borrow.
+    pub fn into_observe(self) -> PeekSlot<'c, T, S> {
+        Slot {
+            place: Place {
+                place: self.place.place,
+                mode: PhantomData,
+            },
+            custody: self.custody,
+        }
+    }
+
+    /// The custody: plain state, which its own type keeps consistent.
+    pub fn custody(&mut self) -> &mut S {
+        self.custody
+    }
+
+    /// The place and the custody, for an implementation's own access to the
+    /// value: every [`Place`] operation that reads, writes or borrows the
+    /// value takes the custody, and is itself unsafe.
+    pub fn parts(&mut self) -> (Place<T, M>, &mut S) {
+        (self.place, self.custody)
+    }
+
+    /// The place and the custody for the rest of this slot's borrow.
+    pub fn into_parts(self) -> (Place<T, M>, &'c mut S) {
+        (self.place, self.custody)
+    }
+
+    /// The slot of a part of the value: `project` computes the part's place
+    /// within this one, and `custody` selects the part's own custody within
+    /// this slot's.
+    ///
+    /// # Safety
+    /// `project` computes a place within the value by raw projection alone
+    /// (as [`Place::project`]), and the custody `custody` selects is that
+    /// part's own (as [`Slot::new`]).
+    pub unsafe fn child<F, SF: ?Sized>(
+        self,
+        project: impl FnOnce(*mut T) -> *mut F,
+        custody: impl FnOnce(&'c mut S) -> &'c mut SF,
+    ) -> Slot<'c, F, SF, M> {
+        Slot {
+            // SAFETY: forwarded from the caller.
+            place: unsafe { self.place.project(project) },
+            custody: custody(self.custody),
+        }
+    }
+}
+
 /// Mandatory cleanup for a stable, possibly partially initialized allocation.
 ///
 /// Construction and cleanup progress is retained in [`Self::State`], a value
@@ -187,6 +601,9 @@ impl Reduction for Prefix {
 /// while its block is live and owned by this state, so a state that names a
 /// block always names one it may access and must release.
 ///
+/// Construction and cleanup receive the value as a [`Slot`], its place and
+/// this state together, so a caller holding one has nothing to promise.
+///
 /// # Safety
 /// [`Self::INITIAL`] must mean "nothing initialized, nothing acquired". The
 /// state must record exactly what construction initialized and acquired, on
@@ -194,7 +611,10 @@ impl Reduction for Prefix {
 /// preserve that unit's state. Cleanup must not allocate, unwind, recursively
 /// destroy a value, or invoke an arbitrary user destructor. `Done` promises
 /// that no initialized subobject or owned child allocation remains and that
-/// releasing the outer allocation without `Drop` is sound.
+/// releasing the outer allocation without `Drop` is sound. Every method is
+/// sound for every call a slot's holder can make, in any order: a cleanup
+/// step after `Done` reports `Done` and touches nothing, and a count at any
+/// point reads only the state and what it records as initialized.
 pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// Upper bound on nested construction/reclamation dispatch, including self.
     /// Implementations delegating to children must add their own fixed dispatch
@@ -211,12 +631,11 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// producing it can neither allocate nor unwind.
     const INITIAL: Self::State;
 
-    /// # Safety
-    /// `place` is the original stable allocation and `state` describes its
-    /// initialized parts. No references into those parts may remain live.
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+    /// One unit of cleanup of the value in `slot`: its place and the state
+    /// that describes its initialized parts. No references into those parts
+    /// remain live while the slot is held.
+    fn reclaim_step(
+        slot: Slot<'_, Self, Self::State>,
         allocator: &mut A,
     ) -> BoundedResult<Reclaimed, A>;
 
@@ -231,10 +650,13 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// defect. Overstating is sound; understating violates this trait's
     /// contract and fails the drain.
     ///
-    /// # Safety
-    /// As [`Self::reclaim_step`]: `place` is the original stable allocation
-    /// paired with `state`, and no references into its parts are live.
-    unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64;
+    /// The value may still be borrowed when its count is read, as a
+    /// published value is by a preparation traversing it, so the count
+    /// reads it only through its slot observed ([`PeekSlot`]), whose place
+    /// cannot write the value or reborrow any of its bytes exclusively; it
+    /// reaches exclusively only a record's own custody ([`Place::custody`]),
+    /// which no reader borrows, through the slot's custody.
+    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64;
 }
 
 /// One cleanup unit of the record inside `slot`'s handle: `unwrap` takes the
@@ -293,24 +715,30 @@ struct Header<A: Allocator> {
     _pin: PhantomPinned,
 }
 
-/// A record's metadata and payload. The header is first, and `Held` places its
-/// value first, so a header pointer is a block pointer.
+/// What a record's acquisition writes, whole: its header and the payload's
+/// state. The header is first.
 #[repr(C)]
-struct Entry<T: Reclaim<A>, A: Allocator> {
+struct Head<T: Reclaim<A>, A: Allocator> {
     header: Header<A>,
     state: T::State,
+}
+
+/// A record's metadata and payload. The head is first, its header first in
+/// it, and `Held` places its value first, so a header pointer is a block
+/// pointer.
+#[repr(C)]
+struct Entry<T: Reclaim<A>, A: Allocator> {
+    head: Head<T, A>,
     value: MaybeUninit<T>,
 }
 
 type Block<T, A> = Held<Entry<T, A>, <A as Allocator>::Permit>;
 
-/// The record's admitted metadata: header, the payload's state and permit,
-/// written in one unit. Evaluated in a constant by every caller, so a payload
-/// whose state cannot fit fails to compile where its record type is used.
+/// The record's admitted metadata: its head, whole, and the permit, written
+/// in one unit. Evaluated in a constant by every caller, so a payload whose
+/// state cannot fit fails to compile where its record type is used.
 const fn metadata<T: Reclaim<A>, A: Allocator>() -> stable::Metadata {
-    stable::Metadata::new::<Entry<T, A>, A::Permit>(
-        size_of::<Header<A>>() + size_of::<T::State>() + size_of::<A::Permit>(),
-    )
+    stable::Metadata::header::<Head<T, A>, Entry<T, A>, A::Permit>()
 }
 
 /// What allocating one record holding a `T` admits and requests: one unit
@@ -335,7 +763,11 @@ pub(crate) struct Reclaimer<A: Allocator> {
     tail: AtomicPtr<Header<A>>,
     /// Stepping caller only: the record whose cleanup is in progress.
     active: AtomicPtr<Header<A>>,
-    /// Stepping caller only: the next removal's unit was admitted.
+    /// Written by the stepping caller only: the next removal's unit was
+    /// admitted. A step that admits it and then finds the front record raced
+    /// by a retiring thread returns `Waiting` and keeps it; the step that
+    /// removes the record spends it without admitting again. Custody the
+    /// scope holds, so observation reads it ([`Self::removal_admitted`]).
     removal_admitted: AtomicBool,
     outstanding: AtomicUsize,
     closed: AtomicBool,
@@ -371,6 +803,13 @@ impl<A: Allocator> Reclaimer<A> {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// Whether the next removal's unit is admitted and retained: exact for
+    /// the caller that steps, whose own stores it reads in program order; a
+    /// snapshot for any other thread while a step is in progress there.
+    pub(crate) fn removal_admitted(&self) -> bool {
+        self.removal_admitted.load(Ordering::Relaxed)
+    }
+
     /// Allocate uninitialized stable storage and its embedded custody record,
     /// its write and its release admitted first and kept in `admitted`. No
     /// `T` is created or moved. A failed physical allocation releases its
@@ -395,23 +834,24 @@ impl<A: Allocator> Reclaimer<A> {
         };
         // Budget/allocator implementations may hold another owner reference, so
         // closure is observed before admission and again after the permit.
-        // SAFETY: header and state are written; no T is formed or moved.
+        // SAFETY: the head, header and state, is written whole at its field;
+        // no T is formed or moved.
         let block = unsafe {
-            stable::acquire::<Entry<T, A>, A>(
+            stable::acquire::<Entry<T, A>, Head<T, A>, A>(
                 admitted,
-                const { metadata::<T, A>() },
                 || !self.is_closed(),
-                |entry| {
-                    ptr::addr_of_mut!((*entry).header).write(Header {
+                || Head {
+                    header: Header {
                         next: AtomicPtr::new(ptr::null_mut()),
                         advance: advance::<T, A>,
                         finish: finish::<T, A>,
                         custody: Holder::Handle,
                         budget: 0,
                         _pin: PhantomPinned,
-                    });
-                    ptr::addr_of_mut!((*entry).state).write(T::INITIAL);
+                    },
+                    state: T::INITIAL,
                 },
+                |entry| ptr::addr_of_mut!((*entry).head),
                 a,
             )?
         };
@@ -631,18 +1071,25 @@ impl<'r, T: Reclaim<A>, A: Allocator> Record<'r, T, A> {
     }
 }
 
-/// The payload destination and state of a block.
+/// The payload's slot in a block: its place, the root of the payload's
+/// provenance ([`Place::root`]), projected from the block's own pointer, so
+/// every place derived from it, in any step, stays valid while the block is
+/// live, with the state the block keeps beside it, its custody.
 ///
 /// # Safety
 /// The block is live and the caller holds its exclusive custody.
 unsafe fn destination<'b, T: Reclaim<A>, A: Allocator>(
     block: NonNull<Block<T, A>>,
-) -> (NonNull<MaybeUninit<T>>, &'b mut T::State) {
-    // SAFETY: forwarded from the caller; field projections stay in bounds.
+) -> Slot<'b, T, T::State> {
+    // SAFETY: forwarded from the caller; field projections stay in bounds,
+    // every access to the payload is through this place, and the state in
+    // the block's head is the one the record's acquisition paired with it.
     unsafe {
-        (
-            NonNull::new_unchecked(ptr::addr_of_mut!((*block.as_ptr()).value.value)),
-            &mut (*block.as_ptr()).value.state,
+        Slot::new(
+            Place::root(NonNull::new_unchecked(ptr::addr_of_mut!(
+                (*block.as_ptr()).value.value
+            ))),
+            &mut (*block.as_ptr()).value.head.state,
         )
     }
 }
@@ -679,25 +1126,78 @@ unsafe fn advance<T: Reclaim<A>, A: Allocator>(
 ) -> BoundedResult<Reclaimed, A> {
     // SAFETY: the vtable was installed for exactly this Block<T, A>, and the
     // caller has exclusive custody after the public handle was dropped.
-    unsafe {
-        let (place, state) = destination::<T, A>(header.cast());
-        T::reclaim_step(place, state, a)
-    }
+    let slot = unsafe { destination::<T, A>(header.cast()) };
+    T::reclaim_step(slot, a)
 }
 
 unsafe fn finish<T: Reclaim<A>, A: Allocator>(header: NonNull<Header<A>>, ending: Ending) -> u64 {
     match ending {
         // SAFETY: the vtable was installed for exactly this Block<T, A>, and
         // the caller has exclusive custody of the record.
-        Ending::Count => unsafe {
-            let (place, state) = destination::<T, A>(header.cast());
-            T::remaining(place, state)
-        },
+        Ending::Count => T::remaining(unsafe { destination::<T, A>(header.cast()) }.into_observe()),
         Ending::Free => {
             // SAFETY: cleanup returned Done, so the payload owns nothing; the
             // block's allocation admitted this release.
             unsafe { stable::free(header.cast::<Block<T, A>>()) };
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::Limits;
+
+    /// A prefix's class is its count: two prefixes of one count are one
+    /// class, of different counts two.
+    #[test]
+    fn a_prefixs_class_is_its_count() {
+        let mut one = Prefix::EMPTY;
+        one.advance();
+        let mut two = one;
+        two.advance();
+        assert_eq!(<Prefix as Reduction>::class(&one), one);
+        assert_eq!(<Prefix as Reduction>::class(&two).initialized(), 2);
+        assert_ne!(
+            <Prefix as Reduction>::class(&one),
+            <Prefix as Reduction>::class(&two)
+        );
+    }
+
+    /// A place's copy is the same place: its pointer, and so its
+    /// provenance, unchanged.
+    #[test]
+    #[expect(
+        clippy::clone_on_copy,
+        reason = "the test runs the place's `Clone` impl itself, which a copy bypasses"
+    )]
+    fn a_copied_place_is_the_same_place() {
+        let mut slot = MaybeUninit::<u64>::uninit();
+        let mut custody = ();
+        // SAFETY: the test owns the destination; nothing else reaches it.
+        let place = unsafe { Place::<u64, Build>::root(NonNull::from(&mut slot)) };
+        let copied = <Place<u64, Build> as Clone>::clone(&place);
+        assert_eq!(place.as_ptr(&mut custody), copied.as_ptr(&mut custody));
+    }
+
+    /// A record's cost evaluated at run time is the constant the scope
+    /// admits: its metadata, header and state written whole with the
+    /// permit, and the whole block.
+    #[test]
+    fn a_records_cost_at_run_time_is_its_metadata_and_its_block() {
+        let (metadata, block) = record_cost::<u64, Limits>();
+        let (constant, bytes) = const { record_cost::<u64, Limits>() };
+        assert_eq!(metadata.bytes(), constant.bytes());
+        assert_eq!(block, bytes);
+    }
+
+    /// A queue dropped as a value holds nothing: the check its drop makes
+    /// holds of an empty one.
+    #[test]
+    fn an_empty_queue_drops_cleanly() {
+        let queue = Reclaimer::<Limits>::new();
+        assert_eq!(queue.outstanding(), 0);
+        drop(queue);
     }
 }

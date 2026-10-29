@@ -6,6 +6,7 @@
 extern crate alloc;
 use super::{Allocator, Budget, WriteWork};
 use crate::bounded::decode::construction::TypedPosition;
+use crate::bounded::decode::construction::reclamation::AbortOnUnwind;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,7 +69,13 @@ impl Drop for Reservation {
         if self.bytes != 0
             && let Some(observer) = self.counters.release_observer
         {
+            // A release runs inside cleanup steps, which must not unwind
+            // (`Reclaim`): a step a release unwound out of would leave its
+            // state recording what it no longer holds. An observer that
+            // unwinds aborts the process instead.
+            let guard = AbortOnUnwind;
             observer(self.bytes);
+            core::mem::forget(guard);
         }
     }
 }
@@ -491,11 +498,12 @@ impl Limits {
     /// release, including releases through shared policies and split permits.
     /// Configure before sharing the policy or issuing any reservation.
     ///
-    /// # Safety
-    /// The callback must perform bounded, nonblocking work and must not
-    /// allocate, panic, or reenter the policy. Releases also occur during
-    /// allocation-free terminal cleanup and unwinding.
-    pub unsafe fn observe_releases(mut self, observer: fn(u64)) -> Self {
+    /// The callback runs inside cleanup steps, allocation-free terminal
+    /// cleanup and unwinding included, so it is held to their contract: it
+    /// performs bounded, nonblocking work and does not allocate. A callback
+    /// that panics aborts the process: a release never unwinds out of a
+    /// cleanup step.
+    pub fn observe_releases(mut self, observer: fn(u64)) -> Self {
         Arc::get_mut(&mut self.counters)
             .expect("release observation must be configured before sharing")
             .release_observer = Some(observer);
@@ -812,5 +820,145 @@ impl Allocator for Limits {
             counters: self.counters.clone(),
             bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn refusals_name_their_cause() {
+        assert_eq!(format!("{}", LimitRefusal::Work), "work limit");
+        assert_eq!(format!("{}", LimitRefusal::Storage), "storage limit");
+        assert_eq!(format!("{}", LimitRefusal::Deadline), "deadline");
+        assert_eq!(
+            format!("{}", LimitRefusal::Scheduled(7)),
+            "scheduled refusal of call 7"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                TransferRefusal::Insufficient {
+                    requested: 9,
+                    held: 4
+                }
+            ),
+            "split of 9 bytes from a reservation of 4"
+        );
+        assert_eq!(
+            format!("{}", TransferRefusal::Foreign),
+            "reservations count against different storage"
+        );
+        assert_eq!(
+            format!("{}", TransferRefusal::Overflow),
+            "merged reservation exceeds u64"
+        );
+    }
+
+    /// A trace counts every attempt, keeps the last and the first refusal,
+    /// and renders them; an empty trace is its default.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the policy's own trace is driven by direct admissions"
+    )]
+    fn a_trace_counts_keeps_and_renders_its_admissions() {
+        let empty = AdmissionTrace::default();
+        assert_eq!(empty.count(), 0);
+        assert!(empty.last().is_none() && empty.first_refusal().is_none());
+        let mut m = Limits::new(1, 64, 0);
+        m.traverse(1, 8).unwrap();
+        assert_eq!(m.traverse(1, 8), Err(LimitRefusal::Work));
+        let trace = m.trace();
+        assert_eq!(trace.count(), 2);
+        let last = trace.last().expect("an attempt was recorded");
+        assert_eq!((last.index, last.result), (1, Err(LimitRefusal::Work)));
+        assert_eq!(trace.first_refusal().map(|refusal| refusal.index), Some(1));
+        let rendered = format!("{trace:?}");
+        assert!(
+            rendered.starts_with("first_refusal=Some(") && rendered.contains("total_events=2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("call=0 Work { values: 1, bytes: 8 } -> Ok(())")
+                && rendered.contains("call=1 Work { values: 1, bytes: 8 } -> Err(Work)"),
+            "{rendered}"
+        );
+        let calls = [
+            Call::Allocate(4),
+            Call::Work {
+                values: 1,
+                bytes: 0,
+            },
+        ];
+        trace.assert_calls(&calls, &calls, "equal calls");
+    }
+
+    #[test]
+    #[should_panic(expected = "admission replay: run=differing calls, first_difference=1")]
+    fn differing_call_sequences_are_reported_at_their_first_difference() {
+        AdmissionTrace::new().assert_calls(
+            &[Call::Allocate(4), Call::Allocate(8)],
+            &[Call::Allocate(4), Call::Allocate(16)],
+            "differing calls",
+        );
+    }
+
+    /// Every admission refused once: each attempt is refused as a scheduled
+    /// refusal of its own index, and its retry admitted; the allowance of a
+    /// bound of `n` steps is `2n + 1`.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the policy's refusal schedule is driven by direct admissions"
+    )]
+    fn every_admission_is_refused_once_then_admitted() {
+        let mut m = Limits::unlimited().refusing_each();
+        assert!(m.refuses_each());
+        assert_eq!(m.allowed::<()>(3), Ok(7));
+        assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Scheduled(0)));
+        assert_eq!(m.traverse(1, 0), Ok(()));
+        assert_eq!(
+            m.allocate(4).map(|permit| permit.bytes()).unwrap_err(),
+            LimitRefusal::Scheduled(2)
+        );
+        assert_eq!(m.allocate(4).map(|permit| permit.bytes()), Ok(4));
+        assert_eq!(m.injected_refusals(), 2);
+        assert!(!Limits::unlimited().refuses_each());
+    }
+
+    /// The selected allocation request is refused once, counted among
+    /// requests only, whether selected at construction or later.
+    #[test]
+    fn the_selected_allocation_request_is_refused_once() {
+        let mut m = Limits::unlimited().refusing_request(Some(1));
+        assert_eq!(m.allocate(4).map(|permit| permit.bytes()), Ok(4));
+        assert_eq!(
+            m.allocate(4).map(|permit| permit.bytes()).unwrap_err(),
+            LimitRefusal::Scheduled(1)
+        );
+        assert_eq!(m.allocate(4).map(|permit| permit.bytes()), Ok(4));
+        let mut later = Limits::unlimited();
+        later.fail_request(Some(0));
+        assert_eq!(
+            later.allocate(2).map(|permit| permit.bytes()).unwrap_err(),
+            LimitRefusal::Scheduled(0)
+        );
+        assert_eq!(later.allocate(2).map(|permit| permit.bytes()), Ok(2));
+        assert_eq!(later.requests(), 2);
+    }
+
+    /// The default policy is unlimited: every quantity's allowance is the
+    /// whole of `u64`.
+    #[test]
+    fn the_default_policy_is_unlimited() {
+        let mut m = Limits::default();
+        assert_eq!(m.remaining(), WriteWork::new(u64::MAX, u64::MAX));
+        let permit = m.allocate(u64::MAX).expect("unlimited storage");
+        assert_eq!(m.live_bytes(), u64::MAX);
+        drop(permit);
+        assert_eq!(m.live_bytes(), 0);
     }
 }

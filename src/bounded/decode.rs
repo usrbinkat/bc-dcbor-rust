@@ -200,6 +200,9 @@ impl StoredKind {
     }
 }
 
+/// One node of a document's arena: plain data, so an arena of them is
+/// discarded in one admitted unit (`Storage::reclaim_copy_step`).
+#[derive(Clone, Copy)]
 struct Entry {
     kind: StoredKind,
     start: usize,
@@ -310,6 +313,9 @@ impl<'d, 'a> Iterator for Children<'d, 'a> {
     }
 }
 
+/// One open container of a parse: plain data, so a stack of them is
+/// discarded in one admitted unit (`Storage::reclaim_copy_step`).
+#[derive(Clone, Copy)]
 struct Frame {
     node: usize,
     remaining: u64,
@@ -977,7 +983,9 @@ mod terms_tests {
     }
 
     /// An input whose decode charges `place`, and the options it is decoded
-    /// under: a place without a witness does not compile.
+    /// under: a place without a witness does not compile. Its one caller is
+    /// the `std` attribution test.
+    #[cfg(feature = "std")]
     fn witness(place: DecodePlace) -> (&'static str, CBOR, Options) {
         match place {
             DecodePlace::Heads | DecodePlace::Completions | DecodePlace::Arena => (
@@ -1356,23 +1364,41 @@ impl BoundedDecodable for bool {
     }
 }
 
+/// The one owned copy construction makes, of `len` bytes: the copy admitted,
+/// its storage requested from `allocator` with its permit held by `permits`,
+/// then reserved fallibly at exactly that length by `reserve`, which reports
+/// whether the physical allocation succeeded.
+fn reserve_copy<A: Allocator>(
+    len: usize,
+    permits: &mut Owned<A::Permit, A::Permit>,
+    allocator: &mut A,
+    reserve: impl FnOnce(usize) -> Option<()>,
+) -> ConstructResult<(), A> {
+    let length = widen(len)?;
+    COPY.admit(allocator, length)?;
+    hold(length, permits, allocator)?;
+    reserve(len).ok_or(BoundedError::Allocation { bytes: length })?;
+    Ok(())
+}
+
 /// `bytes` copied into storage requested from `allocator` and allocated
-/// fallibly at exactly their length: the one owned copy construction makes.
+/// fallibly at exactly their length ([`reserve_copy`]).
 pub fn copy_bytes<A: Allocator>(
     bytes: &[u8],
     permits: &mut Owned<A::Permit, A::Permit>,
     allocator: &mut A,
 ) -> ConstructResult<Vec<u8>, A> {
-    let length = widen(bytes.len())?;
-    COPY.admit(allocator, length)?;
-    hold(length, permits, allocator)?;
     let mut out = Vec::new();
-    out.try_reserve_exact(bytes.len())
-        .map_err(|_| BoundedError::Allocation { bytes: length })?;
+    reserve_copy(bytes.len(), permits, allocator, |len| {
+        out.try_reserve_exact(len).ok()
+    })?;
     out.extend_from_slice(bytes);
     Ok(out)
 }
 
+/// The validated text copied into a `String` reserved like any owned copy
+/// ([`reserve_copy`]): the text is copied as a `str`, so the copy is valid
+/// UTF-8 by its type and is never checked again.
 impl BoundedDecodable for String {
     fn construct<A: Allocator>(
         node: Node<'_, '_>,
@@ -1383,10 +1409,12 @@ impl BoundedDecodable for String {
         let Kind::Text(text) = node.kind() else {
             return Err(wrong_type());
         };
-        let bytes = copy_bytes(text.as_bytes(), permits, allocator)?;
-        // The bytes are the validated text's own.
-        String::from_utf8(bytes)
-            .map_err(|error| DecodeError::Invalid(Error::InvalidUtf8(error.utf8_error())))
+        let mut out = String::new();
+        reserve_copy(text.len(), permits, allocator, |len| {
+            out.try_reserve_exact(len).ok()
+        })?;
+        out.push_str(text);
+        Ok(out)
     }
 }
 

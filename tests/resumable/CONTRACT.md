@@ -43,6 +43,18 @@ and finite completion. Eventual completion alone is insufficient.
 - Observations must expose the relevant retained positions, including header
   bytes, payload validation, key comparison, storage relocation, construction
   progress, and emitted bytes.
+- Every construction state's custody is observable (`Custody`): a projection
+  of the one typed state construction and cleanup read and write, never a
+  second record kept beside it. It distinguishes every state that differs in
+  what is initialized, which allocations, blocks and permits are held,
+  staged, published or awaiting release, how many cleanup units remain, and
+  what the active child holds; a parent's observation embeds its active
+  child's whole. It holds counts and phases, never an address. Observing
+  requires the state's exclusive custody, admits nothing, allocates nothing,
+  and changes neither the state nor the trace; observing twice yields equal
+  observations. Each arena's growth stage (`StorageStage`) is part of it,
+  since a settled arena and one staging or relocating a growth clean up
+  differently.
 - A refusal must preserve all work successfully admitted before it. A step may
   contain successful admissions before a later refusal; assertions must account
   for that committed progress separately from the refused work.
@@ -160,6 +172,21 @@ and finite completion. Eventual completion alone is insufficient.
   any thread, the same operation resumes without replay.
 - Compile-fail tests must enforce input immutability, output-owner lifetimes,
   and preparation-plan and destination borrows held by resumable writers.
+- A binding may declare a cleanup reduction (`Reduction`): a map from its
+  observations to classes such that, from two states of one class, each next
+  cleanup unit, admitted or refused, reaches the same outcome, releases the
+  same bytes and admits the same calls, into states again of one class (a
+  simulation of cleanup). Nothing declares one by default; a state without
+  it is never reduced, and every stop over it runs. A binding over a child
+  declares one only over a child that does, and states its argument at its
+  definition. Containers declare none: they count older children whose
+  custody may differ.
+- Every reclaimable state declares the most cleanup calls it can still take
+  (`Reclaim::remaining`), completion included; the scope enforces it, and a
+  call beyond it is a defect. An arena of plain data settled with no growth
+  staged is discarded in one unit; one staging a growth, relocating or
+  relocated is drained one element per unit, the most any arena's bound
+  charges.
 
 ## Test independence and required schedules
 
@@ -180,7 +207,18 @@ Required schedules include:
 | Fuzzing | Malformed inputs, nesting, truncations, mutations, changing resource schedules, cancellation, semantic agreement, and finite termination |
 
 Negative controls must demonstrate that allocation and work-bound instrumentation
-detect deliberate violations. Fault matrices must exercise all selected cases.
+detect deliberate violations, and that a planted class merging states of
+different custody, and a planted observer losing custody, are rejected.
+
+Every fault schedule runs through one matrix seam (`dcbor-test-support`), in
+one of two layers that use the same oracles and claim different things.
+`DCBOR_RIGOR` selects the layer: `fast` (the default) or `exhaustive`; any
+other value is an error.
+
+| Layer | Claim |
+| --- | --- |
+| fast | Every admission refused once, in one run that suspends at each from the state the unrefused run reaches there (`Limits::refusing_each`); every physical request failed; every cancellation; and one stop of each kind at the first boundary of each certified cleanup class and at every unclassified boundary. |
+| exhaustive | The fast claim, plus each admission refused in a run of its own, and every stop at every boundary, each member of a class required to clean up with exactly the calls its first member admitted: independent evidence for the fast layer's reductions, within the fixtures and sizes enumerated. |
 
 ## Prior-art requirements
 
@@ -228,40 +266,42 @@ compiled only under some features, and the single admission route
 (`clippy.toml`), are thereby checked in every build that compiles them. It
 runs from any directory.
 
-The recorded admission baselines (`tests/data/admission-traces.txt`, and
-`tests/data/admission-traces.num-bigint.txt` where bignums are encoded) are
-rewritten from the current build only deliberately, with every gating feature
-enabled; a change to them states the trace delta it carries:
-
-```sh
-DCBOR_RECORD_TRACES=1 cargo test --features derive,hashbrown --test resumable_contract traces::
-DCBOR_RECORD_TRACES=1 cargo test --features derive,hashbrown,num-bigint --test resumable_contract traces::
-```
-
-Over the flake's standard library the ordered-collection schemas walk trees
-by the stepped cursor, whose admissions differ from the iterator's, so their
-baselines are kept apart (`admission-traces.custom-std.txt` and
-`admission-traces.custom-std.num-bigint.txt`) and recorded in the default
-shell:
-
-```sh
-DCBOR_RECORD_TRACES=1 cargo test --features custom-std-collections,derive,hashbrown --test resumable_contract traces::
-DCBOR_RECORD_TRACES=1 cargo test --features custom-std-collections,derive,hashbrown,num-bigint --test resumable_contract traces::
-```
-
 Standard-library toolchain from the flake, whose `library/` is the
 `usrbinkat/rust` commit pinned in `flake.lock`: its std exposes
 `hashmap_bucket_access` and `BTreeMap::stepped_cursor`
-(`btree_stepped_cursor`), which the ordered-collection schemas walk.
+(`btree_stepped_cursor`), which the ordered-collection schemas walk. Its
+shell is `.#custom-std`, entered with `nix develop .#custom-std`.
 
 ```sh
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+DCBOR_RIGOR=exhaustive cargo test --all-features --test owned_inspection
 ```
 
-Unsafe code is qualified under Miri with `tests/miri-owned.sh` in the flake's
-default shell, whose toolchain carries Miri and builds its sysroot from the
-same patched library. The separate fuzz workspace
+The recorded evidence (the admission traces, the tightness ratios and the
+matrix cost records, `tests/data`) names the configuration it was recorded
+under and is rewritten from the current build only deliberately, every
+variant (`.txt`, `.num-bigint.txt`, `.custom-std.txt`,
+`.custom-std.num-bigint.txt`) by one command in `.#custom-std`, which fails
+unless every variant is recorded; a change to it states the mechanism behind
+each delta:
+
+```sh
+DCBOR_COST_REASON="<the mechanism of the change>" bash tests/record-evidence.sh record
+bash tests/record-evidence.sh check
+```
+
+Unsafe code is qualified under Miri with `tests/miri-owned.sh` in
+`.#custom-std`, whose toolchain carries Miri and builds its sysroot from the
+same patched library: each selected test in a Miri process of its own,
+under strict provenance and both Stacked and Tree Borrows. `DCBOR_RIGOR`,
+`DCBOR_CLASS_COVERAGE` and `DCBOR_WITNESS` reach the interpreted test only
+through Miri's `-Zmiri-env-forward`, one flag per variable
+(`tests/gate-common.sh`), and the classes each model reaches must equal the
+native run's. Its selection (`tests/miri-suites.txt`) is held by the reach
+map (`tests/reach-map.sh`): every function of a module holding `unsafe` is
+reached by a test Miri runs, and the minimal witness sizes Miri runs execute
+every region the full sizes do. The separate fuzz workspace
 must be built and executed with coverage instrumentation and sanitizers using
 the commands in `fuzz/README.md`; `fuzz/smoke.sh` and `fuzz/qualify.sh` run
 every target.

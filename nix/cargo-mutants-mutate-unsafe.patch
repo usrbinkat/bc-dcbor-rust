@@ -1,0 +1,226 @@
+diff --git a/NEWS.md b/NEWS.md
+index 2003a1d..c304360 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -2,6 +2,8 @@
+ 
+ ## Unreleased
+ 
++- New: `--mutate-unsafe=true`, or `mutate_unsafe = true` in the configuration, generates mutants inside `unsafe fn` bodies, which are skipped by default ([#405](https://github.com/sourcefrog/cargo-mutants/issues/405)). A mutant of unsafe code can introduce undefined behavior that the tests do not observe, so its outcome is best judged by tests run under an interpreter such as Miri.
++
+ - New: `#[mutants::exclude_re("pattern")]` attribute to exclude specific mutations by regex, without disabling all mutations on the function. The attribute can be placed on functions, `impl` blocks, `trait` blocks, modules, files, and on expressions that can carry an attribute (such as `match`, struct literals, call expressions, method calls, and unary expressions). Multiple patterns can be applied. Also supported within `cfg_attr`. Requires the [mutants](https://crates.io/crates/mutants) crate version `0.0.5` or later.
+ 
+ - Fixed: `#[mutants::skip]` (and `#[cfg_attr(..., mutants::skip)]`) is now honoured when placed on `const` and `static` items, including associated constants in `impl` and `trait` blocks. Previously the attribute was silently ignored on these items and operator mutants inside the initializer expression were still generated ([#508](https://github.com/sourcefrog/cargo-mutants/issues/508)).
+diff --git a/book/src/mutants.md b/book/src/mutants.md
+index 458a26c..977dc94 100644
+--- a/book/src/mutants.md
++++ b/book/src/mutants.md
+@@ -13,7 +13,7 @@ Some functions are automatically excluded from mutation:
+ - Functions marked with `#[cfg(test)]` or in files marked with `#![cfg(test)]`
+ - Test functions: functions with attributes whose path ends with `test`, including `#[test]`, `#[tokio::test]`, `#[sqlx::test]`, and similar testing framework attributes
+ - Functions marked with `#[mutants::skip]`
+-- `unsafe` functions
++- `unsafe` functions, unless `--mutate-unsafe=true` is given or `mutate_unsafe = true` is set in the configuration
+ 
+ You can also explicitly [skip functions](skip.md) or [filter which functions are mutated](filter_mutants.md).
+ 
+diff --git a/examples/custom_config.toml b/examples/custom_config.toml
+index 7ae4322..f9f5800 100644
+--- a/examples/custom_config.toml
++++ b/examples/custom_config.toml
+@@ -64,6 +64,9 @@ skip_calls = [
+ # Use built-in defaults for skip_calls (includes "with_capacity")
+ skip_calls_defaults = true
+ 
++# Generate mutants inside unsafe fn bodies, which are otherwise skipped
++mutate_unsafe = true
++
+ # Choose test tool: "cargo" or "nextest"
+ test_tool = "cargo"
+ 
+diff --git a/src/config.rs b/src/config.rs
+index 7271192..7bedebe 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -66,6 +66,8 @@ pub struct Config {
+     pub features: Vec<String>,
+     /// Minimum test timeout, in seconds, as a floor on the autoset value.
+     pub minimum_test_timeout: Option<f64>,
++    /// Generate mutants inside `unsafe fn` bodies, which are otherwise skipped.
++    pub mutate_unsafe: Option<bool>,
+     /// Do not activate the `default` feature.
+     pub no_default_features: Option<bool>,
+     /// Output directory.
+diff --git a/src/main.rs b/src/main.rs
+index 3e77156..7486cb2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -408,6 +408,10 @@ pub struct Args {
+     #[arg(long, help_heading = "Generate")]
+     error: Vec<String>,
+ 
++    /// Generate mutants inside `unsafe fn` bodies, which are otherwise skipped.
++    #[arg(long, action = ArgAction::Set, help_heading = "Generate")]
++    mutate_unsafe: Option<bool>,
++
+     // Input ============================================================
+     /// Rust crate directory to examine.
+     #[arg(
+diff --git a/src/options.rs b/src/options.rs
+index b983fb9..e32db80 100644
+--- a/src/options.rs
++++ b/src/options.rs
+@@ -96,6 +96,9 @@ pub struct Options {
+     /// The minimum test timeout, as a floor on the autoset value.
+     pub minimum_test_timeout: Duration,
+ 
++    /// Generate mutants inside `unsafe fn` bodies, which are otherwise skipped.
++    pub mutate_unsafe: bool,
++
+     pub print_caught: bool,
+     pub print_unviable: bool,
+ 
+@@ -367,6 +370,7 @@ impl Options {
+             jobserver_tasks: args.jobserver_tasks,
+             leak_dirs: args.leak_dirs,
+             minimum_test_timeout,
++            mutate_unsafe: args.mutate_unsafe.or(config.mutate_unsafe).unwrap_or(false),
+             no_default_features: args.no_default_features
+                 || config.no_default_features.unwrap_or(false),
+             output_in_dir: args
+@@ -871,6 +875,38 @@ mod test {
+         assert!(options.copy_target);
+     }
+ 
++    #[test]
++    fn mutate_unsafe_off_by_default() {
++        let args = Args::parse_from(["mutants"]);
++        let config = Config::default();
++        let options = Options::new(&args, &config).unwrap();
++        assert!(!options.mutate_unsafe);
++    }
++
++    #[test]
++    fn mutate_unsafe_from_command_line() {
++        let args = Args::parse_from(["mutants", "--mutate-unsafe=true"]);
++        let config = Config::default();
++        let options = Options::new(&args, &config).unwrap();
++        assert!(options.mutate_unsafe);
++    }
++
++    #[test]
++    fn mutate_unsafe_from_config() {
++        let args = Args::parse_from(["mutants"]);
++        let config = Config::from_str("mutate_unsafe = true").unwrap();
++        let options = Options::new(&args, &config).unwrap();
++        assert!(options.mutate_unsafe);
++    }
++
++    #[test]
++    fn mutate_unsafe_command_line_overrides_config() {
++        let args = Args::parse_from(["mutants", "--mutate-unsafe=false"]);
++        let config = Config::from_str("mutate_unsafe = true").unwrap();
++        let options = Options::new(&args, &config).unwrap();
++        assert!(!options.mutate_unsafe);
++    }
++
+     #[test]
+     fn profile_option_from_args() {
+         let args = Args::parse_from(["mutants", "--profile=mutants"]);
+diff --git a/src/visit.rs b/src/visit.rs
+index 2edf8f2..d82a37f 100644
+--- a/src/visit.rs
++++ b/src/visit.rs
+@@ -564,7 +564,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
+         )
+         .entered();
+         trace!("visit fn");
+-        if fn_sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || block_is_empty(&i.block) {
++        if fn_sig_excluded(&i.sig, self.options.mutate_unsafe)
++            || attrs_excluded(&i.attrs)
++            || block_is_empty(&i.block)
++        {
+             return;
+         }
+         self.in_exclude_re_scope(&i.attrs, |v| {
+@@ -586,7 +589,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
+             name = function_name
+         )
+         .entered();
+-        if fn_sig_excluded(&i.sig)
++        if fn_sig_excluded(&i.sig, self.options.mutate_unsafe)
+             || attrs_excluded(&i.attrs)
+             || i.sig.ident == "new"
+             || block_is_empty(&i.block)
+@@ -610,7 +613,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
+             name = function_name
+         )
+         .entered();
+-        if fn_sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || i.sig.ident == "new" {
++        if fn_sig_excluded(&i.sig, self.options.mutate_unsafe)
++            || attrs_excluded(&i.attrs)
++            || i.sig.ident == "new"
++        {
+             return;
+         }
+         if let Some(block) = &i.default {
+@@ -1070,8 +1076,10 @@ fn find_mod_source(
+ }
+ 
+ /// True if the signature of a function is such that it should be excluded.
+-fn fn_sig_excluded(sig: &syn::Signature) -> bool {
+-    if sig.unsafety.is_some() {
++///
++/// An `unsafe fn` is excluded unless `mutate_unsafe` is set.
++fn fn_sig_excluded(sig: &syn::Signature, mutate_unsafe: bool) -> bool {
++    if sig.unsafety.is_some() && !mutate_unsafe {
+         trace!("Skip unsafe fn");
+         true
+     } else {
+@@ -1491,6 +1499,46 @@ mod test {
+         assert_eq!(mutants, []);
+     }
+ 
++    /// With `--mutate-unsafe=true`, free, inherent and trait-default `unsafe fn`
++    /// bodies are mutated like any other function.
++    #[test]
++    fn mutate_unsafe_fn_when_enabled() {
++        let options = Options::from_arg_strs(["mutants", "--mutate-unsafe=true"]);
++        let mutants = mutate_source_str(
++            indoc! {"
++                unsafe fn foo() -> usize {
++                    2 + 3
++                }
++
++                struct S;
++                impl S {
++                    unsafe fn ok(&self) -> bool {
++                        true
++                    }
++                }
++
++                trait T {
++                    unsafe fn ready() -> bool {
++                        true
++                    }
++                }
++            "},
++            &options,
++        )
++        .unwrap();
++        assert_eq!(
++            mutants.iter().map(|m| m.name(false)).collect_vec(),
++            [
++                "src/main.rs: replace foo -> usize with 0",
++                "src/main.rs: replace foo -> usize with 1",
++                "src/main.rs: replace + with - in foo",
++                "src/main.rs: replace + with * in foo",
++                "src/main.rs: replace S::ok -> bool with false",
++                "src/main.rs: replace T::ready -> bool with false",
++            ]
++        );
++    }
++
+     #[test]
+     fn skip_functions_with_test_attribute() {
+         let mutants = mutate_source_str(

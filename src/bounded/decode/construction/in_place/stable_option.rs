@@ -1,8 +1,12 @@
 //! An optional payload whose native representation never contains T inline.
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction};
+use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place, Reduction};
 use crate::bounded::decode::construction::stable::{self, Held, Installed};
-use core::{marker::PhantomData, mem::size_of, ptr};
+use core::{
+    marker::PhantomData,
+    mem::{MaybeUninit, size_of},
+    ptr::{self, NonNull},
+};
 
 /// Optional stable storage for payloads that cannot use a bounded native
 /// `Option<T>` placeholder. Construction publishes the pointer only after T is
@@ -23,11 +27,17 @@ unsafe impl<T: Send, A: Allocator> Send for StableOption<T, A> where A::Permit: 
 // SAFETY: shared access yields only &T.
 unsafe impl<T: Sync, A: Allocator> Sync for StableOption<T, A> {}
 
-/// The payload block: the payload's construction state, its phase, and the
-/// payload itself, built in place.
-struct Body<S, T> {
+/// What the payload block's acquisition writes, whole: the payload's
+/// construction state and the block's phase.
+struct Head<S> {
     child: S,
     phase: Phase,
+}
+
+/// The payload block: its header, then the payload itself, built in place
+/// afterwards.
+struct Body<S, T> {
+    head: Head<S>,
     value: MaybeUninit<T>,
 }
 
@@ -129,21 +139,45 @@ impl<S: Custody, T, P> Custody for OptionState<S, T, P> {
                 admitted: self.admitted,
             };
         };
-        let body = installed.get();
+        let (head, _) = parts(installed);
         StableOptionObservation::Held {
             decision,
-            phase: body.phase,
-            child: body.child.observe(),
+            phase: head.phase,
+            child: head.child.observe(),
         }
     }
 }
 
 /// What the payload block's acquisition writes, for a payload `T` whose
-/// state is `S`, with permits of `P`: the payload's state, the phase and the
-/// permit; the payload itself is built afterwards. Evaluated in a constant
-/// by every caller.
+/// state is `S`, with permits of `P`: its header, whole, and the permit; the
+/// payload itself is built afterwards. Evaluated in a constant by every
+/// caller.
 const fn metadata<S, T, P>() -> stable::Metadata {
-    stable::Metadata::new::<Body<S, T>, P>(size_of::<S>() + size_of::<Phase>() + size_of::<P>())
+    stable::Metadata::header::<Head<S>, Body<S, T>, P>()
+}
+
+/// The payload block's two parts, each projected from the block's own
+/// pointer: the header, the option's own custody, borrowed alone; and the
+/// payload's place ([`Place`]), which stays valid for the block's life.
+/// Every access to the block goes through here: borrowing the whole body
+/// would also reborrow the payload, invalidating every place the payload's
+/// construction keeps within itself. A handle to the block exists only once
+/// its acquisition wrote the header whole ([`stable::install`]), so the
+/// header is initialized whenever this can be called.
+fn parts<S, T, P>(installed: &mut Installed<Body<S, T>, P>) -> (&mut Head<S>, Place<T>) {
+    let body = installed.place();
+    // SAFETY: the handle proves the header written; both projections stay
+    // within the live block, and the header and the payload are disjoint.
+    // The header is the option's own custody, which no reader borrows,
+    // borrowed for as long as the handle, the block's custody, is;
+    // `MaybeUninit<T>` lays out a `T` at its start.
+    unsafe {
+        let payload = body.project(|body| ptr::addr_of_mut!((*body).value).cast::<T>());
+        (
+            body.custody(installed, |body| ptr::addr_of_mut!((*body).head)),
+            payload,
+        )
+    }
 }
 
 impl<T, A: Allocator> StableOption<T, A> {
@@ -187,49 +221,51 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
         .plus(T::COST)
     };
 
-    unsafe fn build_present(
+    fn build_present(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
+        let state = slot.custody();
         if state.decision == Decision::Undecided {
             STEP.admit(a)?;
             state.decision = Decision::Present;
             return Ok(Built::Progress);
         }
-        unsafe { Self::build_step(document, index, place, state, a) }
+        Self::build_step(document, index, slot, a)
     }
 
-    unsafe fn build_absent(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
-        a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    fn build_absent(mut slot: Slot<'_, Self, Self::State>, a: &mut A) -> ConstructResult<Built, A> {
+        let (place, state) = slot.parts();
         if state.body.is_some()
             || !matches!(state.decision, Decision::Undecided | Decision::Present)
         {
             return Err(BoundedError::PlanMismatch.into());
         }
         sized::<Self>().admit(a)?;
+        // SAFETY: the slot pairs the place with this state, whose decision
+        // says nothing is written yet; the write is admitted above.
         unsafe {
-            place.as_ptr().write(MaybeUninit::new(Self {
-                payload: None,
-                marker: PhantomData,
-            }));
-        }
+            place.write(
+                state,
+                Self {
+                    payload: None,
+                    marker: PhantomData,
+                },
+            )
+        };
         state.decision = Decision::Written;
         Ok(Built::Done)
     }
 
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
+        let (place, state) = slot.parts();
         if state.decision == Decision::Written {
             return Err(BoundedError::PlanMismatch.into());
         }
@@ -250,28 +286,32 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
                 }
                 Decision::Null => {
                     sized::<Self>().admit(a)?;
+                    // SAFETY: nothing is written yet; the write is admitted.
                     unsafe {
-                        place.as_ptr().write(MaybeUninit::new(Self {
-                            payload: None,
-                            marker: PhantomData,
-                        }));
-                    }
+                        place.write(
+                            state,
+                            Self {
+                                payload: None,
+                                marker: PhantomData,
+                            },
+                        )
+                    };
                     state.decision = Decision::Written;
                     return Ok(Built::Done);
                 }
                 Decision::Present => {
-                    // SAFETY: only metadata is written; T stays uninitialized
-                    // until built. The block's acquisition admits the
-                    // metadata's bytes, as `metadata` counts them.
+                    // SAFETY: only the header is written, projected to its
+                    // field; T stays uninitialized until built. The block's
+                    // acquisition admits the header's bytes ([`metadata`]).
                     unsafe {
-                        stable::install::<Body<T::State, T>, A>(
+                        stable::install::<Body<T::State, T>, Head<T::State>, A>(
                             &mut state.body,
                             &mut state.admitted,
-                            const { metadata::<T::State, T, A::Permit>() },
-                            |body| {
-                                ptr::addr_of_mut!((*body).child).write(T::INITIAL);
-                                ptr::addr_of_mut!((*body).phase).write(Phase::Build);
+                            || Head {
+                                child: T::INITIAL,
+                                phase: Phase::Build,
                             },
+                            |body| ptr::addr_of_mut!((*body).head),
                             a,
                         )?
                     };
@@ -280,38 +320,34 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
                 Decision::Written => return Err(BoundedError::PlanMismatch.into()),
             }
         };
-        match installed.get().phase {
+        let (head, payload) = parts(installed);
+        match head.phase {
             Phase::Build => {
-                let payload = installed.get();
-                if unsafe {
-                    T::build_step(
-                        document,
-                        index,
-                        NonNull::from(&mut payload.value),
-                        &mut payload.child,
-                        a,
-                    )?
-                } == Built::Done
-                {
-                    payload.phase = Phase::Publish;
+                // SAFETY: the payload's place, rooted at its block, paired
+                // with its own state in the block's header.
+                let child = unsafe { Slot::new(payload, &mut head.child) };
+                if T::build_step(document, index, child, a)? == Built::Done {
+                    head.phase = Phase::Publish;
                 }
                 Ok(Built::Progress)
             }
             Phase::Publish => {
                 sized::<Self>().admit(a)?;
-                let block = installed.view();
-                // SAFETY: the view is the handle's own pointer; projecting
-                // the payload field keeps it within the block.
-                let value = unsafe {
-                    NonNull::new_unchecked(ptr::addr_of_mut!((*block.as_ptr()).value.value))
-                        .cast::<T>()
-                };
+                // The published view is the payload's place, whose
+                // provenance is the block's for the block's life, its raw
+                // pointer taken under the payload's own state.
+                // SAFETY: the place is nonnull.
+                let view = unsafe { NonNull::new_unchecked(payload.as_ptr(&mut head.child)) };
+                // SAFETY: nothing is written yet; the write is admitted.
                 unsafe {
-                    place.as_ptr().write(MaybeUninit::new(Self {
-                        payload: Some(value),
-                        marker: PhantomData,
-                    }));
-                }
+                    place.write(
+                        state,
+                        Self {
+                            payload: Some(view),
+                            marker: PhantomData,
+                        },
+                    )
+                };
                 state.decision = Decision::Written;
                 Ok(Built::Done)
             }
@@ -332,47 +368,141 @@ unsafe impl<T: Reclaim<A>, A: Allocator> Reclaim<A> for StableOption<T, A> {
         body: None,
     };
 
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
+        let state = slot.custody();
         let Some(installed) = state.body.as_mut() else {
             STEP.admit(a)?;
             state.decision = Decision::Undecided;
             state.admitted = stable::Admitted::Nothing;
             return Ok(Reclaimed::Done);
         };
-        let payload = installed.get();
-        if !matches!(payload.phase, Phase::Clean) {
-            if unsafe { T::reclaim_step(NonNull::from(&mut payload.value), &mut payload.child, a)? }
-                == Reclaimed::Done
-            {
-                payload.phase = Phase::Clean;
+        let (head, payload) = parts(installed);
+        if !matches!(head.phase, Phase::Clean) {
+            // SAFETY: the payload's place, rooted at its block, paired with
+            // its own state in the block's header.
+            let child = unsafe { Slot::new(payload, &mut head.child) };
+            if T::reclaim_step(child, a)? == Reclaimed::Done {
+                head.phase = Phase::Clean;
             }
             return Ok(Reclaimed::Progress);
         }
         // SAFETY: the payload's cleanup completed; it owns nothing. The
         // block's release was paid for by its installation.
         unsafe { stable::uninstall(&mut state.body) };
+        state.decision = Decision::Undecided;
+        state.admitted = stable::Admitted::Nothing;
         Ok(Reclaimed::Done)
     }
 
     /// No block: one call. The payload not yet clean: its own calls, the
     /// last of which marks it clean, then one to release the block. Clean:
     /// one.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
-        let Some(installed) = state.body.as_mut() else {
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+        let Some(installed) = slot.custody().body.as_mut() else {
             return 1;
         };
-        let payload = installed.get();
-        if matches!(payload.phase, Phase::Clean) {
+        let (head, payload) = parts(installed);
+        if matches!(head.phase, Phase::Clean) {
             1
         } else {
-            // SAFETY: the block holds the payload's stable place, paired with
-            // its own state, as cleanup steps it.
-            unsafe { T::remaining(NonNull::from(&mut payload.value), &mut payload.child) }
-                .saturating_add(1)
+            // SAFETY: the payload's place, observed, paired with its own
+            // state: a reader of the option may hold the payload borrowed.
+            T::remaining(unsafe { Slot::new(payload.observe(), &mut head.child) }).saturating_add(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bounded::decode::{DecodeError, decode};
+    use crate::bounded::{Limits, Reservation};
+    use core::ops::ControlFlow;
+
+    type Field = StableOption<u64, Limits>;
+
+    /// Cleanup of `slot` to `Done` within its declared count.
+    fn reclaimed(slot: &mut Slot<'_, Field, <Field as Reclaim<Limits>>::State>, a: &mut Limits) {
+        let declared = <Field as Reclaim<Limits>>::remaining(slot.observe());
+        crate::bounded::within_steps("a stable option's cleanup", declared, || {
+            match <Field as Reclaim<Limits>>::reclaim_step(slot.reborrow(), a).unwrap() {
+                Reclaimed::Done => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        });
+    }
+
+    /// A stable option as a map field: omitted, it is written null in one
+    /// admitted write, and absence asked again is refused; present, its
+    /// first unit decides presence before any block is acquired, and it is
+    /// built to the payload, after which absence is refused. Cleanup
+    /// releases everything, each within its declared count.
+    #[test]
+    fn an_omitted_field_is_written_null_and_a_present_one_is_built() {
+        let mut parser = Limits::unlimited();
+        let document = decode(&[0x07], 1, &mut parser).unwrap();
+        let mut a = Limits::unlimited();
+
+        let mut omitted = MaybeUninit::<Field>::uninit();
+        let mut state = <Field as Reclaim<Limits>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its
+        // initial state; every access to either is through this slot.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut omitted)), &mut state) };
+        let attempts = a.attempts();
+        assert_eq!(
+            <Field as InPlace<Limits>>::build_absent(slot.reborrow(), &mut a).unwrap(),
+            Built::Done
+        );
+        assert_eq!(a.attempts(), attempts + 1, "one admitted write");
+        let (place, written) = slot.parts();
+        // SAFETY: the option was written.
+        assert!(!unsafe { place.get(&*written) }.is_some());
+        assert!(matches!(
+            <Field as InPlace<Limits>>::build_absent(slot.reborrow(), &mut a),
+            Err(DecodeError::Resource(BoundedError::PlanMismatch))
+        ));
+        reclaimed(&mut slot, &mut a);
+
+        let mut present = MaybeUninit::<Field>::uninit();
+        let mut state = <Field as Reclaim<Limits>>::INITIAL;
+        // SAFETY: as above.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut present)), &mut state) };
+        assert_eq!(
+            <Field as InPlace<Limits>>::build_present(&document, 0, slot.reborrow(), &mut a)
+                .unwrap(),
+            Built::Progress
+        );
+        assert_eq!(
+            slot.custody().observe(),
+            StableOptionObservation::Unallocated {
+                decision: Decision::Present,
+                admitted: Admitted::Nothing
+            },
+            "presence is decided before any block is acquired"
+        );
+        crate::bounded::within_steps("a present stable option's construction", 16, || {
+            match <Field as InPlace<Limits>>::build_present(&document, 0, slot.reborrow(), &mut a)
+                .unwrap()
+            {
+                Built::Done => ControlFlow::Break(()),
+                Built::Progress => ControlFlow::Continue(()),
+            }
+        });
+        let (place, built) = slot.parts();
+        // SAFETY: construction reported the option written.
+        assert_eq!(unsafe { place.get(&*built) }.as_ref(), Some(&7));
+        assert!(matches!(
+            <Field as InPlace<Limits>>::build_absent(slot.reborrow(), &mut a),
+            Err(DecodeError::Resource(BoundedError::PlanMismatch))
+        ));
+        reclaimed(&mut slot, &mut a);
+        assert_eq!(a.live_bytes(), 0);
+        assert_eq!(
+            metadata::<Written, u64, Reservation>().bytes(),
+            const { metadata::<Written, u64, Reservation>() }.bytes()
+        );
     }
 }

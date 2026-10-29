@@ -198,7 +198,8 @@ fn scan<T>(table: &HashTable<T>, start: usize, maximum: usize) -> (usize, Option
 
 /// Place attribution of bucket enumeration, which this crate's tests record
 /// under `std`.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::*;
     use crate::bounded::places::{self, Factor, Ledgered, Run, WORK};

@@ -127,7 +127,7 @@ fn interleave(cut: Option<usize>, interleaving: Interleaving) -> usize {
             plan_b = Some(plan);
         }
         // Drain the first's retired records while the second stays live.
-        match support::checked(&mut m, |m| owner.step(m)) {
+        match support::scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
             Ok(Reclaimed::Progress | Reclaimed::Waiting | Reclaimed::Done) => {}
             Err(error) if support::ordinary_exhaustion(&m, &error) => {}
             Err(error) => panic!("interleaved cleanup failed: {error:?}"),
@@ -210,7 +210,7 @@ fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
                 });
             }
             assert_ne!(
-                support::checked(&mut m, |m| owner.shutdown_step(m)).ok(),
+                support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).ok(),
                 Some(Reclaimed::Done),
                 "shutdown completed with live plans"
             );
@@ -218,7 +218,7 @@ fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
             // Draining overlaps the retiring workers; the joins precede the
             // final drain, so scheduler starvation is not mistaken for a leak.
             for _ in 0..64 {
-                match support::checked(&mut m, |m| owner.step(m)) {
+                match support::scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
                     Ok(_) => {}
                     Err(error) if support::ordinary_exhaustion(&m, &error) => {}
                     Err(error) => panic!("overlapping cleanup failed: {error:?}"),
@@ -230,15 +230,26 @@ fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
     }
 }
 
+/// Every turn of a map's preparation taken on a worker thread of its own,
+/// the suspended preparation moved between them. The test requires a
+/// retained entry cursor and a retained normalization each to cross a worker
+/// boundary. At minimal witness sizes the map holds 12 entries, the fewest
+/// whose tree has an internal node (a full leaf holds 11), each value of 16
+/// mark pairs as at full sizes: the reach map requires every region the full
+/// sizes execute (`tests/reach-map.sh`), and two entries of four pairs left
+/// the tree's internal-node paths, the one-byte text head and the
+/// character arena's later growth unexecuted.
 #[test]
 #[cfg(feature = "custom-std-collections")]
 fn suspended_entry_cursors_and_texts_transfer_between_workers() {
+    use dcbor_test_support::rigor::sized;
     use std::collections::BTreeMap;
-    let source: BTreeMap<String, String> = (0..16)
+    let (entries, pairs) = sized((16, 16), (12, 16));
+    let source: BTreeMap<String, String> = (0..entries)
         .map(|index| {
             (
                 format!("key-{index:02}"),
-                format!("q{}", "\u{301}\u{316}".repeat(16)),
+                format!("q{}", "\u{301}\u{316}".repeat(pairs)),
             )
         })
         .collect();

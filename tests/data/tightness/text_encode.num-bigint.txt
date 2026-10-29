@@ -1,149 +1,149 @@
 #	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@25a7f40eee405a92f5d34758a496919a22546967 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@0fbe75be38372034b884d347419994d5fec0bc7d rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
 109	109	total	published	TextShape { bytes: 0, scalars: 0, parts: 0, part_bytes: 0, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
 15	12	total	published	TextShape { bytes: 0, scalars: 0, parts: 0, part_bytes: 0, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-541263	538927	total	published	TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-132933	132926	total	published	TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-336271	322415	total	published	TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run bytes
-52225	49218	total	published	TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run values
-104271	94415	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run bytes
-24225	22218	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run values
-557423	539407	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run bytes
-77333	73326	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run values
-339423	329407	total	published	TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
-52833	50826	total	published	TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
-244895	243015	total	published	TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run bytes
-59321	59308	total	published	TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run values
-286271	280415	total	published	TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
-39725	38718	total	published	TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
-51311	44815	total	published	TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-11165	9958	total	published	TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-248531	246675	total	published	TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run bytes
-60230	60223	total	published	TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run values
-2125	1549	total	published	TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-129	122	total	published	TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-534011	531835	total	published	TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run bytes
-131240	131233	total	published	TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run values
+541263	458927	total	published	TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+132933	112928	total	published	TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+336271	306415	total	published	TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run bytes
+52225	45220	total	published	TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run values
+104271	78415	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run bytes
+24225	18220	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run values
+557423	515407	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run bytes
+77333	67328	total	published	TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run values
+339423	309407	total	published	TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
+52833	45828	total	published	TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
+244895	226983	total	published	TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run bytes
+59321	55302	total	published	TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run values
+286271	268415	total	published	TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
+39725	35720	total	published	TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
+51311	37615	total	published	TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+11165	8160	total	published	TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+248531	230675	total	published	TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run bytes
+60230	56225	total	published	TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run values
+2125	1485	total	published	TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+129	108	total	published	TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+534011	499059	total	published	TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run bytes
+131240	123041	total	published	TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run values
 24	24	total	published	preparation of TextShape { bytes: 0, scalars: 0, parts: 0, part_bytes: 0, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
 9	7	total	published	preparation of TextShape { bytes: 0, scalars: 0, parts: 0, part_bytes: 0, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-461112	458840	total	published	preparation of TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-112926	112921	total	published	preparation of TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-320120	312328	total	published	preparation of TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run bytes
-48218	46713	total	published	preparation of TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run values
-88120	82328	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run bytes
-20218	19213	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run values
-533272	523320	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run bytes
-71326	69321	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run values
-319272	313320	total	published	preparation of TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
-47826	46821	total	published	preparation of TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
-228712	226908	total	published	preparation of TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run bytes
-55306	55298	total	published	preparation of TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run values
-274120	270328	total	published	preparation of TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
-36718	36213	total	published	preparation of TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
-43960	39928	total	published	preparation of TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-9358	8753	total	published	preparation of TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-232380	230588	total	published	preparation of TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run bytes
-56223	56218	total	published	preparation of TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run values
-1912	1400	total	published	preparation of TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
-106	101	total	published	preparation of TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
-501084	498972	total	published	preparation of TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run bytes
-123039	123034	total	published	preparation of TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run values
-1912	1400	total	published	preparation of witness of Appending: run bytes
-106	101	total	published	preparation of witness of Appending: run values
-21084	19772	total	published	preparation of witness of Cleanup: run bytes
-3939	3934	total	published	preparation of witness of Cleanup: run values
-1912	1400	total	published	preparation of witness of Composing: run bytes
-106	101	total	published	preparation of witness of Composing: run values
-21084	19772	total	published	preparation of witness of Copying: run bytes
-3939	3934	total	published	preparation of witness of Copying: run values
-1912	1400	total	published	preparation of witness of Emitting: run bytes
-106	101	total	published	preparation of witness of Emitting: run values
-1912	1400	total	published	preparation of witness of Header: run bytes
-106	101	total	published	preparation of witness of Header: run values
-1912	1400	total	published	preparation of witness of Measuring: run bytes
-106	101	total	published	preparation of witness of Measuring: run values
-21084	19772	total	published	preparation of witness of Ordering: run bytes
-3939	3934	total	published	preparation of witness of Ordering: run values
-1912	1400	total	published	preparation of witness of Output: run bytes
-106	101	total	published	preparation of witness of Output: run values
-1912	1400	total	published	preparation of witness of Publishing: run bytes
-106	101	total	published	preparation of witness of Publishing: run values
-1912	1400	total	published	preparation of witness of Reading: run bytes
-106	101	total	published	preparation of witness of Reading: run values
-1912	1400	total	published	preparation of witness of ReleasingChars: run bytes
-106	101	total	published	preparation of witness of ReleasingChars: run values
-21084	19772	total	published	preparation of witness of ReleasingScratch: run bytes
-3939	3934	total	published	preparation of witness of ReleasingScratch: run values
-1082424	1063928	total	published	preparation of worst text: run bytes
-145554	141453	total	published	preparation of worst text: run values
+461112	418840	total	published	preparation of TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+112926	102922	total	published	preparation of TextShape { bytes: 10000, scalars: 10000, parts: 10000, part_bytes: 10000, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+320120	304328	total	published	preparation of TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run bytes
+48218	44714	total	published	preparation of TextShape { bytes: 1500, scalars: 500, parts: 2000, part_bytes: 4000, combining: 1500, runs: 500, sorted_parts: 1500, sorted_runs: 500 }: run values
+88120	74328	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run bytes
+20218	17214	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 2000, part_bytes: 3000, combining: 1000, runs: 1000, sorted_parts: 0, sorted_runs: 0 }: run values
+533272	511320	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run bytes
+71326	66322	total	published	preparation of TextShape { bytes: 2000, scalars: 1000, parts: 3000, part_bytes: 5000, combining: 2000, runs: 1000, sorted_parts: 2000, sorted_runs: 1000 }: run values
+319272	303320	total	published	preparation of TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
+47826	44322	total	published	preparation of TextShape { bytes: 2000, scalars: 1500, parts: 2500, part_bytes: 4000, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
+228712	218892	total	published	preparation of TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run bytes
+55306	53295	total	published	preparation of TextShape { bytes: 2003, scalars: 1001, parts: 2004, part_bytes: 4008, combining: 2003, runs: 1, sorted_parts: 2003, sorted_runs: 1 }: run values
+274120	264328	total	published	preparation of TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run bytes
+36718	34714	total	published	preparation of TextShape { bytes: 2500, scalars: 1500, parts: 1500, part_bytes: 2500, combining: 1000, runs: 500, sorted_parts: 1000, sorted_runs: 500 }: run values
+43960	36328	total	published	preparation of TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+9358	7854	total	published	preparation of TextShape { bytes: 2700, scalars: 900, parts: 900, part_bytes: 2700, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+232380	222588	total	published	preparation of TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run bytes
+56223	54219	total	published	preparation of TextShape { bytes: 4000, scalars: 2000, parts: 2000, part_bytes: 4000, combining: 2000, runs: 1, sorted_parts: 2000, sorted_runs: 1 }: run values
+1912	1368	total	published	preparation of TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run bytes
+106	94	total	published	preparation of TextShape { bytes: 8, scalars: 8, parts: 8, part_bytes: 8, combining: 0, runs: 0, sorted_parts: 0, sorted_runs: 0 }: run values
+501084	482584	total	published	preparation of TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run bytes
+123039	118938	total	published	preparation of TextShape { bytes: 8193, scalars: 4097, parts: 4097, part_bytes: 8193, combining: 4096, runs: 1, sorted_parts: 4096, sorted_runs: 1 }: run values
+1912	1368	total	published	preparation of witness of Appending: run bytes
+106	94	total	published	preparation of witness of Appending: run values
+21084	19256	total	published	preparation of witness of Cleanup: run bytes
+3939	3806	total	published	preparation of witness of Cleanup: run values
+1912	1368	total	published	preparation of witness of Composing: run bytes
+106	94	total	published	preparation of witness of Composing: run values
+21084	19256	total	published	preparation of witness of Copying: run bytes
+3939	3806	total	published	preparation of witness of Copying: run values
+1912	1368	total	published	preparation of witness of Emitting: run bytes
+106	94	total	published	preparation of witness of Emitting: run values
+1912	1368	total	published	preparation of witness of Header: run bytes
+106	94	total	published	preparation of witness of Header: run values
+1912	1368	total	published	preparation of witness of Measuring: run bytes
+106	94	total	published	preparation of witness of Measuring: run values
+21084	19256	total	published	preparation of witness of Ordering: run bytes
+3939	3806	total	published	preparation of witness of Ordering: run values
+1912	1368	total	published	preparation of witness of Output: run bytes
+106	94	total	published	preparation of witness of Output: run values
+1912	1368	total	published	preparation of witness of Publishing: run bytes
+106	94	total	published	preparation of witness of Publishing: run values
+1912	1368	total	published	preparation of witness of Reading: run bytes
+106	94	total	published	preparation of witness of Reading: run values
+21084	19256	total	published	preparation of witness of ReleasingChars: run bytes
+3939	3806	total	published	preparation of witness of ReleasingChars: run values
+21084	19256	total	published	preparation of witness of ReleasingScratch: run bytes
+3939	3806	total	published	preparation of witness of ReleasingScratch: run values
+1082424	1039352	total	published	preparation of worst text: run bytes
+145554	135310	total	published	preparation of worst text: run values
 176	176	measured	published	witness of Appending: Appending allocated
 816	592	measured	published	witness of Appending: Appending bytes
 112	112	measured	published	witness of Appending: Appending peak
 24	23	measured	published	witness of Appending: Appending values
-2125	1549	total	published	witness of Appending: run bytes
-129	122	total	published	witness of Appending: run values
+2125	1485	total	published	witness of Appending: run bytes
+129	108	total	published	witness of Appending: run values
 1	1	measured	cancelled	witness of Cleanup: Cleanup values
-22267	2392	total	cancelled	witness of Cleanup: run bytes
-4204	266	total	cancelled	witness of Cleanup: run values
+22267	2160	total	cancelled	witness of Cleanup: run bytes
+4204	209	total	cancelled	witness of Cleanup: run values
 72	72	measured	published	witness of Composing: Composing bytes
 18	18	measured	published	witness of Composing: Composing values
-2125	1549	total	published	witness of Composing: run bytes
-129	122	total	published	witness of Composing: run values
+2125	1485	total	published	witness of Composing: run bytes
+129	108	total	published	witness of Composing: run values
 2480	2480	measured	published	witness of Copying: Copying allocated
 4212	3588	measured	published	witness of Copying: Copying bytes
 1600	1600	measured	published	witness of Copying: Copying peak
 423	422	measured	published	witness of Copying: Copying values
-22267	20891	total	published	witness of Copying: run bytes
-4204	4197	total	published	witness of Copying: run values
+22267	19859	total	published	witness of Copying: run bytes
+4204	3941	total	published	witness of Copying: run values
 36	36	measured	published	witness of Emitting: Emitting bytes
 9	9	measured	published	witness of Emitting: Emitting values
-2125	1549	total	published	witness of Emitting: run bytes
-129	122	total	published	witness of Emitting: run values
+2125	1485	total	published	witness of Emitting: run bytes
+129	108	total	published	witness of Emitting: run values
 1	1	measured	published	witness of Header: Header bytes
 1	1	measured	published	witness of Header: Header values
-2125	1549	total	published	witness of Header: run bytes
-129	122	total	published	witness of Header: run values
+2125	1485	total	published	witness of Header: run bytes
+129	108	total	published	witness of Header: run values
 36	36	measured	published	witness of Measuring: Measuring bytes
 9	9	measured	published	witness of Measuring: Measuring values
-2125	1549	total	published	witness of Measuring: run bytes
-129	122	total	published	witness of Measuring: run values
+2125	1485	total	published	witness of Measuring: run bytes
+129	108	total	published	witness of Measuring: run values
 10000	10000	measured	published	witness of Ordering: Ordering bytes
 2440	2440	measured	published	witness of Ordering: Ordering values
-22267	20891	total	published	witness of Ordering: run bytes
-4204	4197	total	published	witness of Ordering: run values
+22267	19859	total	published	witness of Ordering: run bytes
+4204	3941	total	published	witness of Ordering: run values
 9	9	measured	published	witness of Output: Output allocated
 40	40	measured	published	witness of Output: Output bytes
 9	9	measured	published	witness of Output: Output peak
 9	9	measured	published	witness of Output: Output retained
 1	1	measured	published	witness of Output: Output values
-2125	1549	total	published	witness of Output: run bytes
-129	122	total	published	witness of Output: run values
+2125	1485	total	published	witness of Output: run bytes
+129	108	total	published	witness of Output: run values
 40	40	measured	published	witness of Publishing: Publishing bytes
 1	1	measured	published	witness of Publishing: Publishing values
-2125	1549	total	published	witness of Publishing: run bytes
-129	122	total	published	witness of Publishing: run values
+2125	1485	total	published	witness of Publishing: run bytes
+129	108	total	published	witness of Publishing: run values
 36	36	measured	published	witness of Reading: Reading bytes
 9	9	measured	published	witness of Reading: Reading values
-2125	1549	total	published	witness of Reading: run bytes
-129	122	total	published	witness of Reading: run values
-96	32	measured	published	witness of ReleasingChars: ReleasingChars bytes
-11	9	measured	published	witness of ReleasingChars: ReleasingChars values
-2125	1549	total	published	witness of ReleasingChars: run bytes
-129	122	total	published	witness of ReleasingChars: run values
-580	516	measured	published	witness of ReleasingScratch: ReleasingScratch bytes
-132	130	measured	published	witness of ReleasingScratch: ReleasingScratch values
-22267	20891	total	published	witness of ReleasingScratch: run bytes
-4204	4197	total	published	witness of ReleasingScratch: run values
-1148111	1096783	total	published	worst text at the worst shape: run bytes
-161945	149650	total	published	worst text at the worst shape: run values
+2125	1485	total	published	witness of Reading: run bytes
+129	108	total	published	witness of Reading: run values
+580	576	measured	cancelled	witness of ReleasingChars: ReleasingChars bytes
+132	130	measured	cancelled	witness of ReleasingChars: ReleasingChars values
+22267	4100	total	cancelled	witness of ReleasingChars: run bytes
+4204	553	total	cancelled	witness of ReleasingChars: run values
+580	576	measured	cancelled	witness of ReleasingScratch: ReleasingScratch bytes
+132	130	measured	cancelled	witness of ReleasingScratch: ReleasingScratch values
+22267	7692	total	cancelled	witness of ReleasingScratch: run bytes
+4204	977	total	cancelled	witness of ReleasingScratch: run values
+1148111	1047631	total	published	worst text at the worst shape: run bytes
+161945	137364	total	published	worst text at the worst shape: run values
 144867	136675	joint	published	worst text: joint worst allocated
-1131727	1096783	joint	published	worst text: joint worst bytes
+1131727	1047631	joint	published	worst text: joint worst bytes
 81984	81984	joint	published	worst text: joint worst peak
 12291	4099	joint	published	worst text: joint worst retained
-157849	149650	joint	published	worst text: joint worst values
-1131727	1096783	total	published	worst text: run bytes
-157849	149650	total	published	worst text: run values
+157849	137364	joint	published	worst text: joint worst values
+1131727	1047631	total	published	worst text: run bytes
+157849	137364	total	published	worst text: run values
 144867	136675	joint	published	worst text: total allocated
-1131727	1096783	joint	published	worst text: total bytes
+1131727	1047631	joint	published	worst text: total bytes
 81984	81984	joint	published	worst text: total peak
 12291	4099	joint	published	worst text: total retained
-157849	149650	joint	published	worst text: total values
+157849	137364	joint	published	worst text: total values

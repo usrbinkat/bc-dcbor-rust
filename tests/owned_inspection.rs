@@ -8,11 +8,21 @@ use dcbor::bounded::{
 };
 use dcbor_test_support::classes::{self, Class, Classes};
 use dcbor_test_support::pipeline::{Expected, inspect, matrix};
-use dcbor_test_support::rigor::{Progress, Rigor, rigor};
+use dcbor_test_support::rigor::{Progress, Rigor, rigor, sized};
 use dcbor_test_support::{self as support, heap};
 
 fn meter() -> Limits {
     Limits::unlimited().logged().strict()
+}
+
+/// The live first document of [`shared_owner`]: a text of 256 ASCII bytes,
+/// whose head is the two-byte form (`0x79 0x01 0x00`). Parsed once per run,
+/// outside the cancellation loop, it takes the two-byte head paths (the
+/// header's, and the head width of its parse bound) that the second
+/// inspection's minimal text of combining marks is too short for, at a cost
+/// independent of the cancellations.
+fn first_document() -> Vec<u8> {
+    dcbor::CBOR::from("a".repeat(256)).to_cbor_data()
 }
 
 /// What one run of [`shared_owner`] reached: the second inspection's turns,
@@ -30,9 +40,15 @@ fn shared_owner(cut: Option<usize>) -> Run {
     const OPTIONS: Options = Options::normalizing(16);
     let mut m = meter();
     let mut owner = support::scope(&mut m);
-    let first = support::copy(&owner, &mut m, &[0x81, 0x01]);
+    let first_wire = first_document();
+    let first = support::copy(&owner, &mut m, &first_wire);
     let document = support::parse(&mut m, first, OPTIONS).expect("first inspection failed");
-    let source = dcbor::CBOR::from("\u{301}".repeat(128)).to_cbor_data();
+    // 128 combining marks (U+0301) natively, 33 at minimal witness sizes:
+    // the two-byte head the full text reaches is taken by the first
+    // document instead. The reach map runs each test at both sizes and fails
+    // when the minimal run leaves unexecuted any region of this crate the
+    // full run executes (`tests/reach-map.sh`).
+    let source = dcbor::CBOR::from("\u{301}".repeat(sized(128, 33))).to_cbor_data();
     let second = support::copy(&owner, &mut m, &source);
     let mut second = DocumentDecoder::parse(second, OPTIONS);
     // The whole operation, its record's cleanup included, is within its
@@ -83,11 +99,11 @@ fn shared_owner(cut: Option<usize>) -> Run {
             Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
             _ => panic!("second inspection failed"),
         }
-        assert_eq!(document.root().encoded(), [0x81, 0x01]);
+        assert_eq!(document.root().encoded(), first_wire);
     }
     // B must finish before A is retired. A's bytes and arena remain usable.
-    document.with_document(|view| assert_eq!(view.root().encoded(), [0x81, 0x01]));
-    assert_eq!(document.bytes(), [0x81, 0x01]);
+    document.with_document(|view| assert_eq!(view.root().encoded(), first_wire));
+    assert_eq!(document.bytes(), first_wire);
     let cancelled = cut.is_some();
     let unexpectedly_published = cancelled && published.is_some();
     drop(second);
@@ -156,12 +172,20 @@ fn inspected_input_moves_out_without_copying_and_the_arena_retires() {
 
 #[test]
 fn every_inspection_admission_allocation_and_stop_boundary() {
+    // 64 combining marks natively; at minimal witness sizes 42, the fewest
+    // whose input (2 bytes a mark and a one-byte head: 86 bytes) has a parse
+    // bound of at least 256 part bytes (`text::PART_BYTES_PER_BYTE`, 3), so
+    // the bound's head takes the two-byte form the full input's does.
+    let combining = sized(64, 42);
     let inputs = [
-        ("null", vec![0xf6]),
-        ("nested array", vec![0x82, 0x01, 0x82, 0x02, 0x03]),
+        ("null".to_string(), vec![0xf6]),
         (
-            "64 combining marks",
-            dcbor::CBOR::from("\u{301}".repeat(64)).to_cbor_data(),
+            "nested array".to_string(),
+            vec![0x82, 0x01, 0x82, 0x02, 0x03],
+        ),
+        (
+            format!("{combining} combining marks"),
+            dcbor::CBOR::from("\u{301}".repeat(combining)).to_cbor_data(),
         ),
     ];
     for (name, wire) in inputs {
@@ -185,6 +209,7 @@ fn a_class_merging_states_of_different_custody_is_rejected() {
         input: |_| Some("merged".to_owned()),
         parse: |_| Some("merged".to_owned()),
         decode: |_| None,
+        prepare: |_| None,
     };
     matrix(
         "inspection under a planted class",

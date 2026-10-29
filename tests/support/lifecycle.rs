@@ -2,8 +2,8 @@
 //! fuzzing. Every retained operation is driven through [`Resumable`], and
 //! every step is checked against its contract: admission before work, no
 //! refund, at most one quantum per turn, no progress without an admission, a
-//! refused unit that alone leaves the position unchanged, and nothing after
-//! publication. Scope setup, input handles, retirement and drain build on it.
+//! prepaid release or a retained admission spent, a refused unit that alone
+//! leaves the position unchanged, and nothing after publication. Scope setup, input handles, retirement and drain build on it.
 //! Unsafe code here implements an instrumented input resource, never a
 //! decoder. Compiled once as the `dcbor-test-support` crate and shared by
 //! every integration test and fuzz target; [`heap`] is the physical heap
@@ -20,7 +20,9 @@ use core::{
 };
 use dcbor::ByteString;
 use dcbor::bounded::decode::construction::in_place::{BufferObservation, InPlace, Transferable};
-use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reclaimed};
+use dcbor::bounded::decode::construction::reclamation::{
+    Custody, PeekSlot, Place, Reclaim, Reclaimed, Slot,
+};
 use dcbor::bounded::decode::construction::{
     Acquisition, Borrowed, Construction, DecodeInput, DecodeOwner, DocumentDecoder, InputDetail,
     OwnedDocument, OwnedInitialized, Position, TypedDecoder, TypedPosition, TypedValue,
@@ -347,10 +349,13 @@ pub fn construction_requests<T: InPlace<Limits>>(
     let observer = heap::Observation::begin(None);
     observer.stop();
     let physical = || observer.snapshot().live as u64;
-    let mut slot = MaybeUninit::<T>::uninit();
-    let place = NonNull::from(&mut slot);
+    let mut value = MaybeUninit::<T>::uninit();
     let mut state = T::INITIAL;
-    let mut previous = observe_custody(&mut state, &m, &observer, "the initial state");
+    // SAFETY: the driver owns the destination and pairs it with its initial
+    // state; every access to either, construction, inspection, the count and
+    // cleanup, is through this slot.
+    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+    let mut previous = observe_custody(slot.custody(), &m, &observer, "the initial state");
     let mut snapshots = vec![Snapshot {
         observation: previous,
         live: m.live_bytes(),
@@ -371,16 +376,11 @@ pub fn construction_requests<T: InPlace<Limits>>(
         m.reserve_log(TURN.values as usize + 2);
         let attempts = m.attempts();
         let live = m.live_bytes();
-        // SAFETY: the slot is this construction's unique, stable destination,
-        // paired with one state from its first step to its last cleanup.
-        let result = observer.window(|| {
-            checked(&mut m, |m| unsafe {
-                T::build_step(&document, 0, place, &mut state, m)
-            })
-        });
+        let result = observer
+            .window(|| checked(&mut m, |m| T::build_step(&document, 0, slot.reborrow(), m)));
         steps += 1;
         let next = observe_custody(
-            &mut state,
+            slot.custody(),
             &m,
             &observer,
             &format!("after build step {steps}"),
@@ -444,9 +444,10 @@ pub fn construction_requests<T: InPlace<Limits>>(
     let held = m.live_bytes();
     let retained = if built { held } else { 0 };
     if built {
+        let (place, state) = slot.parts();
         // SAFETY: construction reported the destination fully initialized;
-        // the borrow ends before cleanup begins.
-        inspect(unsafe { place.as_ref().assume_init_ref() });
+        // the shared borrow of its state ends before cleanup begins.
+        inspect(unsafe { place.get(&*state) });
     }
     let mut cleanup = Vec::new();
     let mut cleaning = Vec::new();
@@ -454,8 +455,7 @@ pub fn construction_requests<T: InPlace<Limits>>(
     // admits nothing and changes nothing, and the cleanup that follows takes
     // no more successful calls than it declares.
     let (attempts, live) = (m.attempts(), m.live_bytes());
-    // SAFETY: the same destination and state, no reference into the value.
-    let declared = unsafe { <T as Reclaim<Limits>>::remaining(place, &mut state) };
+    let declared = <T as Reclaim<Limits>>::remaining(slot.observe());
     assert_eq!(
         (m.attempts(), m.live_bytes()),
         (attempts, live),
@@ -466,17 +466,13 @@ pub fn construction_requests<T: InPlace<Limits>>(
     for unit in 0..allowed(&m, bound) {
         m.reserve_log(TURN.values as usize + 2);
         let at = format!("after {steps} build steps, cleanup unit {unit}");
-        let before = observe_custody(&mut state, &m, &observer, &at);
+        let before = observe_custody(slot.custody(), &m, &observer, &at);
         let (attempts, live, admitted) = (m.attempts(), m.live_bytes(), m.admitted().len());
-        // SAFETY: the same destination and state; no reference into the
-        // value remains.
-        match observer
-            .window(|| checked(&mut m, |m| unsafe { T::reclaim_step(place, &mut state, m) }))
-        {
+        match observer.window(|| checked(&mut m, |m| T::reclaim_step(slot.reborrow(), m))) {
             Err(error) if error.refused() => {
                 if m.attempts() - attempts == 1 {
                     assert_eq!(
-                        observe_custody(&mut state, &m, &observer, &at),
+                        observe_custody(slot.custody(), &m, &observer, &at),
                         before,
                         "{at}: a cleanup unit whose only attempt was refused moved"
                     );
@@ -484,7 +480,7 @@ pub fn construction_requests<T: InPlace<Limits>>(
                 assert_eq!(m.live_bytes(), live, "{at}: a refusal changed what is held");
             }
             Ok(outcome) => {
-                let after = observe_custody(&mut state, &m, &observer, &at);
+                let after = observe_custody(slot.custody(), &m, &observer, &at);
                 snapshots.push(Snapshot {
                     observation: after,
                     live: m.live_bytes(),
@@ -964,10 +960,35 @@ impl ReleaseWitness {
 /// turn admits at most one quantum, and a result that reports progress made
 /// at least one admission or released an allocation prepaid at acquisition.
 pub fn checked<R: Outcome>(m: &mut Limits, step: impl FnOnce(&mut Limits) -> R) -> R {
+    quantum(m, |m| (step(m), false))
+}
+
+/// One fresh scheduler turn of a step of `owner`'s scope ([`checked`]), the
+/// scope's own position read before and after it: a step whose progress
+/// spent the removal admission an earlier `Waiting` step retained
+/// ([`ScopePosition::removal_admitted`](dcbor::bounded::decode::construction::reclamation::ScopePosition))
+/// made progress on that admission, and needs none of its own. Every scope
+/// step a driver checks goes through here.
+pub fn scope_checked<'s, R: Outcome>(
+    m: &mut Limits,
+    owner: &mut DecodeOwner<'s, Limits>,
+    step: impl FnOnce(&mut DecodeOwner<'s, Limits>, &mut Limits) -> R,
+) -> R {
+    quantum(m, |m| {
+        let retained = owner.position().removal_admitted;
+        let result = step(owner, m);
+        (result, retained && !owner.position().removal_admitted)
+    })
+}
+
+/// The turn [`checked`] and [`scope_checked`] share: `step` returns its
+/// result and whether it spent an admission retained from an earlier call,
+/// which witnesses progress as an admission of its own does.
+fn quantum<R: Outcome>(m: &mut Limits, step: impl FnOnce(&mut Limits) -> (R, bool)) -> R {
     m.turn();
     let (before, attempts) = (m.used(), m.attempts());
     let releases = ReleaseWitness::capture(m);
-    let result = step(m);
+    let (result, spent) = step(m);
     let after = m.used();
     assert!(
         after.values >= before.values && after.bytes >= before.bytes,
@@ -979,8 +1000,9 @@ pub fn checked<R: Outcome>(m: &mut Limits, step: impl FnOnce(&mut Limits) -> R) 
     );
     if result.progressed() {
         assert!(
-            m.attempts() > attempts || releases.released(m),
-            "reported progress without an admission or a prepaid release"
+            m.attempts() > attempts || releases.released(m) || spent,
+            "reported progress without an admission or a prepaid release, and spent no \
+             retained admission"
         );
     }
     result
@@ -2101,7 +2123,7 @@ pub fn decode<'s, I: DecodeInput<Limits> + 's, T: Transferable<Limits> + 's>(
 /// the emergency bound; individual operation cleanup uses its own bound.
 pub fn drain(owner: &mut DecodeOwner<'_, Limits>, m: &mut Limits) {
     for _ in 0..TURNS {
-        match checked(m, |m| owner.shutdown_step(m)) {
+        match scope_checked(m, owner, |owner, m| owner.shutdown_step(m)) {
             Ok(Reclaimed::Done) => return,
             Ok(Reclaimed::Progress) | Ok(Reclaimed::Waiting) => {}
             Err(BoundedError::Refused(_)) => {}
@@ -2163,12 +2185,14 @@ unsafe impl Reclaim<Limits> for Instrumented {
         clippy::disallowed_methods,
         reason = "a custom input resource admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        phase: &mut InputPhase,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, InputPhase>,
         a: &mut Limits,
     ) -> BoundedResult<Reclaimed, Limits> {
-        let raw = place.as_ptr().cast::<Self>();
+        let (place, phase) = slot.parts();
+        // Each field is released by raw projection alone: the input's bytes
+        // may still be read through a document's view of them.
+        let raw = place.as_ptr(phase);
         *phase = match *phase {
             InputPhase::Empty | InputPhase::Released => {
                 a.traverse(1, 0).map_err(BoundedError::Refused)?;
@@ -2177,18 +2201,22 @@ unsafe impl Reclaim<Limits> for Instrumented {
             InputPhase::Owned => {
                 a.traverse(1, size_of::<Vec<u8>>() as u64)
                     .map_err(BoundedError::Refused)?;
+                // SAFETY: the phase records the bytes owned and initialized,
+                // and they are dropped once, by projection alone.
                 unsafe { core::ptr::drop_in_place(core::ptr::addr_of_mut!((*raw).bytes)) };
                 InputPhase::BytesReleased
             }
             InputPhase::BytesReleased => {
                 a.traverse(1, size_of::<Option<<Limits as Allocator>::Permit>>() as u64)
                     .map_err(BoundedError::Refused)?;
+                // SAFETY: as above, for the reservation.
                 unsafe { core::ptr::drop_in_place(core::ptr::addr_of_mut!((*raw).permit)) };
                 InputPhase::PermitReleased
             }
             InputPhase::PermitReleased => {
                 a.traverse(1, size_of::<Arc<AtomicUsize>>() as u64)
                     .map_err(BoundedError::Refused)?;
+                // SAFETY: as above, for the release counter, counted first.
                 unsafe {
                     (*raw).released.fetch_add(1, Ordering::SeqCst);
                     core::ptr::drop_in_place(core::ptr::addr_of_mut!((*raw).released));
@@ -2205,8 +2233,8 @@ unsafe impl Reclaim<Limits> for Instrumented {
 
     /// One call per field still owned, the last reporting `Done`; one for a
     /// record holding nothing.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, phase: &mut InputPhase) -> u64 {
-        match *phase {
+    fn remaining(mut slot: PeekSlot<'_, Self, InputPhase>) -> u64 {
+        match *slot.custody() {
             InputPhase::Empty | InputPhase::Released => 1,
             InputPhase::Owned => 3,
             InputPhase::BytesReleased => 2,
@@ -2238,18 +2266,87 @@ pub fn instrumented<'s>(
         .expect("input reservation");
     m.traverse(1, size_of::<Instrumented>() as u64)
         .expect("input initialization");
-    // SAFETY: admitted initialization at the record's final address; the
-    // phase records ownership of every field immediately after.
+    let mut slot = input.destination();
+    let (place, phase) = slot.parts();
+    // SAFETY: admitted initialization at the record's final address, which
+    // its empty phase says holds nothing; the phase records ownership of
+    // every field immediately after.
     unsafe {
-        let (place, phase) = input.destination();
-        place.as_ptr().write(MaybeUninit::new(Instrumented {
-            bytes,
-            permit: Some(permit),
-            released: released.clone(),
-        }));
-        *phase = InputPhase::Owned;
-        input.publish()
+        place.write(
+            phase,
+            Instrumented {
+                bytes,
+                permit: Some(permit),
+                released: released.clone(),
+            },
+        );
     }
+    *phase = InputPhase::Owned;
+    // SAFETY: the value is fully initialized, and its phase describes every
+    // resource it owns.
+    unsafe { input.publish() }
+}
+
+/// A planted binding understating its cleanup: it declares one call but
+/// takes one per unit `left`, then its `Done`. The scope must refuse the
+/// call beyond the declared one as a defect ([`Reclaim::remaining`]); one
+/// definition, planted by every suite that shows the refusal.
+pub struct Understated;
+
+/// The cleanup units an [`Understated`] still takes before its `Done`.
+pub struct UnderstatedState {
+    left: usize,
+}
+
+/// The units left are the binding's whole custody.
+impl Custody for UnderstatedState {
+    type Observation = usize;
+
+    fn observe(&mut self) -> usize {
+        self.left
+    }
+}
+
+// SAFETY: the binding owns nothing; its cleanup only counts down. Its
+// declared count deliberately understates, the defect the scope must refuse.
+unsafe impl Reclaim<Limits> for Understated {
+    type State = UnderstatedState;
+    const INITIAL: UnderstatedState = UnderstatedState { left: 0 };
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a custom resource binding admits its own cleanup, as `Reclaim` documents"
+    )]
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, UnderstatedState>,
+        a: &mut Limits,
+    ) -> BoundedResult<Reclaimed, Limits> {
+        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        let state = slot.custody();
+        if state.left == 0 {
+            return Ok(Reclaimed::Done);
+        }
+        state.left -= 1;
+        Ok(Reclaimed::Progress)
+    }
+
+    /// One call, whatever is left: the planted understatement.
+    fn remaining(_: PeekSlot<'_, Self, UnderstatedState>) -> u64 {
+        1
+    }
+}
+
+/// An [`Understated`] record in `owner`'s scope whose cleanup takes `left`
+/// calls beyond the one it declares, then its `Done`.
+pub fn understated<'s>(
+    owner: &DecodeOwner<'s, Limits>,
+    m: &mut Limits,
+    left: usize,
+) -> dcbor::bounded::decode::construction::OwnedRecord<'s, Understated, Limits> {
+    let mut record = acquire::<Understated>(owner, m, &mut Acquisition::new());
+    // The binding owns nothing; the state is its only custody.
+    record.destination().custody().left = left;
+    record
 }
 
 #[cfg(test)]
@@ -3076,13 +3173,11 @@ pub mod pipeline {
         let bound =
             dcbor::bounded::encoding::owned_prepare_bound::<ByteString, T, Limits, ()>(shape)
                 .expect("the preparation bound of a decoded value fits in u64");
-        // No cleanup argument covers a preparation's states: every one of
-        // its boundaries is its own class.
         let plan = match context.phase(
             Phase::Prepare,
             super::turns(bound),
             || OwnedPreparation::prepare(value),
-            |_| None,
+            classes.prepare,
             |operation| operation.cancel(),
         ) {
             Ok(phased) => match phased.published() {

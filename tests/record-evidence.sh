@@ -33,11 +33,16 @@ esac
 families=(buckets decode emission header lifecycle_borrow lifecycle_construct
 	lifecycle_copy lifecycle_operations lifecycle_parse lifecycle_scope
 	preparation retained_parse string_decode text_encode text_joint text_write validation)
+# Families of code compiled only over the forked collections, recorded and
+# checked in the two custom-std variants alone.
+custom_std_families=(btree)
 suffixes=('' .num-bigint .custom-std .custom-std.num-bigint)
-features=(std,derive,hashbrown,multithreaded
-	std,derive,hashbrown,multithreaded,num-bigint
-	std,derive,hashbrown,multithreaded,custom-std-collections
-	std,derive,hashbrown,multithreaded,custom-std-collections,num-bigint)
+# One feature set per element, its features comma-separated as --features
+# takes them.
+features=('std,derive,hashbrown,multithreaded'
+	'std,derive,hashbrown,multithreaded,num-bigint'
+	'std,derive,hashbrown,multithreaded,custom-std-collections'
+	'std,derive,hashbrown,multithreaded,custom-std-collections,num-bigint')
 
 if [[ "$mode" == record || "$mode" == record-costs ]]; then
 	: "${DCBOR_COST_REASON:?recording requires a mechanism explanation in DCBOR_COST_REASON}"
@@ -45,7 +50,7 @@ fi
 
 costs() {
 	local action="$1" index layer log manifest observed line directory old_identity new_identity header
-	: "${TMPDIR:?set TMPDIR to the session scratchpad}"
+	: "${TMPDIR:?required: the cost recorder's staging directory}"
 	local logs checkpoint reused=''
 	local -A staged_identities=()
 	local baseline="${DCBOR_COST_BASELINE:-$PWD/tests/data/costs}"
@@ -276,6 +281,11 @@ for suffix in "${suffixes[@]}"; do
 	for family in "${families[@]}"; do
 		paths+=("tests/data/tightness/${family}${suffix}.txt")
 	done
+	if [[ "$suffix" == .custom-std* ]]; then
+		for family in "${custom_std_families[@]}"; do
+			paths+=("tests/data/tightness/${family}${suffix}.txt")
+		done
+	fi
 	for path in "${paths[@]}"; do
 		if [[ ! -s "$path" ]]; then
 			echo "$path: missing or empty evidence" >&2

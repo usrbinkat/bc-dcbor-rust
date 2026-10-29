@@ -8,11 +8,9 @@
 //! own record and any resource the task still holds are reclaimed in place,
 //! independent of every other record in the scope. Dropping an operation at
 //! any point only hands its records to the scope queue.
-use core::mem::MaybeUninit;
-use core::ptr::NonNull;
-
 use super::reclamation::{
-    Acquisition, OwnedInitialized, OwnedRecord, Reclaim, Reclaimed, ScopeRef, record_cost,
+    Acquisition, OwnedInitialized, OwnedRecord, PeekSlot, Reclaim, Reclaimed, ScopeRef, Slot,
+    record_cost,
 };
 use crate::bounded::decode::initialization::fields;
 use crate::bounded::{
@@ -102,30 +100,36 @@ impl Places for OperationTerms {
 /// The progress of a task's record: the record's own construction state.
 pub(crate) type Progress<'s, K, A> = <<K as Task<'s, A>>::State as Reclaim<A>>::State;
 
-/// A task's record as an observation sees it, once allocated: its storage,
-/// possibly uninitialized, beside the progress that says which parts are,
-/// both under the operation's exclusive custody, which observing a
-/// construction state requires ([`super::reclamation::Custody`]).
-pub(crate) type Observed<'r, 's, K, A> = Option<(
-    &'r mut MaybeUninit<<K as Task<'s, A>>::State>,
-    &'r mut Progress<'s, K, A>,
-)>;
+/// A task's record as an observation sees it, once allocated: its slot,
+/// observed ([`PeekSlot`]), its value possibly uninitialized, its progress
+/// saying which parts are, under the operation's exclusive custody, which
+/// observing a construction state requires
+/// ([`super::reclamation::Custody`]).
+pub(crate) type Observed<'r, 's, K, A> =
+    Option<PeekSlot<'r, <K as Task<'s, A>>::State, Progress<'s, K, A>>>;
 
 /// One kind of retained work performed in one stable record.
 ///
 /// The record's progress is its own [`Reclaim::State`]: the units of its
 /// resource-free prefix initialized ([`super::reclamation::Prefix`]) for a
 /// record built field by field, or the value's construction state for a
-/// record that is itself a value built in place.
+/// record that is itself a value built in place. The record is received as a
+/// [`Slot`], its place and progress together, so a caller holding one has
+/// nothing to promise.
 ///
 /// # Safety
 /// `initialize` writes the next unit of the record's resource-free prefix and
 /// records it in the progress, which [`Self::initialized`] then counts; the
-/// prefix after any unit must be reclaimable by the record's `reclaim_step`.
-/// `advance` is called only once [`Self::initialized`] reports `INIT_STEPS`,
-/// with the original destination and progress, and must keep the record
-/// reclaimable after every return. `publish` is called once, after `advance`
-/// reported completion.
+/// prefix after any unit must be reclaimable by the record's `reclaim_step`;
+/// once `INIT_STEPS` units are recorded it refuses and changes nothing.
+/// `advance` refuses and changes nothing until [`Self::initialized`] reports
+/// `INIT_STEPS`, keeps the record reclaimable after every return, and reports
+/// completion only once the record's value is fully initialized: the
+/// operation publishes the record on that report. `detail` reads only the
+/// parts the progress records as initialized, and changes, admits and
+/// allocates nothing. The record is reached only through its slot's place,
+/// one for its whole life, so a place derived within it in one call stays
+/// valid in every later one.
 pub unsafe trait Task<'s, A: Allocator>: Sized {
     type State: Reclaim<A, State: Send> + Send + 's;
     type Output;
@@ -141,21 +145,18 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
     /// `INIT_STEPS`.
     fn initialized(progress: &<Self::State as Reclaim<A>>::State) -> usize;
 
-    /// # Safety
-    /// See the trait's contract.
-    unsafe fn initialize(
+    /// One unit of the record's initialization ([`Task`]).
+    fn initialize(
         &mut self,
-        place: *mut Self::State,
-        progress: &mut <Self::State as Reclaim<A>>::State,
+        slot: Slot<'_, Self::State, <Self::State as Reclaim<A>>::State>,
         a: &mut A,
     ) -> Result<(), Self::Error>;
 
-    /// # Safety
-    /// See the trait's contract.
-    unsafe fn advance(
+    /// One unit of the task's work on its initialized record ([`Task`]):
+    /// true once the record's value is complete.
+    fn advance(
         &mut self,
-        place: NonNull<MaybeUninit<Self::State>>,
-        progress: &mut <Self::State as Reclaim<A>>::State,
+        slot: Slot<'_, Self::State, <Self::State as Reclaim<A>>::State>,
         a: &mut A,
     ) -> Result<bool, Self::Error>;
 
@@ -166,11 +167,10 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
     /// unit, including the one that reports `Done`.
     fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A>;
 
-    /// # Safety
-    /// `record` is the record's storage and its progress: only the parts the
-    /// progress records as initialized may be read, and nothing may be
-    /// changed, admitted or allocated.
-    unsafe fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail;
+    /// The task's observation of `record`, its slot observed once
+    /// allocated: only the parts the progress records as initialized are
+    /// read, and nothing is changed, admitted or allocated.
+    fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail;
 }
 
 /// Allocation-free observation of an operation.
@@ -227,12 +227,10 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
         let (allocated, initialized, record) = match self.record.as_mut() {
             None => (false, 0, None),
             Some(record) => {
-                // SAFETY: the controller has exclusive custody of its record;
-                // the storage is exposed only as possibly uninitialized, beside
-                // the progress that says which parts are initialized.
-                let (mut place, progress) = unsafe { record.destination() };
-                let storage: &mut MaybeUninit<K::State> = unsafe { place.as_mut() };
-                (true, K::initialized(progress), Some((storage, progress)))
+                // The controller's exclusive custody of its record: its slot,
+                // observed.
+                let mut slot = record.destination().into_observe();
+                (true, K::initialized(slot.custody()), Some(slot))
             }
         };
         Position {
@@ -242,8 +240,7 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
             cancelling: self.cancelling,
             finished: self.finished,
             outstanding,
-            // SAFETY: the storage is paired with its own progress.
-            detail: unsafe { self.task.detail(record) },
+            detail: self.task.detail(record),
         }
     }
 
@@ -285,26 +282,23 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
             })?);
             return Ok(Step::Progress);
         };
-        // SAFETY: the record is this operation's exclusive stable destination,
+        // The record is this operation's exclusive stable destination,
         // paired with its own progress for its whole lifetime.
-        let (place, progress) = unsafe { record.destination() };
+        let mut slot = record.destination();
         let task = &mut self.task;
-        if K::initialized(progress) < K::INIT_STEPS {
-            // SAFETY: forwarded under the Task contract.
-            at(OperationPlace::Initialization, || unsafe {
-                task.initialize(place.as_ptr().cast(), progress, a)
+        if K::initialized(slot.custody()) < K::INIT_STEPS {
+            at(OperationPlace::Initialization, || {
+                task.initialize(slot.reborrow(), a)
             })?;
             return Ok(Step::Progress);
         }
-        // SAFETY: initialization is complete.
-        if !at(OperationPlace::Task, || unsafe {
-            task.advance(place, progress, a)
-        })? {
+        if !at(OperationPlace::Task, || task.advance(slot.reborrow(), a))? {
             return Ok(Step::Progress);
         }
         let record = self.record.take().ok_or(BoundedError::PlanMismatch)?;
         self.finished = true;
-        // SAFETY: the task reported a fully initialized state.
+        // SAFETY: the task reported completion, which its contract makes
+        // only once the record's value is fully initialized.
         let published = unsafe { record.publish() };
         Ok(Step::Complete(self.task.publish(published)))
     }

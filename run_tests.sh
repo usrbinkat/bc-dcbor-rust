@@ -30,6 +30,7 @@ section "rigor: $DCBOR_RIGOR"
 section "Evidence tooling controls"
 python3 tests/record_evidence_test.py
 python3 tests/mutation_evidence_test.py
+python3 tests/reach_map_test.py
 
 select_targets() {
 	local features="$1" path target
@@ -93,6 +94,12 @@ test_additional_features "derive,hashbrown,multithreaded,num-bigint"
 section "All Default Features and doctests"
 cargo test --quiet
 cargo clippy --all-targets -- -D warnings
+
+# The step-latency ceiling is a property of this qualification host, not of
+# the code, so the latency tests assert it only when asked; every other run,
+# mutation layers included, checks their deterministic assertions alone.
+section "Host step-latency qualification"
+DCBOR_LATENCY_QUALIFICATION=1 cargo test --quiet --test resumable_contract latency::
 
 # The legs above select the root package; every member's own targets, the
 # derive crate's included, are tested and linted here on the stock toolchain.

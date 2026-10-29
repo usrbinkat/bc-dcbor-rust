@@ -94,44 +94,38 @@ impl<P> Permutation<P> {
     /// write, so its fields are written separately.
     pub const INIT_STEPS: usize = Storage::<u8, P>::INIT_STEPS + 10;
 
-    /// Initialize one unit of the empty permutation [`Self::new`] builds.
-    ///
-    /// # Safety
-    /// The destination is unique, stable and uninitialized; `step` starts at
-    /// zero and is retained. An incomplete prefix owns nothing.
-    pub unsafe fn initialize_step<A: Allocator<Permit = P>>(
-        place: *mut Self,
-        step: &mut usize,
+    /// Initialize one unit of the empty permutation [`Self::new`] builds in
+    /// `slot`, its destination paired with its units initialized: the bitmap
+    /// arena, then one field per unit. An incomplete prefix owns nothing.
+    /// Refused once initialized.
+    pub fn initialize_step<A: Allocator<Permit = P>>(
+        mut slot: reclamation::Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
+        use decode::initialization::{init_field, init_part};
         let storage = Storage::<u8, P>::INIT_STEPS;
-        // SAFETY: each unit writes one uninitialized field of the destination.
-        unsafe {
-            if *step < storage {
-                Storage::initialize_step(addr_of_mut!((*place).visited), step, a)?;
-                return Ok(false);
-            }
-            let position = addr_of_mut!((*place).position);
-            match *step - storage {
-                0 => field(
-                    addr_of_mut!((*position).phase),
-                    PermutationPhase::default,
-                    a,
-                )?,
-                1 => field(addr_of_mut!((*position).entry), || 0, a)?,
-                2 => field(addr_of_mut!((*position).offset), || 0, a)?,
-                3 => field(addr_of_mut!((*position).cycle), || 0, a)?,
-                4 => field(addr_of_mut!((*position).current), || 0, a)?,
-                5 => field(addr_of_mut!((*position).source), || 0, a)?,
-                6 => field(addr_of_mut!((*position).low), || 0, a)?,
-                7 => field(addr_of_mut!((*position).high), || 0, a)?,
-                8 => field(addr_of_mut!((*position).bitmap_bytes), || 0, a)?,
-                9 => field(addr_of_mut!((*place).saved), || 0, a)?,
-                _ => return Err(BoundedError::PlanMismatch),
-            }
+        if *slot.custody() < storage {
+            init_part!(slot, visited, 0, |visited| Storage::initialize_step(
+                visited, a
+            )?);
+            return Ok(false);
         }
-        *step += 1;
-        Ok(*step == Self::INIT_STEPS)
+        match *slot.custody() - storage {
+            0 => init_field!(slot, position.phase, PermutationPhase::default, a)?,
+            1 => init_field!(slot, position.entry, || 0, a)?,
+            2 => init_field!(slot, position.offset, || 0, a)?,
+            3 => init_field!(slot, position.cycle, || 0, a)?,
+            4 => init_field!(slot, position.current, || 0, a)?,
+            5 => init_field!(slot, position.source, || 0, a)?,
+            6 => init_field!(slot, position.low, || 0, a)?,
+            7 => init_field!(slot, position.high, || 0, a)?,
+            8 => init_field!(slot, position.bitmap_bytes, || 0, a)?,
+            9 => init_field!(slot, saved, || 0, a)?,
+            _ => return Err(BoundedError::PlanMismatch),
+        }
+        let units = slot.custody();
+        *units += 1;
+        Ok(*units == Self::INIT_STEPS)
     }
 
     /// Whether the visited bitmap holds nothing.

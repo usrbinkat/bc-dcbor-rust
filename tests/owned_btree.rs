@@ -19,19 +19,79 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use support::legality::{Legality, initial, not_last, storage_build, storage_clean};
 
+/// Node occupancy boundaries: empty, one entry, around a node's minimum and
+/// its capacity (a full leaf, then the first split), and around each further
+/// height; and a wide map, 256 entries whose values carry 80 bytes more
+/// each. At minimal witness sizes the third level's (1727, 1728) is dropped:
+/// the reach map requires the minimal run to execute every region the full
+/// run does (`tests/reach-map.sh`). What only those maps reach is head
+/// width, not a tree path: a count of at least 256 (a two-byte head) and an
+/// input of at least 21,846 bytes, whose parse bound of three part bytes a
+/// byte (`text::PART_BYTES_PER_BYTE`) reaches 65,536 (a four-byte head).
+/// The wide map has both at a fraction of their entries.
 #[test]
 fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
-    for count in [
-        0, 1, 5, 6, 10, 11, 12, 13, 70, 71, 72, 143, 144, 145, 1727, 1728,
-    ] {
+    const WIDE: (usize, usize) = (256, 80);
+    let maps: &[(usize, usize)] = support::rigor::sized(
+        &[
+            (0, 0),
+            (1, 0),
+            (5, 0),
+            (6, 0),
+            (10, 0),
+            (11, 0),
+            (12, 0),
+            (13, 0),
+            (70, 0),
+            (71, 0),
+            (72, 0),
+            (143, 0),
+            (144, 0),
+            (145, 0),
+            (1727, 0),
+            (1728, 0),
+            WIDE,
+        ],
+        &[
+            (0, 0),
+            (1, 0),
+            (5, 0),
+            (6, 0),
+            (10, 0),
+            (11, 0),
+            (12, 0),
+            (13, 0),
+            (70, 0),
+            (71, 0),
+            (72, 0),
+            (143, 0),
+            (144, 0),
+            (145, 0),
+            WIDE,
+        ],
+    );
+    for &(count, padding) in maps {
         let expected: BTreeMap<String, String> = (0..count)
-            .map(|n| (format!("{n:x}"), format!("value-{n}")))
+            .map(|n| {
+                (
+                    format!("{n:x}"),
+                    format!("value-{n}{}", "x".repeat(padding)),
+                )
+            })
             .collect();
         let mut symbolic = dcbor::Map::new();
         for (key, value) in &expected {
             symbolic.insert(key.clone(), value.clone());
         }
         let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
+        if (count, padding) == WIDE {
+            assert!(
+                count >= 256 && wire.len() >= 21_846,
+                "the wide map of {count} entries and {} bytes no longer reaches the two-byte \
+                 count head and the four-byte bound head",
+                wire.len()
+            );
+        }
         let mut m = Limits::unlimited().logged().strict();
         let mut owner = support::scope(&mut m);
         let input = support::copy(&owner, &mut m, &wire);
@@ -65,6 +125,36 @@ fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
         support::drain(&mut owner, &mut m);
         assert_eq!(m.live_bytes(), 0);
     }
+}
+
+/// A map's declared dispatch depth is one more than the deeper of its key's
+/// and its value's, as `Reclaim::DISPATCH_DEPTH` requires of a binding that
+/// delegates to children: with the key deeper than the value, the value
+/// deeper than the key, and both alike, so every branch of the declaration
+/// is taken. The children's depths are their own declarations.
+#[test]
+fn a_map_dispatches_one_deeper_than_its_deeper_child() {
+    use dcbor::bounded::decode::construction::reclamation::Reclaim;
+    fn depth<T: Reclaim<Limits>>() -> usize {
+        T::DISPATCH_DEPTH
+    }
+    let (deep, shallow) = (depth::<Vec<Vec<u64>>>(), depth::<u64>());
+    assert!(deep > shallow, "the nested vector dispatches deeper");
+    assert_eq!(
+        depth::<BTreeMap<Vec<Vec<u64>>, u64>>(),
+        deep + 1,
+        "the key deeper than the value"
+    );
+    assert_eq!(
+        depth::<BTreeMap<u64, Vec<Vec<u64>>>>(),
+        deep + 1,
+        "the value deeper than the key"
+    );
+    assert_eq!(
+        depth::<BTreeMap<u64, u64>>(),
+        shallow + 1,
+        "the key and value alike"
+    );
 }
 
 #[test]
@@ -491,11 +581,13 @@ fn map_wire<K: Into<dcbor::CBOR>, V: Into<dcbor::CBOR>>(
 /// the cleanup of the built tree are checked, with integer entries: a text
 /// entry holds four allocations (each string's metadata block and buffer),
 /// so a tree of 143 text entries holds more live allocations than the heap
-/// observer records (512).
+/// observer records (512). At minimal witness sizes the exhaustive layer
+/// keeps the two-level boundaries only, the reach map requiring the same
+/// regions as at full sizes.
 #[test]
 fn tree_construction_is_complete_and_its_transitions_legal() {
     use support::legality::{buffer, written};
-    use support::rigor::{Rigor, rigor};
+    use support::rigor::{Rigor, rigor, sized};
     use support::{construction, legal, observation};
     for count in 0..=13 {
         let wire = map_wire(count, |n| format!("{n:x}"), |n| format!("v{n}"));
@@ -508,7 +600,7 @@ fn tree_construction_is_complete_and_its_transitions_legal() {
     }
     let boundaries: &[usize] = match rigor() {
         Rigor::Fast => &[143, 144],
-        Rigor::Exhaustive => &[143, 144, 1727, 1728],
+        Rigor::Exhaustive => sized(&[143, 144, 1727, 1728], &[143, 144]),
     };
     for &count in boundaries {
         let wire = map_wire(count, |n| n as u64, |n| n as u64);

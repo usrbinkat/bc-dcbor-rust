@@ -4,7 +4,7 @@ extern crate alloc;
 mod cleanup;
 mod cost;
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
+use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place};
 use crate::bounded::decode::construction::stable::{self, Installed};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::storage::{Storage, StoragePosition};
@@ -12,7 +12,7 @@ use alloc::collections::{BTreeMap, btree_map::InPlaceNode};
 use alloc::string::String;
 use core::cmp::Ordering;
 use core::mem::{ManuallyDrop, MaybeUninit, size_of};
-use core::ptr::{NonNull, addr_of_mut};
+use core::ptr::addr_of_mut;
 
 /// A document key's Rust ordering representation, borrowed without allocation.
 pub enum TreeKeyView<'a> {
@@ -35,22 +35,22 @@ pub unsafe trait TreeKey: Ord {
 
 // SAFETY: children are constructed only in their final node slots. Custody
 // records cover every initialized prefix. Publication never moves a child.
+// A build from any phase past publication is refused and changes nothing.
 unsafe impl<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator> InPlace<A> for BTreeMap<K, V> {
     const COST: ConstructionCost = cost::cost::<K, V, A>();
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
+        slot: Slot<'_, Self, Self::State>,
         a: &mut A,
     ) -> ConstructResult<Built, A> {
-        // SAFETY: forwarded from the InPlace caller.
-        unsafe { build(document, index, place, state, a) }
+        build(document, index, slot, a)
     }
 }
 
 // SAFETY: cleanup detaches a published tree, reclaims children in reverse
 // construction order, then frees nodes without reading their reclaimed slots.
+// A step once cleanup is done reports `Done` and touches nothing.
 unsafe impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Reclaim<A> for BTreeMap<K, V> {
     const DISPATCH_DEPTH: usize = if K::DISPATCH_DEPTH > V::DISPATCH_DEPTH {
         K::DISPATCH_DEPTH.saturating_add(1)
@@ -63,17 +63,12 @@ unsafe impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Reclaim<A> for BTreeMap<
         admitted: stable::Admitted::Nothing,
         initialized: 0,
     };
-    unsafe fn reclaim_step(
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut Self::State,
-        a: &mut A,
-    ) -> BoundedResult<Reclaimed, A> {
-        // SAFETY: forwarded from the Reclaim caller.
-        unsafe { cleanup::reclaim(place, state, a) }
+    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        cleanup::reclaim(slot, a)
     }
 
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
-        cleanup::remaining(state)
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+        cleanup::remaining(slot.custody())
     }
 }
 
@@ -193,9 +188,11 @@ struct Node<K, V, P> {
     shape: Shape,
 }
 
+/// One entry's custody record: its key's and value's places, each rooted at
+/// its final slot in a node allocation, and their construction states.
 struct Entry<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
-    key: NonNull<MaybeUninit<K>>,
-    value: NonNull<MaybeUninit<V>>,
+    key: Place<K>,
+    value: Place<V>,
     // Reclaim, rather than Rust Drop, owns the child lifecycle. Even an
     // exhausted user-defined state may have an arbitrary destructor.
     key_state: ManuallyDrop<K::State>,
@@ -342,25 +339,25 @@ where
 const INIT: u8 = 16;
 const COMPARE: crate::bounded::Capped<Caller> = crate::bounded::Capped::new(Caller, 3, 64);
 
-unsafe fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
+/// One unit of the tree's metadata: its block installed, then one field per
+/// unit, each recorded in the state's prefix before returning. A call once
+/// the prefix is complete is refused.
+fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
     state: &mut State<K, V, A>,
     a: &mut A,
 ) -> BoundedResult<bool, A> {
     if state.meta.is_none() {
-        // SAFETY: the held value is MaybeUninit; only its permit is written.
+        // SAFETY: the held value is MaybeUninit and the header is empty, so
+        // only the permit is written; each field is then initialized in an
+        // admitted unit of its own.
         unsafe {
-            stable::install(
+            stable::install::<MaybeUninit<Meta<K, V, A>>, (), A>(
                 &mut state.meta,
                 &mut state.admitted,
-                const {
-                    stable::Metadata::new::<MaybeUninit<Meta<K, V, A>>, A::Permit>(size_of::<
-                        A::Permit,
-                    >(
-                    ))
-                },
                 // Uninitialized bytes already form a valid MaybeUninit. Do
                 // not synthesize or copy the large metadata value here.
-                |_| {},
+                || (),
+                |meta| meta.cast::<()>(),
                 a,
             )?;
         }
@@ -372,8 +369,10 @@ unsafe fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
         .ok_or(BoundedError::PlanMismatch)?
         .get()
         .as_mut_ptr();
-    // SAFETY: each unit initializes one resource-free field, with its prefix
-    // recorded before returning. No field is read before all are initialized.
+    // SAFETY: the prefix records which fields are written, so each unit
+    // initializes the next resource-free field once, recorded before
+    // returning; the match refuses every unit past the last. No field is
+    // read before all are initialized.
     unsafe {
         match state.initialized {
             0 => field(addr_of_mut!((*raw).phase), || Phase::Header, a)?,
@@ -401,6 +400,20 @@ unsafe fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
     }
     state.initialized += 1;
     Ok(state.initialized == INIT)
+}
+
+/// The tree's metadata, borrowed from the state: released before the tree's
+/// own place is accessed under the state, the place's custody. Refused
+/// unless the state records the whole metadata prefix written.
+fn meta<K: Reclaim<A>, V: Reclaim<A>, A: Allocator, R>(
+    state: &mut State<K, V, A>,
+) -> Result<&mut Meta<K, V, A>, BoundedError<R>> {
+    if state.initialized < INIT {
+        return Err(BoundedError::PlanMismatch);
+    }
+    let block = state.meta.as_mut().ok_or(BoundedError::PlanMismatch)?;
+    // SAFETY: the complete prefix initializes every metadata field.
+    Ok(unsafe { block.get().assume_init_mut() })
 }
 
 fn compare<K: TreeKey, A: Allocator>(
@@ -480,29 +493,19 @@ impl Shape {
     }
 }
 
-unsafe fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
+/// One unit of the tree's construction in `slot`.
+fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
     document: &Document<'_, A::Permit>,
     index: usize,
-    place: NonNull<MaybeUninit<BTreeMap<K, V>>>,
-    state: &mut State<K, V, A>,
+    mut slot: Slot<'_, BTreeMap<K, V>, State<K, V, A>>,
     a: &mut A,
 ) -> ConstructResult<Built, A> {
+    let (place, state) = slot.parts();
     if state.initialized < INIT {
-        // SAFETY: construction owns the destination and its metadata prefix.
-        unsafe {
-            initialize(state, a)?;
-        }
+        initialize(state, a)?;
         return Ok(Built::Progress);
     }
-    // SAFETY: the complete prefix initializes all metadata fields.
-    let m = unsafe {
-        state
-            .meta
-            .as_mut()
-            .ok_or(BoundedError::PlanMismatch)?
-            .get()
-            .assume_init_mut()
-    };
+    let m = meta(state)?;
     match m.phase {
         Phase::Header => {
             STEP.admit(a)?;
@@ -716,8 +719,14 @@ unsafe fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
                     m.slot = 0;
                 } else if let Some(spare) = m.entries.reserve_step(m.count, a)? {
                     sized::<Entry<K, V, A>>().admit(a)?;
-                    // SAFETY: the final node's slot is unique and not yet built.
-                    let (key, value) = unsafe { node.raw.slot(m.slot) };
+                    // SAFETY: the final node's slot is unique and not yet built;
+                    // it roots the key's and value's provenance, and the entry
+                    // record's places are the only access to either until the
+                    // tree is published, after which cleanup detaches it first.
+                    let (key, value) = unsafe {
+                        let (key, value) = node.raw.slot(m.slot);
+                        (Place::root(key), Place::root(value))
+                    };
                     spare.push(Entry {
                         key,
                         value,
@@ -740,14 +749,15 @@ unsafe fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
                 .as_mut_slice()
                 .last_mut()
                 .ok_or(BoundedError::PlanMismatch)?;
-            // SAFETY: the entry record owns these final, stable destinations
-            // and records both initialized prefixes throughout construction.
-            let done = unsafe {
-                if m.phase == Phase::Key {
-                    K::build_step(document, m.position, entry.key, &mut entry.key_state, a)?
-                } else {
-                    V::build_step(document, m.position, entry.value, &mut entry.value_state, a)?
-                }
+            // SAFETY: the entry record pairs each final, stable destination,
+            // rooted at its node slot, with the state that records its
+            // initialized prefix throughout construction and cleanup.
+            let done = if m.phase == Phase::Key {
+                let key = unsafe { Slot::new(entry.key, &mut *entry.key_state) };
+                K::build_step(document, m.position, key, a)?
+            } else {
+                let value = unsafe { Slot::new(entry.value, &mut *entry.value_state) };
+                V::build_step(document, m.position, value, a)?
             };
             if done == Built::Done {
                 if m.phase == Phase::Key {
@@ -789,19 +799,139 @@ unsafe fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             // occupancy; sorted document ranks produce strictly ordered keys.
             // Every child completed in its final slot. The raw custody records
             // remain inaccessible until reclamation detaches the map.
-            unsafe {
-                place
-                    .as_ptr()
-                    .write(MaybeUninit::new(BTreeMap::from_in_place(
-                        nodes.first().map(|n| &n.raw),
-                        usize::from(m.height),
-                        m.count,
-                    )));
-            }
-            m.phase = Phase::Complete;
+            let map = unsafe {
+                BTreeMap::from_in_place(
+                    nodes.first().map(|n| &n.raw),
+                    usize::from(m.height),
+                    m.count,
+                )
+            };
+            // SAFETY: the slot pairs the place with this state, and in this
+            // phase nothing is written to it yet; the write is admitted above.
+            unsafe { place.write(state, map) };
+            meta(state)?.phase = Phase::Complete;
             return Ok(Built::Done);
         }
         _ => return Err(BoundedError::PlanMismatch.into()),
     }
     Ok(Built::Progress)
+}
+
+/// The tree's declared cost against what its whole construction and cleanup
+/// measure, recorded exactly ([`places::Tightness`]): a change to the cost's
+/// arithmetic, in either direction, changes a recorded ratio and fails the
+/// ratchet. Every admission is made inside the tree's one place, so the
+/// check ([`places::check`]) also holds each run within its declared cost.
+#[cfg(test)]
+#[cfg(feature = "std")]
+mod attribution {
+    use super::*;
+    use crate::bounded::decode::decode;
+    use crate::bounded::places::{self, Ledgered, Run};
+    use crate::bounded::{Places, ResourceBound, at};
+    use alloc::string::ToString;
+    use core::ops::ControlFlow;
+    use core::ptr::NonNull;
+
+    places! {
+        /// A tree's whole construction and cleanup: the one place its
+        /// declared cost covers.
+        enum TreePlace {
+            Construction,
+        }
+    }
+
+    /// A tree's declared cost at one input's length: its one place's term.
+    struct TreeTerms(ResourceBound);
+
+    impl Places for TreeTerms {
+        type Place = TreePlace;
+
+        fn term(&self, _: TreePlace) -> ResourceBound {
+            self.0
+        }
+    }
+
+    /// The map `wire` holds, of keys `K` and integer values, built and then
+    /// cleaned up, every admission at the tree's place and each loop within
+    /// the steps of the declared cost.
+    fn run<K: TreeKey + InPlace<Ledgered>>(name: &str, wire: &[u8]) -> Run<TreeTerms> {
+        let mut parser = Ledgered::new();
+        let document = decode(wire, 8, &mut parser).expect("the map decodes");
+        // The tree's `COST`, evaluated here at run time: the engine evaluates
+        // it only in constants, which coverage does not observe.
+        let cost = cost::cost::<K, u64, Ledgered>()
+            .bound::<()>(wire.len() as u64)
+            .expect("the cost of a fixture fits in u64");
+        let mut policy = Ledgered::new();
+        let mut destination = MaybeUninit::<BTreeMap<K, u64>>::uninit();
+        let mut state = <BTreeMap<K, u64> as Reclaim<Ledgered>>::INITIAL;
+        // SAFETY: the test owns the destination and pairs it with its initial
+        // state; every access to either is through this slot for the run.
+        let mut slot =
+            unsafe { Slot::new(Place::root(NonNull::from(&mut destination)), &mut state) };
+        crate::bounded::within(name, cost, || {
+            let built = at(TreePlace::Construction, || {
+                build::<K, u64, Ledgered>(&document, 0, slot.reborrow(), &mut policy)
+            });
+            match built.expect("the map builds") {
+                Built::Done => ControlFlow::Break(()),
+                Built::Progress => ControlFlow::Continue(()),
+            }
+        });
+        crate::bounded::within(name, cost, || {
+            let reclaimed = at(TreePlace::Construction, || {
+                cleanup::reclaim::<K, u64, Ledgered>(slot.reborrow(), &mut policy)
+            });
+            match reclaimed.expect("an unlimited policy never refuses") {
+                Reclaimed::Done => ControlFlow::Break(()),
+                Reclaimed::Progress => ControlFlow::Continue(()),
+                Reclaimed::Waiting => unreachable!("a tree's own cleanup never waits"),
+            }
+        });
+        Run {
+            name: name.to_string(),
+            outcome: places::Outcome::Published,
+            policy,
+            terms: TreeTerms(cost),
+        }
+    }
+
+    /// A map of `count` integer keys, each its own value.
+    fn integers(count: u64) -> Vec<u8> {
+        let mut map = crate::Map::new();
+        for n in 0..count {
+            map.insert(n, n);
+        }
+        crate::CBOR::from(map).to_cbor_data()
+    }
+
+    /// A map of `count` text keys, each the hexadecimal of its value.
+    fn texts(count: u64) -> Vec<u8> {
+        let mut map = crate::Map::new();
+        for n in 0..count {
+            map.insert(alloc::format!("{n:x}"), n);
+        }
+        crate::CBOR::from(map).to_cbor_data()
+    }
+
+    /// Every run of a tree is within its declared cost, and each run's cost
+    /// against its measured total is a recorded ratio: an empty tree, one
+    /// entry, a full leaf, a root over two leaves, two levels, and text keys
+    /// compared byte by byte.
+    #[test]
+    fn a_trees_cost_is_recorded_against_its_whole_construction() {
+        let runs = [
+            run::<u64>("empty", &integers(0)),
+            run::<u64>("one entry", &integers(1)),
+            run::<u64>("a full leaf", &integers(11)),
+            run::<u64>("a root over two leaves", &integers(12)),
+            run::<u64>("two levels", &integers(144)),
+            run::<String>("text keys", &texts(13)),
+        ];
+        places::check(&runs);
+        places::Tightness::new("btree")
+            .totals(&runs, places::EVERY)
+            .finish();
+    }
 }

@@ -48,7 +48,12 @@ unchanged() {
 } >"$logs/environment.log" 2>&1
 snapshot >"$logs/source.sha256"
 printf 'STARTED\n' >"$logs/results.txt"
-trap 'status=$?; printf "EXIT %s\n" "$status" >>"$logs/results.txt"' EXIT
+# The exit status every run ends with, recorded beside its results.
+finished() {
+	local status=$?
+	printf 'EXIT %s\n' "$status" >>"$logs/results.txt"
+}
+trap finished EXIT
 cargo build --locked --release --example codec_profile --example reclamation_profile >"$logs/build.log" 2>&1
 unchanged
 for worker in "${workers[@]}"; do

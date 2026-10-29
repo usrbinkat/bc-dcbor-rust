@@ -11,16 +11,15 @@ static HEAP: support::heap::Heap = support::heap::Heap;
 use dcbor::bounded::decode::construction::in_place::{
     Built, ConstructionCost, InPlace, plus, times, unit,
 };
-use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reclaimed};
+use dcbor::bounded::decode::construction::reclamation::{
+    Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+};
 use dcbor::bounded::decode::construction::{Borrowed, TypedDecoder, TypedValue};
 use dcbor::bounded::decode::{ConstructResult, DecodeError, Document, Options, wrong_type};
 use dcbor::bounded::{Allocator, BoundedError, Limits};
 use dcbor_test_support::{self as support, Input, drain, open};
 use std::cell::Cell;
-use std::{
-    mem::MaybeUninit,
-    ptr::{NonNull, addr_of_mut},
-};
+use std::ptr::addr_of_mut;
 
 thread_local! {
     static STARTS: Cell<usize> = const { Cell::new(0) };
@@ -75,18 +74,22 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own construction, as `InPlace` documents"
     )]
-    unsafe fn build_step(
+    fn build_step(
         document: &Document<'_, A::Permit>,
         _: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut ProbeState,
+        mut slot: Slot<'_, Self, ProbeState>,
         allocator: &mut A,
     ) -> ConstructResult<Built, A> {
-        let raw = place.as_ptr().cast::<Self>();
+        let (place, state) = slot.parts();
+        // Each field is written by raw projection alone, never through a
+        // reference to the partly initialized probe.
+        let raw = place.as_ptr(state);
         if !state.started {
             allocator
                 .traverse(1, std::mem::size_of::<usize>() as u64)
                 .map_err(BoundedError::Refused)?;
+            // SAFETY: a plain field of the slot's own destination, written by
+            // raw projection.
             unsafe {
                 addr_of_mut!((*raw).construction_address).write(raw as usize);
             }
@@ -96,6 +99,8 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
         }
         if state.written < 256 {
             allocator.traverse(1, 64).map_err(BoundedError::Refused)?;
+            // SAFETY: the next 64 bytes of the inline payload, within its 256,
+            // written by raw projection.
             unsafe {
                 addr_of_mut!((*raw).inline)
                     .cast::<u8>()
@@ -129,11 +134,11 @@ unsafe impl<A: Allocator> Reclaim<A> for Probe {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut ProbeState,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, ProbeState>,
         a: &mut A,
     ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
+        let state = slot.custody();
         let bytes = state.written.min(64);
         a.traverse(1, bytes as u64).map_err(BoundedError::Refused)?;
         state.written -= bytes;
@@ -147,8 +152,8 @@ unsafe impl<A: Allocator> Reclaim<A> for Probe {
 
     /// One call per 64-byte chunk written, and one for an empty prefix,
     /// whose call reports `Done` at once.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, state: &mut ProbeState) -> u64 {
-        (state.written.div_ceil(64) as u64).max(1)
+    fn remaining(mut slot: PeekSlot<'_, Self, ProbeState>) -> u64 {
+        (slot.custody().written.div_ceil(64) as u64).max(1)
     }
 }
 

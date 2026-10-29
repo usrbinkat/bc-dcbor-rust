@@ -195,71 +195,75 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
             quote!(dcbor::bounded::decode::construction::reclamation::Written::Empty),
         ),
     };
-    let (build, reclaim) = if let Some(ty) = field {
-        let projection = quote! {
-            // SAFETY: compiler-provided field projection uses the actual
-            // struct layout; packed representations are excluded above.
-            let child = unsafe {
-                core::ptr::NonNull::new_unchecked(
-                    core::ptr::addr_of_mut!((*place.as_ptr().cast::<Self>()).0)
-                        .cast::<core::mem::MaybeUninit<#ty>>()
-                )
-            };
+    // The newtype's field slot from the value's, in the slot's mode: the
+    // field's place by compiler-provided field projection over the actual
+    // struct layout (packed representations are excluded above), forming no
+    // reference, and the newtype's state, which is the field's own.
+    // Construction, cleanup and the cleanup count all project the field
+    // through this one expression.
+    let child = field.map(|ty| {
+        let child_of = quote! {
+            // SAFETY: the compiler's projection of the newtype's one field,
+            // within the value, and the newtype's state, which is that
+            // field's own: a one-field struct has exactly its field's
+            // initialization and resource ownership.
+            unsafe { slot.child(|value| core::ptr::addr_of_mut!((*value).0), |state| state) }
         };
+        (ty, child_of)
+    });
+    let (build, reclaim) = if let Some((ty, child_of)) = &child {
         (
             quote! {
-                #projection
-                // SAFETY: a one-field struct has exactly the child's initialization
-                // and resource ownership; its state is the child's own.
-                unsafe { <#ty as __i::InPlace<#a>>::build_step(document, index, child, state, allocator) }
+                <#ty as __i::InPlace<#a>>::build_step(document, index, #child_of, allocator)
             },
             quote! {
-                #projection
-                // SAFETY: the child retains the same destination and state used
-                // during construction, including partial initialization on failure.
-                unsafe { <#ty as __r::Reclaim<#a>>::reclaim_step(child, state, allocator) }
+                <#ty as __r::Reclaim<#a>>::reclaim_step(#child_of, allocator)
             },
         )
     } else {
         (
             quote! {
+                let mut slot = slot;
+                let (place, state) = slot.parts();
+                if *state != dcbor::bounded::decode::construction::reclamation::Written::Empty {
+                    return Err(dcbor::bounded::BoundedError::PlanMismatch.into());
+                }
                 dcbor::bounded::decode::construction::in_place::step(allocator)?;
                 if !matches!(
                     dcbor::bounded::decode::construction::node_at(document, index).map(|node| node.kind()),
                     Some(dcbor::bounded::decode::Kind::Null)
                 ) { return Err(dcbor::bounded::decode::wrong_type()); }
-                // SAFETY: a unit struct is zero-sized and has no fields to initialize.
-                unsafe { place.as_ptr().write(core::mem::MaybeUninit::new(Self)) };
+                // SAFETY: the slot pairs the place with this state, which is
+                // empty; a unit struct is zero-sized and has no fields to
+                // initialize.
+                unsafe { place.write(state, Self) };
                 *state = dcbor::bounded::decode::construction::reclamation::Written::Initialized;
                 Ok(__i::Built::Done)
             },
             quote! {
+                let mut slot = slot;
                 dcbor::bounded::decode::construction::in_place::step(allocator)?;
-                *state = dcbor::bounded::decode::construction::reclamation::Written::Empty;
+                *slot.custody() = dcbor::bounded::decode::construction::reclamation::Written::Empty;
                 Ok(__r::Reclaimed::Done)
             },
         )
     };
     // The untagged value's remaining cleanup calls: the field's own for a
     // newtype; one for a unit struct, whose cleanup is one step.
-    let untagged_remaining = match field {
-        Some(ty) => quote! {
-            // SAFETY: compiler-provided field projection uses the actual
-            // struct layout; the child's state is the newtype's own.
-            let child = unsafe {
-                core::ptr::NonNull::new_unchecked(
-                    core::ptr::addr_of_mut!((*place.as_ptr().cast::<Self>()).0)
-                        .cast::<core::mem::MaybeUninit<#ty>>()
-                )
-            };
-            unsafe { <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::remaining(child, state) }
+    let untagged_remaining = match &child {
+        Some((ty, child_of)) => quote! {
+            <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::remaining(#child_of)
         },
         None => quote! {
-            let _ = (place, state);
+            let _ = slot;
             1
         },
     };
+    let slot_of = |state: TokenStream2| quote!(dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, #state>);
+    let peek_of = |state: TokenStream2| quote!(dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, #state>);
     let payload = if let Some(tag) = schema.tag {
+        let slot = slot_of(quote!(Self::Untagged));
+        let peek = peek_of(quote!(Self::Untagged));
         quote! {
             // SAFETY: compiler field projections preserve payload addresses,
             // and the untagged state starts as the untagged value's initial
@@ -268,28 +272,22 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
                 const TAG: u64 = #tag;
                 type Untagged = #untagged;
                 const UNTAGGED: Self::Untagged = #untagged_initial;
-                unsafe fn build_payload(
+                fn build_payload(
                     document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Untagged,
+                    slot: #slot,
                     allocator: &mut #a,
                 ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
                     use dcbor::bounded::decode::construction::in_place as __i;
                     #build
                 }
-                unsafe fn reclaim_payload(
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Untagged,
+                fn reclaim_payload(
+                    slot: #slot,
                     allocator: &mut #a,
                 ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
                     use dcbor::bounded::decode::construction::reclamation as __r;
-                    let _ = place;
                     #reclaim
                 }
-                unsafe fn remaining_payload(
-                    place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                    state: &mut Self::Untagged,
-                ) -> u64 {
+                fn remaining_payload(slot: #peek) -> u64 {
                     #untagged_remaining
                 }
             }
@@ -319,9 +317,9 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
     };
     let (build, reclaim, remaining, state, initial) = if schema.tag.is_some() {
         (
-            quote!(unsafe { __i::tagged::build::<Self, #a>(document, index, place, state, allocator) }),
-            quote!(unsafe { dcbor::bounded::decode::construction::in_place::tagged::reclaim::<Self, #a>(place, state, allocator) }),
-            quote!(unsafe { dcbor::bounded::decode::construction::in_place::tagged::remaining::<Self, #a>(place, state) }),
+            quote!(__i::tagged::build::<Self, #a>(document, index, slot, allocator)),
+            quote!(dcbor::bounded::decode::construction::in_place::tagged::reclaim::<Self, #a>(slot, allocator)),
+            quote!(dcbor::bounded::decode::construction::in_place::tagged::remaining::<Self, #a>(slot)),
             quote!(dcbor::bounded::decode::construction::in_place::tagged::State<#untagged, <#a as dcbor::bounded::Allocator>::Permit>),
             quote!(dcbor::bounded::decode::construction::in_place::tagged::State::INITIAL),
         )
@@ -337,6 +335,8 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
             untagged_initial,
         )
     };
+    let slot = slot_of(quote!(Self::State));
+    let peek = peek_of(quote!(Self::State));
     quote! {
         #payload
         // SAFETY: the generated projection preserves the final address and
@@ -344,10 +344,9 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
         unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
             const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost = #cost;
 
-            unsafe fn build_step(
+            fn build_step(
                 document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::State,
+                slot: #slot,
                 allocator: &mut #a,
             ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
                 use dcbor::bounded::decode::construction::in_place as __i;
@@ -360,18 +359,13 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
             const DISPATCH_DEPTH: usize = #depth;
             type State = #state;
             const INITIAL: Self::State = #initial;
-            unsafe fn reclaim_step(
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::State,
+            fn reclaim_step(
+                slot: #slot,
                 allocator: &mut #a,
             ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
-                let _ = place;
                 #reclaim
             }
-            unsafe fn remaining(
-                place: core::ptr::NonNull<core::mem::MaybeUninit<Self>>,
-                state: &mut Self::State,
-            ) -> u64 {
+            fn remaining(slot: #peek) -> u64 {
                 #remaining
             }
         }

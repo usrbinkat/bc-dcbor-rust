@@ -1,8 +1,7 @@
-use core::{mem::MaybeUninit, ptr::NonNull};
 use dcbor::bounded::decode::construction::{
     Acquisition, DecodeOwner, TypedDecoder, TypedValue,
     in_place::{Built, ConstructionCost, InPlace, plus, times, unit},
-    reclamation::{Custody, Reclaim, Reclaimed},
+    reclamation::{Custody, PeekSlot, Reclaim, Reclaimed, Slot},
 };
 use dcbor::bounded::decode::{ConstructResult, Document, Options};
 use dcbor::bounded::{Allocator, BoundedError, BoundedResult, Budget, Limits, Step};
@@ -250,16 +249,20 @@ unsafe impl InPlace<Limits> for StableProbe {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own construction, as `InPlace` documents"
     )]
-    unsafe fn build_step(
+    fn build_step(
         _: &Document<'_, <Limits as Allocator>::Permit>,
         _: usize,
-        place: NonNull<MaybeUninit<Self>>,
-        state: &mut ProbeState,
+        mut slot: Slot<'_, Self, ProbeState>,
         a: &mut Limits,
     ) -> ConstructResult<Built, Limits> {
-        let raw = place.as_ptr().cast::<Self>();
+        let (place, state) = slot.parts();
+        // Each field is written by raw projection alone, never through a
+        // reference to the partly initialized probe.
+        let raw = place.as_ptr(state);
         if state.chunks < 4 {
             a.traverse(1, 64).map_err(BoundedError::Refused)?;
+            // SAFETY: the next 64 bytes of the slot's own destination, within
+            // its 256, written by raw projection.
             unsafe {
                 core::ptr::addr_of_mut!((*raw).bytes)
                     .cast::<u8>()
@@ -271,6 +274,8 @@ unsafe impl InPlace<Limits> for StableProbe {
         } else {
             a.traverse(1, core::mem::size_of::<usize>() as u64)
                 .map_err(BoundedError::Refused)?;
+            // SAFETY: a plain field of the slot's own destination, written by
+            // raw projection.
             unsafe {
                 core::ptr::addr_of_mut!((*raw).address).write(raw as usize);
             }
@@ -292,18 +297,17 @@ unsafe impl Reclaim<Limits> for StableProbe {
         clippy::disallowed_methods,
         reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
     )]
-    unsafe fn reclaim_step(
-        _: NonNull<MaybeUninit<Self>>,
-        state: &mut ProbeState,
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, ProbeState>,
         a: &mut Limits,
     ) -> BoundedResult<Reclaimed, Limits> {
         a.traverse(1, 0).map_err(BoundedError::Refused)?;
-        *state = Self::INITIAL;
+        *slot.custody() = Self::INITIAL;
         Ok(Reclaimed::Done)
     }
 
     /// One call, which is `Done`.
-    unsafe fn remaining(_: NonNull<MaybeUninit<Self>>, _: &mut ProbeState) -> u64 {
+    fn remaining(_: PeekSlot<'_, Self, ProbeState>) -> u64 {
         1
     }
 }

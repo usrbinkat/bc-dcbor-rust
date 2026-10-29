@@ -2,6 +2,7 @@ use super::bindings::string_decoder;
 use super::harness::*;
 use super::support::{
     self, Fault, allowed, checked, contracted, drive_faulted, refusal_matrix, refuse, rigor::rigor,
+    scope_checked,
 };
 use dcbor::bounded::decode::{BoundedDecodable, DecodeError, decode, decode_typed};
 use dcbor::bounded::{Allocator, BoundedError, Owned, Step};
@@ -130,16 +131,26 @@ fn partial_field_reservations_are_released_when_failed_construction_is_cancelled
 fn completed_field_values_not_just_permits_survive_later_refusal() {
     use dcbor::bounded::decode::construction::TypedDecoder;
     use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace};
-    use dcbor::bounded::decode::construction::reclamation::{Reclaim, Reclaimed};
-    use dcbor::bounded::decode::{ConstructResult, Document, Options};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::{
-        mem::MaybeUninit,
-        ptr::{NonNull, addr_of_mut},
+    use dcbor::bounded::decode::construction::reclamation::{
+        Mode, PeekSlot, Reclaim, Reclaimed, Slot,
     };
+    use dcbor::bounded::decode::{ConstructResult, Document, Options};
+    use std::ptr::addr_of_mut;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     static CREATED: AtomicUsize = AtomicUsize::new(0);
     static DROPPED: AtomicUsize = AtomicUsize::new(0);
     struct Tracked(String);
+    /// The single `String` field's slot, in the record's slot's mode: its
+    /// place by compiler field projection alone, and the record's state, which
+    /// is the field's own. Construction, cleanup and the cleanup count all
+    /// reach it here.
+    fn field<A: Allocator, M: Mode>(
+        slot: Slot<'_, Tracked, <String as Reclaim<A>>::State, M>,
+    ) -> Slot<'_, String, <String as Reclaim<A>>::State, M> {
+        // SAFETY: the projection stays within the record and forms no
+        // reference; a `Tracked`'s state is its one field's.
+        unsafe { slot.child(|value| addr_of_mut!((*value).0), |state| state) }
+    }
     // SAFETY: the compiler projection preserves the single String field's final
     // address, and the field's own state is used for construction and
     // reclamation.
@@ -147,17 +158,13 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
         // Construction and cleanup are the single String field's.
         const COST: ConstructionCost = <String as InPlace<A>>::COST;
 
-        unsafe fn build_step(
+        fn build_step(
             document: &Document<'_, A::Permit>,
             index: usize,
-            place: NonNull<MaybeUninit<Self>>,
-            state: &mut Self::State,
+            slot: Slot<'_, Self, Self::State>,
             allocator: &mut A,
         ) -> ConstructResult<Built, A> {
-            let child = unsafe {
-                NonNull::new_unchecked(addr_of_mut!((*place.as_ptr().cast::<Self>()).0).cast())
-            };
-            let result = unsafe { String::build_step(document, index, child, state, allocator)? };
+            let result = String::build_step(document, index, field::<A, _>(slot), allocator)?;
             if result == Built::Done {
                 CREATED.fetch_add(1, Ordering::SeqCst);
             }
@@ -169,15 +176,11 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
         type State = <String as Reclaim<A>>::State;
         const INITIAL: Self::State = <String as Reclaim<A>>::INITIAL;
 
-        unsafe fn reclaim_step(
-            place: NonNull<MaybeUninit<Self>>,
-            state: &mut Self::State,
+        fn reclaim_step(
+            slot: Slot<'_, Self, Self::State>,
             a: &mut A,
         ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
-            let child = unsafe {
-                NonNull::new_unchecked(addr_of_mut!((*place.as_ptr().cast::<Self>()).0).cast())
-            };
-            let result = unsafe { String::reclaim_step(child, state, a)? };
+            let result = String::reclaim_step(field::<A, _>(slot), a)?;
             if result == Reclaimed::Done {
                 DROPPED.fetch_add(1, Ordering::SeqCst);
             }
@@ -185,11 +188,8 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
         }
 
         /// The wrapped string's own count, at the same projection.
-        unsafe fn remaining(place: NonNull<MaybeUninit<Self>>, state: &mut Self::State) -> u64 {
-            let child = unsafe {
-                NonNull::new_unchecked(addr_of_mut!((*place.as_ptr().cast::<Self>()).0).cast())
-            };
-            unsafe { <String as Reclaim<A>>::remaining(child, state) }
+        fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+            <String as Reclaim<A>>::remaining(field::<A, _>(slot))
         }
     }
     impl Drop for Tracked {
@@ -459,7 +459,7 @@ fn ownership_is_accounted_at_every_phase_transition_and_cancellation() {
                 // decode's bound.
                 let mut idle = false;
                 for _ in 0..support::typed_turns::<ByteString>(wire.len()) {
-                    match checked(&mut m, |m| owner.step(m)) {
+                    match scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
                         Ok(Reclaimed::Waiting | Reclaimed::Done) => {
                             idle = true;
                             break;

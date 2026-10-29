@@ -1,0 +1,37 @@
+error[E0080]: evaluation panicked: a permit takes more than PERMIT_BYTES bytes
+ --> $WORKSPACE/src/bounded.rs
+  |
+  |         permit_bytes::<P>();
+  |         ^^^^^^^^^^^^^^^^^^^ evaluation of `dcbor::bounded::Owned::<u8, Wide>::RELEASE_BYTES` failed inside this call
+  |
+note: inside `bounded::permit_bytes::<Wide>`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/src/bounded.rs
+  |
+  | /     assert!(
+  | |         core::mem::size_of::<P>() <= PERMIT_BYTES,
+  | |         "a permit takes more than PERMIT_BYTES bytes"
+  | |     );
+  | |_____- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/src/bounded.rs
+  |
+  |             RELEASED.admit(allocator, const { Self::RELEASE_BYTES })?;
+  |                                               ^^^^^^^^^^^^^^^^^^^
+
+note: erroneous constant encountered
+ --> $WORKSPACE/src/bounded.rs
+  |
+  |             RELEASED.admit(allocator, const { Self::RELEASE_BYTES })?;
+  |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn dcbor::bounded::Owned::<u8, Wide>::reserve::<Policy>`
+  --> tests/ui/fail/permit_beyond_limit.rs:27:13
+   |
+27 |     assert!(arena.reserve(1, &mut Policy).is_ok());
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -21,10 +21,10 @@
 293	293	joint	published	copy: total peak
 293	293	joint	published	copy: total retained
 16	10	joint	published	copy: total values
-1790567	1740573	joint	published	owned preparation of 16 texts of 400 pairs: public bytes
-429266	427176	joint	published	owned preparation of 16 texts of 400 pairs: public values
-138467	127093	joint	published	owned preparation of 4 texts of 100 pairs: public bytes
-27741	27188	joint	published	owned preparation of 4 texts of 100 pairs: public values
+1815873	1638045	joint	published	owned preparation of 16 texts of 400 pairs: public bytes
+454926	401576	joint	published	owned preparation of 16 texts of 400 pairs: public values
+139725	120661	joint	published	owned preparation of 4 texts of 100 pairs: public bytes
+29353	25588	joint	published	owned preparation of 4 texts of 100 pairs: public values
 15780	11396	joint	published	owned preparation of 4000 empty strings: public allocated
 8713	8456	joint	published	owned preparation of 4000 empty strings: public peak
 8713	6344	joint	published	owned preparation of 4000 empty strings: public retained
@@ -32,10 +32,10 @@
 3337	3080	joint	published	owned preparation of 500 empty strings: public peak
 3337	2760	joint	published	owned preparation of 500 empty strings: public retained
 1	1	measured	exact	retired copy: Release values
-35421217	1797135	joint	published	typed decode chain of 16 texts of 400 pairs: public bytes
-2379268	408006	joint	published	typed decode chain of 16 texts of 400 pairs: public values
-2243161	128079	joint	published	typed decode chain of 4 texts of 100 pairs: public bytes
-150077	25986	joint	published	typed decode chain of 4 texts of 100 pairs: public values
+35421217	1694607	joint	published	typed decode chain of 16 texts of 400 pairs: public bytes
+2379268	382406	joint	published	typed decode chain of 16 texts of 400 pairs: public values
+2243161	121647	joint	published	typed decode chain of 4 texts of 100 pairs: public bytes
+150077	24386	joint	published	typed decode chain of 4 texts of 100 pairs: public values
 1635692	879259	joint	published	typed decode chain of 4000 empty strings: public allocated
 690249	681883	joint	published	typed decode chain of 4000 empty strings: public peak
 690249	681883	joint	published	typed decode chain of 4000 empty strings: public retained

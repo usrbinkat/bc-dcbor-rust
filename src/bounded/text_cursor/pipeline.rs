@@ -285,7 +285,8 @@ impl<P, B: Budget> Resumable<B> for TextWriter<'_, '_, P> {
 
 /// Place attribution of a text write, which this crate's tests record under
 /// `std`.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::*;
     use crate::CBOR;

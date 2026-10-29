@@ -1029,7 +1029,9 @@ mod tests {
     /// largest per byte on one-byte characters, every pass over them;
     /// each precomposed letter decomposes into a starter and a mark the
     /// next starter releases. U+1D160 is excluded from composition: its
-    /// normal form is its whole decomposition, three bytes per byte.
+    /// normal form is its whole decomposition, three bytes per byte. Its one
+    /// caller is the `std` attribution test.
+    #[cfg(feature = "std")]
     fn witness(place: ValidationPlace) -> String {
         match place {
             ValidationPlace::Reading => format!("\u{301}{}", "x".repeat(64)),

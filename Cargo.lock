@@ -100,6 +100,7 @@ dependencies = [
  "num-bigint",
  "paste",
  "proc-macro2",
+ "quote",
  "spin",
  "syn 2.0.119",
  "thiserror",

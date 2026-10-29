@@ -240,7 +240,8 @@ impl HeaderState {
 
 /// Place attribution of a head's acquisition, which this crate's tests
 /// record under `std`.
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+#[cfg(feature = "std")]
 mod attribution {
     use super::*;
     use crate::bounded::Place;

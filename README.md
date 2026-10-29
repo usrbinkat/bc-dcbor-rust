@@ -220,8 +220,29 @@ Custom bindings implement `in_place::InPlace<A>` and mandatory
 its initialized parts, held allocations, admissions and active child obligations
 under exclusive access. Observation admits and allocates nothing. `Reduction`
 is optional and requires a documented cleanup simulation; containers without
-one retain every stop schedule. Both construction and cleanup receive a stable destination and retained cursor;
-completion returns a status rather than moving a schema value. The former
+one retain every stop schedule. Both construction and cleanup receive the
+value as a `reclamation::Slot`: its `Place` and its retained state, the
+custody paired with it, together. A slot is minted only where the value's
+provenance is rooted (a record's block, a metadata block, a container's
+buffer, a tree node), under `Slot::new`'s one obligation, that pairing; every
+other slot is a child projected from one (`Slot::child`). So the trait
+methods take slots through safe signatures: a caller holding a slot has
+nothing to promise, and the `unsafe trait` contracts require each
+implementation to be sound for every call its holder can make, in any order,
+a cleanup step after `Done` and a build after cleanup began included. Inside
+an implementation a binding reaches its parts by raw projection
+(`Place::project`, `cast`, `add`), writes through `write` and
+`drop_in_place`, and borrows a header exclusively only within `with_mut`,
+never over bytes in which a place lies, so a place one step derives stays
+valid in every later step; each of these is `unsafe`, under the state's
+record of what is initialized. Every access through a place borrows the
+slot's custody: a shared read (`get`) holds it shared while the read is live,
+and every write, exclusive borrow or custody access (`write`,
+`drop_in_place`, `with_mut`, `reach`, `as_ptr`) holds it exclusively, so the
+borrow checker refuses a write under a live read or two exclusive accesses at
+once. Internal metadata initialized field by field is written the same way:
+a `Slot` of the destination and its units initialized, one field per
+admitted unit. Completion returns a status rather than moving a schema value. The former
 `ResumableDecodable::start`, schema-sized associated state, and
 `BuildStep::Complete(T)` protocol have been removed. `CBORBoundedDecodable`
 generates in-place bindings and a guard against user-defined synchronous `Drop`.
@@ -249,7 +270,21 @@ calls its state can still take, the one returning `Done` included, read like
 an observation. The scope holds each queued record to the count it declared
 when its cleanup began and refuses a call beyond it as a defect, so every
 drain, stepped or terminal, is finite. Overstating is sound; understating
-violates the unsafe contract.
+violates the unsafe contract. The count is read while the value may still be
+borrowed, as a published value is by the preparation encoding it, so
+`remaining` receives the value's slot observed, a `reclamation::PeekSlot`:
+shared reads and raw place projections of the value, no write and no
+exclusive reborrow of its bytes. A record's own custody (its phase, handles
+and children's construction states, grouped apart from the published value),
+which no reader borrows, stays reachable through `Place::custody`, for as long
+as the record's progress is borrowed exclusively.
+
+Cleanup steps must not unwind: a step unwound half done would leave its state
+recording what it no longer holds. A policy's release observer
+(`Limits::observe_releases`) runs inside them, held to their contract: bounded,
+nonblocking work that allocates nothing. An observer that panics aborts the
+process rather than unwind out of a release, as a terminal drain that cannot
+complete does.
 
 ## Verification layers
 
@@ -267,6 +302,7 @@ cleanup classes. Exhaustive additionally replays each refusal and each stop
 independently and checks the reductions. Both use the same oracles.
 The Miri gate runs both aliasing models with strict provenance and compares
 its reached class inventory with native execution of the same selections.
+It requires `MIRI_LOG_DIR` or `TMPDIR`: its log directory.
 
 `run_tests.sh` runs the stable feature matrix; its exhaustive mode also
 checks the fast feature-selection assumptions. [tests/BOUNDED.md](tests/BOUNDED.md)
