@@ -1849,19 +1849,90 @@ pub(crate) mod places {
         }
     }
 
-    /// The features that change what this crate's bounds charge, and so the
-    /// ratios its suites record, as the suffix of each record's name: with
-    /// bignums, the preparation's record holds a bignum and its witness
-    /// encodes them. Each build records and checks its own.
-    const VARIANT: &str = match (
-        cfg!(feature = "custom-std-collections"),
-        cfg!(feature = "num-bigint"),
-    ) {
-        (false, false) => "",
-        (false, true) => ".num-bigint",
-        (true, false) => ".custom-std",
-        (true, true) => ".custom-std.num-bigint",
-    };
+    /// This build's variant: [`VARIANT`], the suffix of each record's name,
+    /// and [`RECORDS`], every suite's record of that variant compiled in. The
+    /// features that change what this crate's bounds charge, and so the
+    /// ratios its suites record: with bignums, the preparation's record holds
+    /// a bignum and its witness encodes them; over the forked collections,
+    /// trees are walked by their stepped cursor and built in place (`btree`,
+    /// a suite of those builds alone). Each build records and checks its own.
+    ///
+    /// A record is compiled in, not read at run time, so a check needs no
+    /// filesystem, the interpreter's host isolation included, and a suite
+    /// whose record is missing does not compile. The suites are those
+    /// `tests/record-evidence.sh` checks; a record rewritten by
+    /// [`RECORD_FACTORS`] is compiled into the next build.
+    macro_rules! variant {
+        ($suffix:literal $(, $only:literal)*) => {
+            const VARIANT: &str = $suffix;
+            const RECORDS: &[(&str, &str)] = records!(
+                $suffix;
+                "buckets",
+                "decode",
+                "emission",
+                "header",
+                "lifecycle_borrow",
+                "lifecycle_construct",
+                "lifecycle_copy",
+                "lifecycle_operations",
+                "lifecycle_parse",
+                "lifecycle_scope",
+                "preparation",
+                "retained_parse",
+                "string_decode",
+                "text_encode",
+                "text_joint",
+                "text_write",
+                "validation"
+                $(, $only)*
+            );
+        };
+    }
+
+    /// Each suite named, with its record of the variant `suffix`.
+    macro_rules! records {
+        ($suffix:literal; $($suite:literal),*) => {
+            &[$((
+                $suite,
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/data/tightness/",
+                    $suite,
+                    $suffix,
+                    ".txt"
+                )),
+            )),*]
+        };
+    }
+
+    #[cfg(not(any(feature = "custom-std-collections", feature = "num-bigint")))]
+    variant!("");
+    #[cfg(all(not(feature = "custom-std-collections"), feature = "num-bigint"))]
+    variant!(".num-bigint");
+    #[cfg(all(feature = "custom-std-collections", not(feature = "num-bigint")))]
+    variant!(".custom-std", "btree");
+    #[cfg(all(feature = "custom-std-collections", feature = "num-bigint"))]
+    variant!(".custom-std.num-bigint", "btree");
+
+    /// The compiled record of `suite` ([`RECORDS`]).
+    fn record(suite: &str) -> &'static str {
+        match RECORDS.iter().find(|(name, _)| *name == suite) {
+            Some((_, record)) => record,
+            None => panic!(
+                "{suite}: no record is compiled in for this build: name the suite in \
+                 `variant!` and in tests/record-evidence.sh, then record it with \
+                 {RECORD_FACTORS}=1"
+            ),
+        }
+    }
+
+    /// What the ratchet does with a suite's measured ratios: rewrite its
+    /// record under this configuration, or check them against the record
+    /// given.
+    enum Ratchet<'r> {
+        Record(String),
+        Check(&'r str),
+    }
 
     /// One dimension of a [`ResourceBound`], each composed under its own
     /// rule: work and requests summed, the peak the most held at once,
@@ -2263,49 +2334,51 @@ pub(crate) mod places {
             }
             assert!(self.texts.is_empty(), "{:#?}", self.texts);
             let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tightness");
-            let recording = std::env::var_os(RECORD_FACTORS).is_some();
+            let mode = if std::env::var_os(RECORD_FACTORS).is_some() {
+                Ratchet::Record(configuration().unwrap_or_else(|| {
+                    panic!("recording requires {CONFIGURATION}, which the flake's shells export")
+                }))
+            } else {
+                Ratchet::Check(record(self.suite))
+            };
             ratchet(
                 &format!("{directory}/{}{VARIANT}.txt", self.suite),
                 &measured,
-                recording.then(|| {
-                    configuration().unwrap_or_else(|| {
-                        panic!(
-                            "recording requires {CONFIGURATION}, which the flake's shells export"
-                        )
-                    })
-                }),
+                mode,
             );
         }
     }
 
-    /// The record at `path` against the `measured` ratios, sorted by key:
-    /// rewritten whole under `recording`'s configuration when it is given,
-    /// otherwise compared, any change, unrecorded or no longer measured ratio
-    /// failing with the configurations the record and the run were taken
-    /// under. A record names its configuration on its first line.
-    fn ratchet(path: &str, measured: &[(String, Ratio)], recording: Option<String>) {
+    /// The record of `path` against the `measured` ratios, sorted by key:
+    /// rewritten whole at `path` under the configuration a
+    /// [`Ratchet::Record`] names, or compared with the record a
+    /// [`Ratchet::Check`] gives, any change, unrecorded or no longer measured
+    /// ratio failing with the configurations the record and the run were
+    /// taken under. A record names its configuration on its first line.
+    fn ratchet(path: &str, measured: &[(String, Ratio)], mode: Ratchet<'_>) {
         for (case, ratio) in measured {
             ratio.outcome.admissible(case);
         }
-        if let Some(configuration) = recording {
-            if let Some(directory) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(directory).expect("the record directory is writable");
+        let data = match mode {
+            Ratchet::Record(configuration) => {
+                if let Some(directory) = std::path::Path::new(path).parent() {
+                    std::fs::create_dir_all(directory).expect("the record directory is writable");
+                }
+                let mut data = format!("{CONFIGURATION_LINE}{configuration}\n");
+                for (key, ratio) in measured {
+                    data.push_str(&format!(
+                        "{}\t{}\t{}\t{}\t{key}\n",
+                        ratio.bound,
+                        ratio.used,
+                        ratio.ceiling,
+                        ratio.outcome.name()
+                    ));
+                }
+                publish(path, &data);
+                return;
             }
-            let mut data = format!("{CONFIGURATION_LINE}{configuration}\n");
-            for (key, ratio) in measured {
-                data.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{key}\n",
-                    ratio.bound,
-                    ratio.used,
-                    ratio.ceiling,
-                    ratio.outcome.name()
-                ));
-            }
-            publish(path, &data);
-            return;
-        }
-        let data = std::fs::read_to_string(path)
-            .unwrap_or_else(|error| panic!("{path}: {error}; record it with {RECORD_FACTORS}=1"));
+            Ratchet::Check(data) => data,
+        };
         let mut lines = data.lines();
         let recorded_under = lines
             .next()
@@ -2402,7 +2475,7 @@ pub(crate) mod places {
             ("b bytes".to_string(), ratio(9, 9)),
         ];
         std::fs::write(path, "previous").expect("the previous record");
-        ratchet(path, &measured, Some("toolchain=t std=s".into()));
+        ratchet(path, &measured, Ratchet::Record("toolchain=t std=s".into()));
         assert_eq!(
             std::fs::read_to_string(path).expect("the record"),
             format!(
@@ -2414,10 +2487,12 @@ pub(crate) mod places {
             1,
             "temporary evidence was not removed"
         );
-        ratchet(path, &measured, None);
+        let recorded = || std::fs::read_to_string(path).expect("the record");
+        ratchet(path, &measured, Ratchet::Check(&recorded()));
         let refused = |planted: Vec<(String, Ratio)>| {
             let path = path.to_string();
-            std::panic::catch_unwind(move || ratchet(&path, &planted, None))
+            let data = recorded();
+            std::panic::catch_unwind(move || ratchet(&path, &planted, Ratchet::Check(&data)))
                 .expect_err("a planted change passed the ratchet")
                 .downcast::<String>()
                 .map(|text| *text)
@@ -2476,9 +2551,13 @@ pub(crate) mod places {
 
         let path = std::env::temp_dir().join(format!("dcbor-defect-{}.txt", std::process::id()));
         std::fs::write(&path, "previous evidence").unwrap();
-        for recording in [None, Some("planted configuration".into())] {
+        let previous = std::fs::read_to_string(&path).unwrap();
+        for mode in [
+            Ratchet::Check(&previous),
+            Ratchet::Record("planted configuration".into()),
+        ] {
             let failed = std::panic::catch_unwind(|| {
-                ratchet(path.to_str().unwrap(), &[(case.into(), defect)], recording);
+                ratchet(path.to_str().unwrap(), &[(case.into(), defect)], mode);
             })
             .expect_err("ratchet accepted a defect");
             assert!(message(failed).contains(case));

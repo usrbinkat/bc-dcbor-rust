@@ -138,7 +138,7 @@ DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" tests/reach-map.sh >"$lo
 	cat "$logs/reach.log"
 	exit 1
 }
-DCBOR_RIGOR="$miri_rigor" MIRI_LOG_DIR="$logs/miri-baseline" "${contained[@]}" tests/miri-owned.sh \
+DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" MIRI_LOG_DIR="$logs/miri-baseline" "${contained[@]}" tests/miri-owned.sh \
 	>"$logs/miri-baseline.log" 2>&1 || {
 	cat "$logs/miri-baseline.log"
 	exit 1
@@ -148,7 +148,7 @@ verdict=0
 for domain in "${domains[@]}"; do
 	python3 tests/mutation-evidence.py miri-plan "$logs/$domain/comparison.json" \
 		"$logs/$domain/fast/mutants.out" "$logs/source.sha256" "$logs/reach" "$logs/$domain/miri-plan"
-	DCBOR_RIGOR="$miri_rigor" "${contained[@]}" tests/miri-owned.sh --judge \
+	DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" "${contained[@]}" tests/miri-owned.sh --judge \
 		"$logs/$domain/miri-plan/plan.tsv" "$logs/$domain/miri" "$logs/miri-baseline" \
 		>"$logs/$domain/miri.log" 2>&1 || {
 		cat "$logs/$domain/miri.log"

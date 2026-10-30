@@ -5,11 +5,19 @@
 # target kind, the suite, and an optional test-name filter.
 #
 # `lib` selects the library's test binary by the module path it names;
-# `test` an integration test binary; `abort` an integration test binary whose
+# `test` an integration test binary; `race` an integration test binary whose
+# tests race threads, each run once per seed (tests/gate-common.sh,
+# `miri_seeds`): cross-thread plan retirement against shutdown, a contended
+# queue step, the last worker's handle, and suspended preparations moved
+# between workers; `abort` an integration test binary whose
 # ignored tests each end their own process by aborting, run one at a time
 # and required to abort (natively by SIGABRT, under Miri by its abnormal
-# termination, with no undefined behavior reported). A filter is libtest's:
-# it selects every test whose name contains it.
+# termination, with no undefined behavior reported). A filter names one test
+# by its full path, or a module whose tests it selects (`a::b`, or `a::b::`).
+# libtest matches any substring; the gate keeps only the tests a line names
+# (tests/gate-common.sh, `names_test`), so every test the gate runs has a
+# line naming it. Every line is listed, and must name a test, before any
+# test runs.
 #
 # The filters keep the resumable suite to the code whose unsafe operations
 # are under test: the Slot cursors of BTreeMap, Map and symbolic CBOR; and
@@ -23,13 +31,15 @@ all-features lib bounded::decode::construction::in_place
 all-features test owned_input
 all-features test owned_inspection
 all-features test owned_decode
-all-features test owned_physical_failure terminal_tree_cleanup
+all-features test owned_physical_failure terminal_tree_cleanup_allocates_nothing_in_either_drop_order
 all-features test owned_btree
 all-features test owned_lifecycle_matrix
 all-features test owned_pipeline_matrix
-all-features test owned_pipeline_interleavings
+all-features test owned_pipeline_interleavings retiring_each_preparation_boundary_preserves_other_operations
+all-features race owned_pipeline_interleavings cross_thread_plan_retirement_races_with_shutdown_without_double_release
+all-features race owned_pipeline_interleavings suspended_entry_cursors_and_texts_transfer_between_workers
 all-features test owned_public_contract
-all-features test owner_concurrency
+all-features race owner_concurrency
 all-features test optional_admission
 all-features test reclamation_owner
 all-features test typed_lifecycle_floor
@@ -81,6 +91,8 @@ all-features test bounded_bounds an_unrepresentable_bound_is_refused
 all-features test encode convert_hash_map
 all-features test encode convert_btree_map
 all-features test encode encode_map
+all-features test encode encode_map_misordered
+all-features test encode encode_map_with_map_keys
 all-features test format format_map
 all-features test numeric_profile noncanonical_nan_payloads_encode_as_the_canonical_nan
 all-features test resumable_contract schedules::writer_refusals_preserve_literal_prefix_guards_and_plan_ownership
@@ -96,6 +108,7 @@ all-features test resumable_contract tests::real_capacity_exhaustion_is_distinct
 all-features test resumable_contract derive::derived_unit_and_newtype_resume_without_schema_replay
 all-features test resumable_contract derive::derived_nested_fields_resume_at_every_admission_without_reconstruction
 all-features test resumable_contract hash_map_schema::hash_map_deleted_buckets_encode_literal_output_after_every_refusal
+all-features test resumable_contract std_hash_map_schema::hash_map_deleted_buckets_encode_literal_output_after_every_refusal
 all-features test resumable_contract schema_encoding::many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes
 all-features test resumable_contract text_progress::actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_point
 # Code the all-features build never compiles: the stock collections' entry

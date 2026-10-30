@@ -66,6 +66,10 @@ struct Module {
     unsafe_tokens: bool,
     /// The macros its own code invokes, by name.
     invoked: BTreeSet<String>,
+    /// The statics its own code defines outside its test-only items, a
+    /// function's included, by name and line; a `thread_local!` as
+    /// `thread_local!`.
+    statics: Vec<(String, usize)>,
 }
 
 /// What one walk found: every module, the macros of the crate whose
@@ -83,6 +87,9 @@ struct Scanned {
     unsafe_tokens: bool,
     invoked: BTreeSet<String>,
     unsafe_macros: BTreeSet<String>,
+    /// Each `static` item defined (the `'static` lifetime is no item), by
+    /// name and line, and each `thread_local!`.
+    statics: Vec<(String, usize)>,
 }
 
 impl Scanned {
@@ -96,10 +103,33 @@ impl Scanned {
                     if name == "unsafe" {
                         self.unsafe_tokens = true;
                     }
+                    if name == "static" {
+                        let lifetime = at
+                            .checked_sub(1)
+                            .and_then(|before| trees.get(before))
+                            .is_some_and(|before| {
+                                matches!(before, TokenTree::Punct(punct) if punct.as_char() == '\'')
+                            });
+                        let mut next = at + 1;
+                        if matches!(trees.get(next), Some(TokenTree::Ident(word)) if word == "mut")
+                        {
+                            next += 1;
+                        }
+                        if let (false, Some(TokenTree::Ident(defined))) =
+                            (lifetime, trees.get(next))
+                        {
+                            self.statics
+                                .push((defined.to_string(), ident.span().start().line));
+                        }
+                    }
                     let bang = matches!(trees.get(at + 1), Some(TokenTree::Punct(punct))
                         if punct.as_char() == '!' && punct.spacing() == Spacing::Alone);
                     if !bang {
                         continue;
+                    }
+                    if name == "thread_local" {
+                        self.statics
+                            .push(("thread_local!".to_string(), ident.span().start().line));
                     }
                     if name == "macro_rules" {
                         // A definition: `macro_rules! name { body }`.
@@ -168,6 +198,7 @@ impl Census {
             test_items: Vec::new(),
             unsafe_tokens: false,
             invoked: BTreeSet::new(),
+            statics: Vec::new(),
         });
         let mut own = Scanned::default();
         let mut nested: Vec<&ItemMod> = Vec::new();
@@ -192,10 +223,20 @@ impl Census {
             }
         }
         self.unsafe_macros.extend(own.unsafe_macros);
+        let statics = own
+            .statics
+            .into_iter()
+            .filter(|(_, line)| {
+                !test_items
+                    .iter()
+                    .any(|&(start, end)| start <= *line && *line <= end)
+            })
+            .collect();
         let record = &mut self.modules[index];
         record.unsafe_tokens = own.unsafe_tokens;
         record.invoked = own.invoked;
         record.test_items = test_items;
+        record.statics = statics;
         for module in nested {
             let name = module.ident.to_string();
             let child_path = format!("{module_path}::{name}");
@@ -481,6 +522,84 @@ fn every_unsafe_trust_boundary_of_this_crate_is_found() {
     if let Some(output) = std::env::var_os(OUTPUT) {
         fs::write(PathBuf::from(output), census.json()).expect("the census output is writable");
     }
+}
+
+/// The statics of shipped code, every module and item compiled outside
+/// `cfg(test)`, by module path and name.
+fn shipped_statics(census: &Census) -> Vec<(String, String)> {
+    census
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| !census.test(index))
+        .flat_map(|(_, module)| {
+            module
+                .statics
+                .iter()
+                .map(|(name, _)| (module.path.clone(), name.clone()))
+        })
+        .collect()
+}
+
+/// No shipped code keeps state in a static but the tag registry. Miri
+/// reports memory still allocated when a run ends only when no static
+/// reaches it, so an allocation a static holds is a leak no Miri run can
+/// see. The one static is `crate::tags::GLOBAL_TAGS`, the process-wide
+/// registry of tag names the symbolic API's diagnostics read
+/// (`with_tags!`, `diag.rs`, `dump.rs`): it holds what callers register, for
+/// the process's life, by design, and no code of `crate::bounded` reaches
+/// it. A static added anywhere else, a function's included, or a
+/// `thread_local!`, fails here until it is declared with its reason.
+#[test]
+fn no_shipped_static_holds_state_but_the_tag_registry() {
+    let census = census(Path::new(env!("CARGO_MANIFEST_DIR")));
+    assert!(census.tree.faults.is_empty(), "{:#?}", census.tree.faults);
+    assert_eq!(
+        shipped_statics(&census),
+        vec![("crate::tags".to_string(), "GLOBAL_TAGS".to_string())],
+        "a shipped static that is not declared: Miri cannot report a leak it holds"
+    );
+}
+
+/// The static scan's pass and fail scenarios: a static at module level, one
+/// inside a function, a `static mut` and a `thread_local!` are found; the
+/// `'static` lifetime, a static of a test-only module and a test-only item
+/// of a shipped module are not.
+#[test]
+fn the_static_scan_finds_every_shipped_static_and_nothing_else() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("static_census_tree");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("the previous fixture tree is removable");
+    }
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("the fixture tree is writable");
+    fs::write(
+        src.join("lib.rs"),
+        "pub static TABLE: [u8; 2] = [1, 2];\n\
+         pub fn named(text: &'static str) -> &'static str {\n\
+             static NEXT: u8 = 0;\n\
+             let _ = NEXT;\n\
+             text\n\
+         }\n\
+         static mut COUNT: u8 = 0;\n\
+         std::thread_local! { static DEPTH: u8 = const { 0 }; }\n\
+         #[cfg(test)]\nmod checks { static PROBE: u8 = 0; }\n\
+         #[cfg(test)]\nstatic FIXTURE: u8 = 0;\n",
+    )
+    .expect("the fixture tree is writable");
+    let scanned = census(&root);
+    assert!(scanned.tree.faults.is_empty(), "{:#?}", scanned.tree.faults);
+    let found = |name: &str| ("crate".to_string(), name.to_string());
+    assert_eq!(
+        shipped_statics(&scanned),
+        vec![
+            found("TABLE"),
+            found("NEXT"),
+            found("COUNT"),
+            found("thread_local!"),
+            found("DEPTH"),
+        ]
+    );
 }
 
 /// Where `source`, one file's text, names `miri` in a `cfg`: in `cfg(..)`,

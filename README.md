@@ -293,16 +293,21 @@ In the fork-enabled development shell:
 ```sh
 cargo test --workspace --all-features
 DCBOR_RIGOR=exhaustive cargo test --workspace --all-features
-bash tests/miri-owned.sh
+DCBOR_REACH_DIR=<reach directory> bash tests/reach-map.sh
+DCBOR_REACH_DIR=<reach directory> MIRI_LOG_DIR=<log directory> bash tests/miri-owned.sh
 ```
 
 Fast rigor is the default: every admission is refused once and resumed,
 every physical request is failed, and stops are reduced only by certified
 cleanup classes. Exhaustive additionally replays each refusal and each stop
 independently and checks the reductions. Both use the same oracles.
-The Miri gate runs both aliasing models with strict provenance and compares
-its reached class inventory with native execution of the same selections.
-It requires `MIRI_LOG_DIR` or `TMPDIR`: its log directory.
+The Miri gate runs both aliasing models with strict provenance, symbolic
+alignment checks and host isolation, and compares its reached class
+inventory with native execution of the same selections. It requires a
+passing reach map of the same source (`DCBOR_REACH_DIR`), checked before
+anything runs, and `MIRI_LOG_DIR` or `TMPDIR`, its log directory; it lists
+every selection line before running any, and publishes each test's outcome
+per aliasing model and build domain in `results.tsv`.
 
 `run_tests.sh` runs the stable feature matrix; its exhaustive mode also
 checks the fast feature-selection assumptions. [tests/BOUNDED.md](tests/BOUNDED.md)

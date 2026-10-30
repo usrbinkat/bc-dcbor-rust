@@ -25,34 +25,79 @@ snapshot() {
 # from standard input.
 identity() {
 	local logs="$1"
-	: "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 	{
-		snapshot
-		printf 'configuration\t%s\n' "$DCBOR_CONFIGURATION"
-		# The toolchain's store path: its components (the forked library,
-		# miri, llvm-tools) change it without changing its version.
-		printf 'toolchain\t%s\n' "$(rustc --print sysroot)"
-		rustc -vV
-		cargo -V
+		source_identity || return 1
 		cat
 	} >"$logs/identity-inputs.txt"
 	sha256sum "$logs/identity-inputs.txt" | cut -d' ' -f1 >"$logs/identity.txt"
 }
 
+# What every gate's identity begins with, whatever the gate: the snapshot,
+# the shell's configuration, the toolchain's store path (its components, the
+# forked library, miri, llvm-tools, change it without changing its version),
+# the compiler and Cargo. Two gates' evidence combines only when this part
+# of their identities is equal (`same_source`).
+source_identity() {
+	: "${DCBOR_CONFIGURATION:?run in the configured development shell}"
+	snapshot
+	printf 'configuration\t%s\n' "$DCBOR_CONFIGURATION"
+	printf 'toolchain\t%s\n' "$(rustc --print sysroot)"
+	rustc -vV
+	cargo -V
+}
+
+# Whether the gate whose logs are `$1` ran over this source and toolchain:
+# its identity's inputs begin with exactly this `source_identity`.
+same_source() {
+	local current lines
+	current="$(source_identity)" || return 1
+	lines="$(wc -l <<<"$current")"
+	[[ -s "$1/identity-inputs.txt" ]] &&
+		[[ "$(head -n "$lines" "$1/identity-inputs.txt")" == "$current" ]]
+}
+
+# Host isolation stays on: entropy, the environment and clocks are Miri's
+# deterministic emulation, its entropy drawn from the seed's RNG, so a run is
+# a function of its inputs and its seed. Disabling isolation would hand the
+# interpreted test the host's randomness (std's `RandomState`, so every
+# hash map's layout), its clock and its whole environment, and would make
+# `-Zmiri-env-forward` a no-op. No selected test reads a file: the one
+# recorded oracle a selected test reads, a tightness family's record
+# (`tests/data/tightness`), is compiled in (`src/bounded.rs`, `variant!`).
+#
 # Miri forwards one variable per flag: a comma-separated list would name a
 # single variable that does not exist, and each would silently fall back to
 # its default inside the interpreter. DCBOR_RIGOR selects the verification
 # layer, DCBOR_CLASS_COVERAGE the class inventory, DCBOR_WITNESS the witness
-# sizes; every one is forwarded, so the interpreted test runs what the
-# native one runs. Isolation is disabled (`IsolatedOp::Allow`, Miri's
-# `-Zmiri-disable-isolation`) for the same reason: a test whose oracle is a
-# recorded file (the tightness families, `tests/data/tightness`) reads it
-# under Miri as it does natively, where isolation would end the run as an
-# unsupported `open` before any assertion.
-MIRI_STRICT="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-env-forward=DCBOR_RIGOR -Zmiri-env-forward=DCBOR_CLASS_COVERAGE -Zmiri-env-forward=DCBOR_WITNESS"
+# sizes; each is forwarded, and nothing else of the host's environment is
+# visible.
+#
+# Alignment is checked symbolically: against the alignment each allocation
+# was requested with and the offset into it, not the integer address, which
+# can satisfy an alignment by chance. Cursors stored in a `Slot`'s inline
+# bytes, and values placed in records and metadata blocks, are checked
+# against the alignment their storage guarantees.
+MIRI_STRICT="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-env-forward=DCBOR_RIGOR -Zmiri-env-forward=DCBOR_CLASS_COVERAGE -Zmiri-env-forward=DCBOR_WITNESS"
 
 # The aliasing models every Miri verdict is given under.
 MIRI_MODELS=(stacked tree)
+
+# The seeds a `race` suite's tests run under, one Miri process each
+# (`-Zmiri-seed`): the seed's RNG picks the thread schedule (preemption at
+# basic-block ends, the next thread when one blocks), allocation addresses
+# and weak-memory outcomes, so each seed is one schedule explored. One run
+# is one execution; a race test's claim rests on as many as are run here,
+# not on every interleaving. DCBOR_MIRI_SEEDS, a positive count, 64 by
+# default (the range Miri's own `-Zmiri-many-seeds` defaults to); the seeds
+# are 0 through one less.
+miri_seeds() {
+	local count="${DCBOR_MIRI_SEEDS:-64}"
+	if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+		printf 'DCBOR_MIRI_SEEDS=%s: a positive number of seeds\n' "$count" >&2
+		return 2
+	fi
+	seq 0 $((count - 1))
+}
 
 # One progress line of a gate, on standard output: a timestamp, then the
 # event (PLAN, BUILD, BUILT, START, PASS, FAIL, DONE) and its subject, so a
@@ -118,9 +163,11 @@ domain_features() {
 }
 
 # Each suite of tests/miri-suites.txt: calls `$1` with the suite, its base
-# name (unique across domains), its filter, its kind (`test` or `abort`), its
-# domain, then its cargo selection, the domain's features first. Unknown
-# domains and targets are refused.
+# name (unique across domains), its filter, its kind (`test`, `race` or
+# `abort`), its domain, then its cargo selection, the domain's features
+# first. A `race` suite is an integration test binary whose tests race
+# threads: Miri runs each once per seed (`miri_seeds`), each seed a schedule
+# of its own. Unknown domains and targets are refused.
 each_suite() {
 	local callback="$1" domain target suite filter base kind features
 	local selection
@@ -139,6 +186,10 @@ each_suite() {
 			selection=("${features[@]}" --test "$suite")
 			kind="test"
 			;;
+		race)
+			selection=("${features[@]}" --test "$suite")
+			kind="race"
+			;;
 		abort)
 			selection=("${features[@]}" --test "$suite")
 			kind="abort"
@@ -155,40 +206,69 @@ each_suite() {
 	done <tests/miri-suites.txt
 }
 
+# Whether test `$2` is one a selection line of filter `$1` names: the test
+# itself, or a test of the module it names (`a::b` names `a::b::c`; a filter
+# ending in `::` names that module's tests). libtest's filter matches any
+# substring, so `hash_map_schema::t` also matches `std_hash_map_schema::t`; a
+# line selects only what it names.
+names_test() {
+	local filter="$1" test="$2"
+	case "$filter" in
+	'') return 0 ;;
+	*::) [[ "$test" == "$filter"* ]] ;;
+	*) [[ "$test" == "$filter" || "$test" == "$filter::"* ]] ;;
+	esac
+}
+
 # The tests of kind `$3` suite selection `$4...` runs under Miri, by full
-# name, narrowed by filter `$2`, written to `$1`, nonempty. Of kind `test`,
-# those Miri ignores are excluded (a `cfg_attr(miri, ignore)` drops out
-# here); of kind `abort`, the ignored tests are the scenarios, each ending its
-# own process. Listing runs in the interpreter, so it is Miri's own view of
-# the suite.
+# name, narrowed by filter `$2` to the tests it names (`names_test`), written
+# to `$1`, nonempty. A test the filter matches only as a substring of its
+# name is dropped from this line, and written to `$1.unnamed`: a test the gate
+# runs has a line naming it. Of kind `test`, those Miri ignores are excluded
+# (a `cfg_attr(miri, ignore)` drops out here); of kind `abort`, the ignored
+# tests are the scenarios, each ending its own process. Listing runs in the
+# interpreter, so it is Miri's own view of the suite.
 listed_under_miri() {
-	local out="$1" filter="$2" kind="$3" all ignored
+	local out="$1" filter="$2" kind="$3" all ignored listed test
 	shift 3
 	local narrowed=() miri_cmd
 	if [[ -n "$filter" ]]; then narrowed=("$filter"); fi
 	miri_command || return 2
 	ignored="$(MIRIFLAGS="$(miri_flags stacked)" "${miri_cmd[@]}" "$@" -- "${narrowed[@]}" --ignored --list --format terse 2>>"$out.err")" || return 1
 	case "$kind" in
-	test)
+	test | race)
 		all="$(MIRIFLAGS="$(miri_flags stacked)" "${miri_cmd[@]}" "$@" -- "${narrowed[@]}" --list --format terse 2>>"$out.err")" || return 1
-		LC_ALL=C comm -23 \
+		listed="$(LC_ALL=C comm -23 \
 			<(sed -n 's/: test$//p' <<<"$all" | LC_ALL=C sort) \
-			<(sed -n 's/: test$//p' <<<"$ignored" | LC_ALL=C sort) >"$out"
+			<(sed -n 's/: test$//p' <<<"$ignored" | LC_ALL=C sort))"
 		;;
-	abort) sed -n 's/: test$//p' <<<"$ignored" | LC_ALL=C sort >"$out" ;;
+	abort) listed="$(sed -n 's/: test$//p' <<<"$ignored" | LC_ALL=C sort)" ;;
 	*)
 		printf 'unknown suite kind: %s\n' "$kind" >&2
 		return 2
 		;;
 	esac
-	[[ -s "$out" ]]
+	: >"$out"
+	: >"$out.unnamed"
+	while IFS= read -r test; do
+		[[ -z "$test" ]] && continue
+		if names_test "$filter" "$test"; then
+			printf '%s\n' "$test" >>"$out"
+		else
+			printf '%s\n' "$test" >>"$out.unnamed"
+		fi
+	done <<<"$listed"
+	if [[ ! -s "$out" ]]; then
+		printf 'the line of filter %s names no test this suite runs under Miri\n' "${filter:-(none)}" >>"$out.err"
+		return 1
+	fi
 }
 
 # The libtest arguments that select test `$2` of a suite of kind `$1`: an
 # abort scenario is an ignored test.
 selecting() {
 	case "$1" in
-	test) printf '%s\n' --exact "$2" ;;
+	test | race) printf '%s\n' --exact "$2" ;;
 	abort) printf '%s\n' --ignored --exact "$2" ;;
 	*)
 		printf 'unknown suite kind: %s\n' "$1" >&2

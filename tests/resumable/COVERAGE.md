@@ -149,16 +149,49 @@ run every target. Toolchain and execution commands are in `fuzz/README.md`.
 ## Miri
 
 `../miri-owned.sh` runs the selection in `../miri-suites.txt` under Miri,
-each test in a Miri process of its own, under strict provenance and both
+each test in a Miri process of its own, under strict provenance, symbolic
+alignment checks, host isolation (no file, clock, entropy or environment of
+the host; the variables the gate sets forwarded one by one) and both
 Stacked and Tree Borrows: the owned suites, `reclamation_owner`, the
 ordered-collection schemas and storage cursor of `resumable_contract`, the
 abort witnesses in both domains, and the tests chosen to reach what those
-do not. The union of the classes each model's runs reach must equal the
-native run's: a class the native run reaches and Miri does not is a missed
-unsafe transition. `../reach-map.sh` holds the selection to its target:
-every function of a module holding `unsafe`, outside test code, reached by
-some test Miri runs, and the minimal witness sizes Miri runs executing every
-region the full sizes do.
+do not. Every selection line is listed before any test runs and must name
+a test, by its full path or its module; no test is named twice. The tests
+that race threads (`race` lines) run once per seed, each seed one schedule.
+The union of the classes each model's runs reach must equal the native
+run's: a class the native run reaches and Miri does not is a missed unsafe
+transition. The gate publishes, per test, model, domain and seed, its
+outcome class (`pass`, `undefined_behavior`, `unsupported`, `failed`,
+`not_run`), seconds and peak memory in `results.tsv`, under its identity.
+
+`../reach-map.sh` holds the selection to its target: every function of a
+module holding `unsafe`, outside test code, reached by some test Miri runs,
+and the minimal witness sizes Miri runs executing every region the full
+sizes do. The gate refuses to run without a passing map of the same source
+and toolchain (`DCBOR_REACH_DIR`): set cover chose the fewest tests, so a
+map of other source says nothing of this one.
+
+Miri runs the fast layer: one stop of each kind per certified cleanup class,
+and every stop at an unclassified boundary. That one member stands for its
+class rests on these premises, each checked natively and not under Miri:
+
+- a class keeps everything a state's cleanup reads (`tests/support/classes.rs`;
+  each binding's declared reduction certified a simulation of cleanup over
+  every reached state, `support::certified`);
+- in the exhaustive layer, every member of each class cleans up with exactly
+  its first member's admitted calls (`support::agree`), on the fixtures and
+  sizes the suites enumerate.
+
+So two members of a class take the same cleanup units over the same
+custody, and differ only in what cleanup never reads. A defect on a path
+that reads such a quantity is a path cleanup takes, which the certification
+would have separated into classes of their own. What the premises leave
+open: a member whose difference matters only beyond the enumerated
+fixtures and sizes; and undefined behavior in construction, which the
+fast layer reaches at every admission by its one-pass refusal but stops
+at only one member per class. The exhaustive evidence counts only when it
+ran on the same source and toolchain as the Miri gate (`gate-common.sh`,
+`same_source`).
 
 ## Resource bounds
 

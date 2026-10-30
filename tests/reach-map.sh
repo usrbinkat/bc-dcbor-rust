@@ -50,6 +50,8 @@ for tool in cargo cargo-llvm-cov rustc python3 sha256sum; do
 done
 out="${DCBOR_REACH_DIR:-$(mktemp -d "$TMPDIR/dcbor-reach.XXXXXX")}"
 mkdir -p "$out"
+# A verdict left by an earlier map in this directory is not this one's.
+rm -f "$out/verdict"
 echo "reach map: $out"
 rigor="${DCBOR_RIGOR:-fast}"
 case "$rigor" in
@@ -147,7 +149,7 @@ reach_test() {
 	DCBOR_WITNESS="$sizes" LLVM_PROFILE_FILE="$raw/$index-%p%c.profraw" "$exe" "${select[@]}" \
 		--nocapture --test-threads=1 >"$raw/$index.log" 2>&1 || status=$?
 	case "$kind:$status" in
-	test:0 | abort:134) ;;
+	test:0 | race:0 | abort:134) ;;
 	*)
 		event "FAIL $base $test $sizes: status $status uninterpreted, instrumented ($((SECONDS - started))s, $raw/$index.log)"
 		exit 1
@@ -189,4 +191,8 @@ each_suite reach_suite
 
 event "INDEX $out/reach.json"
 python3 tests/reach-map.py index "$out" "${bases[@]}"
+# Written only once the index passes both its checks (`set -e`): the Miri
+# gate takes a reach map as its selection's evidence only by this verdict
+# and its source identity (tests/miri-owned.sh).
+echo pass >"$out/verdict"
 event "DONE reach map: $out/reach.json"
