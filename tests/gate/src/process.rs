@@ -186,6 +186,20 @@ fn run_once(
     Ok((termination, text, seconds, peak))
 }
 
+/// The value a run printed after `marker` and a tab, on the first line that
+/// holds them. Under `--nocapture` libtest writes `test <name> ... ` before
+/// a test's own output on the same line, so a marker is found where it
+/// stands in its line, never only at the line's start; the tab keeps one
+/// marker from matching another it begins (`DCBOR_MODEL` and
+/// `DCBOR_MODEL_SCHEDULES`).
+fn marked<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let marker = format!("{marker}\t");
+    text.lines().find_map(|line| {
+        line.find(&marker)
+            .map(|at| line[at + marker.len()..].trim_end())
+    })
+}
+
 /// Whether `listed` runs on a sized stack, by its runner's own description.
 pub fn sized(executable: &Path, listed: &Listed, log: &Path) -> Result<bool, String> {
     let (termination, text, _, _) = run_once(
@@ -194,11 +208,7 @@ pub fn sized(executable: &Path, listed: &Listed, log: &Path) -> Result<bool, Str
         &[(DESCRIBE, "1".to_string())],
         log,
     )?;
-    let description = text.lines().find_map(|line| {
-        line.strip_prefix(DESCRIPTION)
-            .and_then(|rest| rest.strip_prefix('\t'))
-    });
-    match (termination, description) {
+    match (termination, marked(&text, DESCRIPTION)) {
         (Termination::Exited(0), Some("sized")) => Ok(true),
         (Termination::Exited(0), Some("unsized")) => Ok(false),
         _ => Err(format!(
@@ -227,15 +237,39 @@ pub fn run(
     }
     let (termination, text, seconds, peak_kb) =
         run_once(executable, &listed.test, &environment, log)?;
-    let schedules = text.lines().find_map(|line| {
-        line.strip_prefix(SCHEDULES)
-            .and_then(|rest| rest.strip_prefix('\t'))
-            .and_then(|count| count.parse().ok())
-    });
+    let schedules = marked(&text, SCHEDULES).and_then(|count| count.parse().ok());
     Ok(Ran {
         outcome: outcome::model(listed.checker, termination, &text),
         schedules,
         seconds,
         peak_kb,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DESCRIPTION, SCHEDULES, marked};
+
+    /// A marker is found where libtest leaves it, after the test's name on
+    /// its line, and at a line's start; each marker reads only its own
+    /// line, not one it begins; no marker, no value.
+    #[test]
+    fn a_marker_is_found_where_libtest_leaves_it_and_nothing_else() {
+        let described = "\nrunning 1 test\n\
+                         test sync::models::loom_models::contended_queue_step::workers_1 ... \
+                         DCBOR_MODEL\tunsized\nok\n";
+        assert_eq!(marked(described, DESCRIPTION), Some("unsized"));
+        assert_eq!(marked(described, SCHEDULES), None);
+        let explored = "running 1 test\n\
+                        test sync::models::shuttle_models::contended_queue_step::workers_5 ... \
+                        DCBOR_MODEL_SCHEDULES\t120\nok\n";
+        assert_eq!(marked(explored, SCHEDULES), Some("120"));
+        assert_eq!(
+            marked(explored, DESCRIPTION),
+            None,
+            "a schedule count is no description"
+        );
+        assert_eq!(marked("DCBOR_MODEL\tsized\n", DESCRIPTION), Some("sized"));
+        assert_eq!(marked("test x ... ok\n", DESCRIPTION), None);
+    }
 }

@@ -59,11 +59,12 @@ logs="${CONCURRENCY_LOG_DIR:-${TMPDIR:?required, or CONCURRENCY_LOG_DIR: the gat
 mkdir -p "$logs" || exit 2
 
 # The environment of every run: nothing a checker or the runner reads
-# besides what the gate sets per row.
-for name in $(compgen -e); do
-	case "$name" in
-	LOOM_* | SHUTTLE_* | DCBOR_MODEL_*) unset "$name" ;;
-	esac
+# besides what the gate sets per row. The names are the shell's own prefix
+# expansion (`${!prefix@}`), which every bash has; `compgen` exists only in
+# a bash built with programmable completion, which the development shell's
+# is not.
+for name in "${!LOOM_@}" "${!SHUTTLE_@}" "${!DCBOR_MODEL_@}"; do
+	unset "$name"
 done
 export RUST_BACKTRACE=0
 page="$(getconf PAGESIZE)" || exit 2
