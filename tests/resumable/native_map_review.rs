@@ -18,39 +18,48 @@ use hashbrown::HashTable;
 /// completes, every control byte charged once.
 #[test]
 fn vacant_bucket_batches_retain_exact_positions_and_bound_total_steps() {
-    let mut table = HashTable::<u64>::with_capacity(1_000_000);
+    let mut table = HashTable::<(u64, u64)>::with_capacity(1_000_000);
     let buckets = table.num_buckets();
     let last = buckets as u64 - 1;
     // Hashed to itself: its home bucket is the last, free as it is inserted.
-    table.insert_unique(last, last, |value| *value);
-    assert_eq!(table.get_bucket(buckets - 1), Some(&last));
-    let mut cursor = BucketCursor::new(&table);
+    table.insert_unique(last, (last, last), |pair| pair.0);
+    assert_eq!(table.get_bucket(buckets - 1), Some(&(last, last)));
+    let mut cursor = BucketCursor::new();
     let mut m = meter();
     for start in (0..buckets).step_by(64) {
         let call = m.attempts();
         refuse(&mut m, Refusal::For(call, LimitRefusal::Work));
         assert!(matches!(
-            cursor.step_batch(&mut m),
+            cursor.step(&table, &mut m),
             Err(BoundedError::Refused(LimitRefusal::Work))
         ));
         assert_eq!(m.first_refusal(), Some((call, LimitRefusal::Work)));
         assert_eq!(cursor.position(), start);
+        assert_eq!(cursor.held(), 0, "a refused window's credit was kept");
         m.fail_call(None);
         m.turn();
-        let expected = if start + 64 >= buckets {
-            BucketStep::Entry {
-                index: buckets - 1,
-                value: &last,
+        match cursor.step(&table, &mut m).unwrap() {
+            BucketStep::Entry { index, .. } => {
+                assert!(start + 64 >= buckets, "an entry before the last window");
+                assert_eq!(index, buckets - 1);
             }
-        } else {
-            BucketStep::Vacant { index: start }
-        };
-        assert_eq!(cursor.step_batch(&mut m).unwrap(), expected);
+            BucketStep::Vacant { index } => {
+                assert!(start + 64 < buckets, "the last window yielded no entry");
+                assert_eq!(index, start);
+            }
+            BucketStep::Complete | BucketStep::Finished => {
+                panic!("the enumeration ended before its entry")
+            }
+        }
         assert_eq!(cursor.position(), (start + 64).min(buckets));
     }
+    // Every control admitted once, one value per window.
     assert_eq!(m.used().bytes, buckets as u64);
     assert_eq!(m.used().values, buckets.div_ceil(64) as u64);
-    assert_eq!(cursor.step_batch(&mut m).unwrap(), BucketStep::Complete);
+    assert!(matches!(
+        cursor.step(&table, &mut m),
+        Ok(BucketStep::Complete)
+    ));
 }
 
 #[test]
@@ -140,9 +149,8 @@ fn root_map_is_permuted_in_place_and_published_only_once_canonical() {
             }
             self.0
                 .get(index - 1)
-                .map_or(Instruction::End, |(key, value)| Instruction::Entry {
-                    next: index + 1,
-                    entry: Some((key, value)),
+                .map_or(Instruction::End, |(key, value)| {
+                    Instruction::Entry(key, value)
                 })
         }
     }
@@ -259,10 +267,7 @@ impl Schema for Entries {
         }
         self.0
             .get(index - 1)
-            .map_or(Instruction::End, |(k, v)| Instruction::Entry {
-                next: index + 1,
-                entry: Some((k, v)),
-            })
+            .map_or(Instruction::End, |(k, v)| Instruction::Entry(k, v))
     }
 }
 
@@ -330,14 +335,8 @@ impl Schema for Nested {
     fn instruction(&self, index: usize) -> Instruction<'_> {
         match index {
             0 => Instruction::UnorderedMap,
-            1 => Instruction::Entry {
-                next: 2,
-                entry: Some((if self.1 { &1u64 } else { &0u64 }, self.0.as_ref())),
-            },
-            2 if self.1 => Instruction::Entry {
-                next: 3,
-                entry: Some((&0u64, &0u64)),
-            },
+            1 => Instruction::Entry(if self.1 { &1u64 } else { &0u64 }, self.0.as_ref()),
+            2 if self.1 => Instruction::Entry(&0u64, &0u64),
             _ => Instruction::End,
         }
     }

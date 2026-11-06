@@ -5,7 +5,10 @@ pub(super) fn expand(schema: &Schema<'_>, fields: &syn::FieldsNamed) -> TokenStr
 }
 
 /// The field engine's cost over fields of `types`, in key order, whose field
-/// state is `field`, under allocator `a` (`in_place::fields::cost`).
+/// state is `field`, under allocator `a` (`in_place::fields::cost`), its
+/// composition checked and unwrapped in a constant (`dcbor::const_cost!`):
+/// a record whose cost does not fit in `u64` fails to compile where it is
+/// first used with a concrete allocator.
 pub(super) fn cost(
     types: &[&syn::Type],
     positional: bool,
@@ -13,10 +16,10 @@ pub(super) fn cost(
     a: &Ident,
 ) -> TokenStream2 {
     quote! {
-        dcbor::bounded::decode::construction::in_place::fields::cost::<#field, <#a as dcbor::bounded::Allocator>::Permit>(
+        dcbor::const_cost!(dcbor::bounded::decode::construction::in_place::fields::cost::<#field, <#a as dcbor::bounded::Allocator>::Permit>(
             #positional,
             &[#(<#types as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::COST),*],
-        )
+        ))
     }
 }
 

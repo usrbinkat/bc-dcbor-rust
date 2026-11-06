@@ -135,11 +135,58 @@ removes those orphan records after publication. Records with another
 configuration header or an unrecognized header are preserved; this run cannot
 qualify or prune them. Captured logs remain in the staging directory.
 
-`tests/record_evidence_test.py` exercises publication, failed-leg preservation,
-identity collisions, orphan detection/removal, preservation of foreign and
-unrecognized records, read-only checking of missing records, isolation from
-inherited trace and tightness recording flags, and resumption (reuse of a
+The recorder is the gate tool's (`tests/gate`, `costs`; the script launches
+`gate costs`). Its tests (`cargo test -p dcbor-gate costs::`) exercise
+publication, failed-leg preservation, identity collisions, orphan
+detection/removal, preservation of foreign and unrecognized records,
+read-only checking of missing records, isolation from inherited trace and
+tightness recording flags and minimal witnesses, and resumption (reuse of a
 completed leg, and rejection of a changed configuration, a missing staged
-record, or a log/inventory mismatch) using fake Cargo in a temporary tree.
-These controls validate recorder behavior, not the measured matrix costs;
-real eight-leg recording and checking remain separate qualification.
+record, or a log/inventory mismatch) with a fake leg runner in a temporary
+tree. These controls validate recorder behavior, not the measured matrix
+costs; real eight-leg recording and checking remain separate qualification.
+
+## Model bounds
+
+`model-bounds.txt` is a record of every model a checker build runs
+(`src/sync/models.rs`, and the baselines' entry point in
+`tests/resumable/native_traces.rs`): its least bound (loom's branch
+capacity, shuttle's step bound), its least stack in bytes where it runs on a
+sized one, and the schedules shuttle's exhaustive search explores. After its
+configuration line it tags the build profile and the page size its stacks
+are multiples of. Its rows are defined once (`tests/model-bounds`), read by
+the model runner (`tests/support/model.rs`) and derived, written and
+verified by the gate (`tests/gate`). `bash tests/concurrency-models.sh
+derive` searches each value upward across processes and rewrites the record:
+a change states its cause, the protocol or the toolchain that moved a count.
+`bash tests/concurrency-models.sh gate` runs each model at its recorded
+values, one under each, and the planted controls, on copies of a clean
+commit.
+
+## Planted controls
+
+`controls/` holds diffs a gate applies to show that one of its checks fails
+on the defect the diff plants (`tests/gate-common.sh`, `apply_diff DIFF
+DIR`). The concurrency gate applies each to a copy of the commit it judges,
+never to the checkout. Each is an exact `-p0` diff against the source it
+plants into: a change to those lines makes it fail to apply, and the gate
+fails.
+
+`relaxed-publication.patch` makes the decode scope queue's link store, the
+publication of every record queued behind another, `Relaxed`
+(`tests/concurrency-models.sh`). loom must refuse it with a causality
+violation on the record's custody in one of its models: a record reached
+through that link alone is read without its retiring thread's writes
+ordered before the read.
+
+`substituted-write.patch` and `substituted-block.patch` each read one of a
+block's two contract quantities from the build's own atomics family instead
+of its production representation (`stable.rs`, `Contract::of`, the one
+definition every block's charge and cost read): the leak I3 forbids, the
+charge varying with the build. Both run under loom and under shuttle. A
+substituted write makes the scope's and the record's headers exceed the
+quantum, so the checker build must fail to compile with the quantum
+assertion (`write_extent`). A substituted block leaves the write within the
+quantum, so the build compiles and the I3 witness
+(`admits_its_production_representation`) must fail on the scope's
+allocation request.

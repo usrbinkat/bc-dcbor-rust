@@ -8,9 +8,7 @@
 #[global_allocator]
 static HEAP: support::heap::Heap = support::heap::Heap;
 
-use dcbor::bounded::decode::construction::in_place::{
-    Built, ConstructionCost, InPlace, plus, times, unit,
-};
+use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace, unit};
 use dcbor::bounded::decode::construction::reclamation::{
     Custody, PeekSlot, Reclaim, Reclaimed, Slot,
 };
@@ -65,9 +63,12 @@ impl Custody for ProbeState {
 unsafe impl<A: Allocator> InPlace<A> for Probe {
     // Build: the address write, four 64-byte units and the final unit;
     // cleanup: four 64-byte units, or one unit before any byte.
-    const COST: ConstructionCost = ConstructionCost::fixed(plus(
-        plus(unit(std::mem::size_of::<usize>()), times(unit(64), 4)),
-        plus(unit(0), times(unit(64), 4)),
+    // Eight 64-byte units in all, four each way, beside the address write
+    // and the empty cleanup unit.
+    const COST: ConstructionCost = ConstructionCost::fixed(dcbor::const_cost!(
+        dcbor::const_cost!(unit(64).checked_mul(8)).checked_add(dcbor::const_cost!(
+            unit(std::mem::size_of::<usize>()).checked_add(unit(0))
+        ))
     ));
 
     #[expect(

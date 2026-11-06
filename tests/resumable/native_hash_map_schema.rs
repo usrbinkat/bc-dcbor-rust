@@ -34,31 +34,33 @@ fn hash_map_deleted_buckets_encode_literal_output_after_every_refusal() {
     prepare_matrix(&map, Ok(&expected));
 }
 
+/// A source can no longer skip bucket controls: `Instruction::Entry` carries
+/// one entry and no index, and only the engine inspects a hash table's
+/// buckets. What a source can still get wrong is offering an entry where no
+/// unordered map takes one: refused, after every refusal schedule, for a
+/// counted field map and an uncounted one.
 #[test]
-fn entry_instruction_cannot_skip_more_than_admitted_controls() {
-    struct InvalidAdvance(usize);
-    impl Schema for InvalidAdvance {
+fn an_entry_offered_to_a_field_map_is_refused() {
+    struct Misplaced(bool);
+    impl Schema for Misplaced {
         fn instruction(&self, index: usize) -> Instruction<'_> {
-            if index == 0 {
-                Instruction::UnorderedMap
-            } else {
-                Instruction::Entry {
-                    next: self.0,
-                    entry: None,
-                }
+            match index {
+                0 if self.0 => Instruction::CountedMap(1),
+                0 => Instruction::Map,
+                _ => Instruction::Entry(&0u64, &0u64),
             }
         }
     }
-    // The malformed source reaches only the map opener and its first entry
-    // instruction. A valid one-entry map includes that prefix plus key/value
+    // The malformed source reaches only the map opener and its entry. A
+    // valid one-entry map includes that prefix plus key and value
     // preparation, ordering and publication, so its production bound covers
-    // rejection without asking the shape walker to accept an invalid advance.
+    // the rejection without asking the shape walker to accept the protocol.
     let mut valid = HashMap::new();
     valid.insert(0u64, 0u64);
     let bound = shape(&valid);
-    for next in [1, 66, usize::MAX] {
-        let source = InvalidAdvance(next);
-        refusal_matrix(&format!("invalid entry advance {next}"), rigor(), |fault| {
+    for counted in [true, false] {
+        let source = Misplaced(counted);
+        refusal_matrix(&format!("entry in a field map, counted {counted}"), rigor(), |fault| {
             prepare_run(&source, &Err(BoundedError::PlanMismatch), fault, bound)
         });
     }

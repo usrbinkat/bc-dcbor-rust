@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -927,7 +927,7 @@
+         } else {
+             // SAFETY: a queued predecessor is released only after the stepping
+             // caller has removed it, which requires this link or the tail.
+-            unsafe { (*previous).next.store(header.as_ptr(), Ordering::Release) };
++            unsafe { (*previous).next.store(header.as_ptr(), Ordering::Relaxed) };
+         }
+     }
+

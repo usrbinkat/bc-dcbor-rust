@@ -7,6 +7,7 @@ use super::header::{Header, HeaderState};
 use super::storage::Storage;
 use super::utf8::Utf8;
 use super::*;
+use crate::bounded::boundary::{Bound, Predicate, boundary};
 use crate::bounded::text_cursor::TextContinuation;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
@@ -587,7 +588,10 @@ impl<I, P> ParserContinuation<I, P> {
                         Kind::Negative(-1 - header.argument as i64)
                     }
                     MajorType::ByteString | MajorType::Text => {
-                        if header.argument > widen(input.len() - self.position)? {
+                        let remaining = widen(input.len() - self.position)?;
+                        if Bound::new(Predicate::Payload, remaining)
+                            .exceeded(allocator, header.argument)
+                        {
                             return Err(Error::Underrun.into());
                         }
                         let length =
@@ -614,7 +618,10 @@ impl<I, P> ParserContinuation<I, P> {
                         Kind::Array(header.argument)
                     }
                     MajorType::Map => {
-                        if header.argument > widen((input.len() - self.position) / 2)? {
+                        let pairs = widen((input.len() - self.position) / 2)?;
+                        if Bound::new(Predicate::Payload, pairs)
+                            .exceeded(allocator, header.argument)
+                        {
                             return Err(Error::Underrun.into());
                         }
                         self.children = header
@@ -651,11 +658,15 @@ impl<I, P> ParserContinuation<I, P> {
                         },
                     },
                 };
-                if self.children > widen(input.len() - self.position)? {
+                let remaining = widen(input.len() - self.position)?;
+                if Bound::new(Predicate::Payload, remaining).exceeded(allocator, self.children) {
                     return Err(Error::Underrun.into());
                 }
                 self.kind = StoredKind::retain(kind, self.position);
-                if self.children > 0 && self.stack.len() >= self.options.max_depth {
+                if self.children > 0
+                    && Bound::new(Predicate::DispatchDepth, self.options.max_depth)
+                        .reached(allocator, self.stack.len())
+                {
                     return Err(DecodeError::DepthLimit {
                         limit: self.options.max_depth,
                     });
@@ -733,15 +744,18 @@ impl<I, P> ParserContinuation<I, P> {
                     .ok_or(BoundedError::PlanMismatch)?
                     .as_ref();
                 let original = &input[self.start..self.position];
-                let remaining = canonical.len().min(original.len()) - self.text_compared;
-                let count = remaining.min(super::construction::stable::QUANTUM);
+                let common = Bound::new(Predicate::Payload, original.len())
+                    .clamp(allocator, canonical.len());
+                let remaining = common - self.text_compared;
+                let count = Bound::new(Predicate::Quantum, super::construction::stable::QUANTUM)
+                    .clamp(allocator, remaining);
                 TEXT_CHECK.admit(allocator, count as u64)?;
                 let end = self.text_compared + count;
                 if canonical[self.text_compared..end] != original[self.text_compared..end] {
                     return Err(Error::NonCanonicalString.into());
                 }
                 self.text_compared = end;
-                if end == canonical.len().min(original.len()) {
+                if end == common {
                     if canonical.len() != original.len() {
                         return Err(Error::NonCanonicalString.into());
                     }
@@ -806,7 +820,8 @@ impl<I, P> ParserContinuation<I, P> {
                 };
                 COMPLETE.admit(allocator)?;
                 let Some(parent) = stack.as_slice().last() else {
-                    if self.position != input.len() {
+                    if boundary!(allocator, Predicate::Payload, self.position, input.len()).is_ne()
+                    {
                         return Err(Error::UnusedData(input.len() - self.position).into());
                     }
                     self.phase = Phase::ReleaseStack;

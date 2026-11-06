@@ -5,19 +5,24 @@
 # survivor of both layers in a module holding `unsafe`, or a descendant of
 # one, is decided under Miri on the tests that reach it (the reach map,
 # tests/reach-map.sh; the judge, tests/miri-owned.sh --judge), against an
-# unmutated Miri gate run of the same identity (tests/mutation-evidence.py).
+# unmutated Miri gate run of the same identity. The domains, the layers'
+# comparison, the Miri plan and the run's verdict are the gate tool's
+# (tests/gate: `domains`, `domain`, `mutation`).
+#
+# Evidence is of a commit: the tree must be clean, as the judge requires.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 : "${TMPDIR:?required: the campaign log directory}"
-for tool in cargo rustc cargo-mutants cargo-llvm-cov python3 patch time systemd-run systemctl sha256sum; do
+for tool in cargo rustc cargo-mutants cargo-llvm-cov patch time systemd-run systemctl sha256sum git tar; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Mutation prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
 		exit 127
 	fi
 done
+gate_prepare
 # A mutant can turn a bounded loop into unbounded allocation (one grew a
 # test binary past 110 GB). Each layer runs in its own memory-capped scope
 # of the user's systemd manager: the kernel kills the runaway test inside
@@ -39,6 +44,7 @@ contained=(systemd-run --user --scope --quiet --collect
 	--)
 logs="$(mktemp -d "$TMPDIR/dcbor-mutations.XXXXXX")"
 printf 'Mutation evidence logs: %s\n' "$logs"
+clean_commit "$logs" || exit 1
 printf '%s\n' "$DCBOR_CONFIGURATION" >"$logs/configuration.txt"
 printf 'memory cap per layer: %s, no swap\n' "$DCBOR_MUTATION_MEMORY" | tee "$logs/containment.txt"
 export CARGO
@@ -50,36 +56,20 @@ snapshot >"$logs/source.sha256"
 # A wall-clock ceiling decides nothing here: it depends on the host's load,
 # not on the mutant (tests/resumable/native_latency.rs).
 unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECTORY DCBOR_CLASS_COVERAGE DCBOR_LATENCY_QUALIFICATION
-# The mutation domains (tests/mutation-evidence.py, DOMAINS): each its
-# features, the files its mutants are drawn from, and the tests that judge
-# them. Every feature compiles all but the code written for builds without
-# std; that code is a domain of its own, built as the no_std legs build it.
-domains=(all-features no_std)
+# The mutation domains (tests/gate, `domains`): each its features, the files
+# its mutants are drawn from, and the tests that judge them.
+listed="$(gate domains)"
+mapfile -t domains <<<"$listed"
 configure() {
 	domain_features "$1"
-	case "$1" in
-	all-features)
-		filters=(--file 'src/bounded/decode/storage.rs'
-			--file 'src/bounded/decode/construction/stable.rs'
-			--file 'src/bounded/decode/construction/in_place/*.rs'
-			--file 'src/bounded/decode/construction/in_place/btree/*.rs'
-			--file 'src/bounded/decode/construction/reclamation/*.rs'
-			--file 'src/bounded/encoding/writer.rs'
-			--file 'src/bounded/text_cursor/initialization.rs')
-		tests=(--workspace --all-targets)
-		;;
-	no_std)
-		# The domain's only code compiled without std and never under every
-		# feature: the decode scope's abort, in the file that holds it. The
-		# derive crate's tests need std, so the package's own targets judge.
-		filters=(--file 'src/bounded/decode/construction/reclamation/owned.rs')
-		tests=(--package dcbor --all-targets)
-		;;
-	*)
-		printf 'unknown mutation domain: %s\n' "$1" >&2
-		exit 2
-		;;
-	esac
+	domain_list "$1" files
+	filters=()
+	local file
+	for file in "${domain_list[@]}"; do
+		filters+=(--file "$file")
+	done
+	domain_list "$1" tests
+	tests=("${domain_list[@]}")
 }
 # The Miri layer's rigor: the Miri gate's own default layer, the same for
 # the reach map, the unmutated baseline and every judgement.
@@ -88,9 +78,11 @@ miri_rigor=fast
 # from different code, toolchain, configuration or domain can never be
 # taken for this run's. The snapshot, the shell's configuration (the
 # toolchain and fork revisions), the compiler and Cargo (gate-common.sh's
-# `identity`); the cargo-mutants version; each domain's features, files and
-# test selection; the Miri layer's rigor and each model's flags.
+# `identity`); the commit; the cargo-mutants version; each domain's
+# features, files and test selection; the Miri layer's rigor and each
+# model's flags.
 {
+	printf 'commit\t%s\n' "$commit"
 	cargo-mutants --version
 	printf 'mutate-unsafe\ttrue\n'
 	for domain in "${domains[@]}"; do
@@ -127,7 +119,7 @@ for domain in "${domains[@]}"; do
 	# A mutant missed by both layers passes only as a declared equivalent
 	# of its domain (tests/mutation-equivalents.json, part of the snapshot),
 	# or, in a tainted module, when Miri catches it.
-	python3 tests/mutation-evidence.py compare "$logs/$domain/fast/mutants.out" \
+	gate mutation compare "$logs/$domain/fast/mutants.out" \
 		"$logs/$domain/exhaustive/mutants.out" tests/mutation-equivalents.json \
 		"$domain" "$logs/$domain/comparison.json"
 done
@@ -146,7 +138,7 @@ DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" MIRI_LOG_DIR="$logs/miri
 
 verdict=0
 for domain in "${domains[@]}"; do
-	python3 tests/mutation-evidence.py miri-plan "$logs/$domain/comparison.json" \
+	gate mutation miri-plan "$logs/$domain/comparison.json" \
 		"$logs/$domain/fast/mutants.out" "$logs/source.sha256" "$logs/reach" "$logs/$domain/miri-plan"
 	DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" "${contained[@]}" tests/miri-owned.sh --judge \
 		"$logs/$domain/miri-plan/plan.tsv" "$logs/$domain/miri" "$logs/miri-baseline" \
@@ -155,9 +147,13 @@ for domain in "${domains[@]}"; do
 		exit 1
 	}
 	snapshot | diff -u "$logs/source.sha256" -
-	python3 tests/mutation-evidence.py miri-verdict "$logs/$domain/comparison.json" \
+	gate mutation miri-verdict "$logs/$domain/comparison.json" \
 		"$logs/$domain/miri-plan" "$logs/$domain/miri/verdicts.tsv" "$logs/$domain/verdict.json" ||
 		verdict=1
 done
+if ! still_at_commit; then
+	echo "the checkout moved off $commit during the campaign" >&2
+	exit 1
+fi
 printf 'Mutation evidence: %s\n' "$logs"
 exit "$verdict"

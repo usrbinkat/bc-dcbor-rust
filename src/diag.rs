@@ -1,16 +1,17 @@
 import_stdlib!();
 
 use super::string_util::flanked;
-use crate::{CBOR, CBORCase, Error, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags};
+use crate::{CBOR, CBORCase, tags_store::TagsStoreTrait};
 
-type SummarizerFn = Arc<dyn Fn(CBOR, bool) -> Result<String, Error> + Send + Sync>;
-
+/// How diagnostic notation is written: annotated with tag names, tags
+/// summarized, on one line, and the tag store names and summarizers come
+/// from. Without a store, no tag is named or summarized.
 #[derive(Clone, Default)]
 pub struct DiagFormatOpts<'a> {
     annotate: bool,
     summarize: bool,
     flat: bool,
-    tags: TagsStoreOpt<'a>,
+    tags: Option<&'a dyn TagsStoreTrait>,
 }
 
 impl<'a> DiagFormatOpts<'a> {
@@ -33,9 +34,9 @@ impl<'a> DiagFormatOpts<'a> {
         self
     }
 
-    /// Sets the tags for the diagnostic notation.
-    pub fn tags(mut self, tags: TagsStoreOpt<'a>) -> Self {
-        self.tags = tags;
+    /// Sets the tag store the notation names and summarizes tags from.
+    pub fn tags(mut self, tags: &'a dyn TagsStoreTrait) -> Self {
+        self.tags = Some(tags);
         self
     }
 }
@@ -45,7 +46,7 @@ impl CBOR {
     /// Returns a representation of this CBOR in diagnostic notation.
     ///
     /// Optionally annotates the output, e.g. formatting dates and adding names
-    /// of known tags.
+    /// of tags the store given registers.
     pub fn diagnostic_opt(&self, opts: &DiagFormatOpts<'_>) -> String {
         self.diag_item(opts).format(opts)
     }
@@ -55,18 +56,20 @@ impl CBOR {
         self.diagnostic_opt(&DiagFormatOpts::default())
     }
 
-    /// Returns a representation of this CBOR in diagnostic notation, with
-    /// annotations.
-    pub fn diagnostic_annotated(&self) -> String {
-        self.diagnostic_opt(&DiagFormatOpts::default().annotate(true))
+    /// Returns a representation of this CBOR in diagnostic notation, each
+    /// tag annotated with its name in `tags`.
+    pub fn diagnostic_annotated(&self, tags: &dyn TagsStoreTrait) -> String {
+        self.diagnostic_opt(&DiagFormatOpts::default().annotate(true).tags(tags))
     }
 
     pub fn diagnostic_flat(&self) -> String {
         self.diagnostic_opt(&DiagFormatOpts::default().flat(true))
     }
 
-    pub fn summary(&self) -> String {
-        self.diagnostic_opt(&DiagFormatOpts::default().summarize(true))
+    /// Returns a flat representation of this CBOR in diagnostic notation,
+    /// each tag `tags` has a summarizer for summarized by it.
+    pub fn summary(&self, tags: &dyn TagsStoreTrait) -> String {
+        self.diagnostic_opt(&DiagFormatOpts::default().summarize(true).tags(tags))
     }
 }
 
@@ -102,18 +105,8 @@ impl CBOR {
                 if opts.summarize {
                     let mut item_to_return: Option<DiagItem> = None;
 
-                    // Attempt to get a summarizer function based on opts.tags
-                    let summarizer_fn_opt: Option<SummarizerFn> = match &opts.tags {
-                        TagsStoreOpt::Custom(tags_store_trait) => {
-                            tags_store_trait.summarizer(tag.value()).cloned() // Clone the Arc
-                        }
-                        TagsStoreOpt::Global => {
-                            with_tags!(|global_tags_store: &dyn TagsStoreTrait| {
-                                global_tags_store.summarizer(tag.value()).cloned()
-                            })
-                        }
-                        TagsStoreOpt::None => None,
-                    };
+                    // The summarizer the store given has for this tag.
+                    let summarizer_fn_opt = opts.tags.and_then(|tags| tags.summarizer(tag.value()));
 
                     // If a summarizer function was found, execute it.
                     if let Some(summarizer_fn) = summarizer_fn_opt {
@@ -139,17 +132,7 @@ impl CBOR {
 
                 // Get a possible comment before we move opts
                 let comment = if opts.annotate {
-                    match &opts.tags {
-                        TagsStoreOpt::None => None,
-                        TagsStoreOpt::Custom(tags_store_trait) => {
-                            tags_store_trait.assigned_name_for_tag(tag)
-                        }
-                        TagsStoreOpt::Global => {
-                            with_tags!(|tags_store: &dyn TagsStoreTrait| {
-                                tags_store.assigned_name_for_tag(tag)
-                            })
-                        }
-                    }
+                    opts.tags.and_then(|tags| tags.assigned_name_for_tag(tag))
                 } else {
                     None
                 };

@@ -1,8 +1,9 @@
 # The Miri gate's selection (tests/miri-owned.sh), which the reach map
 # (tests/reach-map.sh) instruments and the mutation campaign's Miri layer
-# judges on: one line per suite, its mutation domain (`all-features` or
-# `no_std`, whose features tests/gate-common.sh's `domain_features` names), a
-# target kind, the suite, and an optional test-name filter.
+# judges on: one line per suite, its mutation domain (`all-features`,
+# `no_std` or `std`, whose features the gate's one table of domains names,
+# tests/gate `domains`), a target kind, the suite, and an optional test-name
+# filter.
 #
 # `lib` selects the library's test binary by the module path it names;
 # `test` an integration test binary; `race` an integration test binary whose
@@ -116,3 +117,8 @@ all-features test resumable_contract text_progress::actual_normalizer_progress_a
 # encoding each without std.
 no_std lib bounded::tests::a_maps_iteration_order_is_its_encoded_key_order
 no_std lib bounded::tests::a_trees_entries_take_canonical_key_order_not_tree_order
+# Code only the crate's default build compiles: a preparation that charges
+# no bucket traversal and retains no bucket cursor, with neither hashbrown
+# nor the forked collections, reached by preparing a map without them.
+std lib bounded::encoding::bound_tests::shape_and_preparation_reject_the_same_invalid_map_protocols
+std lib bounded::encoding::bound_tests::keys_holding_gapped_maps_are_compacted_before_they_are_ordered

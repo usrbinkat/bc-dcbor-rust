@@ -19,58 +19,64 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use support::legality::{Legality, initial, not_last, storage_build, storage_clean};
 
-/// Node occupancy boundaries: empty, one entry, around a node's minimum and
-/// its capacity (a full leaf, then the first split), and around each further
-/// height; and a wide map, 256 entries whose values carry 80 bytes more
-/// each. At minimal witness sizes the third level's (1727, 1728) is dropped:
-/// the reach map requires the minimal run to execute every region the full
-/// run does (`tests/reach-map.sh`). What only those maps reach is head
-/// width, not a tree path: a count of at least 256 (a two-byte head) and an
-/// input of at least 21,846 bytes, whose parse bound of three part bytes a
-/// byte (`text::PART_BYTES_PER_BYTE`) reaches 65,536 (a four-byte head).
-/// The wide map has both at a fraction of their entries.
+/// The occupancy witnesses through `limit` entries: both counts on each side
+/// of every edge between occupancy classes
+/// (`in_place::tree_occupancy`, emptiness and height), so every class is
+/// witnessed by its least and, below the limit, its greatest count. Every
+/// planning path a count selects is selected by its class; the plan's
+/// arithmetic within a class is certified for every count separately
+/// (`btree::plan_tests`), and the fork's node code branches on nothing but
+/// leaf against internal.
+fn occupancy_witnesses(limit: usize) -> Vec<usize> {
+    use dcbor::bounded::decode::construction::in_place::tree_occupancy;
+    let mut counts = vec![0];
+    for count in 1..=limit {
+        if tree_occupancy(count) != tree_occupancy(count - 1) {
+            if counts.last() != Some(&(count - 1)) {
+                counts.push(count - 1);
+            }
+            counts.push(count);
+        }
+    }
+    counts
+}
+
+/// The occupancy witnesses derive from the occupancy classes exactly: empty,
+/// then the edges of each height, where `raised` takes the tree a level up
+/// (one leaf to 11 entries, two levels to 143, three to 1727).
+#[test]
+fn the_occupancy_witnesses_are_each_classes_edges() {
+    assert_eq!(
+        occupancy_witnesses(1728),
+        [0, 1, 11, 12, 143, 144, 1727, 1728]
+    );
+    assert_eq!(occupancy_witnesses(144), [0, 1, 11, 12, 143, 144]);
+}
+
+/// A tree of each occupancy witness ([`occupancy_witnesses`]): every class's
+/// edges, through the fourth level's first count at full witness sizes and
+/// the third's at minimal sizes, the reach map requiring the minimal run to
+/// execute every region the full run does (`tests/reach-map.sh`); and a wide
+/// map, 256 entries whose values carry 80 bytes more each. What only the
+/// wide map reaches is head width, not a tree path: a count of at least 256
+/// (a two-byte head) and an input of at least 21,846 bytes, whose parse bound
+/// of three part bytes a byte (`text::PART_BYTES_PER_BYTE`) reaches 65,536 (a
+/// four-byte head).
 #[test]
 fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
     const WIDE: (usize, usize) = (256, 80);
-    let maps: &[(usize, usize)] = support::rigor::sized(
-        &[
-            (0, 0),
-            (1, 0),
-            (5, 0),
-            (6, 0),
-            (10, 0),
-            (11, 0),
-            (12, 0),
-            (13, 0),
-            (70, 0),
-            (71, 0),
-            (72, 0),
-            (143, 0),
-            (144, 0),
-            (145, 0),
-            (1727, 0),
-            (1728, 0),
-            WIDE,
-        ],
-        &[
-            (0, 0),
-            (1, 0),
-            (5, 0),
-            (6, 0),
-            (10, 0),
-            (11, 0),
-            (12, 0),
-            (13, 0),
-            (70, 0),
-            (71, 0),
-            (72, 0),
-            (143, 0),
-            (144, 0),
-            (145, 0),
-            WIDE,
-        ],
-    );
+    let maps: Vec<(usize, usize)> = occupancy_witnesses(support::rigor::sized(1728, 144))
+        .into_iter()
+        .map(|count| (count, 0))
+        .chain([WIDE])
+        .collect();
+    let maps = maps.as_slice();
+    // Each map reported as it runs, with the time since the first: which
+    // boundary's map dominates the interpreted run is measured, not assumed.
+    let mut progress = support::rigor::Progress::new("node occupancy boundaries");
+    progress.stage("maps", maps.len(), maps.len());
     for &(count, padding) in maps {
+        progress.case(format!("{count} entries, values padded by {padding} bytes"));
         let expected: BTreeMap<String, String> = (0..count)
             .map(|n| {
                 (

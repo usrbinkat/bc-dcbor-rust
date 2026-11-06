@@ -12,6 +12,7 @@ use super::reclamation::{
     Acquisition, OwnedInitialized, OwnedRecord, PeekSlot, Reclaim, Reclaimed, ScopeRef, Slot,
     record_cost,
 };
+use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::fields;
 use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Failure, Places, ResourceBound, Resumable, Step, Unit,
@@ -56,11 +57,11 @@ impl OperationTerms {
         init: usize,
         task: ResourceBound,
     ) -> Result<Self, BoundedError<R>> {
-        let (metadata, block) = const { record_cost::<T, A>() };
+        let (write, block) = const { record_cost::<T, A>() };
         let block = widen(block)?;
-        // The record's metadata written as the scope acquires it, and its
+        // The record's header written as the scope acquires it, and its
         // release, admitted with it.
-        let admitted = super::stable::acquire_cost(metadata)
+        let admitted = write
             .work()
             .then(super::stable::release_cost::<A::Permit>().work())?;
         Ok(Self {
@@ -286,7 +287,7 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
         // paired with its own progress for its whole lifetime.
         let mut slot = record.destination();
         let task = &mut self.task;
-        if K::initialized(slot.custody()) < K::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, K::INIT_STEPS).below(a, K::initialized(slot.custody())) {
             at(OperationPlace::Initialization, || {
                 task.initialize(slot.reborrow(), a)
             })?;

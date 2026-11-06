@@ -1,7 +1,9 @@
 //! Retained required-field map construction for generated structs.
 use super::*;
+use crate::bounded::boundary::{Predicate, boundary, position};
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
 use crate::bounded::decode::construction::stable::{self, Installed, Stack};
+use crate::sync::{Atomics, Representation};
 
 /// Compiler-generated field projections, indexed by ascending integer wire key.
 ///
@@ -81,6 +83,17 @@ struct Meta<F, P> {
     high: u32,
     /// One custody record per started field, holding its state.
     children: Stack<F, P>,
+}
+
+impl<F, P> Representation for Meta<F, P> {
+    type In<S: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds, its whole value
+/// written with the permit ([`stable::Contract`]): the one definition its
+/// installation and the record's cost read.
+const fn contract<F, P>() -> stable::Contract<Meta<F, P>, Meta<F, P>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of a field map whose fields' states are `F`, with
@@ -179,63 +192,60 @@ fn field_index<R>(field: usize) -> Result<u32, BoundedError<R>> {
 /// subtrees partition the record's bytes, so their per-byte parts together
 /// are at most the largest of them. Positional fields are found by one unit
 /// each. Keyed entries, the fields' and any unknown key's alike, are
-/// [`entries`].
-pub const fn cost<F, P>(positional: bool, fields: &[ConstructionCost]) -> ConstructionCost {
-    let meta = stable::Metadata::whole::<Meta<F, P>, P>().bytes();
-    let child = stable::Metadata::whole::<stable::Child<F, P>, P>().bytes();
+/// [`entries`]. None when a quantity does not fit in `u64`.
+pub const fn cost<F, P>(positional: bool, fields: &[ConstructionCost]) -> Option<ConstructionCost> {
+    let meta = contract::<F, P>();
+    let child = Stack::<F, P>::RECORD;
     let release = stable::release_cost::<P>();
     // The metadata installed; the tag, map and last find steps; cleanup's
     // transition step; the metadata released.
-    let mut fixed = plus(
-        plus(stable::install_cost::<Meta<F, P>, P>(), times(STEP_COST, 4)),
-        plus(release, held(meta)),
-    );
+    let installed = cost!(meta.write().checked_add(cost!(STEP_COST.checked_mul(4))));
+    let mut fixed = cost!(installed.checked_add(cost!(release.checked_add(held(meta.block())))));
     let mut per_byte = ConstructionCost::ZERO.per_byte;
     let mut index = 0;
     while index < fields.len() {
         // The custody record pushed, the advance step, the record popped.
-        let each = plus(
-            plus(
-                plus(stable::install_cost::<stable::Child<F, P>, P>(), STEP_COST),
-                release,
-            ),
-            plus(held(child), plus(fields[index].fixed, ROUNDING)),
-        );
-        fixed = plus(fixed, each);
+        let record = cost!(cost!(child.write().checked_add(STEP_COST)).checked_add(release));
+        let own = cost!(fields[index].fixed.checked_add(ROUNDING));
+        let each = cost!(record.checked_add(cost!(held(child.block()).checked_add(own))));
+        fixed = cost!(fixed.checked_add(each));
         if positional {
-            fixed = plus(fixed, STEP_COST);
+            fixed = cost!(fixed.checked_add(STEP_COST));
         }
-        per_byte = larger(per_byte, fields[index].per_byte);
+        per_byte = per_byte.larger(fields[index].per_byte);
         index += 1;
     }
-    let mut cost = ConstructionCost { fixed, per_byte };
-    if !positional {
-        cost = cost.plus(entries(fields.len()));
+    let cost = ConstructionCost { fixed, per_byte };
+    if positional {
+        Some(cost)
+    } else {
+        cost.checked_add(cost!(entries(fields.len())))
     }
-    cost
 }
 
 /// One keyed entry's units in a record of `count` fields: its find, at most
 /// `floor(log2 count) + 1` search steps, and one to locate or skip its
 /// value. An unknown key below every field's takes exactly this many: the
-/// search halves toward the first field at every step.
-pub const fn entry(count: usize) -> ResourceBound {
+/// search halves toward the first field at every step. None when a quantity
+/// does not fit in `u64`.
+pub const fn entry(count: usize) -> Option<ResourceBound> {
     let search = if count == 0 {
         0
     } else {
         count.ilog2() as u64 + 1
     };
-    times(STEP_COST, search + 2)
+    STEP_COST.checked_mul(search + 2)
 }
 
 /// The keyed entries of a record of `count` fields, by the record's bytes:
 /// each entry has a key and a value of a byte at least, so one [`entry`]
-/// per two bytes, half a unit of each per byte.
-pub const fn entries(count: usize) -> ConstructionCost {
-    ConstructionCost {
+/// per two bytes, half a unit of each per byte. None when a quantity does
+/// not fit in `u64`.
+pub const fn entries(count: usize) -> Option<ConstructionCost> {
+    Some(ConstructionCost {
         fixed: ConstructionCost::ZERO.fixed,
-        per_byte: times(entry(count), PER_BYTE_SCALE / 2),
-    }
+        per_byte: cost!(cost!(entry(count)).checked_mul(PER_BYTE_SCALE / 2)),
+    })
 }
 
 /// One unit of construction of the record in `slot`. Without metadata the
@@ -256,6 +266,7 @@ pub fn build<T: Fields<A>, A: Allocator>(
         // schema-sized tuple, every field written.
         unsafe {
             stable::install::<Meta<T::Field, A::Permit>, Meta<T::Field, A::Permit>, A>(
+                const { contract::<T::Field, A::Permit>() },
                 &mut state.meta,
                 &mut state.admitted,
                 || Meta {
@@ -339,14 +350,14 @@ pub fn build<T: Fields<A>, A: Allocator>(
             STEP.admit(a)?;
             let node = node_at(document, meta.next).ok_or_else(wrong_type)?;
             if let Kind::Unsigned(key) = node.kind()
-                && meta.low < meta.high
+                && boundary!(a, Predicate::Field, meta.low, meta.high).is_lt()
             {
                 let mid = meta.low + (meta.high - meta.low) / 2;
                 match key.cmp(&T::key(mid as usize)) {
                     core::cmp::Ordering::Less => meta.high = mid,
                     core::cmp::Ordering::Greater => meta.low = mid + 1,
                     core::cmp::Ordering::Equal => {
-                        if (mid as usize) < state.position {
+                        if boundary!(a, Predicate::Field, mid as usize, state.position).is_lt() {
                             return Err(BoundedError::PlanMismatch.into());
                         }
                         meta.low = mid;
@@ -361,8 +372,9 @@ pub fn build<T: Fields<A>, A: Allocator>(
         }
         Phase::Allocate => {
             let low = meta.low as usize;
-            let missing = state.position < low;
+            let missing = boundary!(a, Predicate::Field, state.position, low).is_lt();
             let field = if missing { state.position } else { low };
+            boundary!(a, Predicate::Field => position(field, T::COUNT));
             if missing && !T::optional(field) {
                 STEP.admit(a)?;
                 return Err(crate::bounded::decode::DecodeError::Invalid(
@@ -511,9 +523,9 @@ mod tests {
     use crate::bounded::decode::construction::Written;
 
     fn layouts<F, P>() {
-        let _ = const { stable::Metadata::whole::<Meta<F, P>, P>() };
-        let _ = const { stable::Metadata::whole::<stable::Child<State<F, P>, P>, P>() };
-        let bound = const { cost::<F, P>(false, &[ConstructionCost::ZERO]) };
+        let _ = const { contract::<F, P>() };
+        let _ = const { Stack::<State<F, P>, P>::RECORD };
+        let bound = crate::const_cost!(cost::<F, P>(false, &[ConstructionCost::ZERO]));
         assert!(bound.bound::<()>(1).is_ok());
     }
 
@@ -536,12 +548,16 @@ mod tests {
     /// record's bytes, so the record takes the largest.
     #[test]
     fn a_records_cost_adds_each_fields_fixed_part_and_the_largest_per_byte_part() {
-        type Child = stable::Child<Written, Reservation>;
-        let field = ConstructionCost::fixed(unit(4)).plus(ConstructionCost::per_byte(unit(1)));
-        let keyed = |fields: &[ConstructionCost]| cost::<Written, Reservation>(false, fields);
-        let positional = |fields: &[ConstructionCost]| cost::<Written, Reservation>(true, fields);
+        let field = ConstructionCost::fixed(unit(4))
+            .checked_add(ConstructionCost::checked_per_byte(unit(1)).unwrap())
+            .unwrap();
+        let entries = |count: usize| entries(count).unwrap();
+        let keyed =
+            |fields: &[ConstructionCost]| cost::<Written, Reservation>(false, fields).unwrap();
+        let positional =
+            |fields: &[ConstructionCost]| cost::<Written, Reservation>(true, fields).unwrap();
         let (none, one, two) = (keyed(&[]), keyed(&[field]), keyed(&[field, field]));
-        let each = stable::install_cost::<Child, Reservation>().values
+        let each = Stack::<Written, Reservation>::RECORD.write().values
             + STEP_COST.values
             + stable::release_cost::<Reservation>().values
             + field.fixed.values
@@ -549,11 +565,25 @@ mod tests {
         assert_eq!(one.fixed.values - none.fixed.values, each);
         assert_eq!(two.fixed.values - one.fixed.values, each);
         assert_eq!(none.per_byte, entries(0).per_byte);
-        assert_eq!(one.per_byte, plus(field.per_byte, entries(1).per_byte));
         assert_eq!(
-            two.per_byte,
-            plus(field.per_byte, entries(2).per_byte),
+            Some(one.per_byte),
+            field.per_byte.checked_add(entries(1).per_byte)
+        );
+        assert_eq!(
+            Some(two.per_byte),
+            field.per_byte.checked_add(entries(2).per_byte),
             "two fields' per-byte parts are the larger, not the sum"
+        );
+        assert_eq!(
+            cost::<Written, Reservation>(
+                false,
+                &[ConstructionCost::fixed(ResourceBound {
+                    values: u64::MAX,
+                    ..ResourceBound::default()
+                })]
+            ),
+            None,
+            "a field whose cost leaves no room is refused, never wrapped"
         );
         let found = positional(&[field]);
         assert_eq!(

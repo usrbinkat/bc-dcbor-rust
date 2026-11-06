@@ -296,22 +296,26 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
         quote!()
     };
     // A unit is one check step and one cleanup step (`in_place::step`); a
-    // newtype is its field's construction in the same bytes.
+    // newtype is its field's construction in the same bytes. Every composed
+    // cost is checked and unwrapped by `const_cost!`, so one that does not
+    // fit in `u64` fails to compile where the type is first used.
     let payload_cost = match field {
         Some(ty) => {
             quote!(<#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::COST)
         }
-        None => quote!(
-            dcbor::bounded::decode::construction::in_place::ConstructionCost::fixed(
-                dcbor::bounded::decode::construction::in_place::times(
-                    dcbor::bounded::decode::construction::in_place::STEP_COST,
-                    2,
-                )
-            )
-        ),
+        None => quote!(dcbor::const_cost!(
+            match dcbor::bounded::decode::construction::in_place::STEP_COST.checked_mul(2) {
+                ::core::option::Option::Some(steps) => ::core::option::Option::Some(
+                    dcbor::bounded::decode::construction::in_place::ConstructionCost::fixed(steps),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            }
+        )),
     };
     let cost = if schema.tag.is_some() {
-        quote!(dcbor::bounded::decode::construction::in_place::tagged::cost::<#untagged, <#a as dcbor::bounded::Allocator>::Permit>(#payload_cost))
+        quote!(
+            dcbor::const_cost!(dcbor::bounded::decode::construction::in_place::tagged::cost::<#untagged, <#a as dcbor::bounded::Allocator>::Permit>(#payload_cost))
+        )
     } else {
         payload_cost
     };

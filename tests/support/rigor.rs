@@ -93,19 +93,47 @@ pub fn sized<T>(full: T, minimal: T) -> T {
     }
 }
 
+/// The variable that has a run report its inventory: each matrix's stop
+/// classes ([`classes`]) and the boundary valuations its runs reached
+/// ([`reached`]), read by the gate tool's one reader of them (`tests/gate`,
+/// `inventory`), which compares a model's against the native run's and a
+/// minimal-size run's valuations against its full-size run's.
+pub const INVENTORY: &str = "DCBOR_CLASS_COVERAGE";
+
+/// Whether this run reports its inventory: `DCBOR_CLASS_COVERAGE=1`.
+fn inventory() -> bool {
+    match std::env::var(INVENTORY) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        other => panic!("{INVENTORY} must be 1 or unset: {other:?}"),
+    }
+}
+
 /// Emit an exact, address-free class inventory for the native/Miri gate.
 /// Sorting and rendering happen outside physical-observer windows. The gate
 /// compares whole inventories, so a missing matrix or class is a failure.
 pub fn classes(name: &str, classes: impl IntoIterator<Item = String>) {
-    match std::env::var("DCBOR_CLASS_COVERAGE") {
-        Err(std::env::VarError::NotPresent) => return,
-        Ok(value) if value == "1" => {}
-        other => panic!("DCBOR_CLASS_COVERAGE must be 1 or unset: {other:?}"),
+    if !inventory() {
+        return;
     }
     let classes: std::collections::BTreeSet<_> = classes.into_iter().collect();
     eprintln!("DCBOR_CLASSES\t{name:?}\t{}", classes.len());
     for class in classes {
         eprintln!("DCBOR_CLASS\t{name:?}\t{class:?}");
+    }
+}
+
+/// Emit the boundary valuations the runs of the matrix `name` reached, one
+/// line each, the valuation's record row (`dcbor::bounded::boundary::row`)
+/// after the name, beside its classes. The gate requires each Miri model's
+/// to equal the native run's, and a test's at minimal witness sizes to equal
+/// its full sizes' (spec P3, P4).
+pub fn reached(name: &str, reached: dcbor::bounded::boundary::Reached) {
+    if !inventory() {
+        return;
+    }
+    for row in reached.rows() {
+        eprintln!("DCBOR_REACHED\t{name:?}\t{row}");
     }
 }
 
@@ -199,11 +227,9 @@ fn ratchet(name: &str, costs: &[String]) {
         Witness::Full,
         "matrix costs are recorded and checked at full witness sizes; unset {WITNESS}"
     );
-    let configuration =
-        std::env::var("DCBOR_CONFIGURATION").expect("cost evidence requires DCBOR_CONFIGURATION");
+    let configuration = dcbor_record::recording_configuration();
     let variant = std::env::var("DCBOR_COST_VARIANT")
         .expect("cost evidence requires the gate's exact feature projection");
-    assert!(!configuration.is_empty());
     assert!(!variant.is_empty());
     let binary = std::env::current_exe().expect("test executable has a path");
     let binary = binary
@@ -232,10 +258,19 @@ fn ratchet(name: &str, costs: &[String]) {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/costs"));
     let path = root.join(format!("{hash:016x}.txt"));
-    let data = format!(
-        "#\tconfiguration\t{configuration}\n#\tidentity\t{identity}\n{}\n",
-        costs.join("\n")
-    );
+    // A cost record is a record (`dcbor_record`): its identity, then its
+    // costs; a recorded one ends with its mechanism reason.
+    let identity_row = format!("#\tidentity\t{identity}");
+    let rows = |reason: Option<&str>| -> String {
+        let reason = reason.map(|reason| format!("#\treason\t{reason}"));
+        dcbor_record::render(
+            &configuration,
+            core::iter::once(identity_row.as_str())
+                .chain(costs.iter().map(String::as_str))
+                .chain(reason.as_deref()),
+        )
+    };
+    let data = rows(None);
     if mode == "check" {
         let recorded = fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!(
@@ -285,19 +320,10 @@ fn ratchet(name: &str, costs: &[String]) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => panic!("{}: {error}", path.display()),
     }
-    let temporary = root.join(format!(".{hash:016x}.{}.tmp", std::process::id()));
-    {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .expect("create unique cost evidence file");
-        file.write_all(format!("{data}#\treason\t{reason}\n").as_bytes())
-            .expect("write cost evidence");
-        file.sync_all().expect("persist cost evidence");
-    }
-    fs::rename(&temporary, &path).expect("publish cost evidence atomically");
+    dcbor_record::publish(
+        path.to_str().expect("the cost record's path is UTF-8"),
+        &rows(Some(&reason)),
+    );
     written.insert(identity, data);
     eprintln!("DCBOR_COST\t{hash:016x}");
 }

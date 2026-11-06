@@ -564,19 +564,24 @@ fn encoding_length_efficiency() {
 // diagnostic output for bignum values.
 // ============================================================================
 
+/// This crate's tags, the bignum summarizers among them, registered in a
+/// store of the test's own.
+fn tags() -> TagsStore {
+    let mut tags = TagsStore::default();
+    register_tags_in(&mut tags).expect("this crate's tags register in an empty store");
+    tags
+}
+
 /// Test that positive bignum summarizer displays the decimal value
 #[test]
 fn summarizer_positive_bignum() {
-    // Register the bignum tags in the global store
-    dcbor::register_tags();
+    let tags = tags();
 
     let big = BigUint::from(256u32);
     let cbor = CBOR::from(big);
 
-    // With summarizer using global tags, shows: bignum(256)
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    // With the store's summarizer, shows: bignum(256)
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(256)");
 }
@@ -584,15 +589,13 @@ fn summarizer_positive_bignum() {
 /// Test that negative bignum summarizer displays the decimal value
 #[test]
 fn summarizer_negative_bignum() {
-    dcbor::register_tags();
+    let tags = tags();
 
     let big = BigInt::from(-256);
     let cbor = CBOR::from(big);
 
     // With summarizer, shows: bignum(-256)
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(-256)");
 }
@@ -600,14 +603,12 @@ fn summarizer_negative_bignum() {
 /// Test summarizer for zero (tag 2 with empty byte string)
 #[test]
 fn summarizer_zero() {
-    dcbor::register_tags();
+    let tags = tags();
 
     let big = BigUint::from(0u32);
     let cbor = CBOR::from(big);
 
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(0)");
 }
@@ -615,14 +616,12 @@ fn summarizer_zero() {
 /// Test summarizer for -1 (tag 3 with h'00')
 #[test]
 fn summarizer_negative_one() {
-    dcbor::register_tags();
+    let tags = tags();
 
     let big = BigInt::from(-1);
     let cbor = CBOR::from(big);
 
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(-1)");
 }
@@ -630,14 +629,12 @@ fn summarizer_negative_one() {
 /// Test summarizer for large positive value (2^64)
 #[test]
 fn summarizer_large_positive() {
-    dcbor::register_tags();
+    let tags = tags();
 
     let big = BigUint::from(1u128) << 64;
     let cbor = CBOR::from(big);
 
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(18446744073709551616)");
 }
@@ -645,16 +642,14 @@ fn summarizer_large_positive() {
 /// Test summarizer for large negative value (-(2^64 + 1))
 #[test]
 fn summarizer_large_negative() {
-    dcbor::register_tags();
+    let tags = tags();
 
     let big_2_64: BigInt = BigInt::from(1) << 64;
     let sum: BigInt = big_2_64 + 1;
     let big = -sum;
     let cbor = CBOR::from(big);
 
-    let opts = DiagFormatOpts::default()
-        .summarize(true)
-        .tags(TagsStoreOpt::Global);
+    let opts = DiagFormatOpts::default().summarize(true).tags(&tags);
     let diag = cbor.diagnostic_opt(&opts);
     assert_eq!(diag, "bignum(-18446744073709551617)");
 }

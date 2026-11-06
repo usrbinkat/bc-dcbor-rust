@@ -9,124 +9,113 @@ pub struct Tagged<T> {
     pub value: T,
 }
 
-/// The instruction at `index` of a hash map of `len` entries over
-/// `buckets` bucket indices: its counted head, then one window of at most
-/// [`BUCKET_WINDOW`] bucket controls per instruction, the window's first
-/// occupied bucket, if any, found by `first` (the map's `next_full_bucket`,
-/// a group of controls at a time) and its entry read by `entry`. The engine
-/// admits each window before asking for it, and ends the map once `len`
-/// entries are yielded, so no window past the last entry is asked for.
+/// The instruction at `index` of a hash table of `len` entries: its counted
+/// head, then the table itself, whose buckets the engine enumerates
+/// ([`buckets::BucketCursor`]), each window admitted before it is
+/// inspected; the map ends once `len` entries are yielded. The source
+/// inspects no bucket.
 #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
-fn bucket_window<'a>(
-    index: usize,
-    len: usize,
-    buckets: usize,
-    first: impl FnOnce(usize, usize) -> Option<usize>,
-    entry: impl FnOnce(usize) -> Option<(&'a dyn Schema, &'a dyn Schema)>,
-) -> Instruction<'a> {
-    if index == 0 {
-        return Instruction::CountedUnorderedMap(len as u64);
-    }
-    let start = index - 1;
-    if start >= buckets {
-        return Instruction::End;
-    }
-    let end = start + (buckets - start).min(BUCKET_WINDOW);
-    match first(start, end) {
-        Some(bucket) => Instruction::Entry {
-            next: bucket + 2,
-            entry: entry(bucket),
-        },
-        None => Instruction::Entry {
-            next: end + 1,
-            entry: None,
-        },
+fn hash_table(table: &dyn buckets::Buckets, index: usize) -> Instruction<'_> {
+    match index {
+        0 => Instruction::CountedUnorderedMap(table.entry_count() as u64),
+        1 => Instruction::Buckets(table),
+        _ => Instruction::End,
     }
 }
 
 #[cfg(feature = "custom-std-collections")]
 impl<K: Schema, V: Schema, S> Schema for std::collections::HashMap<K, V, S> {
     fn instruction(&self, index: usize) -> Instruction<'_> {
-        bucket_window(
-            index,
-            self.len(),
-            self.num_buckets(),
-            |start, end| self.next_full_bucket(start, end),
-            |bucket| {
-                self.get_bucket(bucket)
-                    .map(|(key, value)| (key as &dyn Schema, value as &dyn Schema))
-            },
-        )
+        hash_table(self, index)
     }
 }
 
 #[cfg(feature = "hashbrown")]
 impl<K: Schema, V: Schema, S> Schema for hashbrown::HashMap<K, V, S> {
     fn instruction(&self, index: usize) -> Instruction<'_> {
-        bucket_window(
-            index,
-            self.len(),
-            self.num_buckets(),
-            |start, end| self.next_full_bucket(start, end),
-            |bucket| {
-                self.get_bucket(bucket)
-                    .map(|(key, value)| (key as &dyn Schema, value as &dyn Schema))
-            },
-        )
+        hash_table(self, index)
     }
 }
 
 #[cfg(feature = "hashbrown")]
 impl<K: Schema, V: Schema> Schema for hashbrown::HashTable<(K, V)> {
     fn instruction(&self, index: usize) -> Instruction<'_> {
-        bucket_window(
-            index,
-            self.len(),
-            self.num_buckets(),
-            |start, end| self.next_full_bucket(start, end),
-            |bucket| {
-                self.get_bucket(bucket)
-                    .map(|(key, value)| (key as &dyn Schema, value as &dyn Schema))
-            },
-        )
+        hash_table(self, index)
     }
 }
 
-/// One transition of a tree's stepped cursor (`btree_stepped_cursor`), its
-/// work already admitted with the engine's instruction; `entry` presents a
-/// yielded key and value as schemas.
+/// The cursor every tree an entry source walks is walked by (a `BTreeMap`,
+/// and the tree behind `crate::Map`), the one choice of it: on the
+/// bounded-collection standard library the tree's stepped cursor
+/// (`btree_stepped_cursor`), one admitted transition per call and no node
+/// move beyond it; elsewhere the tree's whole range, whose standard
+/// iterator compares no keys and moves at most [`tree_moves`] nodes per
+/// step. Either borrows the tree, owns nothing, has no destructor and never
+/// refers to itself, so a [`Slot`] holds it across the engine's relocations:
+/// the argument every tree's `Entries` implementation rests on.
 #[cfg(feature = "custom-std-collections")]
-pub(crate) fn stepped<'a, K: 'a, V: 'a>(
-    cursor: &mut std::collections::btree_map::SteppedCursor<'a, K, V>,
-    entry: impl FnOnce(&'a K, &'a V) -> (&'a dyn Schema, &'a dyn Schema),
-) -> EntryStep<'a> {
-    use std::collections::btree_map::SteppedCursorStep;
-    match cursor.step(|| Ok::<(), core::convert::Infallible>(())) {
-        Ok(SteppedCursorStep::Progress) => EntryStep::Progress,
-        Ok(SteppedCursorStep::Entry(key, value)) => {
-            let (key, value) = entry(key, value);
-            EntryStep::Entry(key, value)
-        }
-        Ok(SteppedCursorStep::Complete | SteppedCursorStep::Finished) => EntryStep::End,
-        Err(never) => match never {},
+type TreeCursor<'a, K, V> = std::collections::btree_map::SteppedCursor<'a, K, V>;
+#[cfg(not(feature = "custom-std-collections"))]
+type TreeCursor<'a, K, V> = BTreeMapRange<'a, K, V>;
+
+/// Store `tree`'s cursor ([`TreeCursor`]) in `slot`.
+pub(crate) fn tree_start<K: Ord, V>(tree: &BTreeMap<K, V>, slot: &mut Slot) {
+    #[cfg(feature = "custom-std-collections")]
+    slot.put::<TreeCursor<'_, K, V>>(tree.stepped_cursor());
+    #[cfg(not(feature = "custom-std-collections"))]
+    slot.put::<TreeCursor<'_, K, V>>(tree.range::<K, _>(..));
+}
+
+/// The node moves one step of `tree`'s cursor ([`TreeCursor`]) makes beyond
+/// its transition: none for the stepped cursor, [`tree_moves`] of the tree's
+/// length for the iterator.
+pub(crate) fn tree_step_moves<K, V>(tree: &BTreeMap<K, V>) -> u64 {
+    #[cfg(feature = "custom-std-collections")]
+    {
+        let _ = tree;
+        0
+    }
+    #[cfg(not(feature = "custom-std-collections"))]
+    {
+        tree_moves(tree.len())
     }
 }
 
-/// One step of a tree's standard iterator over its whole range, which
-/// compares no keys: one entry, its node moves at most
-/// [`tree_moves`] of the tree's length, stated by the source and admitted
-/// with the transition.
-#[cfg(not(feature = "custom-std-collections"))]
-pub(crate) fn ranged<'a, K: 'a, V: 'a>(
-    range: &mut BTreeMapRange<'a, K, V>,
+/// One step of the tree cursor ([`TreeCursor`]) in `slot`, its work already
+/// admitted with the engine's instruction; `entry` presents a yielded key
+/// and value as schemas.
+///
+/// # Safety
+/// `slot` holds the cursor [`tree_start`] stored for a tree of keys `K` and
+/// values `V` borrowed for `'a`.
+pub(crate) unsafe fn tree_next<'a, K: 'a, V: 'a>(
+    slot: &mut Slot,
     entry: impl FnOnce(&'a K, &'a V) -> (&'a dyn Schema, &'a dyn Schema),
 ) -> EntryStep<'a> {
-    match range.next() {
-        Some((key, value)) => {
-            let (key, value) = entry(key, value);
-            EntryStep::Entry(key, value)
+    // SAFETY: forwarded from the caller: `tree_start` stored this cursor.
+    let cursor = unsafe { slot.get::<TreeCursor<'a, K, V>>() };
+    #[cfg(feature = "custom-std-collections")]
+    {
+        use std::collections::btree_map::SteppedCursorStep;
+        match cursor.step(|| Ok::<(), core::convert::Infallible>(())) {
+            Ok(SteppedCursorStep::Progress) => EntryStep::Progress,
+            Ok(SteppedCursorStep::Entry(key, value)) => {
+                let (key, value) = entry(key, value);
+                EntryStep::Entry(key, value)
+            }
+            Ok(SteppedCursorStep::Complete | SteppedCursorStep::Finished) => EntryStep::End,
+            Err(never) => match never {},
         }
-        None => EntryStep::End,
+    }
+    #[cfg(not(feature = "custom-std-collections"))]
+    {
+        match cursor.next() {
+            Some((key, value)) => {
+                let (key, value) = entry(key, value);
+                EntryStep::Entry(key, value)
+            }
+            None => EntryStep::End,
+        }
     }
 }
 
@@ -145,55 +134,30 @@ impl<K: Schema + Ord, V: Schema> Schema for BTreeMap<K, V> {
     }
 }
 
-// SAFETY: the cursor is the map's stepped cursor, which borrows the tree,
-// owns nothing, and never refers to itself.
-#[cfg(feature = "custom-std-collections")]
+// SAFETY: the cursor is the tree's own ([`TreeCursor`]), stored by `start`
+// and read back as the same type by `next`; it borrows the tree, owns
+// nothing and never refers to itself; its moves are `tree_step_moves`'.
 unsafe impl<K: Schema + Ord, V: Schema> Entries for BTreeMap<K, V> {
     fn start(&self, slot: &mut Slot) {
-        slot.put(self.stepped_cursor());
+        tree_start(self, slot);
     }
 
-    /// One transition per call.
     fn moves(&self) -> u64 {
-        0
+        tree_step_moves(self)
     }
 
+    /// Rust key order is not canonical key order.
     fn ordered(&self) -> bool {
         false
     }
 
     unsafe fn next<'a>(&'a self, slot: &mut Slot) -> EntryStep<'a> {
-        // SAFETY: `start` stored this map's stepped cursor.
-        let cursor = unsafe { slot.get::<std::collections::btree_map::SteppedCursor<'a, K, V>>() };
-        stepped(cursor, |key, value| {
-            (key as &dyn Schema, value as &dyn Schema)
-        })
-    }
-}
-
-// SAFETY: the cursor is the map's whole range, which borrows the tree, owns
-// nothing, has no destructor, and never refers to itself; creating it over
-// the unbounded range and stepping it compare no keys.
-#[cfg(not(feature = "custom-std-collections"))]
-unsafe impl<K: Schema + Ord, V: Schema> Entries for BTreeMap<K, V> {
-    fn start(&self, slot: &mut Slot) {
-        slot.put(self.range::<K, _>(..));
-    }
-
-    fn moves(&self) -> u64 {
-        tree_moves(self.len())
-    }
-
-    fn ordered(&self) -> bool {
-        false
-    }
-
-    unsafe fn next<'a>(&'a self, slot: &mut Slot) -> EntryStep<'a> {
-        // SAFETY: `start` stored this map's range.
-        let range = unsafe { slot.get::<BTreeMapRange<'a, K, V>>() };
-        ranged(range, |key, value| {
-            (key as &dyn Schema, value as &dyn Schema)
-        })
+        // SAFETY: `start` stored this tree's cursor.
+        unsafe {
+            tree_next::<K, V>(slot, |key, value| {
+                (key as &dyn Schema, value as &dyn Schema)
+            })
+        }
     }
 }
 

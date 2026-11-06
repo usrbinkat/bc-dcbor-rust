@@ -27,7 +27,9 @@ use dcbor::bounded::decode::construction::{
 };
 use dcbor::bounded::decode::cursor::Phase as ParserPhase;
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
-use dcbor::bounded::encoding::{PlanDetail, PlanPhase, Position as PreparationPosition};
+use dcbor::bounded::encoding::{
+    OwnedEmitPosition, PlanDetail, PlanPhase, Position as PreparationPosition,
+};
 use dcbor::bounded::text_cursor::{Phase as TextPhase, Position as TextPosition};
 
 /// A boundary's cleanup class, rendered: classes of different operations
@@ -38,13 +40,14 @@ pub type Class = String;
 pub type Typed<T> = TypedPosition<<<T as Reclaim<Limits>>::State as Custody>::Observation>;
 
 /// The classifiers of one pipeline run: an input acquisition's, a parse's,
-/// a typed decode's of the value the run decodes, and the owned
-/// preparation's of that value's encoding.
+/// a typed decode's of the value the run decodes, the owned preparation's of
+/// that value's encoding, and its emission's.
 pub struct Classes<P> {
     pub input: fn(&Position<InputDetail<BufferObservation>>) -> Option<Class>,
     pub parse: fn(&Position<ParseDetail>) -> Option<Class>,
     pub decode: fn(&P) -> Option<Class>,
     pub prepare: fn(&Position<PlanDetail>) -> Option<Class>,
+    pub emit: fn(&OwnedEmitPosition) -> Option<Class>,
 }
 
 impl Classes<()> {
@@ -55,6 +58,7 @@ impl Classes<()> {
             parse,
             decode: |_| None,
             prepare,
+            emit,
         }
     }
 }
@@ -68,6 +72,7 @@ impl<P> Classes<P> {
             parse: |_| None,
             decode: |_| None,
             prepare: |_| None,
+            emit: |_| None,
         }
     }
 }
@@ -84,6 +89,7 @@ where
         parse,
         decode: typed::<T>,
         prepare,
+        emit,
     }
 }
 
@@ -98,31 +104,51 @@ pub fn parsed<T: Reclaim<Limits>>() -> Classes<Typed<T>> {
             TypedPosition::Construct(_) | TypedPosition::Finished => None,
         },
         prepare,
+        emit,
     }
 }
 
+/// How much of a record's prefix its cleanup reads: the exact units
+/// written, or, for a record whose cleanup before its prefix is complete
+/// reads only what its detail already carries, that the prefix is partial.
+#[derive(Debug)]
+#[expect(dead_code, reason = "read through the rendering that is the class")]
+enum Initialized {
+    Units(usize),
+    Partial,
+}
+
 /// The operation's own part of a class: whether its record is allocated, how
-/// many of its prefix units are written, whether it is cancelling or
-/// finished, and how many records its scope holds. The operation's cleanup
-/// reads each: a record's cleanup releases its written prefix, and the
-/// scope's drain releases every record it holds.
+/// much of its prefix is written ([`Initialized`]), whether it is cancelling
+/// or finished, and how many records its scope holds. The operation's
+/// cleanup reads each: a record's cleanup releases its written prefix, and
+/// the scope's drain releases every record it holds.
 #[derive(Debug)]
 #[expect(dead_code, reason = "read through the rendering that is the class")]
 struct Operation<D> {
     allocated: bool,
-    initialized: usize,
+    initialized: Initialized,
     cancelling: bool,
     finished: bool,
     outstanding: usize,
     detail: D,
 }
 
+/// The operation's part of a class, its prefix by its exact units.
 fn operation<D, E: Debug>(position: &Position<D>, detail: E) -> Class {
+    operation_with(position, Initialized::Units(position.initialized), detail)
+}
+
+fn operation_with<D, E: Debug>(
+    position: &Position<D>,
+    initialized: Initialized,
+    detail: E,
+) -> Class {
     format!(
         "{:?}",
         Operation {
             allocated: position.allocated,
-            initialized: position.initialized,
+            initialized,
             cancelling: position.cancelling,
             finished: position.finished,
             outstanding: position.outstanding,
@@ -275,11 +301,25 @@ struct Parse {
 /// initialization went, which owns nothing), and whether a normalized
 /// output is held. The input offset, header bytes, payload validated, bytes
 /// compared and children completed are never read by cleanup, and are
-/// dropped. The exhaustive layer stops at every member of every class and
-/// requires their cleanups to be equal, so a projection that dropped what
-/// cleanup reads fails there, named.
+/// dropped. Before the record's prefix is complete its cleanup
+/// (`Parsed::reclaim_step`, `remaining`) reads only whether the input slot
+/// is written and holds the input, which the detail's `input` carries, then
+/// releases the record in one unit; the rest of the prefix is scalars and
+/// the parser's resource-free prefix, owning nothing. So every partial
+/// prefix of an allocated record is one class, its exact units dropped. The
+/// exhaustive layer stops at every member of every class and requires their
+/// cleanups to be equal, so a projection that dropped what cleanup reads
+/// fails there, named.
 pub fn parse(position: &Position<ParseDetail>) -> Option<Class> {
     let detail = &position.detail;
+    let initialized = if position.allocated
+        && 0 < position.initialized
+        && position.initialized < position.initialization_steps
+    {
+        Initialized::Partial
+    } else {
+        Initialized::Units(position.initialized)
+    };
     let record = detail.phase.map(|phase| match phase {
         ParsePhase::Parse
         | ParsePhase::Transfer
@@ -310,8 +350,9 @@ pub fn parse(position: &Position<ParseDetail>) -> Option<Class> {
         | ParserPhase::ReleaseStack
         | ParserPhase::Publish => ParserStage::Active,
     });
-    Some(operation(
+    Some(operation_with(
         position,
+        initialized,
         Parse {
             record,
             parser,
@@ -357,6 +398,12 @@ struct Construct<C> {
 /// construction record's cleanup reads its phase (every phase before
 /// reclamation alike), its document and input slots, and its value through
 /// the value's own cleanup, whose class the value's [`Reduction`] declares.
+/// Before the record's prefix is complete its cleanup
+/// (`Constructed::reclaim_step`, `remaining`) reads only whether the
+/// document slot is written and holds the document, then releases the
+/// record in one unit; the rest of the prefix (the empty input slot, the
+/// value's initial state, the phase) owns nothing. So every partial prefix
+/// of an allocated record is one class, by its document alone.
 pub fn typed<T>(position: &Typed<T>) -> Option<Class>
 where
     T: Reclaim<Limits>,
@@ -364,6 +411,22 @@ where
 {
     match position {
         TypedPosition::Parse(parse_position) => parse(parse_position),
+        TypedPosition::Construct(construct)
+            if construct.allocated
+                && 0 < construct.initialized
+                && construct.initialized < construct.initialization_steps =>
+        {
+            Some(operation_with(
+                construct,
+                Initialized::Partial,
+                Construct::<<T::State as Reduction>::Class> {
+                    record: None,
+                    document: construct.detail.document,
+                    input: false,
+                    value: None,
+                },
+            ))
+        }
         TypedPosition::Construct(construct) => Some(operation(
             construct,
             construction::<T::State>(&construct.detail),
@@ -438,22 +501,60 @@ struct Prepare {
     source: bool,
 }
 
-/// An owned preparation's class.
+/// An owned preparation's class. Before the record's prefix is complete its
+/// cleanup (`Planned::reclaim_step`, `remaining`) reads only whether the
+/// source slot is written and holds the source, which the detail's `source`
+/// carries, reclaims the source through its own record, which empties the
+/// slot, then releases the record in one unit; the phase and the
+/// preparation's prefix own nothing (`Preparation::initialize_step`
+/// acquires nothing). So every partial prefix of an allocated record is one
+/// class, its exact units dropped.
 pub fn prepare(position: &Position<PlanDetail>) -> Option<Class> {
     let detail = &position.detail;
-    Some(operation(
-        position,
-        Prepare {
-            record: detail.phase.map(|phase| match phase {
-                PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
-                PlanPhase::ReclaimPreparation => PlanStage::ReclaimPreparation,
-                PlanPhase::ReclaimSource => PlanStage::ReclaimSource,
-                PlanPhase::Done => PlanStage::Done,
-            }),
-            preparation: detail.preparation.as_ref().map(preparing),
-            source: detail.source,
-        },
-    ))
+    let initialized = if position.allocated
+        && 0 < position.initialized
+        && position.initialized < position.initialization_steps
+    {
+        Initialized::Partial
+    } else {
+        Initialized::Units(position.initialized)
+    };
+    Some(operation_with(position, initialized, plan(detail)))
+}
+
+/// What a plan record's cleanup reads ([`Prepare`]), from its detail.
+fn plan(detail: &PlanDetail) -> Prepare {
+    Prepare {
+        record: detail.phase.map(|phase| match phase {
+            PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
+            PlanPhase::ReclaimPreparation => PlanStage::ReclaimPreparation,
+            PlanPhase::ReclaimSource => PlanStage::ReclaimSource,
+            PlanPhase::Done => PlanStage::Done,
+        }),
+        preparation: detail.preparation.as_ref().map(preparing),
+        source: detail.source,
+    }
+}
+
+/// An emission boundary's class: its plan record's cleanup ([`plan`]),
+/// marked as an emission's, the emission's own progress dropped. Every stop
+/// at an emission boundary retires the writer (it holds no operation in
+/// progress), which hands its record to the scope's drain; the drain reads
+/// only the record. An emission step reads the record through a shared view
+/// of its plan and writes only the writer's own progress
+/// (`OwnedWriter::step`), and the writer's own cleanup carries that progress
+/// only to rebuild itself (`OwnedWriter::reclaim_step`), so nothing an
+/// emission step changes is read by any cleanup: the boundaries of one
+/// emission are one class whatever their offset, gaps passed or bytes
+/// written.
+pub fn emit(position: &OwnedEmitPosition) -> Option<Class> {
+    /// The emission's mark beside its record's cleanup: a plan record's
+    /// state at an emission boundary is never compared with one at a
+    /// preparation boundary, whose operation's cleanup differs.
+    #[derive(Debug)]
+    #[expect(dead_code, reason = "read through the rendering that is the class")]
+    struct Emitting(Prepare);
+    Some(format!("{:?}", Emitting(plan(&position.plan))))
 }
 
 fn construction<S: Reduction>(detail: &ConstructDetail<S::Observation>) -> Construct<S::Class> {

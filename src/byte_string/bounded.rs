@@ -45,7 +45,7 @@ unsafe impl Buffer for ByteString {
 
 // SAFETY: the shared byte-buffer phases record initialization and permits.
 unsafe impl<A: Allocator> InPlace<A> for ByteString {
-    const COST: ConstructionCost = buffer_cost::<Self, A::Permit>();
+    const COST: ConstructionCost = crate::const_cost!(buffer_cost::<Self, A::Permit>());
 
     fn build_step(
         document: &Document<'_, A::Permit>,

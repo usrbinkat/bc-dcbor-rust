@@ -19,6 +19,7 @@
 //! assert_eq!(limits.live_bytes(), 0);
 //! ```
 use super::*;
+use crate::bounded::boundary::boundary;
 pub mod comparison;
 pub mod construction;
 pub mod cursor;
@@ -349,15 +350,15 @@ pub fn decode_with<'a, A: Allocator>(
     let mut entries: Owned<Entry, A::Permit> = Owned::new();
     let mut stack: Owned<Frame, A::Permit> = Owned::new();
     let mut pos = 0usize;
+    let depth = Bound::new(Predicate::DispatchDepth, max_depth);
     loop {
-        if stack.len() > max_depth {
+        if depth.exceeded(allocator, stack.len()) {
             return Err(DecodeError::DepthLimit { limit: max_depth });
         }
         let start = pos;
-        HEAD.admit(
-            allocator,
-            widen(input.len().saturating_sub(pos).min(MAX_HEAD_LEN))?,
-        )?;
+        let head_span = Bound::new(Predicate::Payload, MAX_HEAD_LEN)
+            .clamp(allocator, input.len().saturating_sub(pos));
+        HEAD.admit(allocator, widen(head_span)?)?;
         let (major, argument, head) = crate::decode::parse_header_varint(&input[pos..])?;
         pos = pos.checked_add(head).ok_or(BoundedError::Overflow)?;
         let mut children = 0;
@@ -370,7 +371,9 @@ pub fn decode_with<'a, A: Allocator>(
                 Kind::Negative(-1 - argument as i64)
             }
             MajorType::ByteString | MajorType::Text => {
-                if argument > widen(input.len() - pos)? {
+                if Bound::new(Predicate::Payload, widen(input.len() - pos)?)
+                    .exceeded(allocator, argument)
+                {
                     return Err(Error::Underrun.into());
                 }
                 let len = usize::try_from(argument).map_err(|_| BoundedError::Overflow)?;
@@ -406,7 +409,9 @@ pub fn decode_with<'a, A: Allocator>(
                 Kind::Array(argument)
             }
             MajorType::Map => {
-                if argument > widen((input.len() - pos) / 2)? {
+                if Bound::new(Predicate::Payload, widen((input.len() - pos) / 2)?)
+                    .exceeded(allocator, argument)
+                {
                     return Err(Error::Underrun.into());
                 }
                 children = argument.checked_mul(2).ok_or(BoundedError::Overflow)?;
@@ -442,10 +447,10 @@ pub fn decode_with<'a, A: Allocator>(
         };
         // Every child needs at least a one-byte head. Refuse impossible lengths
         // before reserving any arena capacity for the advertised container.
-        if children > widen(input.len() - pos)? {
+        if Bound::new(Predicate::Payload, widen(input.len() - pos)?).exceeded(allocator, children) {
             return Err(Error::Underrun.into());
         }
-        if children > 0 && stack.len() >= max_depth {
+        if children > 0 && depth.reached(allocator, stack.len()) {
             return Err(DecodeError::DepthLimit { limit: max_depth });
         }
         let index = entries.len();
@@ -470,7 +475,7 @@ pub fn decode_with<'a, A: Allocator>(
         let mut completed = index;
         loop {
             let Some(parent) = stack.items.last_mut() else {
-                if pos != input.len() {
+                if boundary!(allocator, Predicate::Payload, pos, input.len()).is_ne() {
                     return Err(Error::UnusedData(input.len() - pos).into());
                 }
                 return Ok(Document { input, entries });
@@ -481,7 +486,9 @@ pub fn decode_with<'a, A: Allocator>(
                 if let Some((previous_start, previous_end)) = parent.previous_key {
                     let previous = &input[previous_start..previous_end];
                     let key = &input[entry.start..entry.end];
-                    KEY.admit(allocator, widen(previous.len().min(key.len()))?)?;
+                    let compared =
+                        Bound::new(Predicate::Payload, key.len()).clamp(allocator, previous.len());
+                    KEY.admit(allocator, widen(compared)?)?;
                     match previous.cmp(key) {
                         core::cmp::Ordering::Equal => return Err(Error::DuplicateMapKey.into()),
                         core::cmp::Ordering::Greater => return Err(Error::MisorderedMapKey.into()),

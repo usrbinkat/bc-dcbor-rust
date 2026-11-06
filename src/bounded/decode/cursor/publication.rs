@@ -1,4 +1,5 @@
 use super::*;
+use crate::bounded::boundary::{Bound, Predicate, boundary};
 use crate::bounded::decode::construction::reclamation::Slot;
 use core::ptr::addr_of_mut;
 
@@ -21,7 +22,9 @@ impl<I, P> ParserContinuation<I, P> {
         mut arena: Slot<'_, DocumentArena<P>, ArenaParts>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        if !self.ready_to_publish() || arena.custody().released > 0 {
+        if !self.ready_to_publish()
+            || Bound::new(Predicate::Prefix, 0).exceeded(a, arena.custody().released)
+        {
             return Err(BoundedError::PlanMismatch);
         }
         // SAFETY: the arena's one field is its node storage, projected by
@@ -81,7 +84,7 @@ impl<P> DocumentArena<P> {
         match released {
             0 => {
                 Self::ITEMS.admit(a)?;
-                if transferred >= 1 {
+                if Bound::new(Predicate::Prefix, 1).reached(a, transferred) {
                     // SAFETY: the parts pair with the arena's place, and a
                     // first part transferred is the node vector written,
                     // reached by field syntax and dropped once: the parts
@@ -91,7 +94,7 @@ impl<P> DocumentArena<P> {
             }
             1 => {
                 Self::PERMIT.admit(a)?;
-                if transferred == 3 {
+                if boundary!(a, Predicate::Prefix, transferred, 3).is_eq() {
                     // SAFETY: as above, the third part transferred is the
                     // permit written.
                     unsafe { core::ptr::drop_in_place(addr_of_mut!((*raw).entries.permit)) };

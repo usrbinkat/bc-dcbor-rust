@@ -3,6 +3,7 @@ extern crate alloc;
 use super::*;
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place, Reduction};
 use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::sync::{Atomics, Representation};
 use alloc::{string::String, vec::Vec};
 
 /// A resource-free placeholder whose construction and move fit one quantum.
@@ -54,6 +55,17 @@ struct Meta<S, T> {
     /// cleanup and the cleanup count all step the payload through it.
     place: Option<Place<T>>,
     phase: Phase,
+}
+
+impl<S, T> Representation for Meta<S, T> {
+    type In<F: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds, its whole value
+/// written with the permit ([`stable::Contract`]): the one definition its
+/// installation and the option's cost read.
+const fn contract<S, T, P>() -> stable::Contract<Meta<S, T>, Meta<S, T>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of a native `Option` of payload `T`, whose state
@@ -160,6 +172,20 @@ impl<S: Custody, T, P> Custody for OptionalState<S, T, P> {
     }
 }
 
+/// The cost of a native option `O` of payload `T` costing `payload`, whose
+/// state is `S`, with permits of `P`: the present-field marker; the metadata
+/// block, held for the value's life; the option's own write; the empty or
+/// absent cleanup unit; the metadata's release. The payload is built in the
+/// option's own bytes. None when a quantity does not fit in `u64`.
+const fn cost<S, T, O, P>(payload: ConstructionCost) -> Option<ConstructionCost> {
+    let meta = contract::<S, T, P>();
+    let entered = cost!(STEP_COST.checked_add(meta.write()));
+    let written = cost!(sized::<O>().bound().checked_add(STEP_COST));
+    let released = cost!(stable::release_cost::<P>().checked_add(held(meta.block())));
+    let fixed = cost!(cost!(entered.checked_add(written)).checked_add(released));
+    ConstructionCost::fixed(fixed).checked_add(payload)
+}
+
 fn metadata<T: Reclaim<A>, A: Allocator>(
     state: &mut OptionalState<T::State, T, A::Permit>,
     a: &mut A,
@@ -167,6 +193,7 @@ fn metadata<T: Reclaim<A>, A: Allocator>(
     // SAFETY: the header is the whole metadata, every field written.
     unsafe {
         stable::install::<Meta<T::State, T>, Meta<T::State, T>, A>(
+            const { contract::<T::State, T, A::Permit>() },
             &mut state.meta,
             &mut state.admitted,
             || Meta {
@@ -259,23 +286,9 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
 unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> {
     const OPTIONAL: bool = true;
 
-    /// The present-field marker; the metadata block, held for the value's
-    /// life; the option's own write; the empty or absent cleanup unit; the
-    /// metadata's release. The child is built in the option's own bytes.
-    const COST: ConstructionCost = {
-        let meta = stable::Metadata::whole::<Meta<T::State, T>, A::Permit>().bytes();
-        ConstructionCost::fixed(plus(
-            plus(
-                plus(
-                    STEP_COST,
-                    stable::install_cost::<Meta<T::State, T>, A::Permit>(),
-                ),
-                plus(sized::<Self>().bound(), STEP_COST),
-            ),
-            plus(stable::release_cost::<A::Permit>(), held(meta)),
-        ))
-        .plus(T::COST)
-    };
+    /// The option's own parts ([`cost`]) and its payload's.
+    const COST: ConstructionCost =
+        crate::const_cost!(cost::<T::State, T, Self, A::Permit>(T::COST));
 
     fn build_present(
         document: &Document<'_, A::Permit>,

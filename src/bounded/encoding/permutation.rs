@@ -9,6 +9,7 @@
 //! Each destination is written once. Binary lookup costs O(log(entries)) per
 //! moved byte; byte movement is linear, but total lookup work is not.
 use super::*;
+use crate::bounded::boundary::boundary;
 use maps::order::Entry;
 
 #[cfg(test)]
@@ -104,8 +105,9 @@ impl<P> Permutation<P> {
     ) -> BoundedResult<bool, A> {
         use decode::initialization::{init_field, init_part};
         let storage = Storage::<u8, P>::INIT_STEPS;
-        if *slot.custody() < storage {
-            init_part!(slot, visited, 0, |visited| Storage::initialize_step(
+        let units = *slot.custody();
+        if Bound::new(Predicate::Prefix, storage).below(a, units) {
+            init_part!(slot, visited, 0, a, |visited| Storage::initialize_step(
                 visited, a
             )?);
             return Ok(false);
@@ -194,7 +196,7 @@ impl<P> Permutation<P> {
             }
             PermutationPhase::Bitmap => {
                 let count = length.div_ceil(8);
-                if self.visited.len() < count {
+                if Bound::new(Predicate::ArenaLength, count).below(a, self.visited.len()) {
                     // Growth and relocation are turns of their own, capped at
                     // the bitmap's bytes; free bytes are zeroed in this one.
                     let visited = &mut self.visited;
@@ -203,11 +205,13 @@ impl<P> Permutation<P> {
                     else {
                         return Ok(false);
                     };
-                    let amount = (count - spare.len())
-                        .min(decode::construction::stable::QUANTUM)
-                        .min(spare.room());
+                    // A grant holds fewer than `count`: the bitmap is short.
+                    let amount =
+                        Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+                            .clamp(a, count - spare.len());
+                    let amount = Bound::new(Predicate::ArenaLength, spare.room()).clamp(a, amount);
                     FILL.admit(a, amount as u64)?;
-                    spare.extend(&[0; decode::construction::stable::QUANTUM][..amount]);
+                    spare.extend(&[0; decode::construction::stable::QUANTUM][..amount], a);
                 } else {
                     FILL.admit(a, 0)?;
                     p.cycle = base;
@@ -219,21 +223,25 @@ impl<P> Permutation<P> {
                     return Ok(false);
                 };
                 let visited = visited.as_slice();
-                let count = (bytes.len() - p.cycle).min(decode::construction::stable::QUANTUM);
+                // `p.cycle` starts at `base` and never passes the payload's
+                // end: the window is at most a quantum of what remains.
+                let count = Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+                    .clamp(a, bytes.len() - p.cycle);
                 SCAN.admit(a, count as u64)?;
                 let end = p.cycle + count;
-                while p.cycle < end {
-                    let bit = p.cycle - base;
+                for (cycle, &byte) in (p.cycle..end).zip(&bytes[p.cycle..end]) {
+                    let bit = cycle - base;
                     if visited[bit / 8] & (1 << (bit % 8)) == 0 {
-                        self.saved = bytes[p.cycle];
-                        p.current = p.cycle;
+                        self.saved = byte;
+                        p.cycle = cycle;
+                        p.current = cycle;
                         p.low = 0;
                         p.high = entries.len();
                         p.phase = PermutationPhase::Lookup;
                         return Ok(false);
                     }
-                    p.cycle += 1;
                 }
+                p.cycle = end;
                 if p.cycle == bytes.len() {
                     p.phase = PermutationPhase::Clear;
                 }
@@ -246,9 +254,11 @@ impl<P> Permutation<P> {
                 let mid = p.low + (p.high - p.low) / 2;
                 let entry = &entries[mid];
                 let end = entry.output + (entry.end - entry.start);
-                if p.current < entry.output {
+                // Where the byte's source lies: before this entry's output,
+                // after it, or within it at the offset its source is read at.
+                if boundary!(a, Predicate::Payload, p.current, entry.output).is_lt() {
                     p.high = mid;
-                } else if p.current >= end {
+                } else if boundary!(a, Predicate::Payload, p.current, end).is_ge() {
                     p.low = mid + 1;
                 } else {
                     p.source = entry.start + (p.current - entry.output);

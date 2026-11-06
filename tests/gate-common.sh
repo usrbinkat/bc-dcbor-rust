@@ -1,21 +1,34 @@
 # Sourced by the evidence gates (tests/miri-owned.sh, tests/reach-map.sh,
-# tests/mutation-evidence.sh): their one definition of an input closure, of
-# the mutation domains' features, of the Miri gate's selection and models,
-# of the tests a suite runs under Miri, and of what a passing run and an
-# aborting one are. Run from the repository root in the configured
-# development shell.
+# tests/mutation-evidence.sh, tests/concurrency-models.sh): their one
+# definition of an input closure, of the mutation domains' features, of the
+# Miri gate's selection and models, of the tests a suite runs under Miri, of
+# what a passing run and an aborting one are, of the commit evidence is of,
+# its copies, and applying a planted diff to one. Run from the repository
+# root in the configured development shell.
 # shellcheck shell=bash
 
-# Every input a gate's evidence depends on, one digest line each: the
-# sources (the crate, the derive crate, the tests, their registries and
-# records), the manifests, the flake and its patches, and the locks.
+# Every input a gate's evidence depends on, one digest line each: the whole
+# input closure, every file of the repository git tracks or would track (the
+# crates and their manifests, the derive crate, the tests, the examples, the
+# fuzz crate, records, registries, planted controls, lint configuration, the
+# flake, its patches and the locks), sorted by path; only what `.gitignore`
+# excludes, build output and logs, is not an input. A file tracked but
+# deleted from the working tree is named as deleted. A hand-picked list of
+# patterns is no closure: one missed the derive crate's manifest. The one
+# snapshot of every gate, profile and campaign (tests/profile-codec.sh,
+# fuzz/qualify.sh), each identity built by `identity` and each source
+# checked unchanged by `same_source`.
 snapshot() {
-	find src dcbor-derive/src tests -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' \) -print0 |
-		LC_ALL=C sort -z | xargs -0 sha256sum
-	sha256sum Cargo.toml flake.nix nix/*.patch
-	for file in Cargo.lock flake.lock; do
-		if [[ -f "$file" ]]; then sha256sum "$file"; fi
-	done
+	local file
+	git -C "$PWD" ls-files -z --cached --others --exclude-standard --deduplicate |
+		LC_ALL=C sort -z |
+		while IFS= read -r -d '' file; do
+			if [[ -f "$file" ]]; then
+				sha256sum -- "$file"
+			else
+				printf 'deleted  %s\n' "$file"
+			fi
+		done
 }
 
 # The identity of a gate's run: the snapshot, the shell's configuration
@@ -68,9 +81,10 @@ same_source() {
 # Miri forwards one variable per flag: a comma-separated list would name a
 # single variable that does not exist, and each would silently fall back to
 # its default inside the interpreter. DCBOR_RIGOR selects the verification
-# layer, DCBOR_CLASS_COVERAGE the class inventory, DCBOR_WITNESS the witness
-# sizes; each is forwarded, and nothing else of the host's environment is
-# visible.
+# layer, DCBOR_CLASS_COVERAGE the inventory (each matrix's stop classes and
+# the boundary valuations its runs reached, tests/gate `inventory`),
+# DCBOR_WITNESS the witness sizes; each is forwarded, and nothing else of the
+# host's environment is visible.
 #
 # Alignment is checked symbolically: against the alignment each allocation
 # was requested with and the offset into it, not the integer address, which
@@ -97,6 +111,65 @@ miri_seeds() {
 		return 2
 	fi
 	seq 0 $((count - 1))
+}
+
+# The commit a gate's evidence is of: the checkout's HEAD, refused unless the
+# tree is clean, so nothing edited and not committed reaches the evidence.
+# Writes it to `$1/commit.txt` and into the variable `commit`.
+clean_commit() {
+	if [[ -n "$(git -C "$PWD" status --porcelain)" ]]; then
+		event "FAIL the tree is not clean: evidence is of a commit; nothing was run"
+		return 1
+	fi
+	commit="$(git -C "$PWD" rev-parse HEAD)" || return 1
+	printf '%s\n' "$commit" >"$1/commit.txt"
+}
+
+# Whether the checkout is still clean at the commit `clean_commit` named:
+# evidence taken while it moved is of no one commit.
+still_at_commit() {
+	[[ -z "$(git -C "$PWD" status --porcelain)" ]] &&
+		[[ "$(git -C "$PWD" rev-parse HEAD)" == "$commit" ]]
+}
+
+# A copy of the commit `$2` at `$1`, replacing any earlier one: what a
+# planted diff (a mutant, a control) is applied to, never the checkout.
+copy_of() {
+	rm -rf "$1"
+	mkdir -p "$1"
+	git -C "$PWD" archive "$2" | tar -x -C "$1"
+}
+
+# The one applier of a planted diff: `apply_diff DIFF DIR` applies DIFF to
+# the tree at DIR, a copy of a commit (`copy_of`), exactly (`-p0`, no fuzz).
+# The copy is discarded with the diff in it; nothing is reverted, since no
+# tree a gate keeps is ever changed.
+apply_diff() {
+	patch -d "$2" -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$1"
+}
+
+# The gate tool (tests/gate): every decision about what a run produced and
+# whether it is evidence is made there, once; the scripts launch it.
+# `gate_prepare` builds it once, in a target directory of its own, before a
+# script changes its environment: none of the flags or wrappers a gate sets
+# for what it measures (the reach map's coverage instrumentation,
+# RUSTFLAGS, the profile runtime) reaches the tool, which measures without
+# being measured. Built for the host named explicitly, so its path is the
+# same whether or not the shell's cargo sets a target. Its standard input is
+# never a script's: a call inside a loop reading a file leaves that file to
+# the loop.
+gate_prepare() {
+	local target="$PWD/target/gate-tool" host
+	host="$(rustc -vV | sed -n 's/^host: //p')" || return 2
+	[[ -n "$host" ]] || return 2
+	env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u DCBOR_PROFILER \
+		cargo build --quiet --package dcbor-gate --bin gate --target "$host" --target-dir "$target" </dev/null ||
+		return 2
+	GATE_BINARY="$target/$host/debug/gate"
+}
+gate() {
+	: "${GATE_BINARY:?call gate_prepare before the gate tool}"
+	"$GATE_BINARY" "$@" </dev/null
 }
 
 # One progress line of a gate, on standard output: a timestamp, then the
@@ -149,17 +222,19 @@ miri_flags() {
 	esac
 }
 
-# The cargo features of mutation domain `$1`, into the array `features`:
-# every feature, or the no_std build. Unknown domains are refused.
+# The list `$2` (features, files or tests) of build domain `$1`, from the
+# gate's one table of domains (tests/gate, `domains`), into the array
+# `domain_list`. Unknown domains are refused by the gate.
+domain_list() {
+	local listed
+	listed="$(gate domain "$1" "$2")" || return 2
+	mapfile -t domain_list <<<"$listed"
+}
+
+# The cargo features of build domain `$1`, into the array `features`.
 domain_features() {
-	case "$1" in
-	all-features) features=(--all-features) ;;
-	no_std) features=(--no-default-features --features no_std) ;;
-	*)
-		printf 'unknown mutation domain: %s; the domains are all-features and no_std\n' "$1" >&2
-		return 2
-		;;
-	esac
+	domain_list "$1" features || return 2
+	features=("${domain_list[@]}")
 }
 
 # Each suite of tests/miri-suites.txt: calls `$1` with the suite, its base
@@ -275,25 +350,4 @@ selecting() {
 		return 2
 		;;
 	esac
-}
-
-# A successful empty libtest selection is not qualification.
-executed() {
-	grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$1"
-}
-
-# A native run of an abort scenario through cargo, log `$1`: the test binary
-# killed by SIGABRT (cargo-util's `exit_status_to_string`).
-aborted_natively() {
-	grep -Fq 'signal: 6, SIGABRT' "$1"
-}
-
-# A Miri run of an abort scenario, log `$1`: the interpreted program
-# aborted (Miri's `TerminationInfo::Abort`, reported as an abnormal
-# termination), and Miri reported neither undefined behavior nor an
-# unsupported operation, which also end a run.
-aborted_under_miri() {
-	grep -Fq 'abnormal termination' "$1" &&
-		! grep -Fq 'Undefined Behavior' "$1" &&
-		! grep -Fq 'unsupported operation' "$1"
 }

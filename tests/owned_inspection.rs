@@ -210,6 +210,7 @@ fn a_class_merging_states_of_different_custody_is_rejected() {
         parse: |_| Some("merged".to_owned()),
         decode: |_| None,
         prepare: |_| None,
+        emit: |_| None,
     };
     matrix(
         "inspection under a planted class",

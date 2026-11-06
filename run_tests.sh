@@ -27,10 +27,13 @@ fast | exhaustive) ;;
 esac
 section "rigor: $DCBOR_RIGOR"
 
+# The evidence gates' own oracles and their planted-defect controls: the
+# record format, the model-bounds and census rows, and the gate tool
+# (outcomes, rows, Miri results and judgements, bound derivation, the reach
+# map, the mutation comparison and verdicts, the cost recorder, the
+# launchers' contracts).
 section "Evidence tooling controls"
-python3 tests/record_evidence_test.py
-python3 tests/mutation_evidence_test.py
-python3 tests/reach_map_test.py
+cargo test --quiet -p dcbor-record -p dcbor-model-bounds -p dcbor-census -p dcbor-gate
 
 select_targets() {
 	local features="$1" path target

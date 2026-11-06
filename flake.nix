@@ -179,17 +179,15 @@
             '';
           };
           # What maintaining the project runs besides the toolchain: the
-          # mutation campaign and its comparator, the reach map's coverage
-          # (cargo-llvm-cov), the Miri gate's per-test memory and duration
-          # (GNU time), the fuzz campaign (fuzz/qualify.sh, fuzz/smoke.sh),
-          # and the checks of the gate scripts and the comparator's own
-          # sources.
+          # mutation campaign, the reach map's coverage (cargo-llvm-cov), the
+          # Miri gate's per-test memory and duration (GNU time), the fuzz
+          # campaign (fuzz/qualify.sh, fuzz/smoke.sh), and the check of the
+          # gate scripts, which launch the gate tool (tests/gate), built by
+          # the toolchain itself.
           maintenance = [
             cargoMutants
             cargoLlvmCov
             pkgs.cargo-fuzz
-            pkgs.python3
-            pkgs.pyright
             pkgs.shellcheck
             pkgs.time
           ];

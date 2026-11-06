@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # The reach map: which test of the Miri gate's selection (tests/miri-suites.txt)
 # executes which code of this crate, each test run alone, instrumented, as
-# Miri runs it: in its suite's mutation domain's build, the tests Miri lists
-# (those ignored under Miri drop out; an abort suite's scenarios are its
-# ignored tests), the same rigor, the same boundary-minimal witnesses
+# Miri runs it: in its suite's domain's build, the tests Miri lists (those
+# ignored under Miri drop out; an abort suite's scenarios are its ignored
+# tests), the same rigor, the same boundary-minimal witnesses
 # (DCBOR_WITNESS=minimal), no `cfg(miri)` divergence (tests/unsafe_census.rs
 # refuses one in a suite). Miri checks the paths it executes and nothing
 # else, so a mutant is judged under Miri on exactly the tests of its domain
-# whose execution reaches its mutated region (tests/mutation-evidence.py,
-# `miri-plan`).
+# whose execution reaches its mutated region (tests/gate, `mutation
+# miri-plan`).
 #
 # Coverage is LLVM's source-based instrumentation of the workspace crates
 # (cargo-llvm-cov's rustc wrapper), linked against the forked std with the
@@ -26,28 +26,38 @@
 #
 # Each test also runs at the full witness sizes the native layers run
 # (DCBOR_WITNESS=full): its minimal run must execute every region of this
-# crate its full run executes, or the map fails. A witness resized for Miri
-# keeps every path its full size takes.
+# crate its full run executes, and reach exactly the boundary predicate
+# valuations its full run reaches (its log's inventory, DCBOR_CLASS_COVERAGE;
+# tests/gate, `inventory`), or the map fails. A witness resized for Miri
+# keeps every path and every boundary edge its full size takes.
+#
+# Every reading of a build's messages and of a coverage export, every
+# classification of a run, and the map and its verdict are the gate tool's
+# (tests/gate, `reach` and `classify binary`), built before the coverage
+# environment is loaded, so the tool itself is never instrumented.
 #
 # Writes, in DCBOR_REACH_DIR (a new directory under TMPDIR by default):
-# identity.txt, census.jsonl, each suite's Miri-listed tests (<base>.tests),
-# kind (<base>.kind) and domain (<base>.domain), each test's reached regions
-# at minimal sizes (reach/<base>/<index>.json) and at full sizes
-# (reach-full/<base>/<index>.json), the functions of every instrumented
-# binary (functions/<base>.json), and reach.json, the map the campaign's
-# Miri layer reads.
+# identity.txt, census.txt (the census record, dcbor_census, its modules and
+# its cfg predicates), metadata.json (cargo metadata), each suite's
+# Miri-listed tests (<base>.tests), kind (<base>.kind) and domain
+# (<base>.domain), each test's reached regions at minimal sizes
+# (reach/<base>/<index>.json) and at full sizes (reach-full/<base>/<index>.json),
+# each run's log, whose inventory the index reads (raw/<base>/<sizes>/<index>.log),
+# the functions of every instrumented binary (functions/<base>.json), and
+# reach.json, the map the campaign's Miri layer reads.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 : "${TMPDIR:?required: the reach map output directory}"
-for tool in cargo cargo-llvm-cov rustc python3 sha256sum; do
+for tool in cargo cargo-llvm-cov rustc sha256sum; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Reach map prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
 		exit 127
 	fi
 done
+gate_prepare
 out="${DCBOR_REACH_DIR:-$(mktemp -d "$TMPDIR/dcbor-reach.XXXXXX")}"
 mkdir -p "$out"
 # A verdict left by an earlier map in this directory is not this one's.
@@ -73,12 +83,16 @@ counter_relocation="-C llvm-args=-runtime-counter-relocation"
 } | identity "$out"
 echo "identity: $(cat "$out/identity.txt")"
 
-# The trust boundaries.
-DCBOR_UNSAFE_CENSUS="$out/census.jsonl" cargo test --all-features --test unsafe_census -- \
+# The trust boundaries, and every `cfg` predicate of the crate; and the
+# package's feature table as Cargo resolves it, implicit features of its
+# optional dependencies included, against which the index requires each
+# predicate to hold in some build the gates make (tests/gate, `cfgs`).
+DCBOR_UNSAFE_CENSUS="$out/census.txt" cargo test --all-features --test unsafe_census -- \
 	--exact every_unsafe_trust_boundary_of_this_crate_is_found >"$out/census.log" 2>&1 || {
 	cat "$out/census.log"
 	exit 1
 }
+cargo metadata --no-deps --format-version 1 >"$out/metadata.json"
 
 # Every suite's tests as Miri lists them, before the coverage environment
 # is loaded: listing runs in the interpreter, uninstrumented, in the
@@ -89,7 +103,7 @@ miri_prepare >"$out/miri-setup.log" 2>&1 || {
 }
 bases=()
 list_suite() {
-	local base="$2" filter="$3" kind="$4" domain="$5"
+	local base="$2" filter="$3" kind="$4" domain="$5" listed
 	shift 5
 	listed_under_miri "$out/$base.tests" "$filter" "$kind" "$@" || {
 		echo "the tests of $base could not be listed under Miri: $out/$base.tests.err" >&2
@@ -98,7 +112,8 @@ list_suite() {
 	printf '%s\n' "$kind" >"$out/$base.kind"
 	printf '%s\n' "$domain" >"$out/$base.domain"
 	bases+=("$base")
-	planned=$((planned + $(wc -l <"$out/$base.tests")))
+	mapfile -t listed <"$out/$base.tests"
+	planned=$((planned + ${#listed[@]}))
 }
 planned=0
 each_suite list_suite
@@ -126,10 +141,11 @@ done
 # One test of kind `$4` of suite `$2`'s binary `$1`, its index `$3`, run
 # alone at witness sizes `$5`: its profile merged and the regions it
 # executed written to reach/ (minimal, the sizes Miri runs) or reach-full/
-# (full, the native layers' sizes). A `test` must pass; an `abort` scenario
-# must be killed by SIGABRT (exit status 134 through the shell).
+# (full, the native layers' sizes). The run must pass as its kind requires
+# (tests/gate, `classify binary`): a `test` passes, an `abort` scenario is
+# killed by SIGABRT.
 reach_test() {
-	local exe="$1" base="$2" index="$3" kind="$4" sizes="$5" test="$6" raw reach status
+	local exe="$1" base="$2" index="$3" kind="$4" sizes="$5" test="$6" raw reach status outcome
 	case "$sizes" in
 	minimal) reach="reach" ;;
 	full) reach="reach-full" ;;
@@ -148,17 +164,15 @@ reach_test() {
 	status=0
 	DCBOR_WITNESS="$sizes" LLVM_PROFILE_FILE="$raw/$index-%p%c.profraw" "$exe" "${select[@]}" \
 		--nocapture --test-threads=1 >"$raw/$index.log" 2>&1 || status=$?
-	case "$kind:$status" in
-	test:0 | race:0 | abort:134) ;;
-	*)
-		event "FAIL $base $test $sizes: status $status uninterpreted, instrumented ($((SECONDS - started))s, $raw/$index.log)"
+	outcome="$(gate classify binary "$kind" "$status" "$raw/$index.log")"
+	if [[ "$outcome" != pass ]]; then
+		event "FAIL $base $test $sizes: $outcome, status $status, instrumented ($((SECONDS - started))s, $raw/$index.log)"
 		exit 1
-		;;
-	esac
+	fi
 	"$tools/llvm-profdata" merge -sparse "$raw/$index"-*.profraw -o "$raw/$index.profdata"
-	"$tools/llvm-cov" export -format=text -instr-profile="$raw/$index.profdata" "$exe" |
-		python3 tests/reach-map.py regions "$PWD" >"$out/$reach/$base/$index.json"
-	rm -f "$raw/$index"-*.profraw
+	"$tools/llvm-cov" export -format=text -instr-profile="$raw/$index.profdata" "$exe" >"$raw/$index.export.json"
+	gate reach regions "$PWD" "$raw/$index.export.json" >"$out/$reach/$base/$index.json"
+	rm -f "$raw/$index"-*.profraw "$raw/$index.export.json"
 	event "DONE $base $test $sizes ($((SECONDS - started))s)"
 }
 
@@ -168,11 +182,11 @@ reach_suite() {
 	local base="$2" kind="$4" exe index test started=$SECONDS
 	shift 5
 	event "BUILD $base ($out/$base.build.log)"
-	exe="$(cargo test "$@" --no-run --message-format=json 2>>"$out/$base.build.log" |
-		python3 tests/reach-map.py executable)" || {
+	if ! cargo test "$@" --no-run --message-format=json >"$out/$base.build.json" 2>>"$out/$base.build.log" ||
+		! exe="$(gate reach executable "$out/$base.build.json")"; then
 		event "FAIL $base: the instrumented binary could not be built ($out/$base.build.log)"
 		exit 1
-	}
+	fi
 	event "BUILT $base ($((SECONDS - started))s, $exe)"
 	mkdir -p "$out/functions"
 	index=0
@@ -184,14 +198,16 @@ reach_suite() {
 	# Every function the binary instruments, executed or not, from the
 	# profile of its first test: the census's coverage target is checked
 	# against them.
-	"$tools/llvm-cov" export -format=text -instr-profile="$out/raw/$base/minimal/0.profdata" "$exe" |
-		python3 tests/reach-map.py functions "$PWD" >"$out/functions/$base.json"
+	"$tools/llvm-cov" export -format=text -instr-profile="$out/raw/$base/minimal/0.profdata" "$exe" \
+		>"$out/raw/$base/functions.export.json"
+	gate reach functions "$PWD" "$out/raw/$base/functions.export.json" >"$out/functions/$base.json"
+	rm -f "$out/raw/$base/functions.export.json"
 }
 each_suite reach_suite
 
 event "INDEX $out/reach.json"
-python3 tests/reach-map.py index "$out" "${bases[@]}"
-# Written only once the index passes both its checks (`set -e`): the Miri
+gate reach index "$out" "${bases[@]}"
+# Written only once the index passes its four checks (`set -e`): the Miri
 # gate takes a reach map as its selection's evidence only by this verdict
 # and its source identity (tests/miri-owned.sh).
 echo pass >"$out/verdict"

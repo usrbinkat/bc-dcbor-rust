@@ -71,7 +71,10 @@ unsafe impl<A: Allocator> InPlace<A> for Value {
     }
 }
 
-fn run(stop: Option<usize>, terminal: bool) -> usize {
+/// The tree's decode stopped at turn `stop`, cancelled with its cleanup or,
+/// when `terminal`, dropped with its scope: the turn it ended at, and the
+/// boundary valuations the run reached.
+fn run(stop: Option<usize>, terminal: bool) -> (usize, dcbor::bounded::boundary::Reached) {
     let mut m = meter();
     let mut owner = scope(&mut m);
     // Twelve entries require internal nodes and relocation of custody records.
@@ -90,14 +93,14 @@ fn run(stop: Option<usize>, terminal: bool) -> usize {
                 // Exercise the owner's non-refusing terminal cleanup too.
                 drop(owner);
                 assert_eq!(m.live_bytes(), 0);
-                return turn;
+                return (turn, m.reached());
             }
             decoder.cancel();
             support::finish_within(&mut m, &mut decoder, bound);
             drop(decoder);
             drain(&mut owner, &mut m);
             assert_eq!(m.live_bytes(), 0);
-            return turn;
+            return (turn, m.reached());
         }
         match support::checked(&mut m, |m| support::contracted(m, &mut decoder)) {
             Ok(Step::Progress) => {}
@@ -115,7 +118,7 @@ fn run(stop: Option<usize>, terminal: bool) -> usize {
                     drain(&mut owner, &mut m);
                 }
                 assert_eq!(m.live_bytes(), 0);
-                return turn;
+                return (turn, m.reached());
             }
             other => panic!(
                 "unexpected decode outcome: {}",
@@ -135,10 +138,13 @@ fn run(stop: Option<usize>, terminal: bool) -> usize {
 /// construction state's destructor runs, and everything is recovered.
 #[test]
 fn tree_custody_never_drops_child_states() {
-    let last = run(None, false);
-    assert_eq!(run(None, true), last);
+    let (last, _) = run(None, false);
+    assert_eq!(run(None, true).0, last);
     support::stop_matrix("a tree decode stopped", last, |turn| {
-        assert_eq!(run(Some(turn), false), turn);
-        assert_eq!(run(Some(turn), true), turn);
+        let (cancelled, by_cancellation) = run(Some(turn), false);
+        assert_eq!(cancelled, turn);
+        let (dropped, by_drop) = run(Some(turn), true);
+        assert_eq!(dropped, turn);
+        by_cancellation.union(by_drop)
     });
 }

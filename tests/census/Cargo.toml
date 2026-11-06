@@ -1,0 +1,17 @@
+[package]
+name = "dcbor-census"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The unsafe census's rows: written by the census test, read by the gate's reach map and mutation plan."
+license = "BSD-2-Clause-Patent"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The record format, its one implementation.
+dcbor-record = { path = "../record" }
+
+[lints]
+workspace = true

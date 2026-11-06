@@ -81,8 +81,11 @@ Writes are checked for real heap requests on success and every refusal, output
 canaries, retry with the same preparation, and the write bound
 (`Prepared::write_work`). Sources breaking the schema contract exercise an
 encoding longer when prepared than when walked (refused at the arena's cap), a
-counted map visiting another count, an entry past its bucket window, and
-endless nesting (refused by the walk before any allocation). Already-normal
+counted map visiting another count, an entry offered to a field map, and
+endless nesting (refused by the walk before any allocation). No source can
+skip or scan buckets: an entry carries no index, and a hash table's buckets
+are inspected only by the engine's one traversal over the sealed set of
+tables whose accessors this crate's forks provide. Already-normal
 text and numeric arrays request exactly the plan's arenas, as a byte string of
 the same encoded length does. Every head width is checked against every wrong
 output length for refusal before admission or writing, and against literal
@@ -170,7 +173,10 @@ cleanup, owned queue reclamation, owned emission and normalizer
 initialization; and `no_std`, over the owned scope's reclamation, the only
 code of that domain compiled without std and never under every feature.
 The shell supplies cargo-mutants (with `--mutate-unsafe`, so `unsafe fn`
-bodies are in the domain), cargo-llvm-cov and Python; nothing is installed.
+bodies are in the domain) and cargo-llvm-cov; nothing is installed. Every
+decision of the campaign (the domains, the layers' comparison, the Miri
+plan and the verdict) is the gate tool's (`tests/gate`, `domains` and
+`mutation`).
 Cargo-mutants uses copied build directories and the active Cargo wrapper.
 Each layer first requires a successful unmutated baseline.
 
@@ -184,7 +190,8 @@ uncapped. The cap applied is written to `containment.txt` in the logs.
 
 `TMPDIR` is required: the campaign's log directory. Logs, source hashes,
 mutant diffs, outcomes and each domain's `comparison.json` are retained
-there, with the run's identity over its whole input closure. The comparator requires
+there, with the run's identity over its whole input closure, its commit
+first: the campaign requires a clean tree. The comparison requires
 identical planned mutants and diffs, complete outcomes and identical tool
 versions. It reports each layer's caught count over the common viable
 domain, misses by both, and either direction of detection disagreement.
@@ -215,15 +222,19 @@ coverage, at the minimal witness sizes Miri runs
 of such a module is reached by no test Miri runs, or when a minimal witness
 leaves unexecuted a region its full size executes. Test code, a module the
 census finds compiled only under `cfg(test)` or beneath one, is never
-mutated, so it is no trust boundary and need not be reached. Every reader
-of the census parses its rows through one type (`reach-map.py`
-`CensusModule`), which rejects a row of any other shape. The campaign then runs
+mutated, so it is no trust boundary and need not be reached. The census is
+a record whose rows have one definition (`tests/census`, `CensusModule`),
+which the census test writes and the gate reads, rejecting a row of any
+other shape; the reach map and its verdict are the gate's (`reach`). The
+campaign then runs
 the Miri gate unmutated (`tests/miri-owned.sh`, one Miri process per test
 and model, strict provenance, Stacked and Tree Borrows) as the baseline,
 plans each such survivor on exactly the tests whose execution overlaps its
 mutated span, and judges it with `tests/miri-owned.sh --judge`, which
-applies its diff to the working tree, runs those tests under both models
-and reverts it, checking the source snapshot after each. A survivor is then
+requires a clean tree, applies its diff to a copy of the commit made by `git
+archive`, never to the checkout, and runs those tests there under both
+models; the gate tool (`tests/gate`, `miri baseline` and `miri judge`)
+decides each verdict. A survivor is then
 `caught_under_miri` or `missed_under_miri`; one with no reaching test
 (`unreached_under_miri`), a selected test without an unmutated pass under
 both models (`no_baseline`), a planned mutant without a verdict
@@ -233,15 +244,10 @@ catches. Every judgement counts only against a baseline of the same
 identity: sources, locks, features, the forked std and both models'
 `MIRIFLAGS`.
 
-The comparator's planted-defect checks run with:
+The comparison's, the plan's and the verdict's planted-defect checks, and
+the reach map's census rows and index verdicts (unreached, test code,
+witness loss, a row of another shape), run with:
 
 ```sh
-python3 -B tests/mutation_evidence_test.py
-```
-
-The reach map's census rows and index verdicts (unreached, test code,
-witness loss, a row of another shape) are checked with:
-
-```sh
-python3 -B tests/reach_map_test.py
+cargo test -p dcbor-census -p dcbor-gate
 ```

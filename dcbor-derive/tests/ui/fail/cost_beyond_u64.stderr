@@ -1,0 +1,27 @@
+error[E0080]: evaluation panicked: a construction cost exceeds u64
+  --> tests/ui/fail/cost_beyond_u64.rs:34:36
+   |
+34 |       const COST: ConstructionCost = dcbor::const_cost!(
+   |  ____________________________________^
+35 | |         <huge::Huge as InPlace<A>>::COST.checked_add(ConstructionCost::fixed(unit(0)))
+36 | |     );
+   | |_____^ evaluation of `<Overflowing as dcbor::bounded::decode::construction::in_place::InPlace<dcbor::bounded::Limits>>::COST::{constant#0}` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `dcbor::const_cost` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui/fail/cost_beyond_u64.rs:34:36
+   |
+34 |       const COST: ConstructionCost = dcbor::const_cost!(
+   |  ____________________________________^
+35 | |         <huge::Huge as InPlace<A>>::COST.checked_add(ConstructionCost::fixed(unit(0)))
+36 | |     );
+   | |_____^
+   |
+   = note: this note originates in the macro `dcbor::const_cost` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui/fail/cost_beyond_u64.rs:51:13
+   |
+51 |     let _ = <Overflowing as InPlace<Limits>>::COST;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

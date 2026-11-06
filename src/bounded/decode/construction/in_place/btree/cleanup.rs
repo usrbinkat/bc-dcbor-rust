@@ -95,7 +95,7 @@ pub(super) fn reclaim<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
         STEP.admit(a)?;
         return Ok(Reclaimed::Done);
     }
-    if state.initialized < INIT {
+    if Bound::new(Predicate::Prefix, INIT).below(a, state.initialized) {
         // SAFETY: the initialized metadata prefix owns no resources. The
         // outer MaybeUninit is always initialized and has no destructor.
         unsafe {

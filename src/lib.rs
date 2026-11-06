@@ -86,6 +86,8 @@
 #[macro_use]
 mod stdlib;
 
+mod sync;
+
 mod cbor;
 pub use cbor::*;
 
@@ -111,7 +113,7 @@ mod dump;
 pub use dump::HexFormatOpts;
 
 mod tags_store;
-pub use tags_store::{CBORSummarizer, TagsStore, TagsStoreOpt, TagsStoreTrait};
+pub use tags_store::{CBORSummarizer, TagsStore, TagsStoreTrait};
 
 mod tag;
 pub use tag::{Tag, TagValue};

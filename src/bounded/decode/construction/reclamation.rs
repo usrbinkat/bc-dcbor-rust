@@ -10,17 +10,23 @@
 //! one thread; the owned scope re-exposes the same queue across threads only for
 //! payloads its allocation path has proven `Send`.
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::{MaybeUninit, size_of};
+use core::mem::MaybeUninit;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use super::operation::OperationPlace;
 use super::stable::{self, Held};
+use crate::bounded::ResourceBound;
+use crate::bounded::boundary::{Predicate, boundary};
 use crate::bounded::{Allocator, BoundedError, BoundedResult, at};
+use crate::sync::{
+    AtomicBool, AtomicPtr, AtomicUsize, Atomics, Ordered, Ordering, Plain, Representation, Shipped,
+};
 
 mod owned;
 /// Admissions held toward a block, as custody observations report them.
 pub use super::stable::Admitted;
+#[cfg(test)]
+pub(crate) use owned::admits_its_production_representation;
 pub(crate) use owned::{AbortOnUnwind, EMPTIED, ScopeRef, slot_place};
 pub use owned::{
     Acquisition, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition, scope_bound,
@@ -90,7 +96,8 @@ pub trait Custody {
 /// and every stop over it runs. A state whose observation does not carry
 /// what its cleanup depends on cannot implement it soundly: a container
 /// observes its newest child whole but counts its older ones, whose custody
-/// may differ, so containers implement none, and a binding over a child
+/// may differ, so a container implements it only over children whose every
+/// complete state is of one class ([`Uniform`]), and a binding over a child
 /// implements it only over a child that does. An implementation states the
 /// argument for its relation at its definition; the verification suites
 /// check the relation against the states and cleanup transitions they
@@ -100,6 +107,22 @@ pub trait Reduction: Custody {
     type Class: Copy + Eq + Ord + core::fmt::Debug;
 
     fn class(observation: &Self::Observation) -> Self::Class;
+}
+
+/// A reduction whose every complete state, the state any construction
+/// reaches when a build step reports `Built::Done`, is of one class,
+/// [`Self::COMPLETE`]. What a container's reduction rests on: it observes
+/// its newest child whole and counts its older ones, which are complete, so
+/// their cleanups are alike, and its class a simulation of cleanup, exactly
+/// when every complete child is of one class. A state whose complete states
+/// differ in what their cleanup reads (an option complete as absent or as
+/// present) declares none, and a container over it is never reduced. Each
+/// declaration states why it holds; the verification suites require every
+/// complete state they reach to be of the declared class, and reject a
+/// planted declaration that is not.
+pub trait Uniform: Reduction {
+    /// The class of every complete state.
+    const COMPLETE: Self::Class;
 }
 
 /// Whether a resource-free value has been written to its destination: the
@@ -127,6 +150,13 @@ impl Reduction for Written {
     fn class(observation: &Self) -> Self {
         *observation
     }
+}
+
+// Every binding whose state is `Written` records the value written before
+// its build step reports `Done` (the integers' and scalars' bindings, and the
+// derive's unit payloads): a complete state is `Initialized`.
+impl Uniform for Written {
+    const COMPLETE: Self = Written::Initialized;
 }
 
 /// The state of a record an operation initializes in a fixed number of
@@ -698,28 +728,34 @@ enum Holder {
     Active,
 }
 
+/// A record's header, one definition for every atomics family `S`
+/// ([`crate::sync`]): the build stores `Shipped`'s, and every contract
+/// quantity reads `Core`'s ([`Representation`], [`contract`]).
 #[repr(C)]
-struct Header<A: Allocator> {
+struct Header<A: Allocator, S: Atomics = Shipped> {
     /// Written by the retiring thread before publication and by the next
     /// retiring thread when it links behind this record.
-    next: AtomicPtr<Header<A>>,
+    next: S::Link<Header<A, S>>,
     advance: Advance<A>,
     finish: Finish<A>,
-    /// Owned by the handle until publication, then by the stepping caller.
-    custody: Holder,
+    /// Owned by the handle until publication, then by the stepping caller:
+    /// written before the tail swap that publishes the record and read after
+    /// the removal that acquires it, so its accesses are ordered by that
+    /// publication alone.
+    custody: S::Cell<Holder>,
     /// Stepping caller only, once active: the cleanup calls the record may
     /// still take, its declared count when it became active
     /// ([`Reclaim::remaining`]), saturated, which only overstates. Held in
     /// the header's padding beside `custody`.
-    budget: u32,
+    budget: S::Cell<u32>,
     _pin: PhantomPinned,
 }
 
 /// What a record's acquisition writes, whole: its header and the payload's
 /// state. The header is first.
 #[repr(C)]
-struct Head<T: Reclaim<A>, A: Allocator> {
-    header: Header<A>,
+struct Head<T: Reclaim<A>, A: Allocator, S: Atomics = Shipped> {
+    header: Header<A, S>,
     state: T::State,
 }
 
@@ -727,24 +763,50 @@ struct Head<T: Reclaim<A>, A: Allocator> {
 /// it, and `Held` places its value first, so a header pointer is a block
 /// pointer.
 #[repr(C)]
-struct Entry<T: Reclaim<A>, A: Allocator> {
-    head: Head<T, A>,
+struct Entry<T: Reclaim<A>, A: Allocator, S: Atomics = Shipped> {
+    head: Head<T, A, S>,
     value: MaybeUninit<T>,
 }
 
-type Block<T, A> = Held<Entry<T, A>, <A as Allocator>::Permit>;
+type Block<T, A, S = Shipped> = Held<Entry<T, A, S>, <A as Allocator>::Permit>;
 
-/// The record's admitted metadata: its head, whole, and the permit, written
-/// in one unit. Evaluated in a constant by every caller, so a payload whose
-/// state cannot fit fails to compile where its record type is used.
-const fn metadata<T: Reclaim<A>, A: Allocator>() -> stable::Metadata {
-    stable::Metadata::header::<Head<T, A>, Entry<T, A>, A::Permit>()
+impl<T: Reclaim<A>, A: Allocator, S: Atomics> Representation for Head<T, A, S> {
+    type In<F: Atomics> = Head<T, A, F>;
 }
 
-/// What allocating one record holding a `T` admits and requests: one unit
-/// of its metadata, and its whole block.
-pub(crate) const fn record_cost<T: Reclaim<A>, A: Allocator>() -> (stable::Metadata, usize) {
-    (metadata::<T, A>(), size_of::<Block<T, A>>())
+impl<T: Reclaim<A>, A: Allocator, S: Atomics> Representation for Entry<T, A, S> {
+    type In<F: Atomics> = Entry<T, A, F>;
+}
+
+/// What acquiring a record holding a `T` admits ([`stable::Contract`]): its
+/// head, whole, and the permit, written in one unit, and its whole block;
+/// read from the production representation, so the same in every build,
+/// whatever atomics the build stores. Evaluated in a constant by every
+/// caller, so a payload whose state cannot fit fails to compile where its
+/// record type is used.
+const fn contract<T: Reclaim<A>, A: Allocator>()
+-> stable::Contract<Head<T, A>, Entry<T, A>, A::Permit> {
+    stable::Contract::of()
+}
+
+/// What allocating one record holding a `T` admits and requests: the unit
+/// of its write, and its whole block ([`contract`]).
+pub(crate) const fn record_cost<T: Reclaim<A>, A: Allocator>() -> (ResourceBound, usize) {
+    let contract = contract::<T, A>();
+    (contract.write(), contract.block())
+}
+
+/// The production representation's record write and block, read directly
+/// from `Core`'s types and not through [`contract`]: the oracle the I3
+/// witness (`crate::sync::models`) holds what a record admits to in every
+/// build.
+#[cfg(test)]
+pub(crate) fn production_record<T: Reclaim<A>, A: Allocator>() -> (usize, usize) {
+    use crate::sync::Core;
+    (
+        core::mem::size_of::<Head<T, A, Core>>() + core::mem::size_of::<A::Permit>(),
+        core::mem::size_of::<Block<T, A, Core>>(),
+    )
 }
 
 /// What the queue holds at its front, observed without removing anything.
@@ -758,30 +820,33 @@ enum Front {
 /// The queue and accounting of one decode scope. Handles reach it through the
 /// scope; queued blocks are owned by the intrusive queue, not by a dropped
 /// handle. The public authority is [`DecodeOwner`](owned::DecodeOwner).
-pub(crate) struct Reclaimer<A: Allocator> {
-    head: AtomicPtr<Header<A>>,
-    tail: AtomicPtr<Header<A>>,
+pub(crate) struct Reclaimer<A: Allocator, S: Atomics = Shipped> {
+    head: S::Link<Header<A, S>>,
+    tail: S::Link<Header<A, S>>,
     /// Stepping caller only: the record whose cleanup is in progress.
-    active: AtomicPtr<Header<A>>,
+    active: S::Link<Header<A, S>>,
     /// Written by the stepping caller only: the next removal's unit was
     /// admitted. A step that admits it and then finds the front record raced
     /// by a retiring thread returns `Waiting` and keeps it; the step that
     /// removes the record spends it without admitting again. Custody the
     /// scope holds, so observation reads it ([`Self::removal_admitted`]).
-    removal_admitted: AtomicBool,
-    outstanding: AtomicUsize,
-    closed: AtomicBool,
+    removal_admitted: S::Flag,
+    outstanding: S::Counter,
+    closed: S::Flag,
     /// The explicit stepping authority was dropped; remaining references
     /// finish cleanup with the scope's terminal policy.
-    abandoned: AtomicBool,
-    stepping: AtomicBool,
+    abandoned: S::Flag,
+    stepping: S::Flag,
     /// Payload types are erased in the queue. A borrowed owner may hold records
     /// of any type, so it is neither sent nor shared across threads.
     confined: PhantomData<*mut ()>,
 }
 
 impl<A: Allocator> Reclaimer<A> {
-    pub(crate) const fn new() -> Self {
+    /// An empty queue. Built at run time, inside the scope's acquisition:
+    /// its atomics come from [`crate::sync`], and a model checker's atomics
+    /// are not constructible in a constant.
+    pub(crate) fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
             tail: AtomicPtr::new(ptr::null_mut()),
@@ -832,12 +897,21 @@ impl<A: Allocator> Reclaimer<A> {
                 "a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH"
             )
         };
+        // Below or at the limit, the valuation the record reaches; past it is
+        // the compile-time refusal above (`dispatch_depth_beyond_limit`).
+        boundary!(
+            a,
+            Predicate::DispatchDepth,
+            T::DISPATCH_DEPTH,
+            MAX_DISPATCH_DEPTH
+        );
         // Budget/allocator implementations may hold another owner reference, so
         // closure is observed before admission and again after the permit.
         // SAFETY: the head, header and state, is written whole at its field;
         // no T is formed or moved.
         let block = unsafe {
             stable::acquire::<Entry<T, A>, Head<T, A>, A>(
+                const { contract::<T, A>() },
                 admitted,
                 || !self.is_closed(),
                 || Head {
@@ -845,8 +919,8 @@ impl<A: Allocator> Reclaimer<A> {
                         next: AtomicPtr::new(ptr::null_mut()),
                         advance: advance::<T, A>,
                         finish: finish::<T, A>,
-                        custody: Holder::Handle,
-                        budget: 0,
+                        custody: Plain::new(Holder::Handle),
+                        budget: Plain::new(0),
                         _pin: PhantomPinned,
                     },
                     state: T::INITIAL,
@@ -874,8 +948,8 @@ impl<A: Allocator> Reclaimer<A> {
         // SAFETY: the handle has exclusive custody; both writes precede the
         // releasing publication below.
         unsafe {
-            assert!((*header.as_ptr()).custody == Holder::Handle);
-            (*header.as_ptr()).custody = Holder::Queued;
+            assert!((*header.as_ptr()).custody.get() == Holder::Handle);
+            (*header.as_ptr()).custody.set(Holder::Queued);
             (*header.as_ptr())
                 .next
                 .store(ptr::null_mut(), Ordering::Relaxed);
@@ -980,10 +1054,12 @@ impl<A: Allocator> Reclaimer<A> {
             // SAFETY: removal transferred exclusive custody to this caller,
             // and the declared count reads its state as an observation does.
             unsafe {
-                assert!((*head.as_ptr()).custody == Holder::Queued);
-                (*head.as_ptr()).custody = Holder::Active;
+                assert!((*head.as_ptr()).custody.get() == Holder::Queued);
+                (*head.as_ptr()).custody.set(Holder::Active);
                 let declared = ((*head.as_ptr()).finish)(head, Ending::Count);
-                (*head.as_ptr()).budget = u32::try_from(declared).unwrap_or(u32::MAX);
+                (*head.as_ptr())
+                    .budget
+                    .set(u32::try_from(declared).unwrap_or(u32::MAX));
             }
             self.active.store(head.as_ptr(), Ordering::Relaxed);
             return Ok(Reclaimed::Progress);
@@ -991,12 +1067,12 @@ impl<A: Allocator> Reclaimer<A> {
         // SAFETY: the active slot exclusively owns this block, and callbacks
         // receive neither the owner nor its queue.
         unsafe {
-            assert!((*head.as_ptr()).custody == Holder::Active);
+            assert!((*head.as_ptr()).custody.get() == Holder::Active);
             // A record whose cleanup would take more calls than it declared
             // when it became active breaks its `Reclaim` contract: a defect,
             // refused before the call, so no drain, stepped or terminal, runs
             // unbounded.
-            let budget = (*head.as_ptr()).budget;
+            let budget = (*head.as_ptr()).budget.get();
             if budget == 0 {
                 return Err(BoundedError::PlanMismatch);
             }
@@ -1004,7 +1080,7 @@ impl<A: Allocator> Reclaimer<A> {
             let advance = (*head.as_ptr()).advance;
             let advanced = at(OperationPlace::Task, || advance(head, a))?;
             // A successful call spends one; a refused one changed nothing.
-            (*head.as_ptr()).budget = budget - 1;
+            (*head.as_ptr()).budget.set(budget - 1);
             if advanced != Reclaimed::Done {
                 return Ok(Reclaimed::Progress);
             }
@@ -1052,7 +1128,7 @@ impl<'r, T: Reclaim<A>, A: Allocator> Record<'r, T, A> {
         // SAFETY: the unique handle has not been queued, and &mut Option<Self>
         // excludes publication and concurrent access to its destination.
         unsafe {
-            assert!((*header.as_ptr()).custody == Holder::Handle);
+            assert!((*header.as_ptr()).custody.get() == Holder::Handle);
             // The record's own cleanup is its operation's task's.
             let advance = (*header.as_ptr()).advance;
             if at(OperationPlace::Task, || advance(header, a))? != Reclaimed::Done {
@@ -1104,11 +1180,11 @@ unsafe fn published<'b, T: Reclaim<A>, A: Allocator>(block: NonNull<Block<T, A>>
     unsafe { (&*ptr::addr_of!((*block.as_ptr()).value.value)).assume_init_ref() }
 }
 
-impl<A: Allocator> Drop for Reclaimer<A> {
+impl<A: Allocator, S: Atomics> Drop for Reclaimer<A, S> {
     fn drop(&mut self) {
         // The scope block is never dropped as a value: it is released only by
         // shutdown after the queue is empty, or deliberately retained.
-        debug_assert_eq!(*self.outstanding.get_mut(), 0);
+        debug_assert_eq!(S::exclusive(&mut self.outstanding), 0);
     }
 }
 
@@ -1182,14 +1258,24 @@ mod tests {
     }
 
     /// A record's cost evaluated at run time is the constant the scope
-    /// admits: its metadata, header and state written whole with the
-    /// permit, and the whole block.
+    /// admits: its header and state written whole with the permit, and the
+    /// whole block, both the production representation's.
     #[test]
-    fn a_records_cost_at_run_time_is_its_metadata_and_its_block() {
-        let (metadata, block) = record_cost::<u64, Limits>();
-        let (constant, bytes) = const { record_cost::<u64, Limits>() };
-        assert_eq!(metadata.bytes(), constant.bytes());
-        assert_eq!(block, bytes);
+    fn a_records_cost_at_run_time_is_its_write_and_its_block() {
+        let (write, block) = record_cost::<u64, Limits>();
+        assert_eq!((write, block), const { record_cost::<u64, Limits>() });
+        let (written, production) = production_record::<u64, Limits>();
+        assert_eq!(write.values, 1);
+        assert_eq!(write.bytes, written as u64);
+        assert_eq!(block, production);
+    }
+
+    /// I3: a scope and a record admit their production representation
+    /// ([`admits_its_production_representation`]), natively; the models run
+    /// the same witness under each checker.
+    #[test]
+    fn a_scope_and_a_record_admit_their_production_representation() {
+        admits_its_production_representation();
     }
 
     /// A queue dropped as a value holds nothing: the check its drop makes

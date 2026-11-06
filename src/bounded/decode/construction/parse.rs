@@ -12,6 +12,7 @@ use super::reclamation::{
     EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed, ScopeRef, Slot,
     reclaim_within, slot_place,
 };
+use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::cursor::{self, ArenaParts, ParserContinuation, Resources};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::{DecodeError, Document, DocumentArena, Node, Options};
@@ -144,7 +145,7 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
     const INITIAL: Prefix = Prefix::EMPTY;
 
     fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        if slot.custody().initialized() < Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, slot.custody().initialized()) {
             if let Some(input) = Self::input(&mut slot)
                 && input.is_some()
             {
@@ -286,7 +287,7 @@ where
     ) -> Result<(), Self::Error> {
         let prefix = Parsed::<'s, I, A>::PREFIX;
         let (place, progress) = slot.parts();
-        if progress.initialized() >= Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, progress.initialized()) {
             return Err(BoundedError::PlanMismatch.into());
         }
         let raw = place.as_ptr(progress);

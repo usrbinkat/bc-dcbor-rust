@@ -88,10 +88,13 @@ is; any other text is normalized by the retained normalizer. Bignum magnitudes
 are read a quantum of digits at a time, scanned once for their length and once
 for their bytes.
 Custom `encoding::Schema` implementations must produce each instruction in
-bounded work without allocating or recursively traversing children. Dynamic-map
-entry instructions may inspect at most 64 indexed bucket controls and yield at
-most one entry. The engine rejects index advances outside 1 through 64; custom
-implementations must also bound the actual work preceding the returned instruction.
+bounded work without allocating or recursively traversing children. An
+unordered map yields its entries one per instruction (`Instruction::Entry`,
+inspecting nothing), or hands the engine a cursor (`Instruction::Entries`) or,
+for a hash table, the table itself (`Instruction::Buckets`), whose buckets
+only the engine inspects. `encoding::buckets::Buckets` is sealed: implemented
+for std's `HashMap` on the forked standard library and hashbrown's `HashMap`
+and `HashTable`, whose bucket accessors are this crate's own forks'.
 The preparation borrow must preserve the representation throughout traversal:
 a source answering differently when prepared than when its shape was walked is
 refused at the arena's cap. A counted unordered map
@@ -119,11 +122,16 @@ entries are ordered by their prepared key bytes.
 With `hashbrown` enabled, `Preparation` accepts a borrowed
 `hashbrown::HashTable<(K, V)>` from hashbrown 0.17 whose keys and values implement
 `Schema`. `bounded::encoding::maps::MapPreparation` is an alias for that same
-engine. Each admitted scan inspects at most 64 buckets, including vacant buckets,
-and stops at the first entry, found a control group at a time
-(`next_full_bucket` in the pinned hashbrown and the forked standard library);
-the charge is the 64-control window on every target. A map ends once its
-declared entries are yielded, so no bucket after its last entry is scanned.
+engine. A table's buckets are enumerated by the engine's one bucket traversal
+(`encoding::buckets::BucketCursor`), which the shape walk and the preparation
+both drive: each window of 64 index-aligned bucket controls, the table's last
+shorter, is admitted once before it is inspected, its credit spent index by
+index across refusals, and each call stops at the first entry, found a control
+group at a time (`next_full_bucket` in the pinned hashbrown and the forked
+standard library); the charge is by bucket index on every target, never by
+control group. A map ends once its declared entries are yielded, so no bucket
+after its last entry is scanned and the rest of its window's credit is
+forfeited, never refunded.
 Keys and values are prepared through retained schema operations, then flat entry
 descriptors are merge-ordered by canonical key bytes. Key comparisons use the
 decoder's retained comparison primitive, examining at most 64 byte pairs per
@@ -302,8 +310,9 @@ every physical request is failed, and stops are reduced only by certified
 cleanup classes. Exhaustive additionally replays each refusal and each stop
 independently and checks the reductions. Both use the same oracles.
 The Miri gate runs both aliasing models with strict provenance, symbolic
-alignment checks and host isolation, and compares its reached class
-inventory with native execution of the same selections. It requires a
+alignment checks and host isolation, and compares its inventory, the stop
+classes and the boundary predicate valuations each matrix reached, with native
+execution of the same selections. It requires a
 passing reach map of the same source (`DCBOR_REACH_DIR`), checked before
 anything runs, and `MIRI_LOG_DIR` or `TMPDIR`, its log directory; it lists
 every selection line before running any, and publishes each test's outcome

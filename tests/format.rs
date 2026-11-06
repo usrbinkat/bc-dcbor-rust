@@ -1,6 +1,14 @@
 use dcbor::prelude::*;
 use indoc::indoc;
 
+/// The store every annotated form below names and summarizes tags from:
+/// this crate's tags, registered in a store of the test's own.
+fn tags() -> TagsStore {
+    let mut tags = TagsStore::default();
+    register_tags_in(&mut tags).expect("this crate's tags register in an empty store");
+    tags
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     test_name: &str,
@@ -14,6 +22,7 @@ fn run(
     expected_hex: &str,
     expected_hex_annotated: &str,
 ) {
+    let tags = tags();
     let description = format!("{}", cbor);
     if expected_description.is_empty() {
         println!("description:");
@@ -65,7 +74,7 @@ fn run(
         );
     }
 
-    let diagnostic_annotated = cbor.diagnostic_annotated();
+    let diagnostic_annotated = cbor.diagnostic_annotated(&tags);
     if expected_diagnostic_annotated.is_empty() {
         println!("diagnostic_annotated:");
         println!("{}", diagnostic_annotated);
@@ -99,7 +108,7 @@ fn run(
         );
     }
 
-    let summary = cbor.summary();
+    let summary = cbor.summary(&tags);
     if expected_summary.is_empty() {
         println!("summary:");
         println!("{}", summary);
@@ -125,7 +134,7 @@ fn run(
         assert_eq!(hex, expected_hex, "hex in test '{}'", test_name);
     }
 
-    let hex_annotated = cbor.hex_annotated();
+    let hex_annotated = cbor.hex_annotated(&tags);
     if expected_hex_annotated.is_empty() {
         println!("hex_annotated:");
         println!("{}", hex_annotated);
@@ -423,9 +432,11 @@ fn format_tagged() {
     )
 }
 
+/// A date's tag is named `date` in its description and debug description
+/// whatever any store registers (`Date::cbor_tags`); its annotation and
+/// summary come from the store given.
 #[test]
 fn format_date() {
-    dcbor::register_tags();
     // expected-text-output-rubric:
     #[rustfmt::skip]
     run("format_date_negative",
@@ -463,7 +474,6 @@ fn format_date() {
 
 #[test]
 fn format_fractional_date() {
-    dcbor::register_tags();
     // expected-text-output-rubric:
     #[rustfmt::skip]
     run("format_fractional_date",
@@ -550,9 +560,8 @@ fn format_structure() {
 
 #[test]
 fn format_structure_2() {
-    // The annotation names tag 1 `date`, which only registration provides:
-    // registered here, the test holds alone as in its suite.
-    dcbor::register_tags();
+    // The decoded tag 1 is unnamed; its annotation `date` and its summary
+    // come from the store the driver passes.
     let encoded_cbor_hex = &"d9012ca4015059f2293a5bce7d4de59e71b4207ac5d202c11a6035970003754461726b20507572706c652041717561204c6f766504787b4c6f72656d20697073756d20646f6c6f722073697420616d65742c20636f6e73656374657475722061646970697363696e6720656c69742c2073656420646f20656975736d6f642074656d706f7220696e6369646964756e74207574206c61626f726520657420646f6c6f7265206d61676e6120616c697175612e";
     let cbor = CBOR::try_from_hex(encoded_cbor_hex).unwrap();
     let description = r#"300({1: h'59f2293a5bce7d4de59e71b4207ac5d2', 2: 1(1614124800), 3: "Dark Purple Aqua Love", 4: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."})"#;

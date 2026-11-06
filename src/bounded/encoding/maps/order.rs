@@ -1,4 +1,5 @@
 use super::*;
+use crate::bounded::boundary::boundary;
 use decode::comparison::compare_step;
 use decode::initialization::{init_field, init_part};
 
@@ -69,8 +70,9 @@ impl<P> Order<P> {
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         let storage = Storage::<Entry, P>::INIT_STEPS;
-        if *slot.custody() < storage {
-            init_part!(slot, scratch, 0, |scratch| Storage::initialize_step(
+        let units = *slot.custody();
+        if Bound::new(Predicate::Prefix, storage).below(a, units) {
+            init_part!(slot, scratch, 0, a, |scratch| Storage::initialize_step(
                 scratch, a
             )?);
             return Ok(false);
@@ -140,20 +142,36 @@ impl<P> Order<P> {
         match p.phase {
             OrderPhase::Run => {
                 MERGE_STEP.admit(a)?;
-                p.width = p.width.max(1);
-                if p.width >= entries.len() {
+                // A fresh ordering starts with runs of one entry.
+                if p.width == 0 {
+                    p.width = 1;
+                }
+                if Bound::new(Predicate::ArenaLength, entries.len()).reached(a, p.width) {
                     p.phase = OrderPhase::Complete;
                 } else if p.run == entries.len() {
                     p.width = p.width.checked_mul(2).ok_or(BoundedError::Overflow)?;
                     p.run = 0;
                 } else {
-                    self.middle = p.run + p.width.min(entries.len() - p.run);
-                    self.end = self.middle + p.width.min(entries.len() - self.middle);
+                    // `p.run` and `self.middle` never pass the entries' end:
+                    // each run is at most what remains of them.
+                    self.middle = p.run
+                        + Bound::new(Predicate::ArenaLength, entries.len() - p.run)
+                            .clamp(a, p.width);
+                    self.end = self.middle
+                        + Bound::new(Predicate::ArenaLength, entries.len() - self.middle)
+                            .clamp(a, p.width);
                     if self.middle == self.end {
                         p.run = self.end;
                         return Ok(false);
                     }
-                    self.forward = self.middle - p.run <= self.end - self.middle;
+                    // The shorter run is copied to the scratch.
+                    self.forward = boundary!(
+                        a,
+                        Predicate::ArenaLength,
+                        self.middle - p.run,
+                        self.end - self.middle
+                    )
+                    .is_le();
                     p.phase = OrderPhase::Copy;
                 }
             }
@@ -163,7 +181,7 @@ impl<P> Order<P> {
                 } else {
                     (self.middle, self.end - self.middle)
                 };
-                if self.scratch.len() < count {
+                if Bound::new(Predicate::ArenaLength, count).below(a, self.scratch.len()) {
                     // Scratch is retained across runs and maps. Grow
                     // geometrically rather than capping at this run's length:
                     // successive short caps would introduce extra growths

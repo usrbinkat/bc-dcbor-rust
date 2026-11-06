@@ -6,6 +6,20 @@ use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Caller, ResourceBound, Unit, add, mul,
 };
 
+/// A step of a cost's composition in a `const fn` returning `Option`: the
+/// value of `$cost`, or `None` from the enclosing function when a quantity
+/// does not fit in `u64`. What `?` would be, which a `const fn` cannot use.
+/// Every cost builder composes through it, and every `COST` item unwraps the
+/// result with `const_cost!`.
+macro_rules! cost {
+    ($cost:expr) => {
+        match $cost {
+            Some(cost) => cost,
+            None => return None,
+        }
+    };
+}
+
 #[doc(hidden)]
 pub mod enumeration;
 #[doc(hidden)]
@@ -24,14 +38,15 @@ pub(crate) mod text;
 pub use text::{BufferClass, BufferCustody, BufferObservation, Phase as BufferPhase};
 mod vector;
 pub use vector::{
-    ElementObservation, Phase as SequencePhase, SequenceCustody, SequenceObservation,
+    ElementObservation, Phase as SequencePhase, SequenceClass, SequenceCustody, SequenceObservation,
 };
 #[cfg(feature = "custom-std-collections")]
 mod btree;
 #[cfg(feature = "custom-std-collections")]
 pub use btree::{
-    EntryObservation, Phase as TreePhase, Shape as TreeShape, Sort as TreeSort, TreeCustody,
-    TreeKey, TreeKeyView, TreeObservation, TreeProgress,
+    EntryObservation, Occupancy as TreeOccupancy, Phase as TreePhase, Shape as TreeShape,
+    Sort as TreeSort, TreeCustody, TreeKey, TreeKeyView, TreeObservation, TreeProgress,
+    occupancy as tree_occupancy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,11 +63,14 @@ pub enum Built {
 ///
 /// A container's children each encode at least one byte, so each child's
 /// fixed part, and the rounding of its per-byte part, are paid from the
-/// container's bytes ([`Self::children`]): costs compose linearly however
-/// deeply values nest. `peak` holds everything a construction and its
-/// children hold at once; `retained` is what the published value's permits
-/// hold until its cleanup. Every operation is checked in const evaluation:
-/// a cost that does not fit in `u64` fails to compile.
+/// container's bytes ([`Self::checked_children`]): costs compose linearly
+/// however deeply values nest. `peak` holds everything a construction and
+/// its children hold at once; `retained` is what the published value's
+/// permits hold until its cleanup. Every composition is checked
+/// ([`ResourceBound::checked_add`], [`ResourceBound::checked_mul`]): `None`
+/// when a quantity does not fit in `u64`. A `COST` item unwraps its cost
+/// with `const_cost!`, so an overflowing cost fails to compile (E0080); a
+/// composition at run time refuses with [`BoundedError::Overflow`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConstructionCost {
     pub fixed: ResourceBound,
@@ -61,56 +79,6 @@ pub struct ConstructionCost {
 
 /// The sixty-fourths of a unit per byte a [`ConstructionCost`] counts in.
 pub const PER_BYTE_SCALE: u64 = 64;
-
-const fn sum(left: u64, right: u64) -> u64 {
-    match left.checked_add(right) {
-        Some(total) => total,
-        None => panic!("a construction cost exceeds u64"),
-    }
-}
-
-const fn product(left: u64, right: u64) -> u64 {
-    match left.checked_mul(right) {
-        Some(total) => total,
-        None => panic!("a construction cost exceeds u64"),
-    }
-}
-
-/// `left` and `right` together, every quantity summed.
-pub const fn plus(left: ResourceBound, right: ResourceBound) -> ResourceBound {
-    ResourceBound {
-        values: sum(left.values, right.values),
-        bytes: sum(left.bytes, right.bytes),
-        allocated: sum(left.allocated, right.allocated),
-        peak: sum(left.peak, right.peak),
-        retained: sum(left.retained, right.retained),
-    }
-}
-
-/// `bound`, every quantity `count` times.
-pub const fn times(bound: ResourceBound, count: u64) -> ResourceBound {
-    ResourceBound {
-        values: product(bound.values, count),
-        bytes: product(bound.bytes, count),
-        allocated: product(bound.allocated, count),
-        peak: product(bound.peak, count),
-        retained: product(bound.retained, count),
-    }
-}
-
-/// The larger of `left` and `right` in every quantity.
-pub const fn larger(left: ResourceBound, right: ResourceBound) -> ResourceBound {
-    const fn max(left: u64, right: u64) -> u64 {
-        if left > right { left } else { right }
-    }
-    ResourceBound {
-        values: max(left.values, right.values),
-        bytes: max(left.bytes, right.bytes),
-        allocated: max(left.allocated, right.allocated),
-        peak: max(left.peak, right.peak),
-        retained: max(left.retained, right.retained),
-    }
-}
 
 /// One admitted unit of one value and `bytes` bytes, as a cost: for an
 /// [`InPlace`] implementation outside this crate, which reports its own work.
@@ -141,7 +109,7 @@ pub(crate) const fn sized<T>() -> Unit<Caller> {
 }
 
 /// One unit of each quantity: the rounding of a child's per-byte part, paid
-/// from the bytes it encodes ([`ConstructionCost::children`]).
+/// from the bytes it encodes ([`ConstructionCost::checked_children`]).
 pub(crate) const ROUNDING: ResourceBound = ResourceBound {
     values: 1,
     bytes: 1,
@@ -187,42 +155,43 @@ impl ConstructionCost {
         }
     }
 
-    /// A cost of `whole` units of every quantity per byte, in sixty-fourths.
-    pub const fn per_byte(whole: ResourceBound) -> Self {
-        Self {
+    /// A cost of `whole` units of every quantity per byte, in sixty-fourths,
+    /// or none when a quantity does not fit in `u64`.
+    pub const fn checked_per_byte(whole: ResourceBound) -> Option<Self> {
+        Some(Self {
             fixed: Self::ZERO.fixed,
-            per_byte: times(whole, PER_BYTE_SCALE),
-        }
+            per_byte: cost!(whole.checked_mul(PER_BYTE_SCALE)),
+        })
     }
 
-    /// This cost and `other` for the same bytes.
-    pub const fn plus(self, other: Self) -> Self {
-        Self {
-            fixed: plus(self.fixed, other.fixed),
-            per_byte: plus(self.per_byte, other.per_byte),
-        }
+    /// This cost and `other` for the same bytes, or none when a quantity
+    /// does not fit in `u64`.
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            fixed: cost!(self.fixed.checked_add(other.fixed)),
+            per_byte: cost!(self.per_byte.checked_add(other.per_byte)),
+        })
     }
 
     /// The larger of this cost and `other` in every quantity: either of two
     /// alternatives.
     pub const fn larger(self, other: Self) -> Self {
         Self {
-            fixed: larger(self.fixed, other.fixed),
-            per_byte: larger(self.per_byte, other.per_byte),
+            fixed: self.fixed.larger(other.fixed),
+            per_byte: self.per_byte.larger(other.per_byte),
         }
     }
 
     /// Children of this cost within a container's bytes, each encoding at
     /// least one byte: every child's fixed part and the rounding of its
-    /// per-byte part, one unit of each quantity, are paid per byte.
-    pub const fn children(self) -> Self {
-        Self {
+    /// per-byte part, one unit of each quantity, are paid per byte. None
+    /// when a quantity does not fit in `u64`.
+    pub const fn checked_children(self) -> Option<Self> {
+        let paid = cost!(cost!(self.fixed.checked_add(ROUNDING)).checked_mul(PER_BYTE_SCALE));
+        Some(Self {
             fixed: Self::ZERO.fixed,
-            per_byte: plus(
-                self.per_byte,
-                times(plus(self.fixed, ROUNDING), PER_BYTE_SCALE),
-            ),
-        }
+            per_byte: cost!(self.per_byte.checked_add(paid)),
+        })
     }
 
     /// The bound for a value whose subtree encodes `input` bytes. Refused,
@@ -338,7 +307,7 @@ macro_rules! integers {
         // SAFETY: one admitted scalar write initializes the complete value,
         // only from the empty state.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
-            const COST: ConstructionCost = scalar_cost::<$ty>();
+            const COST: ConstructionCost = crate::const_cost!(scalar_cost::<$ty>());
 
             fn build_step(
                 document: &Document<'_, A::Permit>, index: usize,
@@ -368,8 +337,10 @@ integers!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
 /// The cost of a scalar built by one admitted write of its own bytes, and
 /// reclaimed by one step; nothing is allocated. A refused kind or range is
 /// found by that same write unit.
-pub(crate) const fn scalar_cost<T>() -> ConstructionCost {
-    ConstructionCost::fixed(plus(sized::<T>().bound(), STEP_COST))
+pub(crate) const fn scalar_cost<T>() -> Option<ConstructionCost> {
+    Some(ConstructionCost::fixed(cost!(
+        sized::<T>().bound().checked_add(STEP_COST)
+    )))
 }
 
 #[cfg(test)]
@@ -400,9 +371,9 @@ mod tests {
         let a = bound(1, 2, 3, 4, 5);
         let b = bound(10, 1, 30, 2, 50);
         let zero = ResourceBound::default();
-        assert_eq!(plus(a, b), bound(11, 3, 33, 6, 55));
-        assert_eq!(times(a, 3), bound(3, 6, 9, 12, 15));
-        assert_eq!(larger(a, b), bound(10, 2, 30, 4, 50));
+        assert_eq!(a.checked_add(b), Some(bound(11, 3, 33, 6, 55)));
+        assert_eq!(a.checked_mul(3), Some(bound(3, 6, 9, 12, 15)));
+        assert_eq!(a.larger(b), bound(10, 2, 30, 4, 50));
         assert_eq!(unit(5), bound(1, 5, 0, 0, 0));
         assert_eq!(held(7), bound(0, 0, 7, 7, 7));
         let fixed = ConstructionCost::fixed(a);
@@ -413,7 +384,7 @@ mod tests {
                 per_byte: zero
             }
         );
-        let per_byte = ConstructionCost::per_byte(b);
+        let per_byte = ConstructionCost::checked_per_byte(b).unwrap();
         assert_eq!(
             per_byte,
             ConstructionCost {
@@ -425,7 +396,7 @@ mod tests {
             fixed: a,
             per_byte: bound(640, 64, 1920, 128, 3200),
         };
-        assert_eq!(fixed.plus(per_byte), both);
+        assert_eq!(fixed.checked_add(per_byte), Some(both));
         assert_eq!(fixed.larger(per_byte), both);
         assert_eq!(
             ConstructionCost::fixed(b).larger(fixed),
@@ -434,30 +405,75 @@ mod tests {
         // Each child's fixed part and one rounding unit, (2, 3, 4, 5, 6),
         // paid at 64 sixty-fourths a byte beside its own per-byte part.
         assert_eq!(
-            both.children(),
-            ConstructionCost {
+            both.checked_children(),
+            Some(ConstructionCost {
                 fixed: zero,
                 per_byte: bound(768, 256, 2176, 448, 3584)
-            }
+            })
         );
         // A scalar: one write of its own bytes and one step, nothing held.
         assert_eq!(
             scalar_cost::<u64>(),
-            ConstructionCost::fixed(bound(2, 8, 0, 0, 0))
+            Some(ConstructionCost::fixed(bound(2, 8, 0, 0, 0)))
         );
-        assert_eq!(scalar_cost::<u64>(), <u64 as InPlace<Limits>>::COST);
+        assert_eq!(scalar_cost::<u64>(), Some(<u64 as InPlace<Limits>>::COST));
     }
 
+    /// A composition beyond `u64`, in any quantity and by any operation, is
+    /// none, evaluated in a constant as at run time, and refused at run time
+    /// as an overflow, which classifies as invalid input: no cost operation
+    /// panics. In a `COST` item the same none fails to compile
+    /// (`const_cost!`; the `compile_fail` cases of `dcbor-derive`'s UI
+    /// suite).
     #[test]
-    #[should_panic(expected = "a construction cost exceeds u64")]
-    fn a_cost_sum_beyond_u64_panics() {
-        plus(bound(u64::MAX, 0, 0, 0, 0), bound(1, 0, 0, 0, 0));
-    }
-
-    #[test]
-    #[should_panic(expected = "a construction cost exceeds u64")]
-    fn a_cost_multiple_beyond_u64_panics() {
-        times(bound(0, u64::MAX, 0, 0, 0), 2);
+    fn a_cost_beyond_u64_is_refused_never_panicking() {
+        let most = |at: usize| {
+            let mut quantities = [0u64; 5];
+            quantities[at] = u64::MAX;
+            bound(
+                quantities[0],
+                quantities[1],
+                quantities[2],
+                quantities[3],
+                quantities[4],
+            )
+        };
+        for at in 0..5 {
+            assert_eq!(most(at).checked_add(most(at)), None, "quantity {at}");
+            assert_eq!(most(at).checked_mul(2), None, "quantity {at}");
+            assert_eq!(
+                ConstructionCost::checked_per_byte(most(at)),
+                None,
+                "quantity {at}"
+            );
+            let fixed = ConstructionCost::fixed(most(at));
+            assert_eq!(fixed.checked_add(fixed), None, "quantity {at}");
+            assert_eq!(fixed.checked_children(), None, "quantity {at}");
+            let per_byte = ConstructionCost {
+                fixed: ResourceBound::default(),
+                per_byte: most(at),
+            };
+            assert_eq!(per_byte.checked_add(per_byte), None, "quantity {at}");
+            assert_eq!(per_byte.checked_children(), None, "quantity {at}");
+        }
+        const OVERFLOWED: Option<ResourceBound> = ResourceBound {
+            values: u64::MAX,
+            bytes: 0,
+            allocated: 0,
+            peak: 0,
+            retained: 0,
+        }
+        .checked_add(STEP_COST);
+        assert_eq!(OVERFLOWED, None);
+        let refused = most(1)
+            .checked_mul(2)
+            .ok_or(BoundedError::<()>::Overflow)
+            .unwrap_err();
+        assert_eq!(refused, BoundedError::Overflow);
+        assert_eq!(
+            crate::bounded::Failure::class(&refused),
+            crate::bounded::Class::Invalid
+        );
     }
 
     /// A binding that does not implement absence keeps the default: an

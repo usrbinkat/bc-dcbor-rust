@@ -28,7 +28,7 @@ macro_rules! scalar {
         // the empty state; errors leave the destination uninitialized and the
         // empty state safe to reclaim.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
-            const COST: ConstructionCost = scalar_cost::<$ty>();
+            const COST: ConstructionCost = crate::const_cost!(scalar_cost::<$ty>());
 
             fn build_step(
                 document: &Document<'_, A::Permit>,

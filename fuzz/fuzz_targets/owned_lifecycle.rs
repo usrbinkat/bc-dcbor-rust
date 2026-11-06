@@ -1,6 +1,6 @@
 #![no_main]
-use dcbor::bounded::decode::Options;
 use dcbor::bounded::LimitRefusal;
+use dcbor::bounded::decode::Options;
 use dcbor_test_support::classes::Classes;
 use dcbor_test_support::{heap, pipeline};
 use libfuzzer_sys::fuzz_target;
@@ -111,8 +111,11 @@ fn owned_pipeline(wire: &[u8], schedule: usize, stop: pipeline::Stop) {
         refusal,
         LimitRefusal::Scheduled(refusal),
     );
-    if baseline.physical > 0 {
-        let physical = schedule % baseline.physical;
+    let requests = baseline
+        .physical
+        .expect("the heap guard witnesses every physical request");
+    if requests > 0 {
+        let physical = schedule % requests;
         let failed = pipeline::encode::<String>(
             wire,
             &Schedule {
@@ -121,7 +124,11 @@ fn owned_pipeline(wire: &[u8], schedule: usize, stop: pipeline::Stop) {
             },
             classes,
         );
-        assert_eq!(failed.denied, 1, "unobserved physical failure {physical}");
+        assert_eq!(
+            failed.denied,
+            Some(1),
+            "unobserved physical failure {physical}"
+        );
         assert!(failed.failed, "physical failure {physical} misclassified");
         assert!(!failed.complete);
     }

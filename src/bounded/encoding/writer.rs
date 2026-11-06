@@ -80,10 +80,13 @@ impl<'p> PlanView<'p> {
             .holes
             .get(at.hole)
             .map_or(self.bytes.len(), |hole| hole.0);
-        let count = boundary
-            .checked_sub(at.source)
-            .ok_or(BoundedError::PlanMismatch)?
-            .min(decode::construction::stable::QUANTUM);
+        // The segment ends at the next gap or the plan's end, never before
+        // where emission stands, and spans at most a quantum.
+        if Bound::new(Predicate::Payload, boundary).exceeded(b, at.source) {
+            return Err(BoundedError::PlanMismatch);
+        }
+        let count = Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+            .clamp(b, boundary - at.source);
         let bytes = self
             .bytes
             .get(at.source..at.source + count)
@@ -421,10 +424,7 @@ mod tests {
             match index {
                 0 => Instruction::UnorderedMap,
                 index => match self.0.get(index - 1) {
-                    Some((key, value)) => Instruction::Entry {
-                        next: index + 1,
-                        entry: Some((key, value)),
-                    },
+                    Some((key, value)) => Instruction::Entry(key, value),
                     None => Instruction::End,
                 },
             }

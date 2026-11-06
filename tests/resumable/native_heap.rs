@@ -70,7 +70,7 @@ fn allocation_matrix<T: Transferable<Limits> + 'static>(wire: &[u8], check: impl
                 observer.window(|| support::drain(&mut owner, &mut m));
                 cleaned(&observer, published.calls);
                 assert_eq!(m.live_bytes(), 0);
-                published.calls
+                (published.calls, m.reached())
             }
             Some(index) => {
                 assert!(
@@ -86,7 +86,7 @@ fn allocation_matrix<T: Transferable<Limits> + 'static>(wire: &[u8], check: impl
                 observer.window(|| support::drain(&mut owner, &mut m));
                 cleaned(&observer, failed.calls);
                 assert_eq!(m.live_bytes(), 0);
-                failed.calls
+                (failed.calls, m.reached())
             }
         }
     });
@@ -232,7 +232,7 @@ fn every_real_normalization_and_output_allocation_can_fail_without_leaking() {
         }
         assert_eq!(observer.snapshot().live, 0);
         assert_eq!(pool.live_bytes(), 0);
-        measured.calls
+        (measured.calls, pool.reached())
     });
 }
 

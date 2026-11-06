@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -99,7 +99,7 @@
+     pub(crate) const fn of() -> Self {
+         Self {
+             written: crate::bounded::write_extent(
+-                size_of::<W::In<Core>>() + crate::bounded::permit_bytes::<P>(),
++                size_of::<W::In<crate::sync::Shipped>>() + crate::bounded::permit_bytes::<P>(),
+             ) as usize,
+             block: size_of::<Held<M::In<Core>, P>>(),
+             stored: PhantomData,

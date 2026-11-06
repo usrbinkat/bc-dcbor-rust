@@ -88,16 +88,23 @@ and states its own cost.
 every instruction it requests; an implementation keeps each instruction to
 constant work and announces any more it does before the instruction that needs
 it: `Instruction::Inspect` for values examined to choose the next instruction,
-`Entries::moves` for a cursor's node moves per step. The engine checks what it
-can observe (a counted map's count, an entry's bucket window, an encoding
-longer than its walked extent) and refuses a violation as
-`BoundedError::PlanMismatch`. Nothing can detect work an implementation does
-without announcing it.
+`Entries::moves` for a cursor's node moves per step. A hash map hands its
+table to the engine (`Instruction::Buckets`): only the engine inspects its
+buckets, over the sealed set of tables whose bucket accessors this crate's
+forks provide, each window of controls admitted before it is inspected. The
+engine checks what it can observe (a counted map's count, an entry offered
+where no unordered map takes one, an encoding longer than its walked
+extent) and refuses a violation as `BoundedError::PlanMismatch`. Nothing can
+detect work an implementation does without announcing it.
 
 A hand-written `InPlace` states its `COST` with the public cost helpers:
 `unit(bytes)` for one admitted unit of a value and `bytes` bytes, `held(bytes)`
-for an allocation held for the value's life, `plus`, `times` and `larger`
-to compose them, and `ConstructionCost::fixed`, `per_byte` and `children`.
+for an allocation held for the value's life, `ResourceBound::checked_add` and
+`checked_mul` and `ConstructionCost::checked_add` and `larger` to compose
+them, and `ConstructionCost::fixed`, `checked_per_byte` and
+`checked_children`. Every checked composition is `None` when a quantity does
+not fit in `u64`; a `COST` takes it through `const_cost!`, so an overflowing
+cost fails to compile where its binding is first used.
 Derived decoding bindings admit only through the public helpers built on this
 crate's charge rules (`bounded::decode::visits`,
 `bounded::decode::construction::in_place::step`) and state their costs from

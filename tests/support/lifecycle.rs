@@ -7,10 +7,12 @@
 //! Unsafe code here implements an instrumented input resource, never a
 //! decoder. Compiled once as the `dcbor-test-support` crate and shared by
 //! every integration test and fuzz target; [`heap`] is the physical heap
-//! observer, and [`legality`] holds the bindings' successor relations.
+//! observer, [`legality`] holds the bindings' successor relations, and
+//! [`model`] configures every model of a checker build.
 pub mod classes;
 pub mod heap;
 pub mod legality;
+pub mod model;
 pub mod rigor;
 
 use core::fmt::Debug;
@@ -19,6 +21,7 @@ use core::{
     ptr::NonNull,
 };
 use dcbor::ByteString;
+use dcbor::bounded::boundary::Reached as Valuations;
 use dcbor::bounded::decode::construction::in_place::{BufferObservation, InPlace, Transferable};
 use dcbor::bounded::decode::construction::reclamation::{
     Custody, PeekSlot, Place, Reclaim, Reclaimed, Slot,
@@ -57,16 +60,25 @@ pub fn observed() -> Limits {
     observed_with_capacity(u64::MAX)
 }
 
-/// The shared observed policy with a fixture-supplied live-storage limit.
-/// Admission and release observation, strict refusals, and reserved logs are
-/// configured together before any reservation or shared policy can escape.
-pub fn observed_with_capacity(capacity: u64) -> Limits {
+/// The admission oracle's policy with a fixture-supplied live-storage
+/// limit: every call logged, refusals strict, releases witnessed on this
+/// thread, its call log reserved first. Everything it checks is an
+/// admission-level fact, valid in every build, a model checker's included.
+pub fn admission_policy(capacity: u64) -> Limits {
     let mut limits = heap::observe_releases(Limits::new(u64::MAX, u64::MAX, capacity))
         .logged()
-        .strict()
-        .observe(heap::admitted);
+        .strict();
     limits.reserve_log(LOG);
     limits
+}
+
+/// The shared observed policy with a fixture-supplied live-storage limit:
+/// the admission oracle's policy ([`admission_policy`]) reporting each
+/// admitted allocation to the heap observer, which matches it against the
+/// physical requests an armed observation sees. Configured whole before any
+/// reservation or shared policy can escape.
+pub fn observed_with_capacity(capacity: u64) -> Limits {
+    admission_policy(capacity).observe(heap::admitted)
 }
 
 /// The steps an operation of `bound` can take, by the crate's one step rule
@@ -697,6 +709,55 @@ where
     simulation::<T, <T::State as Reduction>::Class>(name, wire, |observation| {
         <T::State as Reduction>::class(observation)
     })
+}
+
+/// `complete` is the class, by `class`, of every state construction of `T`
+/// from `wire` reaches complete: the claim a container's reduction rests on
+/// ([`dcbor::bounded::decode::construction::Uniform`]). The production
+/// check passes `T`'s declared reduction and complete class
+/// ([`uniform`]); a planted complete class must fail it. Returns the reached
+/// states.
+pub fn complete_class<T: InPlace<Limits>, C: Ord + Debug>(
+    name: &str,
+    wire: &[u8],
+    class: impl Fn(&Observation<T>) -> C,
+    complete: C,
+) -> Vec<Constructed<Observation<T>>> {
+    let states = reached::<T>(name, wire);
+    let built: Vec<_> = states.iter().filter(|state| state.built).collect();
+    assert!(
+        !built.is_empty(),
+        "{name}: no construction of {} from {wire:02x?} completed",
+        core::any::type_name::<T>()
+    );
+    for state in built {
+        assert_eq!(
+            class(&state.reached),
+            complete,
+            "{name}: a complete state of {} from {wire:02x?} is not of its declared complete \
+             class",
+            core::any::type_name::<T>()
+        );
+    }
+    states
+}
+
+/// `T`'s declared reduction is a simulation of cleanup ([`certified`]) and
+/// its declared complete class ([`complete_class`]) the class of every
+/// complete state it reaches, building `T` from `wire`.
+pub fn uniform<T>(name: &str, wire: &[u8]) -> Vec<Constructed<Observation<T>>>
+where
+    T: InPlace<Limits>,
+    T::State: dcbor::bounded::decode::construction::Uniform,
+{
+    use dcbor::bounded::decode::construction::{Reduction, Uniform};
+    complete_class::<T, _>(
+        name,
+        wire,
+        <T::State as Reduction>::class,
+        <T::State as Uniform>::COMPLETE,
+    );
+    certified::<T>(name, wire)
 }
 
 /// Every transition the reached `states` took is in the binding's successor
@@ -1480,6 +1541,8 @@ pub struct RefusalRun {
     calls: Vec<Call>,
     admitted: Vec<Call>,
     refusals: Vec<(usize, LimitRefusal, bool)>,
+    /// The boundary valuations the run's policy recorded.
+    reached: Valuations,
 }
 
 impl RefusalRun {
@@ -1531,6 +1594,11 @@ impl RefusalRun {
         &self.admitted
     }
 
+    /// The boundary valuations the run's policy recorded.
+    pub fn reached(&self) -> Valuations {
+        self.reached
+    }
+
     pub fn into_admitted(self) -> Vec<Call> {
         self.admitted
     }
@@ -1568,6 +1636,7 @@ impl RefusalRun {
             calls: m.calls().to_vec(),
             admitted: m.admitted().to_vec(),
             refusals: m.refused_calls().to_vec(),
+            reached: m.reached(),
         }
     }
 
@@ -1660,11 +1729,16 @@ pub fn refusal_matrix(
     );
     progress.stage("every admission refused in one pass", 1, 1);
     progress.case(format!("{} admissions", baseline.admitted.len()));
-    run(Fault {
+    let each = run(Fault {
         refusal: pipeline::Refusal::Each,
         cancel: false,
-    })
-    .each(&baseline);
+    });
+    each.each(&baseline);
+    // The cancellations below run in both layers too: the fast layer's
+    // runs are the baseline, the one-pass refusal and every cancellation;
+    // every run adds the exhaustive layer's refusals of each admission.
+    let mut reached = baseline.reached.union(each.reached);
+    let mut every = reached;
     if rigor == rigor::Rigor::Exhaustive {
         progress.stage(
             "each admission refused in a run of its own",
@@ -1678,6 +1752,7 @@ pub fn refusal_matrix(
                 cancel: false,
             });
             resumed.resumed(&baseline, index, LimitRefusal::Scheduled(index));
+            every = every.union(resumed.reached);
         }
     }
     progress.stage(
@@ -1691,6 +1766,8 @@ pub fn refusal_matrix(
             refusal: pipeline::Refusal::At(index),
             cancel: true,
         });
+        reached = reached.union(stopped.reached);
+        every = every.union(stopped.reached);
         stopped.injected_at(index, LimitRefusal::Scheduled(index));
         assert_eq!(stopped.calls, baseline.calls[..=index]);
         let before = index - baseline.refusals.iter().filter(|r| r.0 < index).count();
@@ -1702,25 +1779,50 @@ pub fn refusal_matrix(
             "{name}: cancellation at call {index}, {call:?}, did not end the trace there"
         );
     }
+    if rigor == rigor::Rigor::Exhaustive {
+        fast_reaches_every(name, reached, every);
+    }
+    rigor::reached(name, reached);
     baseline
+}
+
+/// The fast layer's runs reach every boundary valuation the exhaustive
+/// layer's do: `fast`, the union over the runs the fast layer makes,
+/// misses nothing of `every`, the union over every run. A valuation missed
+/// is named by its record row. The one check of it, for every matrix seam
+/// whose layers select different runs.
+fn fast_reaches_every(name: &str, fast: Valuations, every: Valuations) {
+    let missed: Vec<String> = every
+        .missing_from(fast)
+        .map(dcbor::bounded::boundary::row)
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "{name}: boundary valuations reached by the exhaustive layer and by no run the \
+         fast layer makes: {missed:#?}"
+    );
 }
 
 /// Classification stage shared by resumable refusal matrices. The retained
 /// engine resumes every refusal through the same path; only the policy's
 /// reported reason differs. Fast checks each reason at the final admission,
 /// after all preceding work has been paid. Exhaustive checks that assumption
-/// at every admission. Callers must positively observe the exact reason and
-/// compare the resulting trace and outcome with the ordinary refusal run.
+/// at every admission, and that the final admission's runs reach every
+/// boundary valuation the others do. Callers must positively observe the
+/// exact reason and compare the resulting trace and outcome with the
+/// ordinary refusal run, and return the boundary valuations the run's
+/// policy reached (`Limits::reached`).
 pub fn reason_matrix(
     name: &str,
     rigor: rigor::Rigor,
     baseline: &[Call],
     reasons: &[LimitRefusal],
-    mut run: impl FnMut(usize, LimitRefusal),
+    mut run: impl FnMut(usize, LimitRefusal) -> Valuations,
 ) {
     assert!(!baseline.is_empty(), "{name}: no admission to refuse");
+    let last = baseline.len() - 1;
     let start = match rigor {
-        rigor::Rigor::Fast => baseline.len() - 1,
+        rigor::Rigor::Fast => last,
         rigor::Rigor::Exhaustive => 0,
     };
     let mut progress = rigor::Progress::new(format!("{name}: refusal classification"));
@@ -1729,38 +1831,51 @@ pub fn reason_matrix(
         (baseline.len() - start) * reasons.len(),
         baseline.len() * reasons.len(),
     );
+    let mut fast = Valuations::new();
+    let mut every = Valuations::new();
     for (index, call) in baseline.iter().enumerate().skip(start) {
         for &reason in reasons {
             progress.case(format!("{reason:?} at call {index}: {call:?}"));
-            run(index, reason);
+            let reached = run(index, reason);
+            every = every.union(reached);
+            if index == last {
+                fast = fast.union(reached);
+            }
         }
     }
+    if rigor == rigor::Rigor::Exhaustive {
+        fast_reaches_every(name, fast, every);
+    }
+    rigor::reached(name, fast);
 }
 
 /// Every physical request of an operation `run` performs, failed in a run
 /// of its own: `run` is given the request to fail, or none, carries the
 /// operation's own oracles for a failed run (the failure observed,
 /// classified as physical, everything released), and returns the physical
-/// requests the run made. Every request is failed in both layers: a
-/// physical failure ends the run, and no class of the states it can end in
-/// is certified. Returns the unobstructed run's requests.
-pub fn physical_matrix(name: &str, run: impl Fn(Option<usize>) -> usize) -> usize {
+/// requests the run made and the boundary valuations its policy reached
+/// (`Limits::reached`). Every request is failed in both layers: a physical
+/// failure ends the run, and no class of the states it can end in is
+/// certified. Reports the union of the runs' valuations; returns the
+/// unobstructed run's requests.
+pub fn physical_matrix(name: &str, run: impl Fn(Option<usize>) -> (usize, Valuations)) -> usize {
     let mut progress = rigor::Progress::new(format!("{name}: physical failures"));
-    let requests = run(None);
+    let (requests, mut reached) = run(None);
     progress.dimension("physical requests", requests);
     assert!(
         requests > 0,
         "{name}: the operation made no physical request"
     );
     physical_stage(&mut progress, requests, |index| {
-        run(Some(index));
+        reached = reached.union(run(Some(index)).1);
     });
+    rigor::reached(name, reached);
     requests
 }
 
 /// The physical stage of a matrix: each of `requests` failed in a run of
 /// its own by `run`, reported as it runs.
-fn physical_stage(progress: &mut rigor::Progress, requests: usize, run: impl Fn(usize)) {
+fn physical_stage(progress: &mut rigor::Progress, requests: usize, run: impl FnMut(usize)) {
     whole_stage(
         progress,
         "each physical request failed",
@@ -1795,34 +1910,40 @@ fn whole_stage(
 /// request admitted). One-pass refusal does not apply, since a refused
 /// synchronous operation does not resume; and no cleanup class is certified
 /// for the state a synchronous call ends in, so every admission is refused
-/// in both layers.
-pub fn synchronous_matrix(name: &str, attempts: usize, run: impl FnMut(usize)) {
+/// in both layers. `run` returns the boundary valuations its policy reached
+/// (`Limits::reached`); their union is reported.
+pub fn synchronous_matrix(name: &str, attempts: usize, mut run: impl FnMut(usize) -> Valuations) {
     let mut progress = rigor::Progress::new(name);
     assert!(attempts > 0, "{name}: the operation admitted nothing");
+    let mut reached = Valuations::new();
     whole_stage(
         &mut progress,
         "each admission refused, ending the operation",
         "admission",
         attempts,
-        run,
+        |index| reached = reached.union(run(index)),
     );
+    rigor::reached(name, reached);
 }
 
 /// The stop stage of a single operation whose unobstructed run publishes
 /// after `boundaries` turns: a stop after each number of turns from none
 /// through publication, in a run of its own by `run`, which carries the
-/// operation's own oracles for the stopped run and its cleanup. No cleanup
-/// class is certified for a single operation's states, so every boundary is
-/// stopped at in both layers.
-pub fn stop_matrix(name: &str, boundaries: usize, run: impl FnMut(usize)) {
+/// operation's own oracles for the stopped run and its cleanup and returns
+/// the boundary valuations its policy reached (`Limits::reached`); their
+/// union is reported. No cleanup class is certified for a single
+/// operation's states, so every boundary is stopped at in both layers.
+pub fn stop_matrix(name: &str, boundaries: usize, mut run: impl FnMut(usize) -> Valuations) {
     let mut progress = rigor::Progress::new(name);
+    let mut reached = Valuations::new();
     whole_stage(
         &mut progress,
         "a stop after each number of turns, through publication",
         "turns",
         boundaries + 1,
-        run,
+        |turn| reached = reached.union(run(turn)),
     );
+    rigor::reached(name, reached);
 }
 
 /// [`resume_within`] the general bound of [`TURNS`].
@@ -2824,6 +2945,101 @@ pub mod pipeline {
         };
     }
 
+    /// What witnesses a run's physical allocations: its policy, and the
+    /// observation of the engine's physical requests around each step.
+    /// Two witnesses, each defined once: the heap guard
+    /// ([`heap::Observation`]), which matches every physical request to an
+    /// admission, fails a selected one, and checks that nothing outside an
+    /// engine step allocates; and [`Unwitnessed`], the admission oracle
+    /// alone, for a run inside a model checker, whose runtime allocates on
+    /// the observed thread among the engine's own requests, where no global
+    /// observer can tell them apart. A run under it records its physical
+    /// figures as absent, never as zero.
+    pub trait Physical: Sized {
+        /// The run's policy: the admission oracle's, with what this witness
+        /// adds to it.
+        fn policy() -> Limits;
+        /// The witness of a run failing physical request `fail_at`, unarmed.
+        fn begin(fail_at: Option<usize>) -> Self;
+        /// `f` run with the engine's physical requests witnessed.
+        fn window<R>(&self, f: impl FnOnce() -> R) -> R;
+        /// Witness nothing until the next window.
+        fn stop(&self);
+        /// The physical requests witnessed so far.
+        fn requests(&self) -> Option<usize>;
+        /// The run's physical requests and denials, once it has drained:
+        /// every request admitted, the record complete.
+        fn finish(&self) -> (Option<usize>, Option<usize>);
+    }
+
+    /// The heap guard: the observed policy reports each admitted allocation
+    /// ([`super::observed`]), and an armed observation matches each physical
+    /// request against one.
+    impl Physical for heap::Observation {
+        fn policy() -> Limits {
+            observed()
+        }
+
+        fn begin(fail_at: Option<usize>) -> Self {
+            let observation = heap::Observation::begin(fail_at);
+            observation.stop();
+            observation
+        }
+
+        fn window<R>(&self, f: impl FnOnce() -> R) -> R {
+            heap::Observation::window(self, f)
+        }
+
+        fn stop(&self) {
+            heap::Observation::stop(self);
+        }
+
+        fn requests(&self) -> Option<usize> {
+            Some(self.snapshot().calls)
+        }
+
+        fn finish(&self) -> (Option<usize>, Option<usize>) {
+            let stats = self.snapshot();
+            assert_eq!(stats.unadmitted, 0, "physical allocation without admission");
+            assert!(!stats.overflow, "heap observation incomplete");
+            (Some(stats.calls), Some(stats.denied))
+        }
+    }
+
+    /// The admission oracle alone ([`Physical`]): physical admission is
+    /// checked natively and under Miri, where the heap guard's attribution
+    /// holds; a run under this witness asserts every admission-level fact
+    /// and records no physical figure.
+    pub struct Unwitnessed;
+
+    impl Physical for Unwitnessed {
+        fn policy() -> Limits {
+            super::admission_policy(u64::MAX)
+        }
+
+        fn begin(fail_at: Option<usize>) -> Self {
+            assert_eq!(
+                fail_at, None,
+                "a physical failure is injected only where physical requests are witnessed"
+            );
+            Self
+        }
+
+        fn window<R>(&self, f: impl FnOnce() -> R) -> R {
+            f()
+        }
+
+        fn stop(&self) {}
+
+        fn requests(&self) -> Option<usize> {
+            None
+        }
+
+        fn finish(&self) -> (Option<usize>, Option<usize>) {
+            (None, None)
+        }
+    }
+
     /// One observed boundary, a possible stop: its phase, its turn in the
     /// phase, and the cleanup class of the state it reached, when one is
     /// certified ([`classes`]).
@@ -2832,15 +3048,17 @@ pub mod pipeline {
         pub phase: Phase,
         pub turn: usize,
         pub class: Option<Class>,
-        /// Policy and heap cursors at the boundary, used to resolve replay
-        /// indices to their phase and occurrence without interpreting Debug.
+        /// Policy and physical cursors at the boundary, used to resolve
+        /// replay indices to their phase and occurrence without
+        /// interpreting Debug; the physical one absent where nothing
+        /// physical is witnessed ([`Physical`]).
         pub attempts: usize,
-        pub physical: usize,
+        pub physical: Option<usize>,
     }
 
-    struct Context {
+    struct Context<P> {
         m: Limits,
-        heap: heap::Observation,
+        heap: P,
         boundaries: Vec<Boundary>,
         stop: Option<(Phase, usize, Stop)>,
         /// The schedule's refusals, applied when the measured part of the
@@ -2873,7 +3091,7 @@ pub mod pipeline {
         }
     }
 
-    impl Context {
+    impl<P: Physical> Context<P> {
         /// Record boundary `turn` of `phase`, the state there of cleanup
         /// class `class`, and what the consumer does there: unwinding
         /// happens here; retirement and cancellation are returned for the
@@ -2884,7 +3102,7 @@ pub mod pipeline {
                 turn,
                 class,
                 attempts: self.m.attempts(),
-                physical: self.heap.snapshot().calls,
+                physical: self.heap.requests(),
             });
             match self.stop {
                 Some((at, stop_turn, stop)) if at == phase && stop_turn == turn => {
@@ -2919,9 +3137,9 @@ pub mod pipeline {
         /// no storage synchronously.
         fn retire<T>(&mut self, value: T) {
             let live = self.m.live_bytes();
-            let calls = self.heap.snapshot().calls;
+            let calls = self.heap.requests();
             self.heap.window(|| drop(value));
-            assert_eq!(self.heap.snapshot().calls, calls, "retirement allocated");
+            assert_eq!(self.heap.requests(), calls, "retirement allocated");
             assert_eq!(self.m.live_bytes(), live, "retirement released storage");
         }
 
@@ -2943,10 +3161,10 @@ pub mod pipeline {
         where
             O::Error: Debug,
         {
-            let calls = self.heap.snapshot().calls;
+            let calls = self.heap.requests();
             let mut operation = self.heap.window(make);
             assert_eq!(
-                self.heap.snapshot().calls,
+                self.heap.requests(),
                 calls,
                 "{phase:?} constructor allocated"
             );
@@ -2974,11 +3192,11 @@ pub mod pipeline {
                         if let Some(cancel) = cancel.take() {
                             cancel(&mut operation);
                         }
-                        let calls = self.heap.snapshot().calls;
+                        let calls = self.heap.requests();
                         self.heap
                             .window(|| wound(&mut self.m, &mut operation, cleanup, observed));
                         assert_eq!(
-                            self.heap.snapshot().calls,
+                            self.heap.requests(),
                             calls,
                             "{phase:?} cancellation allocated"
                         );
@@ -3040,8 +3258,8 @@ pub mod pipeline {
 
     /// The scope and the input copied into it, its boundaries classed by
     /// `input`, or how the pipeline stopped.
-    fn acquired<'s>(
-        context: &mut Context,
+    fn acquired<'s, P: Physical>(
+        context: &mut Context<P>,
         owner: &mut DecodeOwner<'s, Limits>,
         wire: &[u8],
         input: fn(&Position<InputDetail<BufferObservation>>) -> Option<Class>,
@@ -3077,8 +3295,8 @@ pub mod pipeline {
     }
 
     /// Acquisition alone: the copied input is retired once published.
-    fn acquisition(
-        context: &mut Context,
+    fn acquisition<P: Physical>(
+        context: &mut Context<P>,
         owner: &mut DecodeOwner<'_, Limits>,
         wire: &[u8],
         classes: &Classes<()>,
@@ -3094,8 +3312,8 @@ pub mod pipeline {
 
     /// Acquisition, then the parsed document inspected in place without
     /// allocating, then retired.
-    fn inspection(
-        context: &mut Context,
+    fn inspection<P: Physical>(
+        context: &mut Context<P>,
         owner: &mut DecodeOwner<'_, Limits>,
         wire: &[u8],
         classes: &Classes<()>,
@@ -3122,21 +3340,21 @@ pub mod pipeline {
             },
             Err(Invalid) => return Reached::Invalid,
         };
-        let calls = context.heap.snapshot().calls;
+        let calls = context.heap.requests();
         context.heap.window(|| {
             document.with_document(|view| assert_eq!(view.root().encoded(), wire));
             assert_eq!(document.root().encoded(), wire);
             assert_eq!(document.bytes(), wire);
         });
-        assert_eq!(context.heap.snapshot().calls, calls, "inspection allocated");
+        assert_eq!(context.heap.requests(), calls, "inspection allocated");
         context.retire(document);
         Reached::Complete
     }
 
     /// Acquisition, typed decoding of `T`, owned preparation and emission,
     /// the emitted chunks appended to `output`.
-    fn encoding<T>(
-        context: &mut Context,
+    fn encoding<T, P: Physical>(
+        context: &mut Context<P>,
         owner: &mut DecodeOwner<'_, Limits>,
         wire: &[u8],
         output: &mut Vec<u8>,
@@ -3192,24 +3410,29 @@ pub mod pipeline {
             context.retire(plan);
             return Reached::Stopped;
         }
-        let calls = context.heap.snapshot().calls;
+        let calls = context.heap.requests();
         let mut writer = context.heap.window(|| plan.into_writer());
         assert_eq!(
-            context.heap.snapshot().calls,
+            context.heap.requests(),
             calls,
             "writer constructor allocated"
         );
         for turn in 0..context.allowed(emit_turns(wire.len())) {
             // A writer holds no operation in progress: every stop retires it.
-            // No cleanup argument covers its states: each is its own class.
-            if context.boundary(Phase::Emit, turn, None).is_some() {
+            // Its boundaries are classed by its plan record's cleanup alone
+            // ([`crate::classes::emit`]), read only when positions are.
+            let class = if context.observed {
+                (classes.emit)(&writer.position())
+            } else {
+                None
+            };
+            if context.boundary(Phase::Emit, turn, class).is_some() {
                 context.retire(writer);
                 return Reached::Stopped;
             }
-            let step = {
-                let _armed = context.heap.armed();
-                emit_turn(&mut context.m, &mut writer)
-            };
+            let step = context
+                .heap
+                .window(|| emit_turn(&mut context.m, &mut writer));
             match step {
                 Ok(OwnedEmitStep::Progress) => {}
                 Ok(OwnedEmitStep::Chunk(chunk)) => {
@@ -3237,8 +3460,8 @@ pub mod pipeline {
     /// under test: they run before the measured part begins, and the
     /// schedule's refusals and failures reach the decode alone. Neither
     /// publication nor retirement releases the input.
-    fn decoding<T: Transferable<Limits> + 'static>(
-        context: &mut Context,
+    fn decoding<T: Transferable<Limits> + 'static, P: Physical>(
+        context: &mut Context<P>,
         owner: &mut DecodeOwner<'static, Limits>,
         wire: &[u8],
         options: Options,
@@ -3302,8 +3525,10 @@ pub mod pipeline {
         /// retaining acquisition admissions. `refused` counts injections only.
         pub refusals: usize,
         pub refused: usize,
-        pub physical: usize,
-        pub denied: usize,
+        /// The physical requests and denials the run's witness saw, absent
+        /// where nothing physical is witnessed ([`Physical`]).
+        pub physical: Option<usize>,
+        pub denied: Option<usize>,
         /// Every observed boundary, in order: each is a possible stop.
         pub boundaries: Vec<Boundary>,
         /// The admitted calls after the selected stop: its cleanup, through
@@ -3318,6 +3543,10 @@ pub mod pipeline {
         pub failed: bool,
         /// Queue draining begins after the pipeline's last live boundary.
         pub drain_attempt: usize,
+        /// Every boundary predicate valuation the run reached, its drain
+        /// included, as its policy recorded them through the seam
+        /// (`bounded::boundary`).
+        pub reached: Valuations,
     }
 
     impl Report {
@@ -3354,11 +3583,16 @@ pub mod pipeline {
         }
 
         fn physical_name(&self, index: usize) -> String {
+            let witnessed = |boundary: &Boundary| {
+                boundary
+                    .physical
+                    .expect("a physical request is named only in a run that witnesses them")
+            };
             let boundary = self
                 .boundaries
                 .iter()
                 .rev()
-                .find(|boundary| boundary.physical <= index)
+                .find(|boundary| witnessed(boundary) <= index)
                 .expect("a measured physical request has a pipeline boundary");
             let first = self
                 .boundaries
@@ -3368,7 +3602,7 @@ pub mod pipeline {
             format!(
                 "{:?} physical request {}, turn {}, class {:?} (replay {index})",
                 boundary.phase,
-                index - first.physical,
+                index - witnessed(first),
                 boundary.turn,
                 boundary.class
             )
@@ -3377,19 +3611,17 @@ pub mod pipeline {
 
     /// Run `body` in one scope under observation, injecting what `schedule`
     /// names, then drain the scope: draining allocates nothing and recovers
-    /// every reservation, every admission fits one quantum, and no physical
-    /// allocation was unadmitted.
-    fn observe(
+    /// every reservation, every admission fits one quantum, and, where `P`
+    /// witnesses physical requests, none was unadmitted.
+    fn observe<P: Physical>(
         wire: &[u8],
         schedule: &Schedule,
-        body: impl FnOnce(&mut Context, &mut DecodeOwner<'static, Limits>, &mut Vec<u8>) -> Reached,
+        body: impl FnOnce(&mut Context<P>, &mut DecodeOwner<'static, Limits>, &mut Vec<u8>) -> Reached,
     ) -> Report {
-        let observation = heap::Observation::begin(schedule.physical);
-        observation.stop();
         let stop = schedule.stop;
         let mut context = Context {
-            m: observed(),
-            heap: observation,
+            m: P::policy(),
+            heap: P::begin(schedule.physical),
             boundaries: Vec::new(),
             stop,
             refusal: schedule.refusal,
@@ -3416,14 +3648,12 @@ pub mod pipeline {
                 Reached::Stopped
             }
         };
-        let calls = context.heap.snapshot().calls;
+        let calls = context.heap.requests();
         let drain_attempt = context.m.attempts();
         context.heap.window(|| drain(&mut owner, &mut context.m));
-        assert_eq!(context.heap.snapshot().calls, calls, "drain allocated");
+        assert_eq!(context.heap.requests(), calls, "drain allocated");
         assert_eq!(context.m.live_bytes(), 0);
-        let stats = context.heap.snapshot();
-        assert_eq!(stats.unadmitted, 0, "physical allocation without admission");
-        assert!(!stats.overflow, "heap observation incomplete");
+        let (physical, denied) = context.heap.finish();
         let complete = matches!(reached, Reached::Complete);
         let accounting = RefusalRun::of(&context.m);
         let cleanup = context
@@ -3434,8 +3664,8 @@ pub mod pipeline {
             attempts: context.m.attempts(),
             refusals: context.m.refusals(),
             refused: context.m.injected_refusals(),
-            physical: stats.calls,
-            denied: stats.denied,
+            physical,
+            denied,
             boundaries: context.boundaries,
             cleanup,
             complete,
@@ -3443,48 +3673,93 @@ pub mod pipeline {
             stopped: matches!(reached, Reached::Stopped),
             failed: matches!(reached, Reached::Failed),
             drain_attempt,
+            reached: context.m.reached(),
         }
     }
 
-    /// Copy `wire`, which may be any bytes, into a scope, observed
-    /// ([`observe`]), its boundaries classed by `classes`; complete once the
-    /// published copy equals it.
+    /// The pipeline's runs under the physical witness `P` ([`Physical`]).
+    /// The module's free functions are these under the heap guard.
+    pub struct Under<P>(core::marker::PhantomData<P>);
+
+    impl<P: Physical> Under<P> {
+        /// Copy `wire`, which may be any bytes, into a scope, observed
+        /// ([`observe`]), its boundaries classed by `classes`; complete once
+        /// the published copy equals it.
+        pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+            observe::<P>(wire, schedule, |context, owner, _| {
+                acquisition(context, owner, wire, classes)
+            })
+        }
+
+        /// Copy `wire` and parse it to a document inspected in place,
+        /// observed ([`observe`]), its boundaries classed by `classes`;
+        /// complete once the document's root is the input.
+        pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+            observe::<P>(wire, schedule, |context, owner, _| {
+                inspection(context, owner, wire, classes)
+            })
+        }
+
+        /// Copy `wire`, decode it as `T`, prepare the value's encoding owned
+        /// and emit it, observed ([`observe`]), its boundaries classed by
+        /// `classes`; complete once the emitted bytes are the input, as
+        /// every canonical input's are.
+        pub fn encode<T>(wire: &[u8], schedule: &Schedule, classes: &Classes<Typed<T>>) -> Report
+        where
+            T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
+        {
+            observe::<P>(wire, schedule, |context, owner, output| {
+                let reached = encoding::<T, P>(context, owner, wire, output, classes);
+                if matches!(reached, Reached::Complete) {
+                    assert_eq!(output.as_slice(), wire, "emission diverged from the input");
+                }
+                reached
+            })
+        }
+
+        /// Decode `wire`, which may be any bytes, as `T` under `options` from
+        /// a custom input ([`decoding`]), observed ([`observe`]), its
+        /// boundaries classed by `classes`, a published value given to
+        /// `inspect`. The drain releases the input exactly once.
+        pub fn decode<T: Transferable<Limits> + 'static>(
+            wire: &[u8],
+            options: Options,
+            schedule: &Schedule,
+            classes: &Classes<Typed<T>>,
+            inspect: impl FnOnce(&T),
+        ) -> Report {
+            let released = Arc::new(AtomicUsize::new(0));
+            let report = observe::<P>(wire, schedule, |context, owner, _| {
+                decoding::<T, P>(context, owner, wire, options, classes, &released, inspect)
+            });
+            assert_eq!(
+                released.load(Ordering::SeqCst),
+                1,
+                "the drain did not release the input exactly once"
+            );
+            report
+        }
+    }
+
+    /// [`Under::acquire`] under the heap guard.
     pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
-        observe(wire, schedule, |context, owner, _| {
-            acquisition(context, owner, wire, classes)
-        })
+        Under::<heap::Observation>::acquire(wire, schedule, classes)
     }
 
-    /// Copy `wire` and parse it to a document inspected in place, observed
-    /// ([`observe`]), its boundaries classed by `classes`; complete once the
-    /// document's root is the input.
+    /// [`Under::inspect`] under the heap guard.
     pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
-        observe(wire, schedule, |context, owner, _| {
-            inspection(context, owner, wire, classes)
-        })
+        Under::<heap::Observation>::inspect(wire, schedule, classes)
     }
 
-    /// Copy `wire`, decode it as `T`, prepare the value's encoding owned and
-    /// emit it, observed ([`observe`]), its boundaries classed by `classes`;
-    /// complete once the emitted bytes are the input, as every canonical
-    /// input's are.
+    /// [`Under::encode`] under the heap guard.
     pub fn encode<T>(wire: &[u8], schedule: &Schedule, classes: &Classes<Typed<T>>) -> Report
     where
         T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
     {
-        observe(wire, schedule, |context, owner, output| {
-            let reached = encoding::<T>(context, owner, wire, output, classes);
-            if matches!(reached, Reached::Complete) {
-                assert_eq!(output.as_slice(), wire, "emission diverged from the input");
-            }
-            reached
-        })
+        Under::<heap::Observation>::encode::<T>(wire, schedule, classes)
     }
 
-    /// Decode `wire`, which may be any bytes, as `T` under `options` from a
-    /// custom input ([`decoding`]), observed ([`observe`]), its boundaries
-    /// classed by `classes`, a published value given to `inspect`. The
-    /// drain releases the input exactly once.
+    /// [`Under::decode`] under the heap guard.
     pub fn decode<T: Transferable<Limits> + 'static>(
         wire: &[u8],
         options: Options,
@@ -3492,16 +3767,7 @@ pub mod pipeline {
         classes: &Classes<Typed<T>>,
         inspect: impl FnOnce(&T),
     ) -> Report {
-        let released = Arc::new(AtomicUsize::new(0));
-        let report = observe(wire, schedule, |context, owner, _| {
-            decoding::<T>(context, owner, wire, options, classes, &released, inspect)
-        });
-        assert_eq!(
-            released.load(Ordering::SeqCst),
-            1,
-            "the drain did not release the input exactly once"
-        );
-        report
+        Under::<heap::Observation>::decode::<T>(wire, options, schedule, classes, inspect)
     }
 
     /// Observation without effect: `schedule` run again reading no position
@@ -3584,6 +3850,10 @@ pub mod pipeline {
             unobserved.cleanup, observed.cleanup,
             "{at}: observing positions changed the cleanup"
         );
+        assert_eq!(
+            unobserved.reached, observed.reached,
+            "{at}: observing positions changed the boundary valuations reached"
+        );
     }
 
     /// What the unobstructed pipeline reaches, and so every refused run.
@@ -3641,7 +3911,10 @@ pub mod pipeline {
         progress.dimension("attempts", baseline.attempts);
         progress.dimension("admitted calls", baseline.accounting.admitted().len());
         progress.dimension("policy refusals", baseline.refusals);
-        progress.dimension("physical requests", baseline.physical);
+        let requests = baseline
+            .physical
+            .expect("the fault matrix runs where physical requests are witnessed");
+        progress.dimension("physical requests", requests);
         progress.dimension("boundaries", baseline.boundaries.len());
         progress.dimension(
             "classes",
@@ -3672,6 +3945,17 @@ pub mod pipeline {
         );
         assert_eq!(baseline.refused, 0);
         unaffected(&run, &Schedule::BASELINE, &baseline, "unobstructed");
+        // The boundary valuations reached by the runs the fast layer makes,
+        // and by every run the matrix makes: under the exhaustive layer they
+        // must be equal, the evidence that one stop per certified class
+        // passes every boundary predicate edge its class's members pass.
+        let fast_reached = std::cell::Cell::new(baseline.reached);
+        let every_reached = std::cell::Cell::new(baseline.reached);
+        let fast = |report: &Report| {
+            fast_reached.set(fast_reached.get().union(report.reached));
+            every_reached.set(every_reached.get().union(report.reached));
+        };
+        let every = |report: &Report| every_reached.set(every_reached.get().union(report.reached));
         let each = Schedule {
             refusal: Refusal::Each,
             ..Schedule::BASELINE
@@ -3682,6 +3966,7 @@ pub mod pipeline {
             baseline.accounting.admitted().len()
         ));
         let refused = run(&each);
+        fast(&refused);
         assert_eq!(
             refused.refused,
             baseline.accounting.admitted().len(),
@@ -3705,6 +3990,7 @@ pub mod pipeline {
                     ..Schedule::BASELINE
                 };
                 let resumed = run(&schedule);
+                every(&resumed);
                 assert_eq!(resumed.refused, 1, "{at}: refusal unobserved");
                 resumed.accounting.resumed(
                     &baseline.accounting,
@@ -3715,7 +4001,7 @@ pub mod pipeline {
                 unaffected(&run, &schedule, &resumed, &at);
             }
         }
-        super::physical_stage(&mut progress, baseline.physical, |index| {
+        super::physical_stage(&mut progress, requests, |index| {
             let at = baseline.physical_name(index);
             eprintln!("[{name}] {at}");
             let schedule = Schedule {
@@ -3723,21 +4009,32 @@ pub mod pipeline {
                 ..Schedule::BASELINE
             };
             let failed = run(&schedule);
-            assert_eq!(failed.denied, 1, "{at}: failure unobserved");
+            // Every physical request is failed in both layers.
+            fast(&failed);
+            assert_eq!(failed.denied, Some(1), "{at}: failure unobserved");
             assert!(failed.failed, "{at}: failure misclassified");
             assert!(!failed.complete, "{at}: published after failure");
             if exhaustive {
                 unaffected(&run, &schedule, &failed, &at);
             }
         });
+        // The fast layer's stops: the first boundary of each certified class
+        // and every unclassified one. The exhaustive layer stops at every
+        // boundary, each marked whether the fast layer would.
         let mut first = std::collections::BTreeSet::new();
-        let selected: Vec<&Boundary> = baseline
+        let in_fast: Vec<bool> = baseline
             .boundaries
             .iter()
-            .filter(|boundary| match (&boundary.class, rigor) {
-                (_, Rigor::Exhaustive) | (None, Rigor::Fast) => true,
-                (Some(class), Rigor::Fast) => first.insert(class.clone()),
+            .map(|boundary| match &boundary.class {
+                None => true,
+                Some(class) => first.insert(class.clone()),
             })
+            .collect();
+        let selected: Vec<(&Boundary, bool)> = baseline
+            .boundaries
+            .iter()
+            .zip(in_fast)
+            .filter(|&(_, in_fast)| in_fast || rigor == Rigor::Exhaustive)
             .collect();
         const STOPS: [Stop; 3] = [Stop::Retire, Stop::Unwind, Stop::Cancel];
         progress.stage(
@@ -3748,7 +4045,7 @@ pub mod pipeline {
         // Every classed stop, keyed by its class and kind of stop, with the
         // cleanup it made: members of one class must clean up alike.
         let mut members = Vec::new();
-        for boundary in selected {
+        for (boundary, in_fast) in selected {
             for stop in STOPS {
                 let at = format!(
                     "{stop:?} at {:?} {}, class {:?}",
@@ -3760,6 +4057,11 @@ pub mod pipeline {
                     ..Schedule::BASELINE
                 };
                 let stopped = run(&schedule);
+                if in_fast {
+                    fast(&stopped);
+                } else {
+                    every(&stopped);
+                }
                 assert!(stopped.stopped, "{at}: not reached");
                 assert!(
                     !stopped.failed && !stopped.invalid,
@@ -3775,6 +4077,12 @@ pub mod pipeline {
             }
         }
         super::agree(name, members);
+        if exhaustive {
+            fast_reaches_every(name, fast_reached.get(), every_reached.get());
+        }
+        // What the fast layer reaches is what every layer, Miri's included,
+        // runs: the gate compares it across witness sizes and runners.
+        crate::rigor::reached(name, fast_reached.get());
     }
 
     #[cfg(test)]
@@ -3809,6 +4117,44 @@ pub mod pipeline {
     }
 
     #[cfg(test)]
+    mod reach_tests {
+        use super::*;
+        use dcbor::bounded::boundary::{Boundary, Predicate, Valuation};
+
+        fn reached(boundaries: &[Boundary]) -> Valuations {
+            let mut reached = Valuations::new();
+            for &boundary in boundaries {
+                reached.insert(boundary);
+            }
+            reached
+        }
+
+        const PAST: Boundary = Boundary {
+            predicate: Predicate::ArenaLength,
+            valuation: Valuation::Past,
+        };
+        const TOMBSTONE: Boundary = Boundary {
+            predicate: Predicate::Buckets,
+            valuation: Valuation::Tombstone,
+        };
+
+        /// The comparator's pass scenario: a fast layer reaching everything
+        /// the exhaustive one does, and more, passes.
+        #[test]
+        fn a_fast_layer_reaching_every_valuation_passes() {
+            fast_reaches_every("control", reached(&[PAST, TOMBSTONE]), reached(&[PAST]));
+        }
+
+        /// The comparator's planted defect: a valuation only the exhaustive
+        /// layer reached is named.
+        #[test]
+        #[should_panic(expected = "buckets\\ttombstone")]
+        fn a_valuation_only_the_exhaustive_layer_reached_is_named() {
+            fast_reaches_every("planted", reached(&[PAST]), reached(&[PAST, TOMBSTONE]));
+        }
+    }
+
+    #[cfg(test)]
     mod unwind_tests {
         use super::*;
 
@@ -3832,7 +4178,7 @@ pub mod pipeline {
         #[test]
         #[should_panic(expected = "unexpected production panic")]
         fn scheduled_unwind_does_not_accept_a_production_panic() {
-            observe(
+            observe::<heap::Observation>(
                 &[],
                 &Schedule {
                     stop: Some((Phase::Scope, 0, Stop::Unwind)),

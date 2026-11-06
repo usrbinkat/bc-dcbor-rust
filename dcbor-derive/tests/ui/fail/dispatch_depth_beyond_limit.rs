@@ -4,7 +4,7 @@
 mod policy;
 
 use dcbor::bounded::decode::construction::in_place::{
-    Built, ConstructionCost, InPlace, plus, step, unit,
+    Built, ConstructionCost, InPlace, step, unit,
 };
 use dcbor::bounded::decode::construction::reclamation::{
     MAX_DISPATCH_DEPTH, PeekSlot, Reclaim, Reclaimed, Slot, Written,
@@ -32,7 +32,7 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
 }
 
 unsafe impl<A: Allocator> InPlace<A> for AtLimit {
-    const COST: ConstructionCost = ConstructionCost::fixed(plus(unit(0), unit(0)));
+    const COST: ConstructionCost = ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
 
     fn build_step(
         _: &Document<'_, A::Permit>,

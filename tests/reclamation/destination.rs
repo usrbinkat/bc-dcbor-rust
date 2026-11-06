@@ -4,8 +4,9 @@ use super::*;
 /// `stop` turns: cancellation releases nothing synchronously, and its own
 /// cleanup takes every unit refused once, releasing nothing, before it is
 /// admitted, within the decode's bound. The turns construction took to
-/// publish, when it published within `stop`.
-fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
+/// publish, when it published within `stop`, and the boundary valuations
+/// the run reached.
+fn cancelled(wire: &[u8], stop: usize) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
     let bound = support::typed_turns::<Vec<String>>(wire.len());
     let mut m = meter();
     let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
@@ -62,7 +63,7 @@ fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
     drain(&mut owner, &mut m);
     assert_eq!(owner.outstanding(), 0);
     assert_eq!(m.live_bytes(), 0);
-    published
+    (published, m.reached())
 }
 
 /// The construction cancelled after every number of turns through its
@@ -71,13 +72,17 @@ fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
 #[test]
 fn cancelled_construction_reclaims_at_every_boundary() {
     let wire = [0x82, 0x61, b'a', 0x61, b'b'];
-    let boundaries = cancelled(&wire, usize::MAX).expect("construction never reached publication");
+    let boundaries = cancelled(&wire, usize::MAX)
+        .0
+        .expect("construction never reached publication");
     support::stop_matrix("cancelled construction of two texts", boundaries, |stop| {
+        let (published, reached) = cancelled(&wire, stop);
         assert_eq!(
-            cancelled(&wire, stop).is_some(),
+            published.is_some(),
             stop == boundaries,
             "a stop after {stop} turns"
         );
+        reached
     });
 }
 

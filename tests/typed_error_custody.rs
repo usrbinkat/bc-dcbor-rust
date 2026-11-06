@@ -1,9 +1,7 @@
 #![cfg(feature = "std")]
 
 use dcbor::bounded::decode::construction::TypedDecoder;
-use dcbor::bounded::decode::construction::in_place::{
-    Built, ConstructionCost, InPlace, plus, unit,
-};
+use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace, unit};
 use dcbor::bounded::decode::construction::reclamation::{
     PeekSlot, Reclaim, Reclaimed, Slot, Written,
 };
@@ -27,7 +25,8 @@ impl Drop for Fails {
 // records completion before the later transition intentionally returns an error.
 unsafe impl<A: Allocator> InPlace<A> for Fails {
     // Two build units, the second failing, and one cleanup unit.
-    const COST: ConstructionCost = ConstructionCost::fixed(plus(plus(unit(0), unit(0)), unit(0)));
+    const COST: ConstructionCost =
+        ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(3)));
 
     #[expect(
         clippy::disallowed_methods,

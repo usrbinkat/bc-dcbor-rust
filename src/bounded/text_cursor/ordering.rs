@@ -13,6 +13,7 @@
 //! stable scatters into the scratch and `r` copies back: `4` table units and
 //! `6r` part units, linear in the run whatever its length.
 use super::*;
+use crate::bounded::boundary::{boundary, units};
 use crate::bounded::decode::construction::reclamation::Slot;
 use crate::bounded::decode::storage::StoragePosition;
 
@@ -111,8 +112,9 @@ impl<P> Ordering<P> {
     ) -> BoundedResult<bool, A> {
         use crate::bounded::decode::initialization::{init_field, init_part};
         let storage_steps = Storage::<char, P>::INIT_STEPS;
-        if *slot.custody() < storage_steps {
-            init_part!(slot, scratch, 0, |scratch| Storage::initialize_step(
+        let units = *slot.custody();
+        if Bound::new(Predicate::Prefix, storage_steps).below(a, units) {
+            init_part!(slot, scratch, 0, a, |scratch| Storage::initialize_step(
                 scratch, a
             )?);
             return Ok(false);
@@ -191,7 +193,9 @@ impl<P> Ordering<P> {
         chars: &mut [char],
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
-        if self.phase == OrderingPhase::Copy && self.scratch.len() < chars.len() {
+        if self.phase == OrderingPhase::Copy
+            && Bound::new(Predicate::ArenaLength, chars.len()).below(allocator, self.scratch.len())
+        {
             let scratch = &mut self.scratch;
             // A growth unit of the scratch, or a free slot for the next
             // character.
@@ -217,17 +221,23 @@ impl<P> Ordering<P> {
                 if self.end == self.start && canonical_combining_class(chars[self.start]) == 0 {
                     self.start += 1;
                     self.end = self.start;
-                } else if self.end < chars.len() && canonical_combining_class(chars[self.end]) != 0
+                } else if Bound::new(Predicate::ArenaLength, chars.len()).below(allocator, self.end)
+                    && canonical_combining_class(chars[self.end]) != 0
                 {
                     self.end += 1;
-                } else if self.end - self.start < 2 {
-                    // A run of one part is in order.
-                    self.start = self.end;
                 } else {
-                    // Each counter counts at most the run's parts.
-                    u32::try_from(self.end - self.start).map_err(|_| BoundedError::Overflow)?;
-                    self.pass = 0;
-                    self.phase = OrderingPhase::Clear;
+                    // The run's end is decided: one part, two, or more. A
+                    // run of one is in order; two or more are sorted.
+                    let run = self.end - self.start;
+                    boundary!(allocator, Predicate::TextRun => units(run));
+                    if boundary!(allocator, Predicate::TextRun, run, 2).is_lt() {
+                        self.start = self.end;
+                    } else {
+                        // Each counter counts at most the run's parts.
+                        u32::try_from(run).map_err(|_| BoundedError::Overflow)?;
+                        self.pass = 0;
+                        self.phase = OrderingPhase::Clear;
+                    }
                 }
             }
             OrderingPhase::Clear => {

@@ -607,12 +607,14 @@ fn tag() {
     assert_eq!(format!("{:?}", tag), "Tag { value: 2, name: None }");
 }
 
+/// A date's tag carries its name, whatever any tag store registers
+/// (`Date::cbor_tags`, `tests/tag_store.rs`): both renderings name it.
 #[test]
 fn encode_date() {
     test_cbor_codable(
         Date::from_timestamp(1675854714.0),
-        "tagged(1, unsigned(1675854714))",
-        "1(1675854714)",
+        "tagged(date, unsigned(1675854714))",
+        "date(1675854714)",
         "c11a63e3837a",
     )
 }

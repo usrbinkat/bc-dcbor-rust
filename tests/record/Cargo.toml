@@ -1,0 +1,15 @@
+[package]
+name = "dcbor-record"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The one form of dcbor's recorded oracles: the configuration header, parse and atomic publication."
+license = "BSD-2-Clause-Patent"
+
+# A leaf: no dependency, of the workspace or otherwise, so nothing reaches a
+# test build or a gate build through it.
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 //! Retained lexicographic comparison of immutable encoded map keys.
 use core::cmp::Ordering;
 
+use super::super::boundary::{Bound, Predicate, boundary, units};
 use super::super::{BoundedError, Budget, Caller, Capped, Failure, Resumable, Step, WriteWork};
 
 /// One comparison turn: one value and at most a quantum of byte pairs. The
@@ -173,20 +174,24 @@ pub(crate) fn compare_step<B: Budget>(
     position: &mut usize,
     budget: &mut B,
 ) -> Result<Option<Ordering>, BoundedError<B::Refusal>> {
-    let remaining = left
-        .len()
-        .min(right.len())
-        .checked_sub(*position)
+    const QUANTUM: usize = super::construction::stable::QUANTUM;
+    let shorter = Bound::new(Predicate::Payload, right.len()).clamp(budget, left.len());
+    if *position == 0 {
+        // The copy units the shorter key spans: where a comparison crosses
+        // from one turn's window into the next.
+        boundary!(budget, Predicate::KeySpan => units(shorter.div_ceil(QUANTUM)));
+    }
+    let remaining = (!Bound::new(Predicate::Payload, shorter).exceeded(budget, *position))
+        .then(|| shorter - *position)
         .ok_or(BoundedError::PlanMismatch)?;
-    let count = remaining.min(super::construction::stable::QUANTUM);
+    let count = Bound::new(Predicate::Quantum, QUANTUM).clamp(budget, remaining);
     COMPARE.admit(budget, count as u64)?;
-    let end = *position + count;
-    while *position < end {
+    for _ in 0..count {
         let ordering = left[*position].cmp(&right[*position]);
         *position += 1;
         if ordering != Ordering::Equal {
             return Ok(Some(ordering));
         }
     }
-    Ok((*position == left.len().min(right.len())).then(|| left.len().cmp(&right.len())))
+    Ok((*position == shorter).then(|| left.len().cmp(&right.len())))
 }

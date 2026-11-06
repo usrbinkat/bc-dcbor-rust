@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -101,7 +101,7 @@
+             written: crate::bounded::write_extent(
+                 size_of::<W::In<Core>>() + crate::bounded::permit_bytes::<P>(),
+             ) as usize,
+-            block: size_of::<Held<M::In<Core>, P>>(),
++            block: size_of::<Held<M::In<crate::sync::Shipped>, P>>(),
+             stored: PhantomData,
+         }
+     }

@@ -5,8 +5,10 @@ use alloc::{string::String, vec::Vec};
 
 use super::*;
 use crate::bounded::Capped;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction};
+use crate::bounded::boundary::{Bound, Predicate, boundary};
+use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction, Uniform};
 use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::sync::{Atomics, Representation};
 
 /// Where a byte buffer's construction or cleanup is: its empty header
 /// written, its payload's reservation, release and allocation, the copy,
@@ -36,6 +38,17 @@ pub(crate) struct Meta<P> {
     pub(crate) phase: Phase,
     pub(crate) payload: Option<P>,
     copied: usize,
+}
+
+impl<P> Representation for Meta<P> {
+    type In<S: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds, its whole value
+/// written with the permit ([`stable::Contract`]): the one definition its
+/// installation and every buffer binding's cost read.
+const fn contract<P>() -> stable::Contract<Meta<P>, Meta<P>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of a byte buffer with permits of `P`: its
@@ -122,6 +135,14 @@ impl<P> Reduction for BufferState<P> {
     }
 }
 
+// A buffer's construction reports `Done` only from `Copy` once every byte is
+// copied, its phase then `Complete`, and only after `AllocatePayload`
+// granted its payload's permit, which `Copy` never releases: a complete
+// buffer is `Written` with its payload held.
+impl<P> Uniform for BufferState<P> {
+    const COMPLETE: BufferClass = BufferClass::Written { payload: true };
+}
+
 impl<P> Custody for BufferState<P> {
     type Observation = BufferObservation;
 
@@ -204,6 +225,7 @@ fn allocate_meta<A: Allocator>(
     // SAFETY: the header is the whole metadata, every field written.
     unsafe {
         stable::install::<Meta<A::Permit>, Meta<A::Permit>, A>(
+            const { contract::<A::Permit>() },
             &mut state.meta,
             &mut state.admitted,
             || Meta {
@@ -226,31 +248,29 @@ fn allocate_meta<A: Allocator>(
 /// before any of them. Per byte: every copy but the last covers at least
 /// [`COPIED`] bytes, so its values are at most `PER_BYTE_SCALE / COPIED`
 /// sixty-fourths per byte, rounded up; every byte copied once; the payload,
-/// of at most every byte of the subtree, held.
-pub(crate) const fn buffer_cost<H, P>() -> ConstructionCost {
-    let meta = stable::Metadata::whole::<Meta<P>, P>().bytes();
+/// of at most every byte of the subtree, held. None when a quantity does
+/// not fit in `u64`.
+pub(crate) const fn buffer_cost<H, P>() -> Option<ConstructionCost> {
+    let meta = contract::<P>();
     let last = Unit::new(Caller, COPY.values(), 0).bound();
-    let build = plus(
-        plus(
-            plus(
-                stable::install_cost::<Meta<P>, P>(),
-                stable::release_cost::<P>(),
-            ),
-            sized::<H>().bound(),
-        ),
-        plus(plus(STEP_COST, stable::release_cost::<P>()), last),
+    let written = cost!(
+        cost!(meta.write().checked_add(stable::release_cost::<P>()))
+            .checked_add(sized::<H>().bound())
     );
+    let payload =
+        cost!(cost!(STEP_COST.checked_add(stable::release_cost::<P>())).checked_add(last));
+    let build = cost!(written.checked_add(payload));
     let cleanup = buffer_cleanup::<H>();
-    ConstructionCost {
-        fixed: plus(plus(build, cleanup), held(meta)),
+    Some(ConstructionCost {
+        fixed: cost!(cost!(build.checked_add(cleanup)).checked_add(held(meta.block()))),
         per_byte: ResourceBound {
-            values: COPY.values() * PER_BYTE_SCALE.div_ceil(COPIED),
+            values: cost!(COPY.values().checked_mul(PER_BYTE_SCALE.div_ceil(COPIED))),
             bytes: PER_BYTE_SCALE,
             allocated: PER_BYTE_SCALE,
             peak: PER_BYTE_SCALE,
             retained: PER_BYTE_SCALE,
         },
-    }
+    })
 }
 
 /// The cleanup of a complete byte buffer of header `H` ([`reclaim_buffer`]):
@@ -388,17 +408,19 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
         }
         Phase::Copy => {
             let start = state.installed()?.copied;
-            let remaining = bytes
-                .len()
-                .checked_sub(start)
-                .ok_or(BoundedError::PlanMismatch)?;
+            if Bound::new(Predicate::Payload, bytes.len()).exceeded(a, start) {
+                return Err(BoundedError::PlanMismatch);
+            }
+            let remaining = bytes.len() - start;
             if !H::boundary(source, start) {
                 return Err(BoundedError::PlanMismatch);
             }
-            let mut end = start + remaining.min(stable::QUANTUM);
+            let mut end =
+                start + Bound::new(Predicate::Quantum, stable::QUANTUM).clamp(a, remaining);
             // A boundary is at most three bytes before the end: a scalar is
             // at most four bytes.
-            while end > start && !H::boundary(source, end) {
+            while boundary!(a, Predicate::Payload, end, start).is_gt() && !H::boundary(source, end)
+            {
                 end -= 1;
             }
             if end == start && remaining != 0 {
@@ -412,7 +434,7 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
                     vector.capacity() - vector.len()
                 })
             };
-            if end - start > spare {
+            if Bound::new(Predicate::ArenaLength, spare).exceeded(a, end - start) {
                 return Err(BoundedError::PlanMismatch);
             }
             COPY.admit(a, (end - start) as u64)?;
@@ -441,7 +463,7 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
 // reserves its byte allocation once, and appends only admitted UTF-8 chunks.
 // All phases, including allocation failures, are understood by Reclaim above.
 unsafe impl<A: Allocator> InPlace<A> for String {
-    const COST: ConstructionCost = buffer_cost::<String, A::Permit>();
+    const COST: ConstructionCost = crate::const_cost!(buffer_cost::<String, A::Permit>());
 
     fn build_step(
         document: &Document<'_, A::Permit>,
@@ -470,7 +492,7 @@ mod tests {
     #[test]
     fn a_buffers_cost_charges_each_byte_once_and_a_copy_per_61_bytes() {
         assert_eq!(COPIED, 61);
-        let cost = buffer_cost::<String, Reservation>();
+        let cost = buffer_cost::<String, Reservation>().expect("a buffer's cost fits in u64");
         assert_eq!(cost, <String as InPlace<Limits>>::COST);
         assert_eq!(
             cost.per_byte,

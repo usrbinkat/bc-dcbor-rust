@@ -2,6 +2,9 @@
 # Recorded, time-bounded campaign over the existing fuzz targets.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=tests/gate-common.sh
+source tests/gate-common.sh
+: "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 
 seconds=${FUZZ_SECONDS:-600}
 seed=${FUZZ_SEED:-20261019}
@@ -28,21 +31,14 @@ finished() {
 }
 trap finished EXIT
 
-snapshot() {
-	for file in flake.nix flake.lock Cargo.toml Cargo.lock fuzz/Cargo.toml fuzz/Cargo.lock; do
-		if [[ -f $file ]]; then sha256sum "$file"; fi
-	done
-	find src dcbor-derive/src fuzz/src fuzz/fuzz_targets tests -type f \
-		\( -name '*.rs' -o -name '*.toml' -o -name '*.txt' \) -print0 |
-		LC_ALL=C sort -z | xargs -0 sha256sum
-	sha256sum fuzz/qualify.sh
-}
-
+# The campaign is evidence of the source it started on: every gate's one
+# input closure (tests/gate-common.sh, `source_identity`), checked unchanged
+# after every build and every target, the difference written when it moved.
 unchanged() {
-	snapshot >"$logs/current-source.sha256"
-	if ! diff -u "$logs/source.sha256" "$logs/current-source.sha256" >"$logs/source-diff.log"; then
+	if ! same_source "$logs"; then
 		printf 'SOURCE CHANGED\n' >>"$logs/results.txt"
-		cat "$logs/source-diff.log" >&2
+		source_identity >"$logs/current-identity-inputs.txt"
+		diff -u "$logs/identity-inputs.txt" "$logs/current-identity-inputs.txt" >&2 || true
 		exit 1
 	fi
 }
@@ -50,15 +46,14 @@ unchanged() {
 # Fuzzing checks the existing oracles; inherited recorder settings must not
 # turn a campaign into baseline publication or cost-record generation.
 unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECTORY DCBOR_CLASS_COVERAGE
-snapshot >"$logs/source.sha256"
+# The campaign's identity: the gates' one identity (tests/gate-common.sh),
+# with the fuzzer, its seconds per target and its seed.
 {
-	date -u
-	rustc -Vv
-	cargo -V
-	cargo fuzz --version
-	printf 'seconds_per_target=%s seed=%s\n' "$seconds" "$seed"
-	cat "$logs/source.sha256"
-} >"$logs/environment-and-sources.log" 2>&1
+	printf 'fuzzer\t%s\n' "$(cargo fuzz --version)"
+	printf 'seconds_per_target\t%s\tseed\t%s\n' "$seconds" "$seed"
+} | identity "$logs"
+printf 'Campaign identity: %s\n' "$(cat "$logs/identity.txt")"
+date -u >"$logs/started.txt"
 
 if cargo fuzz build >"$logs/build.log" 2>&1; then
 	unchanged
@@ -66,7 +61,7 @@ if cargo fuzz build >"$logs/build.log" 2>&1; then
 else
 	status=$?
 	printf 'BUILD FAIL exit=%s\n' "$status" >>"$logs/results.txt"
-	tail -n 80 "$logs/build.log"
+	cat "$logs/build.log"
 	exit "$status"
 fi
 
@@ -81,7 +76,7 @@ while read -r target max_len; do
 	else
 		status=$?
 		printf '%s FAIL exit=%s\n' "$target" "$status" >>"$logs/results.txt"
-		tail -n 80 "$logs/$target.log"
+		cat "$logs/$target.log"
 		exit "$status"
 	fi
 done <<'TARGETS'

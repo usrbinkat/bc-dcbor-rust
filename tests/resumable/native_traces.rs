@@ -36,7 +36,8 @@
 use super::bindings::{string_decoder, text_encoder};
 use super::harness::*;
 use super::support::classes::Classes;
-use super::support::{self, drive_within, finish_within, pipeline};
+use super::support::pipeline::{Physical, Under};
+use super::support::{self, drive_within, finish_within, heap, pipeline};
 use dcbor::bounded::decode::construction::in_place::StableOption;
 use dcbor::bounded::decode::cursor::Decoder;
 use dcbor::bounded::decode::header::HeaderCursor;
@@ -48,6 +49,7 @@ use dcbor::bounded::{
     prepare,
 };
 use dcbor::{ByteString, CBOR, Map};
+use dcbor_record as record;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
@@ -96,12 +98,6 @@ const RECORDED: &str = concat!(
 /// Rewrites [`RECORDED`] from the current build when set.
 const RECORD: &str = "DCBOR_RECORD_TRACES";
 
-/// The configuration a run is under, exported by the flake's shells.
-const CONFIGURATION: &str = "DCBOR_CONFIGURATION";
-
-/// The first line of every record: this marker, then its configuration.
-const CONFIGURATION_LINE: &str = "#\tconfiguration\t";
-
 /// Every feature a case may be gated on, and whether this build enables it.
 const FEATURES: &[(&str, bool)] = &[
     ("derive", cfg!(feature = "derive")),
@@ -117,13 +113,6 @@ fn enabled(feature: &str) -> bool {
         Some(&(_, enabled)) => enabled,
         None => panic!("{feature} is not a gating feature; the features are {FEATURES:?}"),
     }
-}
-
-/// The configuration this run is under, when its shell exports one.
-fn configuration() -> Option<String> {
-    std::env::var(CONFIGURATION)
-        .ok()
-        .filter(|identity| !identity.is_empty())
 }
 
 /// What a case is written to reach: its operation publishes, or rejects its
@@ -186,15 +175,26 @@ struct Case {
     policy: Option<Limits>,
 }
 
-/// Every case, each named once, and the feature the cases being added are
-/// compiled under.
-#[derive(Default)]
+/// Every case, each named once, the feature the cases being added are
+/// compiled under, and the policy each case runs under: its witness's
+/// ([`Physical::policy`]), the heap guard's natively, the admission oracle's
+/// alone inside a model.
 struct Cases {
     cases: Vec<Case>,
     feature: Option<&'static str>,
+    meter: fn() -> Limits,
 }
 
 impl Cases {
+    /// No case yet, each to run under witness `W`'s policy.
+    fn under<W: Physical>() -> Self {
+        Self {
+            cases: Vec::new(),
+            feature: None,
+            meter: W::policy,
+        }
+    }
+
     fn add(
         &mut self,
         name: String,
@@ -244,7 +244,7 @@ impl Cases {
     ) where
         O::Error: Debug,
     {
-        let mut m = meter();
+        let mut m = (self.meter)();
         let result = drive_within(&mut m, &mut operation, bound);
         let reached = observed(&result);
         match result {
@@ -263,7 +263,7 @@ impl Cases {
         outcome: Outcome,
         operation: impl FnOnce(&mut Limits) -> Observed,
     ) {
-        let mut m = meter();
+        let mut m = (self.meter)();
         let reached = operation(&mut m);
         self.policy(name.into(), outcome, reached, m);
     }
@@ -483,7 +483,7 @@ fn owned_decode<T>(cases: &mut Cases, name: &str, outcome: Outcome, wire: &[u8])
 where
     T: dcbor::bounded::decode::construction::in_place::Transferable<Limits>,
 {
-    let mut m = meter();
+    let mut m = (cases.meter)();
     let (mut owner, input) = support::open(&mut m, wire);
     let result = support::decode::<_, T>(&mut m, input, Options::normalizing(8));
     let reached = observed(&result);
@@ -509,7 +509,8 @@ fn reached(report: &pipeline::Report) -> Observed {
     }
 }
 
-fn owned(cases: &mut Cases) {
+/// The owned cases, the pipeline's under witness `W` ([`Under`]).
+fn owned<W: Physical>(cases: &mut Cases) {
     let texts = [
         0x83, 0x63, b'a', b'b', b'c', 0x63, b'1', b'2', b'3', 0x61, b'x',
     ];
@@ -555,37 +556,37 @@ fn owned(cases: &mut Cases) {
         (
             "u64",
             Outcome::Published,
-            pipeline::encode::<u64>(&[0x19, 0x01, 0x00], baseline, &Classes::none()),
+            Under::<W>::encode::<u64>(&[0x19, 0x01, 0x00], baseline, &Classes::none()),
         ),
         (
             "String",
             Outcome::Published,
-            pipeline::encode::<String>(&text, baseline, &Classes::none()),
+            Under::<W>::encode::<String>(&text, baseline, &Classes::none()),
         ),
         (
             "Vec<u64>",
             Outcome::Published,
-            pipeline::encode::<Vec<u64>>(&integers, baseline, &Classes::none()),
+            Under::<W>::encode::<Vec<u64>>(&integers, baseline, &Classes::none()),
         ),
         (
             "Vec<String>",
             Outcome::Published,
-            pipeline::encode::<Vec<String>>(&texts, baseline, &Classes::none()),
+            Under::<W>::encode::<Vec<String>>(&texts, baseline, &Classes::none()),
         ),
         (
             "inspect",
             Outcome::Published,
-            pipeline::inspect(&integers, baseline, unclassed),
+            Under::<W>::inspect(&integers, baseline, unclassed),
         ),
         (
             "inspect invalid",
             Outcome::Invalid,
-            pipeline::inspect(&[0x82, 0x01], baseline, unclassed),
+            Under::<W>::inspect(&[0x82, 0x01], baseline, unclassed),
         ),
         (
             "acquire",
             Outcome::Published,
-            pipeline::acquire(&integers, baseline, unclassed),
+            Under::<W>::acquire(&integers, baseline, unclassed),
         ),
     ];
     for (name, outcome, report) in reports {
@@ -631,7 +632,7 @@ fn text(cases: &mut Cases) {
             text_encoder(&source),
             support::normalize_turns(&source),
         );
-        let mut m = meter();
+        let mut m = (cases.meter)();
         let result = drive_within(
             &mut m,
             &mut TextPreparation::new(&source),
@@ -688,7 +689,7 @@ fn sources() -> Vec<(&'static str, Box<dyn Schema>)> {
 /// `source` prepared, then its plan emitted, each its own case, each
 /// published.
 fn prepared_and_emitted(cases: &mut Cases, name: &str, source: &dyn Schema) {
-    let (plan, m) = prepared(source);
+    let (plan, m) = prepared_under(source, (cases.meter)());
     let mut bytes = vec![0; plan.len()];
     cases.retained(
         format!("Writer {name}"),
@@ -803,52 +804,46 @@ fn derived(cases: &mut Cases) {
     owned_decode::<Choice>(cases, "derived choice", Outcome::Published, &choice);
 }
 
+/// A hash table enumerated by the engine's one bucket traversal, each call
+/// in a fresh turn: its windows, the entries ending them early, and the
+/// completion forfeiting the last window's credit.
 #[cfg(feature = "hashbrown")]
 fn buckets(cases: &mut Cases) {
-    use dcbor::bounded::encoding::buckets::{BucketCursor, BucketStep};
+    use dcbor::bounded::encoding::{
+        BUCKET_WINDOW,
+        buckets::{BucketCursor, BucketStep, Buckets},
+    };
     let mut table = hashbrown::HashTable::with_capacity(64);
-    for value in [0u64, 17, 40, 63] {
-        table.insert_unique(value, value, |value| *value);
+    for key in [0u64, 17, 40, 63] {
+        table.insert_unique(key, (key, key), |pair| pair.0);
     }
-    for (name, batched) in [("single", false), ("batched", true)] {
-        let mut m = meter();
-        let mut cursor = BucketCursor::new(&table);
-        let mut reached = Err(format!(
-            "incomplete after {} buckets",
-            table.num_buckets() + 1
-        ));
-        for _ in 0..=table.num_buckets() {
-            m.fresh();
-            let step = if batched {
-                cursor.step_batch(&mut m)
-            } else {
-                cursor.step(&mut m)
-            };
-            match step {
-                Ok(BucketStep::Complete) => {
-                    reached = Ok(Outcome::Published);
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    reached = observed::<(), _>(&Err(error));
-                    break;
-                }
+    let source: &dyn Buckets = &table;
+    // At most a call per window and per entry, then the completion.
+    let calls = table.num_buckets().div_ceil(BUCKET_WINDOW) + table.len() + 1;
+    let mut m = (cases.meter)();
+    let mut cursor = BucketCursor::new();
+    let mut reached = Err(format!("incomplete after {calls} calls"));
+    for _ in 0..calls {
+        m.fresh();
+        match cursor.step(source, &mut m) {
+            Ok(BucketStep::Complete) => {
+                reached = Ok(Outcome::Published);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                reached = observed::<(), _>(&Err(error));
+                break;
             }
         }
-        cases.policy(
-            format!("BucketCursor {name}"),
-            Outcome::Published,
-            reached,
-            m,
-        );
     }
+    cases.policy("BucketCursor".into(), Outcome::Published, reached, m);
 }
 
-fn cases() -> Cases {
-    let mut cases = Cases::default();
+fn cases<W: Physical>() -> Cases {
+    let mut cases = Cases::under::<W>();
     decoding(&mut cases);
-    owned(&mut cases);
+    owned::<W>(&mut cases);
     text(&mut cases);
     preparation(&mut cases);
     synchronous_encoding(&mut cases);
@@ -885,8 +880,8 @@ fn parse_call(text: &str) -> Result<Call, String> {
     })
 }
 
-/// The recorded data: [`CONFIGURATION_LINE`] and `configuration`, then one
-/// case per line, sorted by name: its name, the feature it is gated on or
+/// The recorded data, a record ([`record::render`]) under `configuration`:
+/// one case per row, sorted by name: its name, the feature it is gated on or
 /// [`UNGATED`], its outcome, and its calls in their `Debug` rendering
 /// separated by `; `, the four separated by tabs. Only admissible cases are
 /// rendered ([`Cases::inadmissible`]).
@@ -907,42 +902,18 @@ fn render(cases: &Cases, configuration: &str) -> String {
             )
         })
         .collect();
-    let mut data = format!("{CONFIGURATION_LINE}{configuration}\n");
-    for (name, (feature, outcome, calls)) in sorted {
-        let calls: Vec<String> = calls.iter().map(|call| format!("{call:?}")).collect();
-        data.push_str(&format!(
-            "{name}\t{feature}\t{}\t{}\n",
-            outcome.name(),
-            calls.join("; ")
-        ));
-    }
-    data
-}
-
-/// Publish `data` as `path` whole: written to a temporary file beside it,
-/// then renamed over it, so a failed write leaves the previous record.
-fn publish(path: &str, data: &str) {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let temporary = format!(
-        "{path}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .unwrap_or_else(|error| panic!("{temporary}: {error}"));
-    let result = file
-        .write_all(data.as_bytes())
-        .and_then(|_| file.sync_all());
-    drop(file);
-    if let Err(error) = result.and_then(|_| std::fs::rename(&temporary, path)) {
-        let _ = std::fs::remove_file(&temporary);
-        panic!("{path}: {error}");
-    }
+    let rows: Vec<String> = sorted
+        .into_iter()
+        .map(|(name, (feature, outcome, calls))| {
+            let calls: Vec<String> = calls.iter().map(|call| format!("{call:?}")).collect();
+            format!(
+                "{name}\t{feature}\t{}\t{}",
+                outcome.name(),
+                calls.join("; ")
+            )
+        })
+        .collect();
+    record::render(configuration, rows.iter().map(String::as_str))
 }
 
 /// One recorded case: the feature it is gated on, its outcome, and its
@@ -959,17 +930,10 @@ struct Recorded {
 fn recorded() -> (String, BTreeMap<String, Recorded>) {
     let data = std::fs::read_to_string(RECORDED)
         .unwrap_or_else(|error| panic!("{RECORDED}: {error}; record it with {RECORD}=1"));
-    let mut lines = data.lines();
-    let configuration = lines
-        .next()
-        .and_then(|line| line.strip_prefix(CONFIGURATION_LINE))
-        .unwrap_or_else(|| {
-            panic!("{RECORDED}:1: not the configuration it was recorded under; record it with {RECORD}=1")
-        })
-        .to_string();
+    let read = record::read(RECORDED, &data, &format!("{RECORD}=1"));
+    let configuration = read.configuration.to_string();
     let mut recorded = BTreeMap::new();
-    for (number, line) in lines.enumerate() {
-        let at = number + 2;
+    for (at, line) in read.rows {
         let mut columns = line.splitn(4, '\t');
         let (Some(name), Some(feature), Some(outcome), Some(calls)) = (
             columns.next(),
@@ -1018,9 +982,75 @@ fn recorded() -> (String, BTreeMap<String, Recorded>) {
 /// Every case reaches the outcome it declares before anything is recorded or
 /// compared; recording rewrites every case, so it runs only where every
 /// gated case is compiled, and only under a named configuration.
+///
+/// The one model entry point of these baselines (`tests/unsafe_census.rs`,
+/// `MODEL_ENTRY_POINTS`). Under a model checker's cfg the library holds that
+/// checker's atomics (`src/sync.rs`), which exist only inside a model, so
+/// the same cases run as one single-threaded execution of it and are
+/// compared with the same record: a checker build admits exactly what
+/// production admits (I3), by the one driver, under the admission oracle
+/// alone ([`pipeline::Unwitnessed`]), which reproduces the record natively
+/// ([`the_admission_oracle_alone_reproduces_the_record`]).
+///
+/// The model is configured by the one runner of every model
+/// ([`support::model`]): its bound and stack are recorded, derived by the
+/// concurrency gate (`tests/gate`). Under loom the baselines run on one
+/// spawned thread of the recorded stack, loom's own default stack being
+/// measured too small for them.
 #[test]
 fn every_baseline_admits_exactly_its_recorded_calls() {
-    let cases = cases();
+    #[cfg(not(any(loom, shuttle)))]
+    baselines::<heap::Observation>();
+
+    /// The test target and the model of this entry point, as the bounds
+    /// record names them (`dcbor_model_bounds`).
+    #[cfg(any(loom, shuttle))]
+    const MODEL: (&str, &str) = (
+        "resumable_contract",
+        "traces::every_baseline_admits_exactly_its_recorded_calls",
+    );
+
+    #[cfg(loom)]
+    support::model::loom_sized(MODEL.0, MODEL.1, baselines::<pipeline::Unwitnessed>);
+
+    #[cfg(all(shuttle, not(loom)))]
+    support::model::shuttle(MODEL.0, MODEL.1, baselines::<pipeline::Unwitnessed>);
+}
+
+/// The admission oracle alone ([`pipeline::Unwitnessed`]), run natively,
+/// renders the recorded baselines byte for byte: dropping the physical
+/// witness changes only what is observed, never a call admitted, so the
+/// models compare against the one record, not a second. The record holds
+/// every gated case; a build renders the ones it compiles, so the
+/// comparison is of the record's configuration line, its ungated cases and
+/// the cases of every feature this build enables, each line whole.
+#[test]
+fn the_admission_oracle_alone_reproduces_the_record() {
+    let (recorded_under, _) = recorded();
+    let record = std::fs::read_to_string(RECORDED)
+        .unwrap_or_else(|error| panic!("{RECORDED}: {error}; record it with {RECORD}=1"));
+    let compiled: String = record
+        .split_inclusive('\n')
+        .enumerate()
+        .filter(|(at, line)| {
+            *at == 0 || {
+                let feature = line.split('\t').nth(1).unwrap_or(UNGATED);
+                feature == UNGATED || enabled(feature)
+            }
+        })
+        .map(|(_, line)| line)
+        .collect();
+    let rendered = render(&cases::<pipeline::Unwitnessed>(), &recorded_under);
+    assert!(
+        rendered == compiled,
+        "the admission oracle alone diverged from {RECORDED}"
+    );
+}
+
+/// The baselines, compared with their record or, under `DCBOR_RECORD_TRACES`,
+/// recorded ([`every_baseline_admits_exactly_its_recorded_calls`]).
+fn baselines<W: Physical>() {
+    let cases = cases::<W>();
     let inadmissible = cases.inadmissible();
     assert!(
         inadmissible.is_empty(),
@@ -1037,14 +1067,15 @@ fn every_baseline_admits_exactly_its_recorded_calls() {
             disabled.is_empty(),
             "recording requires every gating feature; disabled: {disabled:?}"
         );
-        let configuration = configuration().unwrap_or_else(|| {
-            panic!("recording requires {CONFIGURATION}, which the flake's shells export")
-        });
-        publish(RECORDED, &render(&cases, &configuration));
+        record::publish(
+            RECORDED,
+            &render(&cases, &record::recording_configuration()),
+        );
         return;
     }
     let (recorded_under, recorded) = recorded();
-    let running_under = configuration().unwrap_or_else(|| "an unnamed configuration".into());
+    let running_under =
+        record::configuration().unwrap_or_else(|| "an unnamed configuration".into());
     // A case gated on a feature this build enables must run; one gated on a
     // disabled feature is not compiled, and is checked in the builds that are.
     let unrun: Vec<&String> = recorded
@@ -1138,7 +1169,7 @@ impl Resumable<Limits> for Defective {
 /// case beside them is not refused.
 #[test]
 fn a_planted_defect_or_undeclared_outcome_is_never_recorded() {
-    let mut cases = Cases::default();
+    let mut cases = Cases::under::<heap::Observation>();
     cases.retained(
         "planted defect".into(),
         Outcome::Published,
@@ -1166,7 +1197,7 @@ fn a_planted_defect_or_undeclared_outcome_is_never_recorded() {
     let path = std::env::temp_dir().join(format!("dcbor-trace-defect-{}.txt", std::process::id()));
     std::fs::write(&path, "previous evidence").unwrap();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        publish(
+        record::publish(
             path.to_str().unwrap(),
             &render(&cases, "planted configuration"),
         );
@@ -1181,30 +1212,20 @@ fn a_planted_defect_or_undeclared_outcome_is_never_recorded() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// A record renders its configuration first and every case's outcome, and
-/// publication replaces the record whole, leaving no temporary file.
+/// A trace record is a record ([`record::render`]) whose rows are its cases:
+/// name, feature gate, outcome and calls; its header and publication are the
+/// record module's, checked there.
 #[test]
-fn a_record_names_its_configuration_and_is_published_whole() {
-    let mut cases = Cases::default();
+fn a_trace_record_names_its_configuration_and_each_case() {
+    let mut cases = Cases::under::<heap::Observation>();
     cases.synchronous("one", Outcome::Invalid, |_| Ok(Outcome::Invalid));
-    let data = render(&cases, "toolchain=t std=s");
     assert_eq!(
-        data,
-        format!("{CONFIGURATION_LINE}toolchain=t std=s\none\t{UNGATED}\tinvalid\t\n")
+        render(&cases, "toolchain=t std=s"),
+        record::render(
+            "toolchain=t std=s",
+            [format!("one\t{UNGATED}\tinvalid\t").as_str()]
+        )
     );
-    let directory = std::env::temp_dir().join(format!("dcbor-traces-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("a temporary directory");
-    let path = directory.join("record.txt");
-    let path = path.to_str().expect("a UTF-8 temporary path");
-    std::fs::write(path, "previous").expect("the previous record");
-    publish(path, &data);
-    assert_eq!(std::fs::read_to_string(path).expect("the record"), data);
-    assert_eq!(
-        std::fs::read_dir(&directory).unwrap().count(),
-        1,
-        "temporary evidence was not removed"
-    );
-    std::fs::remove_dir_all(&directory).expect("the temporary directory removed");
 }
 
 #[test]

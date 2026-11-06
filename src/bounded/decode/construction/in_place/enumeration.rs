@@ -1,7 +1,9 @@
 //! Retained discriminant selection and tag-last enum construction.
 use super::*;
+use crate::bounded::boundary::{Predicate, boundary, position};
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
 use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::sync::{Atomics, Representation};
 
 /// Representation-specific projections generated from explicit enum layouts.
 ///
@@ -90,6 +92,17 @@ struct Meta<V> {
     /// The document index of the node the current phase reads.
     index: usize,
     phase: Phase<V>,
+}
+
+impl<V> Representation for Meta<V> {
+    type In<F: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds, its whole value
+/// written with the permit ([`stable::Contract`]): the one definition its
+/// installation and the enum's cost read.
+const fn contract<V, P>() -> stable::Contract<Meta<V>, Meta<V>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of an enum whose payloads' states are `V`, with
@@ -184,9 +197,10 @@ const fn commit(tag_bytes: usize) -> Unit<Caller> {
 
 /// The selection's units over `count` variants: one per variant passed and
 /// one more. A discriminant no variant has takes exactly this many: each
-/// variant compared, then the rejection.
-pub const fn selection(count: usize) -> ResourceBound {
-    times(STEP_COST, count as u64 + 1)
+/// variant compared, then the rejection. None when a quantity does not fit
+/// in `u64`.
+pub const fn selection(count: usize) -> Option<ResourceBound> {
+    STEP_COST.checked_mul(count as u64 + 1)
 }
 
 /// The cost of an enum of the `variants` payload costs, whose payloads'
@@ -195,25 +209,27 @@ pub const fn selection(count: usize) -> ResourceBound {
 /// discriminant inspections; the [`selection`] over its variants; the native
 /// tag's commit; cleanup's unit before any payload and the metadata's
 /// release. Only one variant's payload is built, in the enum's own bytes:
-/// the largest of their costs.
-pub const fn cost<V, P>(tag_bytes: usize, variants: &[ConstructionCost]) -> ConstructionCost {
-    let meta = stable::Metadata::whole::<Meta<V>, P>().bytes();
-    let inspections = times(STEP_COST, 3);
-    let selection = selection(variants.len());
-    let fixed = plus(
-        plus(
-            plus(stable::install_cost::<Meta<V>, P>(), inspections),
-            plus(selection, commit(tag_bytes).bound()),
-        ),
-        plus(plus(STEP_COST, stable::release_cost::<P>()), held(meta)),
+/// the largest of their costs. None when a quantity does not fit in `u64`.
+pub const fn cost<V, P>(
+    tag_bytes: usize,
+    variants: &[ConstructionCost],
+) -> Option<ConstructionCost> {
+    let meta = contract::<V, P>();
+    let inspections = cost!(STEP_COST.checked_mul(3));
+    let selection = cost!(selection(variants.len()));
+    let read = cost!(meta.write().checked_add(inspections));
+    let selected = cost!(selection.checked_add(commit(tag_bytes).bound()));
+    let released = cost!(
+        cost!(STEP_COST.checked_add(stable::release_cost::<P>())).checked_add(held(meta.block()))
     );
+    let fixed = cost!(cost!(read.checked_add(selected)).checked_add(released));
     let mut payload = ConstructionCost::ZERO;
     let mut index = 0;
     while index < variants.len() {
         payload = payload.larger(variants[index]);
         index += 1;
     }
-    ConstructionCost::fixed(fixed).plus(payload)
+    ConstructionCost::fixed(fixed).checked_add(payload)
 }
 
 /// One unit of construction of the enum in `slot`. Without metadata the state
@@ -233,6 +249,7 @@ pub fn build<T: Variants<A>, A: Allocator>(
         // SAFETY: the header is the whole metadata, every field written.
         unsafe {
             stable::install::<Meta<T::Payload>, Meta<T::Payload>, A>(
+                const { contract::<T::Payload, A::Permit>() },
                 &mut state.meta,
                 &mut state.admitted,
                 || Meta {
@@ -304,7 +321,7 @@ pub fn build<T: Variants<A>, A: Allocator>(
             length,
         } => {
             STEP.admit(a)?;
-            if state.variant == T::COUNT {
+            if boundary!(a, Predicate::Field, state.variant, T::COUNT).is_eq() {
                 return Err(wrong_type());
             }
             let (expected, expected_length) = T::descriptor(state.variant);
@@ -312,6 +329,7 @@ pub fn build<T: Variants<A>, A: Allocator>(
                 if expected_length != length {
                     return Err(wrong_type());
                 }
+                boundary!(a, Predicate::Field => position(state.variant, T::COUNT));
                 // The payload's custody starts with its selection, before
                 // any of its fields is built.
                 let child = T::start(state.variant).ok_or(BoundedError::PlanMismatch)?;
@@ -419,10 +437,15 @@ mod tests {
     fn an_enums_cost_is_its_largest_variants_with_a_selection_per_variant() {
         assert_eq!(commit(1).bound(), unit(1));
         assert_eq!(commit(0).bound(), unit(0));
-        let large = ConstructionCost::fixed(unit(40)).plus(ConstructionCost::per_byte(unit(2)));
-        let small = ConstructionCost::fixed(unit(8)).plus(ConstructionCost::per_byte(unit(1)));
+        let payload = |fixed: usize, per_byte: usize| {
+            ConstructionCost::fixed(unit(fixed))
+                .checked_add(ConstructionCost::checked_per_byte(unit(per_byte)).unwrap())
+                .unwrap()
+        };
+        let (large, small) = (payload(40, 2), payload(8, 1));
+        let selection = |count: usize| selection(count).unwrap();
         let enumeration = |tag_bytes, variants: &[ConstructionCost]| {
-            cost::<Written, Reservation>(tag_bytes, variants)
+            cost::<Written, Reservation>(tag_bytes, variants).unwrap()
         };
         let alone = enumeration(1, &[large]);
         let both = enumeration(1, &[large, small]);
@@ -446,6 +469,15 @@ mod tests {
         assert_eq!(
             enumeration(1, &[]).fixed.values + selection(1).values - selection(0).values,
             enumeration(1, &[ConstructionCost::ZERO]).fixed.values
+        );
+        let widest = ConstructionCost::fixed(ResourceBound {
+            values: u64::MAX,
+            ..ResourceBound::default()
+        });
+        assert_eq!(
+            cost::<Written, Reservation>(1, &[widest]),
+            None,
+            "a payload whose cost leaves no room is refused, never wrapped"
         );
     }
 }

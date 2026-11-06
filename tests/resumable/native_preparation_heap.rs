@@ -34,6 +34,7 @@ fn preparation_physical_failures_preserve_independent_plan_ownership() {
         assert!(stats.live <= meter.live_bytes() as usize);
         assert!(stats.peak <= meter.peak_bytes() as usize);
         drop(preparation);
+        let mut reached = meter.reached();
         if let Some(plan) = output {
             assert!(meter.live_bytes() > 0);
             let expected = text_wire(&"q\u{316}\u{301}".repeat(32));
@@ -47,11 +48,12 @@ fn preparation_physical_failures_preserve_independent_plan_ownership() {
             .expect("emission failed");
             assert_eq!(emission.requests(), 0, "emission requested allocation");
             assert_eq!(bytes, expected);
+            reached = reached.union(emission.reached());
             drop(plan);
         }
         assert_eq!(observer.snapshot().live, 0);
         assert_eq!(meter.live_bytes(), 0);
-        stats.calls
+        (stats.calls, reached)
     };
     physical_matrix("text preparation physically", run);
 }

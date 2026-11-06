@@ -75,17 +75,26 @@ pub(crate) use init_field;
 /// `$base` plus the part's own are the part's: `$init`, given the part's slot
 /// as `$part` (its place by field syntax, its own units counted from
 /// `$base`), initializes it; the parent's units are then `$base` and the
-/// part's. Evaluates to `$init`'s value.
+/// part's. Evaluates to `$init`'s value. Whether the parent's units reach
+/// `$base` is a boundary predicate ([`Predicate::Prefix`]) recorded to the
+/// policy `$a`.
 ///
 /// Sound for any slot whose units are at least `$base`: units are initialized
 /// in order, so the parent's count less `$base` is exactly what the part
 /// holds, its own custody, and its place is a field of the parent's.
+///
+/// [`Predicate::Prefix`]: crate::bounded::boundary::Predicate::Prefix
 macro_rules! init_part {
-    ($slot:expr, $field:ident, $base:expr, |$part:ident| $init:expr) => {{
+    ($slot:expr, $field:ident, $base:expr, $a:expr, |$part:ident| $init:expr) => {{
         let (place, units) = $slot.parts();
         let base: usize = $base;
-        let mut part_units = units
-            .checked_sub(base)
+        let short = $crate::bounded::boundary::Bound::new(
+            $crate::bounded::boundary::Predicate::Prefix,
+            *units,
+        )
+        .exceeded(&mut *$a, base);
+        let mut part_units = (!short)
+            .then(|| *units - base)
             .ok_or($crate::bounded::BoundedError::PlanMismatch)?;
         let result = {
             // SAFETY: the part's place is a field of the slot's own

@@ -6,6 +6,7 @@ use super::reclamation::{
     Custody, DecodeOwner, OwnedInitialized, PeekSlot, Prefix, Reclaim, Reclaimed, ScopeRef, Slot,
 };
 use crate::ByteString;
+use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Places, ResourceBound, Unit, WriteWork,
@@ -206,7 +207,7 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         a: &mut A,
     ) -> Result<(), Self::Error> {
         let (place, prefix) = slot.parts();
-        if prefix.initialized() >= Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, prefix.initialized()) {
             return Err(BoundedError::PlanMismatch);
         }
         let source = self.source;

@@ -1,0 +1,19 @@
+[package]
+name = "dcbor-model-bounds"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The rows of dcbor's model-bounds record, read by the model runner and the gate."
+license = "BSD-2-Clause-Patent"
+
+# Over the record format alone: the model runner (dcbor-test-support) and
+# the gate (dcbor-gate) both read these rows and may not depend on each
+# other.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dcbor-record = { path = "../record" }
+
+[lints]
+workspace = true

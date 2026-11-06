@@ -23,12 +23,15 @@ impl<S: Copy, P> TextContinuation<S, P> {
     ) -> BoundedResult<bool, A> {
         let storage = Storage::<char, P>::INIT_STEPS;
         let ordering = ordering::Ordering::<P>::INIT_STEPS;
-        if *slot.custody() < storage {
-            init_part!(slot, chars, 0, |chars| Storage::initialize_step(chars, a)?);
+        let units = *slot.custody();
+        if Bound::new(Predicate::Prefix, storage).below(a, units) {
+            init_part!(slot, chars, 0, a, |chars| Storage::initialize_step(
+                chars, a
+            )?);
             return Ok(false);
         }
-        if *slot.custody() < storage + ordering {
-            init_part!(slot, ordering, storage, |part| {
+        if Bound::new(Predicate::Prefix, storage + ordering).below(a, units) {
+            init_part!(slot, ordering, storage, a, |part| {
                 ordering::Ordering::initialize_step(part, a)?
             });
             return Ok(false);

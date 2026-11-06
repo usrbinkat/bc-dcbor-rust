@@ -138,10 +138,10 @@ The following insights about the API design of this crate have been learned duri
 
 12. **Tag Registration System**: The library provides a comprehensive tag registration system:
     - `TagsStore` provides the core registry mapping between tag numbers and human-readable names
-    - Global tag registry accessible via `with_tags!` and `with_tags_mut!` macros
-    - Thread-safe access to the registry via mutex protection
+    - A store is always the caller's, passed explicitly to what reads it (`DiagFormatOpts::tags`, `HexFormatOpts::tags`, `diagnostic_annotated`, `summary`, `hex_annotated`); the crate keeps no store of its own, and no conversion or codec path reads one
+    - `register_tags_in` registers this crate's tags and summarizers in a given store
     - Customizable tag summarizers for formatting tagged values in diagnostic output
-    - Prevention of duplicate registrations with conflicting names
+    - Registrations that would make a lookup ambiguous (a value under two names, a name for two values, an unnamed or empty-named tag) are refused with typed errors, registering nothing
     - Graceful handling of unregistered tags with fallback mechanisms
 
 ### 🔵 FUTURE ENHANCEMENTS

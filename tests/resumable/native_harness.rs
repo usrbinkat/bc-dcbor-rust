@@ -90,9 +90,17 @@ pub fn emit(plan: &Prepared<Reservation>, expected: &[u8], m: &mut Limits) {
 }
 
 /// `source` prepared under fresh checked turns within its shape's bound,
-/// with the policy holding its reservations.
+/// under the suite's policy ([`meter`]), with the policy holding its
+/// reservations ([`prepared_under`]). Its one caller, the schema group, is
+/// registered under `derive`.
+#[cfg(feature = "derive")]
 pub fn prepared(source: &dyn Schema) -> (Prepared<Reservation>, Limits) {
-    let mut m = meter();
+    prepared_under(source, meter())
+}
+
+/// `source` prepared under fresh checked turns within its shape's bound,
+/// under `m`, which then holds its reservations.
+pub fn prepared_under(source: &dyn Schema, mut m: Limits) -> (Prepared<Reservation>, Limits) {
     let plan = drive_within(
         &mut m,
         &mut Preparation::new(source),
@@ -184,9 +192,13 @@ pub fn prepare_matrix_bounded(
 /// Prepare `source` under the heap observer, failing physical request
 /// `failure`. Observed storage stays within reservations, every request was
 /// admitted, and failure or completion releases every byte and reservation.
-/// Returns the physical requests made.
+/// Returns the physical requests made and the boundary valuations the
+/// preparation reached.
 #[cfg(any(feature = "derive", feature = "hashbrown"))]
-pub fn prepare_physically(source: &dyn Schema, failure: Option<usize>) -> usize {
+pub fn prepare_physically(
+    source: &dyn Schema,
+    failure: Option<usize>,
+) -> (usize, dcbor::bounded::boundary::Reached) {
     let turns = prepare_turns(shape(source));
     let mut m = meter();
     let observation = Observation::begin(failure);
@@ -218,7 +230,7 @@ pub fn prepare_physically(source: &dyn Schema, failure: Option<usize>) -> usize 
     drop(output);
     assert_eq!(m.live_bytes(), 0);
     assert_eq!(observation.snapshot().live, 0);
-    stats.calls
+    (stats.calls, m.reached())
 }
 
 /// Every physical allocation of preparing `source`, failed in a run of its

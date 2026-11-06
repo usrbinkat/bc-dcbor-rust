@@ -4,7 +4,7 @@
 #[global_allocator]
 static HEAP: heap::Heap = heap::Heap;
 use core::cell::Cell;
-use dcbor::bounded::encoding::{BUCKET_WINDOW, Instruction, Shape};
+use dcbor::bounded::encoding::{Instruction, Shape};
 use dcbor::{ByteString, CBOR, CBORBoundedEncodable, CBOREncodable, bounded::*};
 use dcbor_test_support::heap::{self, Observation};
 use dcbor_test_support::{physical_matrix, synchronous_matrix};
@@ -87,6 +87,7 @@ fn every_preparation_admission_can_refuse_without_leaking() {
             "no further admission after refusal"
         );
         assert_eq!(policy.live_bytes(), 0, "leak at admission {at}");
+        policy.reached()
     });
 }
 
@@ -113,7 +114,7 @@ fn every_real_scratch_allocation_can_fail_after_admission() {
             0,
             "permits survive allocation failure {failure:?}"
         );
-        heap.calls
+        (heap.calls, policy.reached())
     });
 }
 
@@ -175,10 +176,12 @@ fn every_write_refusal_preserves_guards_and_allows_retry_without_allocating() {
             assert!(guarded.iter().all(|b| *b == 0xee));
         }
         // A writer is per attempt, not consumed permanently by a failed write.
+        let mut retried = policy(None);
         prepared
-            .encode_into(&mut guarded[1..=len], &mut policy(None))
+            .encode_into(&mut guarded[1..=len], &mut retried)
             .unwrap();
         assert_eq!(&guarded[1..=len], symbolic);
+        refusing.reached().union(retried.reached())
     });
     drop(prepared);
     assert_eq!(allocator.live_bytes(), 0);
@@ -261,26 +264,24 @@ fn a_counted_map_visiting_another_count_is_refused_at_its_end() {
     refused_as(&Miscounted, BoundedError::PlanMismatch);
 }
 
-/// An unordered map whose entry claims to inspect a whole window past the
-/// most one instruction may.
-struct Leaping;
+/// A counted field map whose source offers an entry: no source inspects
+/// buckets or skips an index (`Instruction::Entry` carries one entry and no
+/// index), so this is what a source can still answer outside its contract.
+struct Misplaced;
 
-impl Schema for Leaping {
+impl Schema for Misplaced {
     fn instruction(&self, index: usize) -> Instruction<'_> {
         match index {
-            0 => Instruction::UnorderedMap,
-            1 => Instruction::Entry {
-                next: 2 + BUCKET_WINDOW,
-                entry: None,
-            },
+            0 => Instruction::CountedMap(1),
+            1 => Instruction::Entry(&0u64, &true),
             _ => Instruction::End,
         }
     }
 }
 
 #[test]
-fn an_entry_past_its_window_is_refused() {
-    refused_as(&Leaping, BoundedError::PlanMismatch);
+fn an_entry_offered_to_a_field_map_is_refused() {
+    refused_as(&Misplaced, BoundedError::PlanMismatch);
 }
 
 /// A source that is its own child, without end.
@@ -539,6 +540,7 @@ fn decoder_refuses_every_admission_and_real_allocation_without_leaking() {
         assert_eq!(policy.attempts(), at + 1);
         assert_eq!(policy.live_bytes(), 0);
         assert_eq!(heap.unadmitted, 0);
+        policy.reached()
     });
     physical_matrix("decoding nested texts physically", |failure| {
         let mut policy = policy(None);
@@ -556,7 +558,7 @@ fn decoder_refuses_every_admission_and_real_allocation_without_leaking() {
             }
         }
         assert_eq!(policy.live_bytes(), 0);
-        heap.calls
+        (heap.calls, policy.reached())
     });
 }
 
@@ -588,6 +590,7 @@ fn extended_failures<T: Schema + ?Sized>(name: &str, value: &T) {
         assert_eq!(policy.attempts(), at + 1);
         assert_eq!(policy.live_bytes(), 0);
         assert_eq!(heap.unadmitted, 0);
+        policy.reached()
     });
     physical_matrix(&format!("encoding {name} physically"), |failure| {
         let mut policy = policy(None);
@@ -604,7 +607,7 @@ fn extended_failures<T: Schema + ?Sized>(name: &str, value: &T) {
             }
         }
         assert_eq!(policy.live_bytes(), 0);
-        heap.calls
+        (heap.calls, policy.reached())
     });
     let mut allocator = policy(None);
     let prepared = prepare(value, &mut allocator).unwrap();
@@ -623,8 +626,10 @@ fn extended_failures<T: Schema + ?Sized>(name: &str, value: &T) {
             Err(BoundedError::Refused(LimitRefusal::Scheduled(at)))
         );
         assert_eq!(heap.calls, 0);
-        prepared.encode_into(&mut bytes, &mut policy(None)).unwrap();
+        let mut retried = policy(None);
+        prepared.encode_into(&mut bytes, &mut retried).unwrap();
         assert_eq!(bytes, expected.as_ref());
+        budget.reached().union(retried.reached())
     });
     drop(prepared);
     assert_eq!(allocator.live_bytes(), 0);

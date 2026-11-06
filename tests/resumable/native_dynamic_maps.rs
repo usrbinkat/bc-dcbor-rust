@@ -3,11 +3,101 @@ use super::support::{checked, contracted, prepare_turns, repeated_refusal, shape
 use dcbor::bounded::{
     BoundedError, Step, WriteWork,
     encoding::{
-        buckets::{BucketCursor, BucketStep},
+        BUCKET_WINDOW,
+        buckets::{BucketCursor, BucketStep, Buckets},
         maps::MapPreparation,
     },
 };
 use hashbrown::HashTable;
+
+/// `table` enumerated to completion by the engine's one bucket traversal,
+/// each call first refused `refusals` times and resumed from exactly where
+/// it was, its window's credit included. Every call is checked against the
+/// charge rule: one value, and a whole window of controls (the table's last
+/// window shorter) exactly when the credit held before it was spent; no
+/// control inspected that was not admitted; a vacant call reporting where it
+/// began, an entry the bucket it stopped at; the completion one value and no
+/// control, its credit forfeited. Returns the entries found with their
+/// buckets, in bucket order, the calls made, the completion included, and
+/// the completed cursor.
+fn enumerate(
+    table: &HashTable<(u64, u64)>,
+    refusals: usize,
+    m: &mut Limits,
+) -> (Vec<(usize, u64)>, u64, BucketCursor) {
+    let source: &dyn Buckets = table;
+    let buckets = table.num_buckets();
+    let mut cursor = BucketCursor::new();
+    let mut found = Vec::new();
+    let mut admitted = 0usize;
+    // At most one call per window and one per entry, then the completion.
+    for calls in 1..=buckets.div_ceil(BUCKET_WINDOW) + table.len() + 1 {
+        if refusals > 0 {
+            let position = cursor;
+            repeated_refusal("bucket enumeration", m, position, refusals, |m| {
+                let result = cursor.step(source, m).map(|_| ());
+                (cursor, result)
+            });
+        }
+        m.fresh();
+        let (before, used) = (cursor, m.used());
+        let step = cursor.step(source, m).unwrap();
+        let charged = WriteWork::new(m.used().values - used.values, m.used().bytes - used.bytes);
+        if let BucketStep::Complete = step {
+            assert_eq!(
+                charged,
+                WriteWork::new(1, 0),
+                "the completion inspected a control"
+            );
+            assert_eq!(cursor.position(), before.position(), "the completion moved");
+            assert_eq!(cursor.held(), 0, "the completion kept its credit");
+            assert_eq!(found.len(), table.len(), "completed before every entry");
+            assert_eq!(m.used().bytes, admitted as u64);
+            return (found, calls as u64, cursor);
+        }
+        let window = if before.held() == 0 {
+            BUCKET_WINDOW.min(buckets - before.position())
+        } else {
+            0
+        };
+        assert_eq!(
+            charged,
+            WriteWork::new(1, window as u64),
+            "a call at {} holding {} admitted the wrong controls",
+            before.position(),
+            before.held()
+        );
+        admitted += window;
+        assert!(
+            cursor.position() > before.position()
+                && cursor.position() <= before.position() + before.held() + window,
+            "a call at {} inspected controls its credit did not cover",
+            before.position()
+        );
+        assert!(
+            cursor.position() <= admitted,
+            "a control inspected unadmitted"
+        );
+        match step {
+            BucketStep::Vacant { index } => assert_eq!(index, before.position()),
+            BucketStep::Entry { index, .. } => {
+                assert_eq!(
+                    index,
+                    cursor.position() - 1,
+                    "the entry is not where it stopped"
+                );
+                let (_, value) = table
+                    .get_bucket(index)
+                    .expect("an entry's bucket is occupied");
+                found.push((index, *value));
+            }
+            BucketStep::Complete | BucketStep::Finished => {
+                unreachable!("the completion returned above; nothing finished before it")
+            }
+        }
+    }
+    panic!("the enumeration exceeded a call per window and per entry");
+}
 
 #[test]
 fn hash_map_normalized_duplicates_reject_across_every_refusal() {
@@ -17,49 +107,38 @@ fn hash_map_normalized_duplicates_reject_across_every_refusal() {
     prepare_matrix(&map, Err(BoundedError::DuplicateKey));
 }
 
-/// One bucket per step, every control byte up to the last entry accounted
-/// for, repeated refusals leaving the position unchanged; the cursor
-/// completes after the last entry, scanning no bucket after it.
+/// A sparse table enumerated with every call refused three times first: each
+/// window of controls up to the last entry's admitted once and none after
+/// it, every refusal leaving the cursor and its credit unchanged; the
+/// entries found at their buckets; nothing allocated; the finished cursor
+/// admitting nothing.
 #[test]
-fn sparse_bucket_steps_account_for_every_control_byte_and_repeated_refusal() {
+fn sparse_bucket_windows_account_for_every_control_byte_and_repeated_refusal() {
     let mut table = HashTable::with_capacity(8192);
-    for n in [0u64, 2000, 6000] {
-        table.insert_unique(n, n, |n| *n);
+    for key in [0u64, 2000, 6000] {
+        table.insert_unique(key, (key, key), |pair| pair.0);
     }
     assert!(
         table.num_buckets() > 6001,
         "buckets lie after the last entry"
     );
-    let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
-    let mut found = Vec::new();
-    for index in 0..=6000 {
-        assert_eq!(cursor.position(), index);
-        repeated_refusal("sparse bucket scan", &mut m, index, 3, |m| {
-            let result = cursor.step(m).map(|_| ());
-            (cursor.position(), result)
-        });
-        m.fresh();
-        match cursor.step(&mut m).unwrap() {
-            BucketStep::Entry {
-                index: actual,
-                value,
-            } => {
-                assert_eq!(actual, index);
-                found.push(*value);
-            }
-            BucketStep::Vacant { index: actual } => assert_eq!(actual, index),
-            _ => panic!("premature completion"),
-        }
-    }
-    found.sort();
-    assert_eq!(found, [0, 2000, 6000]);
-    assert_eq!(m.used().bytes, 6001);
-    assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Complete);
-    assert_eq!(cursor.position(), 6001, "no bucket after the last entry");
-    assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Finished);
-    assert_eq!(m.used().values, 6001 + 1);
+    let (found, calls, mut cursor) = enumerate(&table, 3, &mut m);
+    assert_eq!(found, [(0, 0), (2000, 2000), (6000, 6000)]);
+    // The windows up to the last entry's: each admitted whole once.
+    let windows = 6000 / BUCKET_WINDOW + 1;
+    assert_eq!(m.used().bytes, (windows * BUCKET_WINDOW) as u64);
+    // A call per window, one more for each entry ending its window early
+    // but the last, whose window the completion forfeits, and the completion.
+    assert_eq!(calls, (windows + 2 + 1) as u64);
+    assert_eq!(m.used().values, calls);
     assert!(m.calls().iter().all(|c| !matches!(c, Call::Allocate(_))));
+    let attempts = m.attempts();
+    assert!(matches!(
+        cursor.step(&table as &dyn Buckets, &mut m),
+        Ok(BucketStep::Finished)
+    ));
+    assert_eq!(m.attempts(), attempts, "a finished cursor admitted");
 }
 
 #[test]
@@ -147,92 +226,70 @@ fn empty_dynamic_map_has_one_canonical_header() {
     prepare_matrix(&table, Ok(&[0xa0]));
 }
 
+/// A table whose removals leave three entries among deleted and vacant
+/// buckets, enumerated with every call, the completion included, refused
+/// three times first: each refusal leaves the cursor and its credit
+/// unchanged; the three entries are found at their buckets; every window up
+/// to the last entry's admitted once, none after it; the completion
+/// forfeits the rest of that window; the finished cursor admits nothing.
 #[test]
-fn deletion_sparse_cursor_refuses_at_every_bucket_and_terminal_transition() {
+fn deletion_sparse_cursor_refuses_at_every_call_and_terminal_transition() {
     let mut table = HashTable::with_capacity(256);
-    for value in 0..256u64 {
-        table.insert_unique(value, value, |value| *value);
+    for key in 0..256u64 {
+        table.insert_unique(key, (key, key), |pair| pair.0);
     }
     let buckets = table.num_buckets();
     for index in 0..buckets {
         if let Ok(entry) = table.get_bucket_entry(index)
-            && ![0, 127, 255].contains(entry.get())
+            && ![0, 127, 255].contains(&entry.get().0)
         {
             entry.remove();
         }
     }
     assert_eq!(table.num_buckets(), buckets);
     assert_eq!(table.len(), 3);
-    // The last entry, 255, lies in bucket 255: the cursor completes at the
-    // next step, before the buckets after it.
+    // The last entry, 255, lies in bucket 255, short of the table's end.
     let last = 255;
-    assert_eq!(table.get_bucket(last), Some(&255));
+    assert_eq!(table.get_bucket(last), Some(&(255, 255)));
     assert!(buckets > last + 1, "buckets lie after the last entry");
-    let mut cursor = BucketCursor::new(&table);
     let mut m = meter();
-    let mut found = Vec::new();
-    for index in 0..=last + 1 {
-        repeated_refusal("deletion-sparse bucket scan", &mut m, index, 3, |m| {
-            let result = cursor.step(m).map(|_| ());
-            (cursor.position(), result)
-        });
-        m.fresh();
-        match cursor.step(&mut m).unwrap() {
-            BucketStep::Entry {
-                index: actual,
-                value,
-            } => {
-                assert_eq!(actual, index);
-                found.push(*value);
-            }
-            BucketStep::Vacant { index: actual } => assert_eq!(actual, index),
-            BucketStep::Complete => assert_eq!(index, last + 1),
-            BucketStep::Finished => panic!("early terminal state"),
-        }
-        assert_eq!(cursor.position(), (index + 1).min(last + 1));
-    }
-    found.sort();
-    assert_eq!(found, [0, 127, 255]);
-    let scanned = last as u64 + 1;
-    assert_eq!(m.used(), WriteWork::new(scanned + 1, scanned));
-    let calls = m.calls().len();
-    assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Finished);
-    assert_eq!(m.calls().len(), calls);
+    let (found, calls, mut cursor) = enumerate(&table, 3, &mut m);
+    assert_eq!(found, [(0, 0), (127, 127), (255, 255)]);
+    assert_eq!(cursor.position(), last + 1, "a bucket after the last entry");
+    let windows = last / BUCKET_WINDOW + 1;
+    assert_eq!(
+        m.used(),
+        WriteWork::new(calls, (windows * BUCKET_WINDOW) as u64)
+    );
+    let attempts = m.attempts();
+    assert!(matches!(
+        cursor.step(&table as &dyn Buckets, &mut m),
+        Ok(BucketStep::Finished)
+    ));
+    assert_eq!(m.attempts(), attempts, "a finished cursor admitted");
 }
 
+/// One entry deep in a large table: every call admits at most one window
+/// and inspects nothing its credit does not cover, a call within a window
+/// admitting no control again; the entry ends its window's enumeration and
+/// the completion follows at once, no bucket after the entry inspected.
 #[test]
-fn all_ready_bucket_step_never_scans_past_one_control_byte() {
+fn a_call_inspects_only_controls_its_window_admitted() {
     let mut table = HashTable::with_capacity(8192);
-    table.insert_unique(4096, 7u64, |value| *value);
-    assert_eq!(table.get_bucket(4096), Some(&7));
-    let mut cursor = BucketCursor::new(&table);
+    table.insert_unique(4096, (4096u64, 7u64), |pair| pair.0);
+    assert_eq!(table.get_bucket(4096), Some(&(4096, 7)));
     let mut m = meter();
-    let mut entries = 0;
-    for index in 0..=4096 {
-        let before = (m.used(), m.calls().len());
-        match cursor.step(&mut m).unwrap() {
-            BucketStep::Entry {
-                index: actual,
-                value,
-            } => {
-                assert_eq!((actual, *value), (index, 7));
-                entries += 1;
-            }
-            BucketStep::Vacant { index: actual } => assert_eq!(actual, index),
-            _ => panic!("premature completion"),
-        }
-        assert_eq!(cursor.position(), index + 1);
-        assert_eq!(
-            (m.used(), m.calls().len()),
-            (
-                WriteWork::new(before.0.values + 1, before.0.bytes + 1),
-                before.1 + 1
-            )
-        );
-    }
-    assert_eq!(entries, 1);
-    assert_eq!(cursor.step(&mut m).unwrap(), BucketStep::Complete);
-    assert_eq!(cursor.position(), 4097, "no bucket after the entry");
+    let (found, calls, cursor) = enumerate(&table, 0, &mut m);
+    assert_eq!(found, [(4096, 7)]);
+    assert_eq!(cursor.position(), 4097, "a bucket after the entry");
+    // The entry opens its window: one call per window through it, then the
+    // completion.
+    let windows = 4096 / BUCKET_WINDOW + 1;
+    assert_eq!(calls, windows as u64 + 1);
+    assert_eq!(
+        m.used(),
+        WriteWork::new(calls, (windows * BUCKET_WINDOW) as u64)
+    );
 }
 
 #[test]

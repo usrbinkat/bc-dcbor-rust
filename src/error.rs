@@ -2,7 +2,7 @@ import_stdlib!();
 
 use core::str::Utf8Error;
 
-use crate::tag::Tag;
+use crate::tag::{Tag, TagValue};
 
 /// A comprehensive set of errors that can occur during CBOR encoding and
 /// decoding operations, with special focus on enforcing the deterministic
@@ -130,6 +130,36 @@ pub enum Error {
     /// tag found.
     #[error("expected CBOR tag {0}, but got {1}")]
     WrongTag(Tag, Tag),
+
+    /// A tag registered in a [`crate::TagsStore`] has no name: a store maps
+    /// tag values and names to each other, so every tag it registers is
+    /// named. Nothing was registered.
+    #[error("tag {0} cannot be registered without a name")]
+    UnnamedTag(TagValue),
+
+    /// A tag registered in a [`crate::TagsStore`] has an empty name, which
+    /// names nothing. Nothing was registered.
+    #[error("tag {0} cannot be registered with an empty name")]
+    EmptyTagName(TagValue),
+
+    /// A tag value registered in a [`crate::TagsStore`] under one name was
+    /// registered again under another. Nothing was registered.
+    #[error("tag {value} is registered as '{registered}', not '{given}'")]
+    ConflictingTagName {
+        value: TagValue,
+        registered: String,
+        given: String,
+    },
+
+    /// A name registered in a [`crate::TagsStore`] for one tag value was
+    /// registered again for another, which would make the name's lookup
+    /// depend on the order of registration. Nothing was registered.
+    #[error("tag name '{name}' is registered for tag {registered}, not {given}")]
+    ConflictingTagValue {
+        name: String,
+        registered: TagValue,
+        given: TagValue,
+    },
 
     /// Invalid UTF‑8 in a text string.
     #[error("invalid UTF‑8 string: {0}")]

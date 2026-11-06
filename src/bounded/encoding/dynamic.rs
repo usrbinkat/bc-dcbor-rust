@@ -101,20 +101,21 @@ impl<P> Dynamic<P> {
         let storage = Storage::<Entry, P>::INIT_STEPS;
         let order = Order::<P>::INIT_STEPS;
         let permutation = permutation::Permutation::<P>::INIT_STEPS;
-        if *slot.custody() < storage {
-            init_part!(slot, entries, 0, |entries| Storage::initialize_step(
+        let units = *slot.custody();
+        if Bound::new(Predicate::Prefix, storage).below(a, units) {
+            init_part!(slot, entries, 0, a, |entries| Storage::initialize_step(
                 entries, a
             )?);
             return Ok(false);
         }
-        if *slot.custody() < storage + order {
-            init_part!(slot, order, storage, |part| Order::initialize_step(
+        if Bound::new(Predicate::Prefix, storage + order).below(a, units) {
+            init_part!(slot, order, storage, a, |part| Order::initialize_step(
                 part, a
             )?);
             return Ok(false);
         }
-        if *slot.custody() < storage + order + permutation {
-            init_part!(slot, permutation, storage + order, |part| {
+        if Bound::new(Predicate::Prefix, storage + order + permutation).below(a, units) {
+            init_part!(slot, permutation, storage + order, a, |part| {
                 permutation::Permutation::initialize_step(part, a)?
             });
             return Ok(false);
@@ -294,7 +295,7 @@ impl<P> Preparation<'_, P> {
             });
             return Ok(());
         };
-        if c.source < c.end {
+        if Bound::new(Predicate::Payload, c.end).below(a, c.source) {
             if let Some(&(start, skip)) = holes.as_slice().get(c.hole)
                 && start == c.source
             {
@@ -306,8 +307,15 @@ impl<P> Preparation<'_, P> {
                     .checked_sub(skip)
                     .ok_or(BoundedError::PlanMismatch)?;
             } else {
+                // The run ends at the next gap or the payload's end, which
+                // lies past the source: a gap before it is a plan whose gap
+                // records do not account for its bytes.
                 let boundary = holes.as_slice().get(c.hole).map_or(c.end, |h| h.0);
-                let count = (boundary - c.source).min(decode::construction::stable::QUANTUM);
+                if Bound::new(Predicate::Payload, boundary).reached(a, c.source) {
+                    return Err(BoundedError::PlanMismatch);
+                }
+                let count = Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+                    .clamp(a, boundary - c.source);
                 MOVE.admit(a, widen(count)?)?;
                 bytes
                     .as_mut_slice()
@@ -315,13 +323,13 @@ impl<P> Preparation<'_, P> {
                 c.source += count;
                 c.destination += count;
             }
-        } else if bytes.len() > c.destination {
+        } else if Bound::new(Predicate::ArenaLength, bytes.len()).below(a, c.destination) {
             let destination = c.destination;
             let bytes = &mut self.bytes;
             at(PreparationPlace::Compaction, || {
                 bytes.truncate_copy_step(destination, a)
             })?;
-        } else if holes.len() > holes_start {
+        } else if Bound::new(Predicate::ArenaLength, holes.len()).below(a, holes_start) {
             let holes = &mut self.holes;
             at(PreparationPlace::Compaction, || {
                 holes.truncate_copy_step(holes_start, a)
@@ -452,7 +460,7 @@ impl<P> Preparation<'_, P> {
                 }
             }
             DynamicPhase::Clear => {
-                if entries.len() > start {
+                if Bound::new(Predicate::ArenaLength, entries.len()).below(a, start) {
                     // Truncating plain descriptors is one unit; the entry
                     // arena is settled, so it truncates in this one.
                     let entries = &mut self.dynamic.entries;

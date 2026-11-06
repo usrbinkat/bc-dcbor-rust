@@ -4,12 +4,14 @@ use super::{
     string_util::{flanked, sanitized},
     varint::{EncodeVarInt, MajorType},
 };
-use crate::{CBOR, CBORCase, TagsStoreOpt, tags_store::TagsStoreTrait, with_tags};
+use crate::{CBOR, CBORCase, tags_store::TagsStoreTrait};
 
+/// How a hex dump is written: annotated, one item per line with notes, and
+/// the tag store tag names come from. Without a store, no tag is named.
 #[derive(Default)]
 pub struct HexFormatOpts<'a> {
     annotate: bool,
-    tags: TagsStoreOpt<'a>,
+    tags: Option<&'a dyn TagsStoreTrait>,
 }
 
 impl<'a> HexFormatOpts<'a> {
@@ -19,9 +21,9 @@ impl<'a> HexFormatOpts<'a> {
         self
     }
 
-    /// Sets the formatting context for the hex dump.
-    pub fn context(mut self, tags: TagsStoreOpt<'a>) -> Self {
-        self.tags = tags;
+    /// Sets the tag store the annotations name tags from.
+    pub fn tags(mut self, tags: &'a dyn TagsStoreTrait) -> Self {
+        self.tags = Some(tags);
         self
     }
 }
@@ -54,9 +56,9 @@ impl CBOR {
     }
 
     /// Returns the encoded hexadecimal representation of this CBOR, with
-    /// annotations.
-    pub fn hex_annotated(&self) -> String {
-        self.hex_opt(&HexFormatOpts::default().annotate(true))
+    /// annotations, each tag named by its name in `tags`.
+    pub fn hex_annotated(&self, tags: &dyn TagsStoreTrait) -> String {
+        self.hex_opt(&HexFormatOpts::default().annotate(true).tags(tags))
     }
 
     fn dump_items(&self, level: usize, opts: &HexFormatOpts<'_>) -> Vec<DumpItem> {
@@ -110,20 +112,8 @@ impl CBOR {
                 let header = tag.value().encode_varint(MajorType::Tagged);
                 let header_data = vec![vec![header[0]], header[1..].to_vec()];
                 let mut note_components: Vec<String> = vec![format!("tag({})", tag.value())];
-                match opts.tags {
-                    TagsStoreOpt::None => {}
-                    TagsStoreOpt::Global => {
-                        with_tags!(|tags_store: &dyn TagsStoreTrait| {
-                            if let Some(name) = tags_store.assigned_name_for_tag(tag) {
-                                note_components.push(name);
-                            }
-                        })
-                    }
-                    TagsStoreOpt::Custom(tags_store_trait) => {
-                        if let Some(name) = tags_store_trait.assigned_name_for_tag(tag) {
-                            note_components.push(name);
-                        }
-                    }
+                if let Some(name) = opts.tags.and_then(|tags| tags.assigned_name_for_tag(tag)) {
+                    note_components.push(name);
                 }
                 let tag_note = note_components.join(" ");
                 vec![

@@ -10,13 +10,14 @@
 #[global_allocator]
 static HEAP: heap::Heap = heap::Heap;
 use dcbor::bounded::Limits;
+use dcbor::bounded::decode::construction::TypedPosition;
 use dcbor::bounded::decode::construction::in_place::StableOption;
 use dcbor::bounded::decode::construction::in_place::Transferable;
 use dcbor::bounded::encoding::TransferableSchema;
 use dcbor_test_support::classes::{self, Classes, Typed};
 use dcbor_test_support::heap;
 use dcbor_test_support::pipeline::{Expected, encode, matrix};
-use dcbor_test_support::rigor::rigor;
+use dcbor_test_support::rigor::{Rigor, rigor};
 
 /// The fault matrix of `T` decoded from `wire` and encoded back to it, its
 /// stops classed by `classes`.
@@ -48,6 +49,33 @@ fn scalar_pipeline_distinguishes_turn_exhaustion_from_injected_refusals() {
     );
 }
 
+/// The emission classes' planted control: every emission boundary merged
+/// with the decode's first boundary, taken before its parse record exists,
+/// whose cleanup is the input record's alone, every other classifier the
+/// real one. That decode boundary is alone in its class otherwise, so only
+/// the merge of the emission's boundaries with it can make the exhaustive
+/// layer refuse a class, and it must: an emission boundary's cleanup is its
+/// plan record's, the decoded value and its input with it.
+#[test]
+#[should_panic(expected = "the class merges states of different custody")]
+fn an_emission_class_merged_with_a_decode_boundary_is_rejected() {
+    const PLANTED: &str = "planted";
+    let merged = Classes::<Typed<u64>> {
+        decode: |position| match position {
+            TypedPosition::Parse(parse) if !parse.allocated => Some(PLANTED.to_owned()),
+            other => classes::typed::<u64>(other),
+        },
+        emit: |_| Some(PLANTED.to_owned()),
+        ..classes::reduced::<u64>()
+    };
+    matrix(
+        "an emission under a planted class",
+        Rigor::Exhaustive,
+        Expected::Complete,
+        |schedule| encode::<u64>(&[0x19, 0x01, 0x00], schedule, &merged),
+    );
+}
+
 #[test]
 fn text_survives_every_admission_physical_failure_and_stop() {
     pipeline::<String>(
@@ -58,15 +86,87 @@ fn text_survives_every_admission_physical_failure_and_stop() {
     );
 }
 
+/// `["q\u{301}", "b"]`: two text elements, the first normalizing.
+const TWO_TEXTS: [u8; 7] = [0x82, 0x63, b'q', 0xcc, 0x81, 0x61, b'b'];
+
 #[test]
 fn vector_children_survive_every_admission_physical_failure_and_stop() {
-    // ["q\u{301}", "b"] crosses parsing, normalization, the document's
-    // transfer, vector child construction and pre-publication cleanup.
+    // Crosses parsing, normalization, the document's transfer, vector child
+    // construction and pre-publication cleanup, its stops classed by the
+    // sequence's declared reduction over its texts' complete class.
     pipeline::<Vec<String>>(
         "vector",
-        &[0x82, 0x63, b'q', 0xcc, 0x81, 0x61, b'b'],
+        &TWO_TEXTS,
         Expected::Complete,
-        classes::parsed::<Vec<String>>(),
+        classes::reduced::<Vec<String>>(),
+    );
+}
+
+/// The claims the sequences' stop classes rest on, each checked on every
+/// state its construction reaches, from nothing built to complete, each
+/// cancelled there and cleaned up: every complete scalar, text and tagged
+/// text is of its declared complete class, and each sequence's declared
+/// reduction, over those elements, is a simulation of its cleanup, for a
+/// vector and an array, of scalars and of texts.
+#[test]
+fn sequences_and_their_elements_declare_sound_reductions() {
+    dcbor_test_support::uniform::<u64>("an integer", &[0x19, 0x01, 0x00]);
+    dcbor_test_support::uniform::<String>("a text", &[0x63, b'q', 0xcc, 0x81]);
+    dcbor_test_support::uniform::<String>("an empty text", &[0x60]);
+    dcbor_test_support::certified::<Vec<String>>("a vector of texts", &TWO_TEXTS);
+    dcbor_test_support::certified::<Vec<u64>>("a vector of integers", &[0x83, 0x01, 0x02, 0x03]);
+    dcbor_test_support::certified::<Vec<u64>>("an empty vector", &[0x80]);
+    dcbor_test_support::certified::<[u64; 2]>("an array of integers", &[0x82, 0x01, 0x18, 0x18]);
+}
+
+/// The complete-class check's planted control: a text declared complete
+/// without its payload's permit, which every complete text holds, is
+/// refused.
+#[test]
+#[should_panic(expected = "is not of its declared complete class")]
+fn a_planted_complete_class_is_rejected() {
+    use dcbor::bounded::decode::construction::Reduction;
+    use dcbor::bounded::decode::construction::in_place::BufferClass;
+    dcbor_test_support::complete_class::<String, _>(
+        "a text under a planted complete class",
+        &[0x63, b'q', 0xcc, 0x81],
+        |observation| {
+            <<String as dcbor::bounded::decode::construction::Reclaim<Limits>>::State as Reduction>::class(observation)
+        },
+        BufferClass::Written { payload: false },
+    );
+}
+
+/// The sequence reduction's planted control: a class that drops the
+/// committed count merges a vector holding one complete text with one
+/// holding two, whose cleanups differ by a text's, and the simulation check
+/// refuses it.
+#[test]
+#[should_panic(expected = "the class merges states of different custody")]
+fn a_sequence_class_dropping_its_committed_count_is_rejected() {
+    use dcbor::bounded::decode::construction::Reduction;
+    use dcbor::bounded::decode::construction::in_place::SequenceClass;
+    type State = <Vec<String> as dcbor::bounded::decode::construction::Reclaim<Limits>>::State;
+    dcbor_test_support::simulation::<Vec<String>, _>(
+        "a vector under a planted class",
+        &TWO_TEXTS,
+        |observation| match <State as Reduction>::class(observation) {
+            SequenceClass::Written {
+                payload, newest, ..
+            } => SequenceClass::Written {
+                payload,
+                committed: 0,
+                newest,
+            },
+            SequenceClass::Reclaim {
+                payload, newest, ..
+            } => SequenceClass::Reclaim {
+                payload,
+                committed: 0,
+                newest,
+            },
+            other => other,
+        },
     );
 }
 

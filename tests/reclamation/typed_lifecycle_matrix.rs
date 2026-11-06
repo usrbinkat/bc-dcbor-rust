@@ -103,7 +103,8 @@ unsafe impl<A: Allocator, const D: usize> Reclaim<A> for Declared<D> {
 // empty state.
 unsafe impl<A: Allocator, const D: usize> InPlace<A> for Declared<D> {
     // One build unit and one cleanup unit.
-    const COST: ConstructionCost = ConstructionCost::fixed(plus(unit(0), unit(0)));
+    const COST: ConstructionCost =
+        ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
 
     #[expect(
         clippy::disallowed_methods,

@@ -19,6 +19,7 @@ use super::reclamation::Place;
 use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Caller, Capped, ResourceBound, TURN, Unit,
 };
+use crate::sync::{Atomics, Core, Representation};
 
 /// The largest unit of bytes any single admission may cover: the bytes of
 /// one turn's quantum ([`TURN`]).
@@ -58,59 +59,85 @@ pub enum Admitted {
     Release,
 }
 
-/// The bytes a block's acquisition writes, established when its type is
-/// instantiated: its permit and its header, one typed value written whole,
-/// at most a quantum together, so the write is one admitted unit, of a block
-/// that occupies memory. The header's type is the one [`acquire`] writes, so
-/// the charge is that type's size and nothing written goes uncharged. Every
-/// caller constructs it in a constant (`const { .. }` or an associated
-/// constant), so a block that cannot be written in one unit fails to compile
-/// where its type is used, and [`acquire`] holds no run-time check of either
-/// bound. Padding the writes do not reach, between the value and the permit
-/// or past the header, is storage the block holds, not bytes written.
-#[derive(Clone, Copy)]
-pub(crate) struct Metadata {
-    bytes: usize,
+/// The contract quantities of acquiring a block of `M` with permits of `P`
+/// whose acquisition writes a header `W`: the bytes written, the permit and
+/// the header, one typed value written whole, at most a quantum together, so
+/// the write is one admitted unit ([`Self::write`]); and the block's bytes,
+/// requested from the allocator and held until the block is freed
+/// ([`Self::block`]). Padding the write does not reach, between the value
+/// and the permit or past the header, is storage the block holds, not bytes
+/// written.
+///
+/// The one definition of both: [`acquire`] admits exactly the contract it
+/// is given, whose type names what it stores, and every cost term of a
+/// block reads the same contract, so a block's charge and its bound cannot
+/// diverge. `W` and `M` are the types the build stores; the quantities are
+/// read from their production representation
+/// ([`Representation::In<Core>`](Representation)), so they are the same in
+/// every build whatever atomics a model checker substitutes, while
+/// [`acquire`] stores and frees `M`'s physical layout. Built only by
+/// [`Self::of`], which every caller evaluates in a constant (`const { .. }`
+/// or an associated constant), so a write beyond a quantum fails to compile
+/// where the block's type is used and [`acquire`] holds no run-time check.
+pub(crate) struct Contract<W, M, P> {
+    written: usize,
+    block: usize,
+    stored: PhantomData<Describes<W, M, P>>,
 }
 
-impl Metadata {
-    /// A block of `M` with permits of `P` whose acquisition writes the
-    /// permit and a header of `W`, whole.
-    pub(crate) const fn header<W, M, P>() -> Self {
-        assert!(
-            size_of::<Held<M, P>>() > 0,
-            "a stable block occupies memory"
-        );
+/// The types a [`Contract`] describes, named without being held: a contract
+/// is two numbers about them, so it owns none of them and is `Copy`, `Send`
+/// and `Sync` whatever they are.
+type Describes<W, M, P> = fn() -> (W, M, P);
+
+impl<W, M, P> Clone for Contract<W, M, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W, M, P> Copy for Contract<W, M, P> {}
+
+impl<W: Representation, M: Representation, P> Contract<W, M, P> {
+    /// The contract of a block storing `M`, whose acquisition writes `W`,
+    /// with permits of `P`: read from their production representation.
+    pub(crate) const fn of() -> Self {
         Self {
-            bytes: crate::bounded::write_extent(
-                size_of::<W>() + crate::bounded::permit_bytes::<P>(),
+            written: crate::bounded::write_extent(
+                size_of::<W::In<Core>>() + crate::bounded::permit_bytes::<P>(),
             ) as usize,
+            block: size_of::<Held<M::In<Core>, P>>(),
+            stored: PhantomData,
         }
     }
+}
 
-    /// A block of `M` with permits of `P` whose acquisition writes the whole
-    /// value and the permit.
-    pub(crate) const fn whole<M, P>() -> Self {
-        Self::header::<M, M, P>()
+impl<W, M, P> Contract<W, M, P> {
+    /// What the acquisition admits for its write: one [`WRITE`] of its
+    /// bytes. Its release ([`release_cost`]) is admitted with it.
+    pub(crate) const fn write(self) -> ResourceBound {
+        Unit::new(Caller, WRITE.values(), self.written as u64).bound()
     }
 
-    /// The bytes written.
-    pub(crate) const fn bytes(self) -> usize {
-        self.bytes
+    /// The block's bytes: the allocation requested and held.
+    pub(crate) const fn block(self) -> usize {
+        self.block
     }
 }
 
-/// What [`acquire`] admits for a block whose initialization writes
-/// `metadata`: one [`WRITE`] of its bytes. Its release ([`release_cost`]) is
-/// admitted with it.
-pub(crate) const fn acquire_cost(metadata: Metadata) -> ResourceBound {
-    Unit::new(Caller, WRITE.values(), metadata.bytes as u64).bound()
+// A stored type that holds no primitive of an atomics family is itself in
+// every family: the empty header of a block written in later units, an
+// uninitialized value of such a type, and a child custody record.
+impl Representation for () {
+    type In<S: Atomics> = ();
 }
 
-/// What [`install`] admits for metadata `M` with permits of `P`: the whole
-/// block written.
-pub(crate) const fn install_cost<M, P>() -> ResourceBound {
-    acquire_cost(Metadata::whole::<M, P>())
+impl<T: Representation> Representation for MaybeUninit<T> {
+    type In<S: Atomics> = MaybeUninit<T::In<S>>;
+}
+
+impl<S, P> Representation for Child<S, P> {
+    type In<F: Atomics> = Self;
 }
 
 /// What one release unit admits, with permits of `P`, by the acquisition it
@@ -135,13 +162,15 @@ impl<M, P> Held<M, P> {
 
 /// Acquire one stable block of `M` whose acquisition writes the permit and
 /// the header `head` makes, a `W` written whole at the place `project` names
-/// in the value. Its write, charged by the header's type ([`Metadata::header`],
-/// evaluated in a constant), then the block's release, are each admitted
-/// once, before the allocation is requested; `admitted` keeps what was
-/// admitted across a refused or failed allocation. `open` is consulted after
-/// the permit is granted and before memory is touched, because allocator
-/// callbacks may close the owning scope. The header is made only once the
-/// block exists.
+/// in the value. What is admitted is `contract`'s ([`Contract`], evaluated
+/// in a constant by the caller, its type naming what is stored): its write,
+/// then the block's release, each admitted once, before its allocation is
+/// requested; `admitted` keeps what was admitted across a refused or failed
+/// allocation. What is stored is `M`'s physical layout, which beneath a
+/// model checker's atomics exceeds the contract's block. `open` is consulted
+/// after the permit is granted and before memory is touched, because
+/// allocator callbacks may close the owning scope. The header is made only
+/// once the block exists.
 ///
 /// # Safety
 /// `project` must return the address of a `W` within the value it is given,
@@ -150,20 +179,26 @@ impl<M, P> Held<M, P> {
 /// in admitted units of its own. Neither `head` nor `project` may unwind,
 /// allocate, or read uninitialized memory.
 pub(crate) unsafe fn acquire<M, W, A: Allocator>(
+    contract: Contract<W, M, A::Permit>,
     admitted: &mut Admitted,
     open: impl Fn() -> bool,
     head: impl FnOnce() -> W,
     project: impl FnOnce(*mut M) -> *mut W,
     a: &mut A,
 ) -> BoundedResult<NonNull<Held<M, A::Permit>>, A> {
-    let metadata = const { Metadata::header::<W, M, A::Permit>() };
+    const {
+        assert!(
+            size_of::<Held<M, A::Permit>>() > 0,
+            "a stable block occupies memory"
+        )
+    };
     let layout = Layout::new::<Held<M, A::Permit>>();
-    let bytes = u64::try_from(layout.size()).map_err(|_| BoundedError::Overflow)?;
+    let bytes = u64::try_from(contract.block).map_err(|_| BoundedError::Overflow)?;
     if !open() {
         return Err(BoundedError::PlanMismatch);
     }
     if *admitted == Admitted::Nothing {
-        WRITE.admit(a, metadata.bytes as u64)?;
+        WRITE.admit(a, contract.written as u64)?;
         *admitted = Admitted::Write;
     }
     if *admitted == Admitted::Write {
@@ -174,9 +209,9 @@ pub(crate) unsafe fn acquire<M, W, A: Allocator>(
     if !open() {
         return Err(BoundedError::PlanMismatch);
     }
-    // SAFETY: the layout is nonzero ([`Metadata`]); a null result is a
+    // SAFETY: the layout is nonzero (asserted above); a null result is a
     // physical failure and drops the granted permit, releasing exactly what
-    // was admitted for it.
+    // was admitted for it. The failure reports the request admitted.
     let raw = NonNull::new(unsafe { alloc(layout) }.cast::<Held<M, A::Permit>>())
         .ok_or(BoundedError::Allocation { bytes })?;
     // SAFETY: the block is unique and aligned. The permit is written before
@@ -327,33 +362,37 @@ impl<M, P> Installed<MaybeUninit<M>, P> {
 }
 
 /// Acquire a block of `M` whose acquisition writes the header `head` makes
-/// at the place `project` names, admissions kept in `admitted` across a
-/// refused or failed allocation; the handle that owns it.
+/// at the place `project` names, admitting `contract`, admissions kept in
+/// `admitted` across a refused or failed allocation; the handle that owns
+/// it.
 ///
 /// # Safety
 /// As [`acquire`].
 pub(crate) unsafe fn installed<M, W, A: Allocator>(
+    contract: Contract<W, M, A::Permit>,
     admitted: &mut Admitted,
     head: impl FnOnce() -> W,
     project: impl FnOnce(*mut M) -> *mut W,
     a: &mut A,
 ) -> BoundedResult<Installed<M, A::Permit>, A> {
     // SAFETY: forwarded from the caller.
-    let block = unsafe { acquire::<M, W, A>(admitted, || true, head, project, a)? };
+    let block = unsafe { acquire::<M, W, A>(contract, admitted, || true, head, project, a)? };
     Ok(Installed {
         block,
         marker: PhantomData,
     })
 }
 
-/// Acquire a block of `M` into the empty `slot`, its acquisition writing the
-/// header `head` makes at the place `project` names, admissions kept in
-/// `admitted` across a refused or failed allocation.
+/// Acquire a block of `M` into the empty `slot`, admitting `contract`, its
+/// acquisition writing the header `head` makes at the place `project`
+/// names, admissions kept in `admitted` across a refused or failed
+/// allocation.
 ///
 /// # Safety
 /// As [`acquire`]. A `slot` already holding a block is a plan mismatch and
 /// acquires nothing.
 pub(crate) unsafe fn install<M, W, A: Allocator>(
+    contract: Contract<W, M, A::Permit>,
     slot: &mut Option<Installed<M, A::Permit>>,
     admitted: &mut Admitted,
     head: impl FnOnce() -> W,
@@ -364,7 +403,7 @@ pub(crate) unsafe fn install<M, W, A: Allocator>(
         return Err(BoundedError::PlanMismatch);
     }
     // SAFETY: forwarded from the caller.
-    *slot = Some(unsafe { installed::<M, W, A>(admitted, head, project, a)? });
+    *slot = Some(unsafe { installed::<M, W, A>(contract, admitted, head, project, a)? });
     Ok(())
 }
 
@@ -408,6 +447,11 @@ unsafe impl<S: Send, P: Send> Send for Stack<S, P> {}
 unsafe impl<S, P> Sync for Stack<S, P> {}
 
 impl<S, P> Stack<S, P> {
+    /// What pushing one record admits and holds ([`Contract`]): the record
+    /// written whole with its permit, and its block. Every cost term of a
+    /// child record reads it.
+    pub(crate) const RECORD: Contract<Child<S, P>, Child<S, P>, P> = Contract::of();
+
     pub(crate) const fn new() -> Self {
         Self {
             head: None,
@@ -437,6 +481,7 @@ impl<S, P> Stack<S, P> {
         // SAFETY: the header is the whole record, every field written.
         let held = unsafe {
             acquire::<Child<S, P>, Child<S, P>, A>(
+                Self::RECORD,
                 &mut self.admitted,
                 || true,
                 || Child { state, previous },
@@ -493,28 +538,42 @@ mod tests {
     use super::*;
     use crate::bounded::Reservation;
 
-    /// A block's write, evaluated at run time as every caller evaluates it
-    /// in a constant: the header's bytes and the permit's, whatever the rest
-    /// of the value; a whole value is its own header; acquiring or
-    /// installing admits one value and those bytes.
+    // Stored types of the fixtures below, none holding an atomics family.
+    impl Representation for u32 {
+        type In<S: Atomics> = Self;
+    }
+    impl Representation for u64 {
+        type In<S: Atomics> = Self;
+    }
+    impl Representation for [u64; 4] {
+        type In<S: Atomics> = Self;
+    }
+
+    /// A block's contract, evaluated at run time as every caller evaluates
+    /// it in a constant: its write is the header's bytes and the permit's,
+    /// whatever the rest of the value, one admitted value; a whole value is
+    /// its own header; its block is the whole held value with its permit,
+    /// padding included, the bytes the allocator is asked for.
     #[test]
-    fn a_blocks_write_is_its_header_and_its_permit() {
+    fn a_blocks_contract_is_its_header_and_permit_written_and_its_whole_block() {
         let permit = size_of::<Reservation>();
-        assert_eq!(
-            Metadata::header::<u32, [u64; 4], Reservation>().bytes(),
-            4 + permit
-        );
-        assert_eq!(Metadata::whole::<u64, Reservation>().bytes(), 8 + permit);
-        let written = ResourceBound {
+        let written = |bytes: usize| ResourceBound {
             values: 1,
-            bytes: (8 + permit) as u64,
+            bytes: bytes as u64,
             ..ResourceBound::default()
         };
-        assert_eq!(install_cost::<u64, Reservation>(), written);
-        assert_eq!(
-            acquire_cost(Metadata::header::<u64, [u64; 4], Reservation>()),
-            written
-        );
+        let header = Contract::<u32, [u64; 4], Reservation>::of();
+        assert_eq!(header.write(), written(4 + permit));
+        assert_eq!(header.block(), 32 + permit);
+        let whole = Contract::<u64, u64, Reservation>::of();
+        assert_eq!(whole.write(), written(8 + permit));
+        assert_eq!(whole.block(), 8 + permit);
+        // A value whose size is not a multiple of the permit's alignment:
+        // the block holds the padding before the permit, which is written
+        // by no unit.
+        let padded = Contract::<u32, u32, Reservation>::of();
+        assert_eq!(padded.write(), written(4 + permit));
+        assert_eq!(padded.block(), 8 + permit);
         assert_eq!(
             release_cost::<Reservation>(),
             ResourceBound {

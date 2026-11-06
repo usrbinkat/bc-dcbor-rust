@@ -339,7 +339,7 @@ impl<P: Place> Capped<P> {
     }
 
     pub(crate) fn admit<B: Budget>(self, budget: &mut B, bytes: u64) -> BoundedResult<(), B> {
-        if bytes > self.cap {
+        if Bound::new(Predicate::Quantum, self.cap).exceeded(budget, bytes) {
             return Err(BoundedError::PlanMismatch);
         }
         admit_at(self.place, budget, self.values, bytes)
@@ -462,8 +462,31 @@ pub(crate) trait Places {
     }
 }
 
+/// The value of a construction cost computed in a constant, the one form
+/// every `COST` item takes (`InPlace::COST`, derived bindings included): the
+/// cost's composition (`in_place`, `checked_*`) is `None` when a quantity
+/// does not fit in `u64`, and this panics in const evaluation, so an
+/// overflowing cost fails to compile (E0080) where its binding is first
+/// used with a concrete allocator. A run-time composition refuses instead
+/// ([`BoundedError::Overflow`]).
+#[macro_export]
+macro_rules! const_cost {
+    ($cost:expr $(,)?) => {
+        const {
+            match $cost {
+                ::core::option::Option::Some(cost) => cost,
+                ::core::option::Option::None => {
+                    ::core::panic!("a construction cost exceeds u64")
+                }
+            }
+        }
+    };
+}
+
 #[cfg(feature = "num-bigint")]
 mod bigint;
+pub mod boundary;
+use boundary::{Bound, Predicate};
 pub mod decode;
 pub mod encoding;
 mod policy;
@@ -492,8 +515,9 @@ pub enum BoundedError<R> {
     /// The output given is not the plan's length; nothing was written.
     OutputSize { measured: u64, provided: u64 },
     /// A source answered differently than its schema contract allows (a
-    /// counted map's count, an entry window, an encoding past its walked
-    /// extent), or a plan's bytes do not account for its length.
+    /// counted map's count, an entry where no scanning unordered map takes
+    /// one, an encoding past its walked extent), or a plan's bytes do not
+    /// account for its length.
     PlanMismatch,
 }
 
@@ -534,6 +558,14 @@ pub trait Budget {
     /// Repeated passes are counted separately; a conservative aggregate may
     /// admit a whole pass. These units bound reported operations, not CPU time.
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal>;
+
+    /// Observe that a boundary predicate reached a valuation
+    /// ([`boundary`]): pure observation, called by the seam in every build
+    /// before the comparison's result is used and never able to change it.
+    /// It admits nothing, refuses nothing, must not allocate or unwind, and
+    /// may run inside cleanup and terminal steps. By default nothing is
+    /// recorded.
+    fn boundary(&mut self, _boundary: boundary::Boundary) {}
 }
 
 /// A budget that also governs allocation: each allocation is requested in
@@ -580,6 +612,10 @@ impl<B: Budget + ?Sized> Budget for &mut B {
     )]
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
         (**self).traverse(values, bytes)
+    }
+
+    fn boundary(&mut self, boundary: boundary::Boundary) {
+        (**self).boundary(boundary)
     }
 }
 
@@ -776,7 +812,7 @@ impl<T, P> Owned<T, P> {
             .len()
             .checked_add(additional)
             .ok_or(BoundedError::Overflow)?;
-        while self.capacity < needed {
+        while Bound::new(Predicate::ArenaLength, self.capacity).exceeded(allocator, needed) {
             let grown = if self.capacity == 0 {
                 4
             } else {
@@ -816,12 +852,11 @@ impl<T, P> Owned<T, P> {
         item: T,
         allocator: &mut A,
     ) -> BoundedResult<(), A> {
-        let shifted = self
-            .items
-            .len()
-            .checked_sub(at)
-            .ok_or(BoundedError::Overflow)?;
-        Self::MOVE.admit(allocator, widen(shifted)?)?;
+        let len = self.items.len();
+        if Bound::new(Predicate::ArenaLength, len).exceeded(allocator, at) {
+            return Err(BoundedError::Overflow);
+        }
+        Self::MOVE.admit(allocator, widen(len - at)?)?;
         self.reserve(1, allocator)?;
         self.items.insert(at, item);
         Ok(())
@@ -1080,6 +1115,51 @@ impl ResourceBound {
             allocated: mul(self.allocated, count)?,
             peak: if count == 0 { 0 } else { self.peak },
             retained: if count == 0 { 0 } else { self.retained },
+        })
+    }
+
+    /// This bound and `other` together, every quantity summed, or none when
+    /// one does not fit in `u64`: the one sum of bounds, which construction
+    /// costs compose in constants ([`decode::construction::in_place`]), where
+    /// none fails to compile (`const_cost!`), and which a run-time caller
+    /// refuses as [`BoundedError::Overflow`].
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        let (Some(values), Some(bytes), Some(allocated), Some(peak), Some(retained)) = (
+            self.values.checked_add(other.values),
+            self.bytes.checked_add(other.bytes),
+            self.allocated.checked_add(other.allocated),
+            self.peak.checked_add(other.peak),
+            self.retained.checked_add(other.retained),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak,
+            retained,
+        })
+    }
+
+    /// This bound, every quantity `count` times, or none when one does not
+    /// fit in `u64` ([`Self::checked_add`]).
+    pub const fn checked_mul(self, count: u64) -> Option<Self> {
+        let (Some(values), Some(bytes), Some(allocated), Some(peak), Some(retained)) = (
+            self.values.checked_mul(count),
+            self.bytes.checked_mul(count),
+            self.allocated.checked_mul(count),
+            self.peak.checked_mul(count),
+            self.retained.checked_mul(count),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak,
+            retained,
         })
     }
 
@@ -1809,45 +1889,9 @@ pub(crate) mod places {
     /// Rewrites every suite's recorded ratios from the current build when set.
     const RECORD_FACTORS: &str = "DCBOR_RECORD_FACTORS";
 
-    /// The configuration a run is under, exported by the flake's shells: the
-    /// toolchain and the standard library it builds against.
-    const CONFIGURATION: &str = "DCBOR_CONFIGURATION";
-
-    /// The first line of every record: this marker, then its configuration.
-    const CONFIGURATION_LINE: &str = "#\tconfiguration\t";
-
-    /// The configuration this run is under, when its shell exports one.
-    fn configuration() -> Option<String> {
-        std::env::var(CONFIGURATION)
-            .ok()
-            .filter(|identity| !identity.is_empty())
-    }
-
-    /// Publish `data` as `path` whole: written to a temporary file beside it,
-    /// then renamed over it, so a failed write leaves the previous record.
-    fn publish(path: &str, data: &str) {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let temporary = format!(
-            "{path}.{}.{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .unwrap_or_else(|error| panic!("{temporary}: {error}"));
-        let result = file
-            .write_all(data.as_bytes())
-            .and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(error) = result.and_then(|_| std::fs::rename(&temporary, path)) {
-            let _ = std::fs::remove_file(&temporary);
-            panic!("{path}: {error}");
-        }
-    }
+    // The one form of every recorded oracle: its configuration line and
+    // atomic publication.
+    use dcbor_record as record;
 
     /// This build's variant: [`VARIANT`], the suffix of each record's name,
     /// and [`RECORDS`], every suite's record of that variant compiled in. The
@@ -1859,40 +1903,31 @@ pub(crate) mod places {
     ///
     /// A record is compiled in, not read at run time, so a check needs no
     /// filesystem, the interpreter's host isolation included, and a suite
-    /// whose record is missing does not compile. The suites are those
-    /// `tests/record-evidence.sh` checks; a record rewritten by
+    /// whose record is missing does not compile. The suites are the one
+    /// inventory of them (`tests/data/tightness/families.rs`), which the
+    /// gate checks every variant of too; a record rewritten by
     /// [`RECORD_FACTORS`] is compiled into the next build.
-    macro_rules! variant {
-        ($suffix:literal $(, $only:literal)*) => {
-            const VARIANT: &str = $suffix;
-            const RECORDS: &[(&str, &str)] = records!(
-                $suffix;
-                "buckets",
-                "decode",
-                "emission",
-                "header",
-                "lifecycle_borrow",
-                "lifecycle_construct",
-                "lifecycle_copy",
-                "lifecycle_operations",
-                "lifecycle_parse",
-                "lifecycle_scope",
-                "preparation",
-                "retained_parse",
-                "string_decode",
-                "text_encode",
-                "text_joint",
-                "text_write",
-                "validation"
-                $(, $only)*
-            );
+    macro_rules! families {
+        (
+            every: [$($every:literal),* $(,)?],
+            custom_std: [$($custom:literal),* $(,)?] $(,)?
+        ) => {
+            #[cfg(not(any(feature = "custom-std-collections", feature = "num-bigint")))]
+            variant!(""; $($every),*);
+            #[cfg(all(not(feature = "custom-std-collections"), feature = "num-bigint"))]
+            variant!(".num-bigint"; $($every),*);
+            #[cfg(all(feature = "custom-std-collections", not(feature = "num-bigint")))]
+            variant!(".custom-std"; $($every,)* $($custom),*);
+            #[cfg(all(feature = "custom-std-collections", feature = "num-bigint"))]
+            variant!(".custom-std.num-bigint"; $($every,)* $($custom),*);
         };
     }
 
-    /// Each suite named, with its record of the variant `suffix`.
-    macro_rules! records {
-        ($suffix:literal; $($suite:literal),*) => {
-            &[$((
+    /// The variant of `suffix` and its suites, each with its record.
+    macro_rules! variant {
+        ($suffix:literal; $($suite:literal),* $(,)?) => {
+            const VARIANT: &str = $suffix;
+            const RECORDS: &[(&str, &str)] = &[$((
                 $suite,
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -1901,18 +1936,14 @@ pub(crate) mod places {
                     $suffix,
                     ".txt"
                 )),
-            )),*]
+            )),*];
         };
     }
 
-    #[cfg(not(any(feature = "custom-std-collections", feature = "num-bigint")))]
-    variant!("");
-    #[cfg(all(not(feature = "custom-std-collections"), feature = "num-bigint"))]
-    variant!(".num-bigint");
-    #[cfg(all(feature = "custom-std-collections", not(feature = "num-bigint")))]
-    variant!(".custom-std", "btree");
-    #[cfg(all(feature = "custom-std-collections", feature = "num-bigint"))]
-    variant!(".custom-std.num-bigint", "btree");
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/tightness/families.rs"
+    ));
 
     /// The compiled record of `suite` ([`RECORDS`]).
     fn record(suite: &str) -> &'static str {
@@ -1920,8 +1951,7 @@ pub(crate) mod places {
             Some((_, record)) => record,
             None => panic!(
                 "{suite}: no record is compiled in for this build: name the suite in \
-                 `variant!` and in tests/record-evidence.sh, then record it with \
-                 {RECORD_FACTORS}=1"
+                 tests/data/tightness/families.rs, then record it with {RECORD_FACTORS}=1"
             ),
         }
     }
@@ -2335,9 +2365,7 @@ pub(crate) mod places {
             assert!(self.texts.is_empty(), "{:#?}", self.texts);
             let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tightness");
             let mode = if std::env::var_os(RECORD_FACTORS).is_some() {
-                Ratchet::Record(configuration().unwrap_or_else(|| {
-                    panic!("recording requires {CONFIGURATION}, which the flake's shells export")
-                }))
+                Ratchet::Record(record::recording_configuration())
             } else {
                 Ratchet::Check(record(self.suite))
             };
@@ -2354,7 +2382,8 @@ pub(crate) mod places {
     /// [`Ratchet::Record`] names, or compared with the record a
     /// [`Ratchet::Check`] gives, any change, unrecorded or no longer measured
     /// ratio failing with the configurations the record and the run were
-    /// taken under. A record names its configuration on its first line.
+    /// taken under. A record names its configuration on its first line
+    /// ([`record`]).
     fn ratchet(path: &str, measured: &[(String, Ratio)], mode: Ratchet<'_>) {
         for (case, ratio) in measured {
             ratio.outcome.admissible(case);
@@ -2364,36 +2393,33 @@ pub(crate) mod places {
                 if let Some(directory) = std::path::Path::new(path).parent() {
                     std::fs::create_dir_all(directory).expect("the record directory is writable");
                 }
-                let mut data = format!("{CONFIGURATION_LINE}{configuration}\n");
-                for (key, ratio) in measured {
-                    data.push_str(&format!(
-                        "{}\t{}\t{}\t{}\t{key}\n",
-                        ratio.bound,
-                        ratio.used,
-                        ratio.ceiling,
-                        ratio.outcome.name()
-                    ));
-                }
-                publish(path, &data);
+                let rows: Vec<String> = measured
+                    .iter()
+                    .map(|(key, ratio)| {
+                        format!(
+                            "{}\t{}\t{}\t{}\t{key}",
+                            ratio.bound,
+                            ratio.used,
+                            ratio.ceiling,
+                            ratio.outcome.name()
+                        )
+                    })
+                    .collect();
+                record::publish(
+                    path,
+                    &record::render(&configuration, rows.iter().map(String::as_str)),
+                );
                 return;
             }
             Ratchet::Check(data) => data,
         };
-        let mut lines = data.lines();
-        let recorded_under = lines
-            .next()
-            .and_then(|line| line.strip_prefix(CONFIGURATION_LINE))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{path}:1: not the configuration it was recorded under; record it with \
-                     {RECORD_FACTORS}=1"
-                )
-            })
-            .to_string();
-        let running_under = configuration().unwrap_or_else(|| "an unnamed configuration".into());
+        let read = record::read(path, data, &format!("{RECORD_FACTORS}=1"));
+        let recorded_under = read.configuration;
+        let running_under =
+            record::configuration().unwrap_or_else(|| "an unnamed configuration".into());
         let mut recorded = std::collections::BTreeMap::new();
-        for (number, line) in lines.enumerate() {
-            let at = || format!("{path}:{}", number + 2);
+        for (number, line) in read.rows {
+            let at = || format!("{path}:{number}");
             let mut fields = line.splitn(5, '\t');
             let (Some(bound), Some(used), Some(ceiling), Some(outcome), Some(key)) = (
                 fields.next(),
@@ -2478,8 +2504,12 @@ pub(crate) mod places {
         ratchet(path, &measured, Ratchet::Record("toolchain=t std=s".into()));
         assert_eq!(
             std::fs::read_to_string(path).expect("the record"),
-            format!(
-                "{CONFIGURATION_LINE}toolchain=t std=s\n4\t2\tmeasured\tpublished\ta values\n9\t9\tmeasured\tpublished\tb bytes\n"
+            record::render(
+                "toolchain=t std=s",
+                [
+                    "4\t2\tmeasured\tpublished\ta values",
+                    "9\t9\tmeasured\tpublished\tb bytes"
+                ]
             )
         );
         assert_eq!(
@@ -2675,7 +2705,9 @@ pub(crate) mod places {
         }
         let base = encoding::Shape {
             instructions: 64,
-            dynamic: 16,
+            bucket_tables: 1,
+            buckets: 64,
+            bucket_entries: 8,
             depth: 4,
             maps: 4,
             unordered: 2,
@@ -2698,9 +2730,13 @@ pub(crate) mod places {
             bignums: 1,
             digits: 4,
         };
-        let counts: [Count<encoding::Shape>; 21] = [
+        let counts: [Count<encoding::Shape>; 23] = [
             ("instructions", |shape, value| shape.instructions = value),
-            ("dynamic", |shape, value| shape.dynamic = value),
+            ("bucket_tables", |shape, value| shape.bucket_tables = value),
+            ("buckets", |shape, value| shape.buckets = value),
+            ("bucket_entries", |shape, value| {
+                shape.bucket_entries = value
+            }),
             ("depth", |shape, value| shape.depth = value),
             ("maps", |shape, value| shape.maps = value),
             ("unordered", |shape, value| shape.unordered = value),
@@ -2733,28 +2769,24 @@ pub(crate) mod places {
             }),
         ];
         for (count, set) in counts {
-            // A shape's instructions include its dynamic ones: they are held
-            // at least the dynamic count while either varies.
             monotone(&format!("prepare_bound in {count}"), 0..=256, |value| {
                 let mut shape = base;
                 set(&mut shape, value);
-                shape.instructions = shape.instructions.max(shape.dynamic);
                 encoding::prepare_bound::<Reservation, ()>(shape).unwrap()
             });
             monotone(&format!("encode_bound in {count}"), 0..=256, |value| {
                 let mut shape = base;
                 set(&mut shape, value);
-                shape.instructions = shape.instructions.max(shape.dynamic);
                 super::encode_bound::<Reservation, ()>(shape).unwrap()
             });
         }
-        #[cfg(feature = "hashbrown")]
-        for batched in [false, true] {
+        #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+        {
             monotone("bucket_bound in buckets", sizes(), |buckets| {
-                encoding::buckets::bucket_bound::<()>(buckets, 8, batched).unwrap()
+                encoding::buckets::bucket_bound::<()>(buckets, 8).unwrap()
             });
             monotone("bucket_bound in entries", sizes(), |entries| {
-                encoding::buckets::bucket_bound::<()>(4096, entries, batched).unwrap()
+                encoding::buckets::bucket_bound::<()>(4096, entries).unwrap()
             });
         }
     }
@@ -2874,17 +2906,11 @@ pub(crate) mod places {
         type Place = T::Place;
 
         fn term(&self, place: T::Place) -> ResourceBound {
-            let sum = |left: u64, right: u64| add::<()>(left, right).expect("terms fit in u64");
-            self.iter().map(|terms| terms.term(place)).fold(
-                ResourceBound::default(),
-                |total, term| ResourceBound {
-                    values: sum(total.values, term.values),
-                    bytes: sum(total.bytes, term.bytes),
-                    allocated: sum(total.allocated, term.allocated),
-                    peak: sum(total.peak, term.peak),
-                    retained: sum(total.retained, term.retained),
-                },
-            )
+            self.iter()
+                .map(|terms| terms.term(place))
+                .fold(ResourceBound::default(), |total, term| {
+                    total.checked_add(term).expect("terms fit in u64")
+                })
         }
     }
 

@@ -14,10 +14,11 @@ pub(crate) mod with_std {
         },
         fmt, format, hash,
         ops::Deref,
+        rc::Rc,
         result::Result as StdResult,
         str,
         string::{String, ToString},
-        sync::{Arc, Mutex, MutexGuard, Once},
+        sync::Arc,
         time::Duration,
         vec::Vec,
     };
@@ -31,7 +32,6 @@ pub(crate) mod with_std {
 pub(crate) mod without_std {
     extern crate alloc;
 
-    // pub(crate) use alloc::rc; // Unused import
     pub(crate) use alloc::{
         borrow::ToOwned,
         boxed::Box,
@@ -39,7 +39,9 @@ pub(crate) mod without_std {
             BTreeMap, BTreeSet, VecDeque,
             btree_map::{Range as BTreeMapRange, Values as BTreeMapValues},
         },
-        fmt, format, str,
+        fmt, format,
+        rc::Rc,
+        str,
         string::{String, ToString},
         sync::Arc,
         vec,
@@ -51,7 +53,6 @@ pub(crate) mod without_std {
     };
 
     pub(crate) use hashbrown::{HashMap, HashSet};
-    pub(crate) use spin::{Mutex, MutexGuard, Once};
     pub(crate) use thiserror::Error as ThisError;
 }
 

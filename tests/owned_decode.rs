@@ -1,6 +1,6 @@
 use dcbor::bounded::decode::construction::{
     Acquisition, DecodeOwner, TypedDecoder, TypedValue,
-    in_place::{Built, ConstructionCost, InPlace, plus, times, unit},
+    in_place::{Built, ConstructionCost, InPlace, unit},
     reclamation::{Custody, PeekSlot, Reclaim, Reclaimed, Slot},
 };
 use dcbor::bounded::decode::{ConstructResult, Document, Options};
@@ -72,9 +72,10 @@ fn live_record_waiting_spends_no_work_and_shutdown_closes_admission() {
 }
 
 /// Decode an instrumented input, moving the whole consumer state between
-/// turns and cancelling at turn `cancel_at`. Returns the turns taken and
-/// whether the value was published.
-fn run(cancel_at: Option<usize>) -> (usize, bool) {
+/// turns and cancelling at turn `cancel_at`. Returns the turns taken,
+/// whether the value was published, and the boundary valuations the run
+/// reached.
+fn run(cancel_at: Option<usize>) -> (usize, bool, dcbor::bounded::boundary::Reached) {
     let wire = [0x62, b'o', b'k'];
     // The decode within its own bound; a cancelled one also reclaims the
     // instrumented input, whose cleanup its acquisition accounts: three
@@ -137,7 +138,7 @@ fn run(cancel_at: Option<usize>) -> (usize, bool) {
     drain(&mut owner, &mut m);
     assert_eq!(m.live_bytes(), 0);
     assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
-    (turns, published)
+    (turns, published, m.reached())
 }
 
 #[test]
@@ -152,15 +153,16 @@ fn movable_decode_publication_and_retirement() {
 /// decode finishes its cleanup and the scope recovers everything ([`run`]).
 #[test]
 fn cancellation_through_initialization_parse_build_and_publication() {
-    let (turns, published) = run(None);
+    let (turns, published, _) = run(None);
     assert!(published, "uncancelled decode did not publish");
     support::stop_matrix("instrumented decode cancelled at a turn", turns, |stop| {
-        let (_, published) = run(Some(stop));
+        let (_, published, reached) = run(Some(stop));
         assert_eq!(
             published,
             stop == turns,
             "cancellation before turn {stop} of {turns}"
         );
+        reached
     });
 }
 
@@ -240,9 +242,10 @@ impl Custody for ProbeState {
 // No initialized field owns resources, so every partial prefix is reclaimable.
 unsafe impl InPlace<Limits> for StableProbe {
     // Four 64-byte writes and the address write; one cleanup unit.
-    const COST: ConstructionCost = ConstructionCost::fixed(plus(
-        plus(times(unit(64), 4), unit(core::mem::size_of::<usize>())),
-        unit(0),
+    const COST: ConstructionCost = ConstructionCost::fixed(dcbor::const_cost!(
+        dcbor::const_cost!(unit(64).checked_mul(4)).checked_add(dcbor::const_cost!(
+            unit(core::mem::size_of::<usize>()).checked_add(unit(0))
+        ))
     ));
 
     #[expect(

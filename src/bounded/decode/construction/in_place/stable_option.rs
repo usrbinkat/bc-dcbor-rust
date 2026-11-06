@@ -1,10 +1,11 @@
 //! An optional payload whose native representation never contains T inline.
 use super::*;
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place, Reduction};
-use crate::bounded::decode::construction::stable::{self, Held, Installed};
+use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::sync::{Atomics, Representation};
 use core::{
     marker::PhantomData,
-    mem::{MaybeUninit, size_of},
+    mem::MaybeUninit,
     ptr::{self, NonNull},
 };
 
@@ -39,6 +40,14 @@ struct Head<S> {
 struct Body<S, T> {
     head: Head<S>,
     value: MaybeUninit<T>,
+}
+
+impl<S> Representation for Head<S> {
+    type In<F: Atomics> = Self;
+}
+
+impl<S, T> Representation for Body<S, T> {
+    type In<F: Atomics> = Self;
 }
 
 /// Where the payload block is: the payload under construction, complete
@@ -148,12 +157,14 @@ impl<S: Custody, T, P> Custody for OptionState<S, T, P> {
     }
 }
 
-/// What the payload block's acquisition writes, for a payload `T` whose
-/// state is `S`, with permits of `P`: its header, whole, and the permit; the
-/// payload itself is built afterwards. Evaluated in a constant by every
-/// caller.
-const fn metadata<S, T, P>() -> stable::Metadata {
-    stable::Metadata::header::<Head<S>, Body<S, T>, P>()
+/// What the payload block's acquisition admits and holds, for a payload `T`
+/// whose state is `S`, with permits of `P` ([`stable::Contract`]): its
+/// header, whole, and the permit written, the payload built afterwards; and
+/// the whole block, the payload's bytes included. The one definition its
+/// installation and the option's cost read, evaluated in a constant by
+/// both.
+const fn contract<S, T, P>() -> stable::Contract<Head<S>, Body<S, T>, P> {
+    stable::Contract::of()
 }
 
 /// The payload block's two parts, each projected from the block's own
@@ -180,6 +191,23 @@ fn parts<S, T, P>(installed: &mut Installed<Body<S, T>, P>) -> (&mut Head<S>, Pl
     }
 }
 
+/// The cost of a stable option `O` of payload `T` costing `payload`, whose
+/// state is `S`, with permits of `P`: the present-field marker; the null
+/// decision; the payload block's admission, the block, holding `T`, held
+/// for the value's life; the null or published write; cleanup's empty unit
+/// and the block's release. The payload is built in the block. None when a
+/// quantity does not fit in `u64`.
+const fn cost<S, T, O, P>(payload: ConstructionCost) -> Option<ConstructionCost> {
+    let body = contract::<S, T, P>();
+    let decided = cost!(STEP_COST.checked_mul(2));
+    let written = cost!(body.write().checked_add(sized::<O>().bound()));
+    let released = cost!(
+        cost!(STEP_COST.checked_add(stable::release_cost::<P>())).checked_add(held(body.block()))
+    );
+    let fixed = cost!(cost!(decided.checked_add(written)).checked_add(released));
+    ConstructionCost::fixed(fixed).checked_add(payload)
+}
+
 impl<T, A: Allocator> StableOption<T, A> {
     pub fn as_ref(&self) -> Option<&T> {
         self.payload.map(|payload| {
@@ -199,27 +227,9 @@ impl<T, A: Allocator> StableOption<T, A> {
 unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
     const OPTIONAL: bool = true;
 
-    /// The present-field marker; the null decision; the payload block's
-    /// admission, the block, holding T, held for the value's life; the null
-    /// or published write; cleanup's empty unit and the block's release. The
-    /// payload is built in the option's own bytes.
-    const COST: ConstructionCost = {
-        let block = size_of::<Held<Body<T::State, T>, A::Permit>>();
-        ConstructionCost::fixed(plus(
-            plus(
-                times(STEP_COST, 2),
-                plus(
-                    stable::acquire_cost(metadata::<T::State, T, A::Permit>()),
-                    sized::<Self>().bound(),
-                ),
-            ),
-            plus(
-                plus(STEP_COST, stable::release_cost::<A::Permit>()),
-                held(block),
-            ),
-        ))
-        .plus(T::COST)
-    };
+    /// The option's own parts ([`cost`]) and its payload's.
+    const COST: ConstructionCost =
+        crate::const_cost!(cost::<T::State, T, Self, A::Permit>(T::COST));
 
     fn build_present(
         document: &Document<'_, A::Permit>,
@@ -302,9 +312,10 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
                 Decision::Present => {
                     // SAFETY: only the header is written, projected to its
                     // field; T stays uninitialized until built. The block's
-                    // acquisition admits the header's bytes ([`metadata`]).
+                    // acquisition admits the header's bytes ([`contract`]).
                     unsafe {
                         stable::install::<Body<T::State, T>, Head<T::State>, A>(
+                            const { contract::<T::State, T, A::Permit>() },
                             &mut state.body,
                             &mut state.admitted,
                             || Head {
@@ -500,9 +511,9 @@ mod tests {
         ));
         reclaimed(&mut slot, &mut a);
         assert_eq!(a.live_bytes(), 0);
-        assert_eq!(
-            metadata::<Written, u64, Reservation>().bytes(),
-            const { metadata::<Written, u64, Reservation>() }.bytes()
-        );
+        let body = contract::<Written, u64, Reservation>();
+        let constant = const { contract::<Written, u64, Reservation>() };
+        assert_eq!(body.write(), constant.write());
+        assert_eq!(body.block(), constant.block());
     }
 }

@@ -56,8 +56,12 @@ representation_matrix!(c_primitive_layout, C, u8);
 /// retirement releases nothing synchronously, and the scope's queued cleanup
 /// takes every unit refused once, releasing nothing, before it is admitted,
 /// then recovers everything. Both are within the decode's own bound. The
-/// turns construction took to publish, when it published within `stop`.
-fn retired<T: Transferable<Limits> + 'static>(wire: &[u8], stop: usize) -> Option<usize> {
+/// turns construction took to publish, when it published within `stop`, and
+/// the boundary valuations the run reached.
+fn retired<T: Transferable<Limits> + 'static>(
+    wire: &[u8],
+    stop: usize,
+) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
     let bound = support::typed_turns::<T>(wire.len());
     let mut m = meter();
     let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
@@ -107,7 +111,7 @@ fn retired<T: Transferable<Limits> + 'static>(wire: &[u8], stop: usize) -> Optio
     assert!(drained, "cleanup exceeded its bound of {bound} turns");
     assert_eq!(owner.outstanding(), 0);
     assert_eq!(m.live_bytes(), 0);
-    published
+    (published, m.reached())
 }
 
 /// The enumeration constructed from `wire` retired after every number of
@@ -116,6 +120,7 @@ fn retired<T: Transferable<Limits> + 'static>(wire: &[u8], stop: usize) -> Optio
 /// publish.
 fn cancellation<T: Transferable<Limits> + 'static>(wire: &[u8]) {
     let boundaries = retired::<T>(wire, usize::MAX)
+        .0
         .expect("enumeration never reached publication within its bound");
     support::stop_matrix(
         &format!(
@@ -124,11 +129,13 @@ fn cancellation<T: Transferable<Limits> + 'static>(wire: &[u8]) {
         ),
         boundaries,
         |stop| {
+            let (published, reached) = retired::<T>(wire, stop);
             assert_eq!(
-                retired::<T>(wire, stop).is_some(),
+                published.is_some(),
                 stop == boundaries,
                 "a stop after {stop} turns"
             );
+            reached
         },
     );
 }

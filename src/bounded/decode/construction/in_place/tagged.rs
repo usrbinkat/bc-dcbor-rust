@@ -1,7 +1,8 @@
 //! Tag validation with independently retained payload initialization.
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction};
+use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction, Uniform};
 use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::sync::{Atomics, Representation};
 
 /// Generated aligned projections for a tagged schema's untagged payload.
 ///
@@ -50,6 +51,17 @@ struct Meta<U> {
     child: U,
     index: usize,
     phase: Phase,
+}
+
+impl<U> Representation for Meta<U> {
+    type In<F: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds, its whole value
+/// written with the permit ([`stable::Contract`]): the one definition its
+/// installation and the tagged value's cost read.
+const fn contract<U, P>() -> stable::Contract<Meta<U>, Meta<U>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of a tagged value whose untagged payload's state
@@ -123,6 +135,13 @@ impl<U: Reduction, P> Reduction for State<U, P> {
     }
 }
 
+// A tagged value reports `Done` exactly when its untagged payload does, its
+// phase then `Complete`, which classes as `Live` of the payload's class; the
+// payload, complete, is of its one complete class.
+impl<U: Uniform, P> Uniform for State<U, P> {
+    const COMPLETE: Self::Class = TaggedClass::Live(U::COMPLETE);
+}
+
 impl<U: Custody, P> Custody for State<U, P> {
     type Observation = TaggedObservation<U::Observation>;
 
@@ -143,14 +162,14 @@ impl<U: Custody, P> Custody for State<U, P> {
 /// state is `U`, with permits of type `P`: the metadata block, held for the
 /// value's life; the tag inspection; cleanup's unit before any payload and
 /// the metadata's release. The payload is built in the tagged value's own
-/// bytes.
-pub const fn cost<U, P>(payload: ConstructionCost) -> ConstructionCost {
-    let meta = stable::Metadata::whole::<Meta<U>, P>().bytes();
-    ConstructionCost::fixed(plus(
-        plus(stable::install_cost::<Meta<U>, P>(), STEP_COST),
-        plus(plus(STEP_COST, stable::release_cost::<P>()), held(meta)),
-    ))
-    .plus(payload)
+/// bytes. None when a quantity does not fit in `u64`.
+pub const fn cost<U, P>(payload: ConstructionCost) -> Option<ConstructionCost> {
+    let meta = contract::<U, P>();
+    let inspected = cost!(meta.write().checked_add(STEP_COST));
+    let released = cost!(
+        cost!(STEP_COST.checked_add(stable::release_cost::<P>())).checked_add(held(meta.block()))
+    );
+    ConstructionCost::fixed(cost!(inspected.checked_add(released))).checked_add(payload)
 }
 
 /// One unit of construction of the tagged value in `slot`. Without metadata
@@ -167,6 +186,7 @@ pub fn build<T: Payload<A>, A: Allocator>(
         // SAFETY: the header is the whole metadata, every field written.
         unsafe {
             stable::install::<Meta<T::Untagged>, Meta<T::Untagged>, A>(
+                const { contract::<T::Untagged, A::Permit>() },
                 &mut state.meta,
                 &mut state.admitted,
                 || Meta {
@@ -283,18 +303,29 @@ mod tests {
     /// it being built in the value's own bytes.
     #[test]
     fn a_tagged_values_cost_is_its_own_fixed_part_and_its_payloads() {
-        let bare = cost::<Written, Reservation>(ConstructionCost::ZERO);
+        let bare = cost::<Written, Reservation>(ConstructionCost::ZERO).unwrap();
         assert_eq!(bare.per_byte, ConstructionCost::ZERO.per_byte);
         assert_eq!(
             bare.fixed.values,
-            stable::install_cost::<Meta<Written>, Reservation>().values
+            contract::<Written, Reservation>().write().values
                 + 2 * STEP_COST.values
                 + stable::release_cost::<Reservation>().values,
             "the install, the inspection, cleanup's unit and the release"
         );
-        let payload = ConstructionCost::fixed(unit(16)).plus(ConstructionCost::per_byte(unit(3)));
-        let tagged = cost::<Written, Reservation>(payload);
-        assert_eq!(tagged.fixed, plus(bare.fixed, payload.fixed));
+        let payload = ConstructionCost::fixed(unit(16))
+            .checked_add(ConstructionCost::checked_per_byte(unit(3)).unwrap())
+            .unwrap();
+        let tagged = cost::<Written, Reservation>(payload).unwrap();
+        assert_eq!(Some(tagged.fixed), bare.fixed.checked_add(payload.fixed));
         assert_eq!(tagged.per_byte, payload.per_byte);
+        let widest = ConstructionCost::fixed(ResourceBound {
+            values: u64::MAX,
+            ..ResourceBound::default()
+        });
+        assert_eq!(
+            cost::<Written, Reservation>(widest),
+            None,
+            "a payload whose cost leaves no room is refused, never wrapped"
+        );
     }
 }

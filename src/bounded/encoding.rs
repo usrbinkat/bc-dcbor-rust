@@ -1,4 +1,5 @@
 //! Retained schema traversal and canonical byte preparation.
+use super::boundary::boundary;
 use super::*;
 use core::mem::{MaybeUninit, size_of};
 use core::ptr::{NonNull, addr_of, addr_of_mut};
@@ -14,8 +15,10 @@ use decode::construction::{
 use decode::initialization::field;
 use decode::storage::Storage;
 use text_cursor::{TextContinuation, TextShape};
-#[cfg(feature = "hashbrown")]
+#[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
 pub mod buckets;
+#[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+use buckets::{BucketCursor, BucketStep, Buckets};
 mod dynamic;
 mod permutation;
 pub use permutation::{PermutationPhase, PermutationPosition};
@@ -23,20 +26,17 @@ pub mod maps;
 pub use dynamic::{DynamicPhase, DynamicPosition};
 mod values;
 pub use values::Tagged;
-#[cfg(not(feature = "custom-std-collections"))]
-pub(crate) use values::ranged;
-#[cfg(feature = "custom-std-collections")]
-pub(crate) use values::stepped;
+pub(crate) use values::{tree_next, tree_start, tree_step_moves};
 mod writer;
 pub use writer::{EmitPosition, OwnedEmitPosition, OwnedEmitStep, OwnedWriter, emit_bound};
 
 /// One bounded-work schema instruction. Implementations must not scan fields,
 /// allocate, or recursively visit children while producing an instruction.
-/// Dynamic map entries may inspect at most [`BUCKET_WINDOW`] indexed bucket
-/// controls, yielding at most one entry. `Entry::next` advances by 1 through
-/// [`BUCKET_WINDOW`] instructions.
-/// The engine validates this advance; implementations remain responsible for
-/// bounding the actual work performed before returning the instruction.
+/// An unordered map yields its entries one per instruction
+/// ([`Instruction::Entry`]), or hands the engine a cursor
+/// ([`Instruction::Entries`]) or, for a hash table, the table itself
+/// ([`Instruction::Buckets`]), whose buckets only the engine inspects, each
+/// window of controls admitted first.
 /// References and representation must remain stable for the preparation borrow.
 /// Implementing this safe trait does not authorize transferring retained
 /// instructions or cursors between threads. Owned preparation additionally
@@ -143,18 +143,22 @@ pub enum Instruction<'a> {
         magnitude: &'a num_bigint::BigUint,
         negative: bool,
     },
-    /// Up to [`BUCKET_WINDOW`] inspected buckets, yielding at most one entry.
-    /// `next` is the instruction index after the last inspected bucket,
-    /// including vacancies.
-    Entry {
-        next: usize,
-        entry: Option<(&'a dyn Schema, &'a dyn Schema)>,
-    },
+    /// One entry of the unordered map this source began, its key and its
+    /// value: the next instruction is the next index. A source inspects
+    /// nothing to produce it.
+    Entry(&'a dyn Schema, &'a dyn Schema),
     /// The entries of the unordered map this source began, drawn from a
     /// cursor the engine retains, for collections without positional access.
     /// Valid once per map, before any entry; no further instruction of this
     /// source is requested.
     Entries(&'a dyn Entries),
+    /// The hash table whose entries are the unordered map this source
+    /// began, enumerated by the engine's one bucket traversal
+    /// ([`buckets::BucketCursor`]), a window of controls admitted before it
+    /// is inspected. Valid once per map, before any entry; no further
+    /// instruction of this source is requested.
+    #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+    Buckets(&'a dyn Buckets),
     /// The source value is outside the dCBOR profile; preparation fails with
     /// [`BoundedError::OutOfRange`].
     OutOfRange,
@@ -361,13 +365,6 @@ fn check_count<R>(declared: Option<u64>, actual: u64) -> Result<(), BoundedError
     Ok(())
 }
 
-fn check_entry_next<R>(after: usize, next: usize) -> Result<(), BoundedError<R>> {
-    if next < after || next - after >= BUCKET_WINDOW {
-        return Err(BoundedError::PlanMismatch);
-    }
-    Ok(())
-}
-
 /// An open map: one element of the open-map arena, which relocates an
 /// element in one admitted unit, so it fits a quantum (`Storage`). Plain
 /// data, so an arena of them is discarded in one admitted unit
@@ -463,9 +460,12 @@ pub struct Preparation<'a, P> {
     finished: bool,
     dynamic: dynamic::Dynamic<P>,
     map_frames: Storage<MapFrame<'a>, P>,
-    /// The retained cursors of the open [`Instruction::Entries`] maps,
-    /// innermost last.
-    cursors: Storage<(&'a dyn Entries, Slot), P>,
+    /// The retained cursors of the open [`Instruction::Entries`] and
+    /// [`Instruction::Buckets`] maps, innermost last: an entry source and
+    /// its cursor's slot, or no source and a slot holding a hash table and
+    /// its [`buckets::BucketCursor`]. The reference's niche keeps an element
+    /// at a quantum.
+    cursors: Storage<(Option<&'a dyn Entries>, Slot), P>,
     /// The most bytes the plan's arena grows to: the source's extent when
     /// a shape walk established it, so the published arena holds no more.
     cap: usize,
@@ -505,9 +505,11 @@ impl TextCheck {
     /// [`Self::proven`]. A window ends at the last scalar boundary within a
     /// quantum; the check stops at the first scalar that leaves it unproven.
     fn step<B: Budget>(&mut self, text: &str, b: &mut B) -> BoundedResult<bool, B> {
-        let mut end = text
-            .len()
-            .min(self.at + decode::construction::stable::QUANTUM);
+        // A window of at most a quantum of what remains (`self.at` is a
+        // scalar boundary the last window ended at, never past the text).
+        let mut end = self.at
+            + Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+                .clamp(b, text.len() - self.at);
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -577,8 +579,11 @@ impl Staged {
     /// appended: a bignum's magnitude, the only producer of more than a
     /// head.
     #[cfg(feature = "num-bigint")]
-    pub(crate) fn fill<R>(&mut self, bytes: &[u8]) -> Result<(), BoundedError<R>> {
-        if !self.is_empty() || bytes.len() > self.bytes.len() {
+    pub(crate) fn fill<B: Budget>(&mut self, bytes: &[u8], b: &mut B) -> BoundedResult<(), B> {
+        // The copy below writes `bytes.len()` of the staged quantum.
+        if !self.is_empty()
+            || Bound::new(Predicate::Quantum, self.bytes.len()).exceeded(b, bytes.len())
+        {
             return Err(BoundedError::PlanMismatch);
         }
         self.bytes[..bytes.len()].copy_from_slice(bytes);
@@ -712,8 +717,9 @@ impl<'a, P> Preparation<'a, P> {
         // by `$init` over its own slot.
         macro_rules! part {
             ($field:ident, $steps:expr, |$part:ident| $init:expr) => {
-                if *slot.custody() < base + $steps {
-                    init_part!(slot, $field, base, |$part| $init);
+                let units = *slot.custody();
+                if Bound::new(Predicate::Prefix, base + $steps).below(a, units) {
+                    init_part!(slot, $field, base, a, |$part| $init);
                     return Ok(false);
                 }
                 base += $steps;
@@ -817,12 +823,11 @@ impl<'a, P> Preparation<'a, P> {
         let Some(spare) = at(PreparationPlace::PlanBytes, || storage.reserve_step(cap, a))? else {
             return Ok(0);
         };
-        let count = source
-            .len()
-            .min(decode::construction::stable::QUANTUM)
-            .min(spare.room());
+        let count = Bound::new(Predicate::Quantum, decode::construction::stable::QUANTUM)
+            .clamp(a, source.len());
+        let count = Bound::new(Predicate::ArenaLength, spare.room()).clamp(a, count);
         APPEND.admit(a, widen(count)?)?;
-        Ok(spare.extend(&source[..count]))
+        Ok(spare.extend(&source[..count], a))
     }
 
     /// One step, publishing the plan by moving its arenas out.
@@ -971,7 +976,7 @@ impl<'a, P> Preparation<'a, P> {
             return Ok(None);
         }
         if let Some(encoded) = &self.normalized {
-            if self.normalized_at < encoded.as_ref().len() {
+            if Bound::new(Predicate::Payload, encoded.as_ref().len()).below(a, self.normalized_at) {
                 self.normalized_at += Self::append(
                     &mut self.bytes,
                     self.cap,
@@ -996,9 +1001,10 @@ impl<'a, P> Preparation<'a, P> {
         if let Some(values) = self.inspect {
             // The announced inspections, in units of at most `UNIT_VALUES`;
             // what remains is kept across refusals.
-            let count = values.min(UNIT_VALUES);
+            let count = Bound::new(Predicate::Quantum, UNIT_VALUES).clamp(a, values);
             INSPECTED.admit(a, count)?;
-            self.inspect = (values > count).then(|| values - count);
+            // `count` is `values` or less: anything left is kept.
+            self.inspect = (values != count).then(|| values - count);
             return Ok(None);
         }
         if let Some(text) = self.text_source {
@@ -1016,7 +1022,9 @@ impl<'a, P> Preparation<'a, P> {
                 }
                 return Ok(None);
             }
-            if self.text_init < Self::TEXT_STEPS {
+            // The continuation's next unit rewrites the field its units
+            // select: a prefix, through the seam.
+            if Bound::new(Predicate::Prefix, Self::TEXT_STEPS).below(a, self.text_init) {
                 // SAFETY: the continuation's place is rooted at an exclusive
                 // borrow of this field, valid, aligned and writable for it,
                 // and no place derived from it outlives this call; its units
@@ -1046,7 +1054,7 @@ impl<'a, P> Preparation<'a, P> {
             return Ok(None);
         }
         if let Some(source) = self.child {
-            if self.frames.len() >= 128 {
+            if Bound::new(Predicate::DispatchDepth, 128).reached(a, self.frames.len()) {
                 return Err(BoundedError::DepthLimit);
             }
             let frames = &mut self.frames;
@@ -1091,10 +1099,12 @@ impl<'a, P> Preparation<'a, P> {
                 return Ok(None);
             };
             DONE.admit(a)?;
-            let len = bytes
-                .len()
-                .checked_sub(self.omitted)
-                .ok_or(BoundedError::Overflow)?;
+            // The published length: the plan's bytes less the gap bytes its
+            // heads omitted, which never exceed them.
+            if Bound::new(Predicate::Payload, bytes.len()).exceeded(a, self.omitted) {
+                return Err(BoundedError::Overflow);
+            }
+            let len = bytes.len() - self.omitted;
             return Ok(Some(C::complete(bytes, holes, len)));
         };
         let bytes = &mut self.bytes;
@@ -1130,7 +1140,6 @@ impl<'a, P> Preparation<'a, P> {
             ),
             None => None,
         };
-        let dynamic = top.is_some_and(|map| matches!(map.state, MapState::Dynamic { .. }));
         let entry_count = self.dynamic.entries.len();
         // A counted unordered map whose source has yielded every entry its
         // head declared, the last one compacted: it ends here, without
@@ -1159,67 +1168,93 @@ impl<'a, P> Preparation<'a, P> {
             scan = Some(spare);
         }
         let source = frame.source;
-        let instruction = if complete {
-            // The end, admitted as any instruction of the map: no cursor
-            // transition is made, so no node move.
+        let fetched = if complete {
+            // The end, admitted as a transition of the map: no cursor
+            // transition is made, so no node move and no bucket inspected.
             CURSOR.admit(a)?;
             if frame.ordered {
                 cursors.pop();
                 frame.ordered = false;
             }
-            Instruction::End
+            Some(Instruction::End)
         } else if frame.ordered {
-            // One admitted cursor transition per instruction, as an indexed
-            // entry advancing by exactly one; a structural transition is a
-            // vacant entry. The node moves the cursor states for the
-            // transition, twice over for the one that starts it, are
-            // admitted before it in units of at most `UNIT_VALUES`, so no
-            // unit is wider than a turn whatever the tree's height.
-            let (entries, slot) = cursors
+            let (driver, slot) = cursors
                 .as_mut_slice()
                 .last_mut()
                 .ok_or(BoundedError::PlanMismatch)?;
-            let entries: &'a dyn Entries = *entries;
-            let moves = if frame.fresh {
-                mul(entries.moves(), 2)?
-            } else {
-                entries.moves()
-            };
-            if frame.moved < moves {
-                let count = (moves - frame.moved).min(UNIT_VALUES);
-                MOVED.admit(a, count)?;
-                frame.moved += count;
-                return Ok(None);
-            }
-            CURSOR.admit(a)?;
-            frame.moved = 0;
-            if frame.fresh {
-                entries.start(slot);
-                frame.fresh = false;
-            }
-            let next = frame.next.checked_add(1).ok_or(BoundedError::Overflow)?;
-            // SAFETY: the top cursor was started by this frame's own source.
-            match unsafe { entries.next(slot) } {
-                EntryStep::Progress => Instruction::Entry { next, entry: None },
-                EntryStep::Entry(key, value) => Instruction::Entry {
-                    next,
-                    entry: Some((key, value)),
-                },
-                EntryStep::End => {
-                    cursors.pop();
-                    frame.ordered = false;
-                    Instruction::End
+            match *driver {
+                Some(entries) => {
+                    // One admitted cursor transition per instruction. The node
+                    // moves the cursor states for the transition, twice over
+                    // for the one that starts it, are admitted before it in
+                    // units of at most `UNIT_VALUES`, so no unit is wider than
+                    // a turn whatever the tree's height.
+                    let entries: &'a dyn Entries = entries;
+                    let moves = if frame.fresh {
+                        mul(entries.moves(), 2)?
+                    } else {
+                        entries.moves()
+                    };
+                    if frame.moved < moves {
+                        let count = Bound::new(Predicate::Quantum, UNIT_VALUES)
+                            .clamp(a, moves - frame.moved);
+                        MOVED.admit(a, count)?;
+                        frame.moved += count;
+                        return Ok(None);
+                    }
+                    CURSOR.admit(a)?;
+                    frame.moved = 0;
+                    if frame.fresh {
+                        entries.start(slot);
+                        frame.fresh = false;
+                    }
+                    // SAFETY: the top cursor was started by this frame's own
+                    // source.
+                    match unsafe { entries.next(slot) } {
+                        EntryStep::Progress => None,
+                        EntryStep::Entry(key, value) => Some(Instruction::Entry(key, value)),
+                        EntryStep::End => {
+                            cursors.pop();
+                            frame.ordered = false;
+                            Some(Instruction::End)
+                        }
+                    }
                 }
+                // A hash table's bucket cursor: the engine's one bucket
+                // traversal, which admits its own call and window.
+                #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+                None => {
+                    // SAFETY: a slot of no entry source holds the table and
+                    // its cursor, stored by `Instruction::Buckets` as exactly
+                    // this type.
+                    let (table, cursor) = unsafe { slot.get::<(&'a dyn Buckets, BucketCursor)>() };
+                    let table: &'a dyn Buckets = *table;
+                    match at(PreparationPlace::Buckets, || cursor.step(table, a))? {
+                        BucketStep::Vacant { .. } => None,
+                        BucketStep::Entry { key, value, .. } => {
+                            Some(Instruction::Entry(key, value))
+                        }
+                        BucketStep::Complete => {
+                            cursors.pop();
+                            frame.ordered = false;
+                            Some(Instruction::End)
+                        }
+                        BucketStep::Finished => return Err(BoundedError::PlanMismatch),
+                    }
+                }
+                // No bucket cursor exists where no hash table is encoded.
+                #[cfg(not(any(feature = "hashbrown", feature = "custom-std-collections")))]
+                None => return Err(BoundedError::PlanMismatch),
             }
         } else {
-            if dynamic {
-                CURSOR.admit(a)?;
-            } else {
-                INDEXED.admit(a)?;
-            }
-            source.instruction(frame.next)
+            INDEXED.admit(a)?;
+            Some(source.instruction(frame.next))
         };
         frame.next = frame.next.checked_add(1).ok_or(BoundedError::Overflow)?;
+        // A transition that yielded no entry is its own step's progress.
+        let Some(instruction) = fetched else {
+            return Ok(None);
+        };
         match instruction {
             Instruction::Head(major, argument) => self.staged.head(major, argument),
             Instruction::Inspect(values) => self.inspect = Some(values),
@@ -1268,15 +1303,40 @@ impl<'a, P> Preparation<'a, P> {
                 *ordered = entries.ordered();
                 // The cursor starts with its first transition, whose node
                 // moves are admitted with it.
-                cursors.push((entries, Slot::new()));
+                cursors.push((Some(entries), Slot::new()));
                 frame.ordered = true;
                 frame.fresh = true;
             }
-            Instruction::Entry { next, entry } => {
-                // frame.next already includes the one-instruction increment.
-                // Subtraction avoids overflow at the upper index boundary.
-                check_entry_next(frame.next, next)?;
-                frame.next = next;
+            #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+            Instruction::Buckets(table) => {
+                let map = frame
+                    .map
+                    .and_then(|index| maps.as_mut_slice().get_mut(index))
+                    .ok_or(BoundedError::PlanMismatch)?;
+                let MapState::Dynamic {
+                    phase: EntryPhase::Scan,
+                    ordered,
+                    start,
+                    ..
+                } = &mut map.state
+                else {
+                    return Err(BoundedError::PlanMismatch);
+                };
+                if frame.ordered || entry_count != *start {
+                    return Err(BoundedError::PlanMismatch);
+                }
+                // A hash table's order is not canonical key order.
+                *ordered = false;
+                // The table and its cursor, retained in the cursor arena:
+                // the cursor's position and credit are what each step
+                // resumes from.
+                let mut slot = Slot::new();
+                slot.put((table, BucketCursor::new()));
+                cursors.push((None, slot));
+                frame.ordered = true;
+                frame.fresh = false;
+            }
+            Instruction::Entry(key, value) => {
                 // An entry is the instruction of a scanning unordered map,
                 // whose slot was reserved for it; any other map's source
                 // answered outside its contract.
@@ -1295,17 +1355,15 @@ impl<'a, P> Preparation<'a, P> {
                 else {
                     return Err(BoundedError::PlanMismatch);
                 };
-                if let Some((key, value)) = entry {
-                    slot.push(maps::order::Entry {
-                        start: bytes.len(),
-                        key_end: 0,
-                        end: 0,
-                        output: 0,
-                    });
-                    *phase = EntryPhase::Key;
-                    *pending = Some(value);
-                    self.child = Some(key);
-                }
+                slot.push(maps::order::Entry {
+                    start: bytes.len(),
+                    key_end: 0,
+                    end: 0,
+                    output: 0,
+                });
+                *phase = EntryPhase::Key;
+                *pending = Some(value);
+                self.child = Some(key);
             }
             Instruction::UnorderedMap
             | Instruction::Map
@@ -1408,6 +1466,11 @@ impl<'a, P> Preparation<'a, P> {
                                 .ok_or(BoundedError::PlanMismatch)?;
                             hole.1 = MAX_HEAD_LEN - len;
                             let start = hole.0 + hole.1;
+                            // The head ends within the plan's bytes: the gap
+                            // was appended whole before the map's payload.
+                            if boundary!(a, Predicate::Payload, start + len, bytes.len()).is_gt() {
+                                return Err(BoundedError::PlanMismatch);
+                            }
                             bytes.as_mut_slice()[start..start + len].copy_from_slice(&head[..len]);
                             self.omitted = self
                                 .omitted
@@ -1430,13 +1493,16 @@ impl<'a, P> Preparation<'a, P> {
 /// What a source's retained preparation depends on, each at most.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Shape {
-    /// The schema instructions it answers: every `End`, omitted field,
-    /// vacant bucket range and cursor transition included.
+    /// The schema instructions it answers and the entry cursor transitions
+    /// it makes: every `End` and omitted field included, each inspecting at
+    /// most a head.
     pub instructions: u64,
-    /// The instructions among them answered after their source began an
-    /// unordered map: each may inspect up to 64 bytes of bucket controls,
-    /// where any other inspects at most a head.
-    pub dynamic: u64,
+    /// The hash tables it enumerates ([`Instruction::Buckets`]).
+    pub bucket_tables: u64,
+    /// Their buckets, all together: every control admitted once.
+    pub buckets: u64,
+    /// Their entries, all together.
+    pub bucket_entries: u64,
     /// The most frames open at once: the root and each child within its
     /// parent. The engine refuses more than 128.
     pub depth: u64,
@@ -1526,12 +1592,11 @@ impl Shape {
         add(self.extent, mul(self.maps, widen(MAX_HEAD_LEN)?)?)
     }
 
-    /// One instruction of the walk, admitted and counted; `dynamic` when its
-    /// source began an unordered map before it.
-    fn instruction<B: Budget>(&mut self, dynamic: bool, budget: &mut B) -> BoundedResult<(), B> {
+    /// One instruction of the walk, or one entry cursor transition,
+    /// admitted and counted.
+    fn instruction<B: Budget>(&mut self, budget: &mut B) -> BoundedResult<(), B> {
         WALKED.admit(budget)?;
         self.instructions = add(self.instructions, 1)?;
-        self.dynamic = add(self.dynamic, u64::from(dynamic))?;
         Ok(())
     }
 
@@ -1618,7 +1683,7 @@ impl Shape {
         let mut extent = 0;
         let mut index = 0;
         loop {
-            self.instruction(within > unordered, budget)?;
+            self.instruction(budget)?;
             if within > unordered
                 && map
                     .as_ref()
@@ -1696,17 +1761,48 @@ impl Shape {
                         )?,
                     )?;
                 }
-                Instruction::Entry { next, entry } => {
-                    check_entry_next(index.checked_add(1).ok_or(BoundedError::Overflow)?, next)?;
+                Instruction::Entry(key, value) => {
                     if within == unordered {
                         return Err(BoundedError::PlanMismatch);
                     }
                     let entries = map.as_mut().ok_or(BoundedError::PlanMismatch)?;
-                    if let Some(entry) = entry {
-                        self.entry(entries, entry, depth, within, budget)?;
+                    self.entry(entries, (key, value), depth, within, budget)?;
+                }
+                // The table's buckets enumerated by the engine's one bucket
+                // traversal, each window admitted before it is inspected, as
+                // the preparation enumerates them again; the map ends once
+                // its declared entries are yielded.
+                #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+                Instruction::Buckets(table) => {
+                    if within == unordered || map.as_ref().is_none_or(|map| map.entries != 0) {
+                        return Err(BoundedError::PlanMismatch);
                     }
-                    index = next;
-                    continue;
+                    self.bucket_tables = add(self.bucket_tables, 1)?;
+                    self.buckets = add(self.buckets, widen(table.num_buckets())?)?;
+                    let mut cursor = BucketCursor::new();
+                    loop {
+                        if map
+                            .as_ref()
+                            .is_some_and(|map| yielded_all(declared, map.entries))
+                        {
+                            // The end the preparation admits as a
+                            // transition of the map, no bucket inspected.
+                            self.instruction(budget)?;
+                            return self.closed(map, true, declared, extent);
+                        }
+                        match cursor.step(table, budget)? {
+                            BucketStep::Vacant { .. } => {}
+                            BucketStep::Entry { key, value, .. } => {
+                                self.bucket_entries = add(self.bucket_entries, 1)?;
+                                let entries = map.as_mut().ok_or(BoundedError::PlanMismatch)?;
+                                self.entry(entries, (key, value), depth, within, budget)?
+                            }
+                            BucketStep::Complete => {
+                                return self.closed(map, true, declared, extent);
+                            }
+                            BucketStep::Finished => return Err(BoundedError::PlanMismatch),
+                        }
+                    }
                 }
                 Instruction::Entries(entries) => {
                     if within == unordered || map.as_ref().is_none_or(|map| map.entries != 0) {
@@ -1720,7 +1816,7 @@ impl Shape {
                     entries.start(&mut slot);
                     let mut first = true;
                     loop {
-                        self.instruction(true, budget)?;
+                        self.instruction(budget)?;
                         if map
                             .as_ref()
                             .is_some_and(|map| yielded_all(declared, map.entries))
@@ -1780,13 +1876,31 @@ struct MapExtent {
 }
 
 /// The work a walk of a source of `shape` reports ([`Shape::of`]): one value
-/// per instruction, per entry cursor move and per inspection, and each
-/// text's bytes once. A walk allocates nothing.
+/// per instruction, per entry cursor move and per inspection, each text's
+/// bytes once, and each hash table's enumeration by the bucket cursor
+/// ([`bucket_work`]). A walk allocates nothing.
 pub fn walk_work<R>(shape: Shape) -> Result<WriteWork, BoundedError<R>> {
     WALKED
         .times(shape.instructions)?
         .then(STEPPED.of(add(shape.moves, shape.inspected)?)?)?
-        .then(SCANNED.units(shape.texts, shape.text_bytes)?)
+        .then(SCANNED.units(shape.texts, shape.text_bytes)?)?
+        .then(bucket_work::<R>(shape)?)
+}
+
+/// The work of enumerating `shape`'s hash tables, each by the one bucket
+/// cursor ([`buckets::bucket_bound`] summed over them): what the walk and
+/// the preparation each charge, both enumerating them. None where no hash
+/// table is encoded.
+fn bucket_work<R>(shape: Shape) -> Result<WriteWork, BoundedError<R>> {
+    #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+    {
+        buckets::bucket_work::<R>(shape.bucket_tables, shape.buckets, shape.bucket_entries)
+    }
+    #[cfg(not(any(feature = "hashbrown", feature = "custom-std-collections")))]
+    {
+        let _ = shape;
+        Ok(WriteWork::default())
+    }
 }
 
 /// `floor(log2 n) + 1` for `n` at least one, and one for none: at least the
@@ -1907,6 +2021,8 @@ places! {
         Check,
         Permutation,
         Visited,
+        /// Hash tables' buckets, enumerated by the bucket cursor.
+        Buckets,
         /// Bignum magnitudes' digits, scanned and emitted.
         Digits,
         Completion,
@@ -1919,11 +2035,10 @@ places! {
 const INDEXED: Unit<PreparationPlace> =
     Unit::new(PreparationPlace::Instructions, 1, MAX_HEAD_LEN as u64);
 
-/// Inspecting one instruction of a source that began an unordered map, or
-/// making one entry cursor transition: one value and up to a window of
-/// bucket controls.
-const CURSOR: Unit<PreparationPlace> =
-    Unit::new(PreparationPlace::Instructions, 1, BUCKET_WINDOW as u64);
+/// One entry cursor transition, or the end of a counted map reached without
+/// one: one value. A transition inspects no bucket control; a hash table's
+/// controls are admitted by its bucket cursor ([`buckets::BucketCursor`]).
+const CURSOR: Unit<PreparationPlace> = Unit::new(PreparationPlace::Instructions, 1, 0);
 
 /// The node moves an entry cursor states for its transition, one value
 /// each, admitted before it in units of at most [`UNIT_VALUES`].
@@ -1939,8 +2054,9 @@ const INSPECTED: Rate<PreparationPlace> = Rate::new(PreparationPlace::Instructio
 /// turn can hold, never in one it cannot.
 const UNIT_VALUES: u64 = TURN.values;
 
-/// The most bucket controls one [`Instruction::Entry`] inspects, and so the
-/// most its `next` may advance past the instruction's own index: a quantum.
+/// The bucket controls one window of a hash table's enumeration admits
+/// ([`buckets::BucketCursor`]): a quantum, the last window of a table
+/// shorter. Windows are index-aligned.
 pub const BUCKET_WINDOW: usize = decode::construction::stable::QUANTUM;
 
 /// Pushing one frame.
@@ -2035,7 +2151,10 @@ impl PreparationTerms {
         use core::mem::size_of;
         let Shape {
             instructions,
-            dynamic,
+            // Counted into the bucket cursor's term ([`bucket_work`]).
+            bucket_tables: _,
+            buckets: _,
+            bucket_entries: _,
             depth,
             maps,
             unordered,
@@ -2067,9 +2186,6 @@ impl PreparationTerms {
         let payloads = payloads.min(cap);
         let payload_probes = payload_probes.min(probed);
         let largest_payload = largest_payload.min(extent);
-        let indexed = instructions
-            .checked_sub(dynamic)
-            .ok_or(BoundedError::Overflow)?;
         // Frames, open maps and open entry cursors: at most one per frame,
         // and the arena holds one more than it uses.
         let held = add(depth, 1)?;
@@ -2112,19 +2228,22 @@ impl PreparationTerms {
         let mut set = |place: PreparationPlace, term: ResourceBound| {
             terms[place as usize] = term;
         };
-        // Each instruction, an entry cursor's transitions among the dynamic
-        // ones with the node moves they state, and the inspections sources
-        // announce.
+        // Each instruction a source answers, each entry cursor transition and
+        // each counted map's end reached without one, at most a source
+        // instruction's head each; the node moves cursors state, and the
+        // inspections sources announce.
         set(
             PreparationPlace::Instructions,
             work(
                 INDEXED
-                    .times(indexed)?
-                    .then(CURSOR.times(dynamic)?)?
+                    .times(instructions)?
                     .then(MOVED.over(0, moves)?)?
                     .then(INSPECTED.over(0, inspected)?)?,
             ),
         );
+        // Each hash table's buckets, enumerated by the bucket cursor: every
+        // control admitted once with its window.
+        set(PreparationPlace::Buckets, work(bucket_work::<R>(shape)?));
         // Each bignum's digits read twice, in its scan and its emission, a
         // unit of at most a quantum of their bytes at a time, each pass's
         // last unit partial.
@@ -2152,7 +2271,7 @@ impl PreparationTerms {
         set(PreparationPlace::OpenMaps, open_maps);
         let (cursors, cursors_growth) = arena(
             held,
-            widen(size_of::<(&'static dyn Entries, Slot)>())?,
+            widen(size_of::<(Option<&'static dyn Entries>, Slot)>())?,
             false,
         )?;
         set(PreparationPlace::Cursors, cursors);
@@ -2323,7 +2442,7 @@ impl PreparationTerms {
             Storage::<MapFrame<'static>, ()>::element_work(held)?,
             Storage::<u8, ()>::element_work(add(appended, 1)?)?,
             Storage::<(usize, usize), ()>::element_work(add(maps, 1)?)?,
-            Storage::<(&'static dyn Entries, Slot), ()>::element_work(held)?,
+            Storage::<(Option<&'static dyn Entries>, Slot), ()>::element_work(held)?,
             Storage::<maps::order::Entry, ()>::element_work(add(entries, 1)?)?,
             Storage::<u8, ()>::element_work(add(largest, 1)?)?,
         ]
@@ -2635,7 +2754,8 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
         mut slot: reclamation::Slot<'_, Self, Prefix>,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
-        if slot.custody().initialized() < Self::INIT_STEPS {
+        let initialized = slot.custody().initialized();
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, initialized) {
             if let Some(source) = Self::source(&mut slot)
                 && source.is_some()
             {
@@ -2752,7 +2872,7 @@ where
         a: &mut A,
     ) -> Result<(), Self::Error> {
         let (place, prefix) = slot.parts();
-        if prefix.initialized() >= Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, prefix.initialized()) {
             return Err(BoundedError::PlanMismatch);
         }
         let raw = place.as_ptr(prefix);
@@ -3135,20 +3255,13 @@ mod bound_tests {
             match (self.0, index) {
                 (0, 0) => Instruction::CountedMap(1),
                 (1, 0) => Instruction::CountedUnorderedMap(1),
-                (2 | 3 | 7, 0) => Instruction::UnorderedMap,
-                (2, 1) => Instruction::Entry {
-                    next: 1,
-                    entry: None,
-                },
-                (3, 1) => Instruction::Entry {
-                    next: 2 + BUCKET_WINDOW,
-                    entry: None,
-                },
+                // An entry offered to a field map, counted or not.
+                (2, 0) => Instruction::CountedMap(1),
+                (3, 0) => Instruction::Map,
+                (2 | 3, 1) => Instruction::Entry(&0u64, &0u64),
+                (7, 0) => Instruction::UnorderedMap,
                 (4, 0) => Instruction::Field(0, None),
-                (5, 0) => Instruction::Entry {
-                    next: 1,
-                    entry: None,
-                },
+                (5, 0) => Instruction::Entry(&0u64, &0u64),
                 (6, 0 | 1) => Instruction::Map,
                 (7, 1) => Instruction::Field(0, None),
                 (8, 0) => Instruction::CountedUnorderedMap(1),
@@ -3156,10 +3269,7 @@ mod bound_tests {
                 (9, 0) => Instruction::Map,
                 (10, 0) => Instruction::Head(MajorType::Array, Argument::Shortest(0)),
                 (11, 0) => Instruction::UnorderedMap,
-                (11, 1) => Instruction::Entry {
-                    next: 2,
-                    entry: Some((&0u64, &0u64)),
-                },
+                (11, 1) => Instruction::Entry(&0u64, &0u64),
                 (11, 2) => Instruction::Entries(self),
                 (12, 0) => Instruction::CountedMap(0),
                 (12, 1) => Instruction::Field(0, Some(&0u64)),
@@ -3244,10 +3354,7 @@ mod bound_tests {
             match index {
                 0 => Instruction::UnorderedMap,
                 index => match self.0.get(index - 1) {
-                    Some((key, value)) => Instruction::Entry {
-                        next: index + 1,
-                        entry: Some((key, value)),
-                    },
+                    Some((key, value)) => Instruction::Entry(key, value),
                     None => Instruction::End,
                 },
             }
@@ -3774,6 +3881,38 @@ mod bound_tests {
                     )]),
                     Some(Cancel::Draining(|position| relocates(position.bytes, 512))),
                 ),
+                // A hash table of 200 pairs in 256 buckets, every key in its
+                // own home bucket, enumerated by the bucket cursor: four
+                // windows, an entry ending nearly every call.
+                #[cfg(feature = "hashbrown")]
+                PreparationPlace::Buckets => {
+                    let hash = |pair: &(u64, u64)| pair.0;
+                    let mut table = hashbrown::HashTable::new();
+                    for key in (0..200u64).chain([255]) {
+                        table.insert_unique(key, (key, key), hash);
+                    }
+                    ("hash table", Box::new(table), None)
+                }
+                // The forked standard library's map where hashbrown's is not
+                // built, under the default hasher's fixed keys, so its layout
+                // is the same on every run.
+                #[cfg(all(feature = "custom-std-collections", not(feature = "hashbrown")))]
+                PreparationPlace::Buckets => (
+                    "hash map",
+                    Box::new(
+                        (0..200u64)
+                            .map(|key| (key, key))
+                            .collect::<std::collections::HashMap<
+                                u64,
+                                u64,
+                                std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+                            >>(),
+                    ),
+                    None,
+                ),
+                // No hash table is encoded where neither is built.
+                #[cfg(not(any(feature = "hashbrown", feature = "custom-std-collections")))]
+                PreparationPlace::Buckets => return None,
                 // Bignums of many digits each: both passes over every digit,
                 // in full units of a quantum but for each pass's last.
                 #[cfg(feature = "num-bigint")]
@@ -4108,6 +4247,7 @@ mod bound_tests {
                     | PreparationPlace::Check
                     | PreparationPlace::Permutation
                     | PreparationPlace::Visited
+                    | PreparationPlace::Buckets
                     | PreparationPlace::Digits
                     | PreparationPlace::Completion
                     | PreparationPlace::Cleanup => places::Factor::Measured,
@@ -4146,7 +4286,7 @@ mod bound_tests {
         assert_eq!(limits.used(), WriteWork::new(shape.instructions, 0));
         assert_eq!(
             (
-                shape.dynamic,
+                shape.bucket_tables,
                 shape.maps,
                 shape.unordered,
                 shape.entries,
@@ -4165,10 +4305,11 @@ mod bound_tests {
         let source: Vec<Box<dyn Schema>> = vec![Box::new(keys), Box::new(Empty)];
         let mut limits = Limits::unlimited();
         let shape = Shape::of(&source, &mut limits).unwrap();
-        // After each unordered map's own instruction: the outer map's two
-        // entries and end, the inner key map's entry and end, the empty key
-        // map's end. The field map's are not.
-        assert_eq!(shape.dynamic, 3 + 2 + 1);
+        // Entries yielded one per instruction enumerate no hash table.
+        assert_eq!(
+            (shape.bucket_tables, shape.buckets, shape.bucket_entries),
+            (0, 0, 0)
+        );
         assert_eq!(shape.maps, 4);
         assert_eq!(shape.unordered, 3);
         assert_eq!(shape.entries, 3);

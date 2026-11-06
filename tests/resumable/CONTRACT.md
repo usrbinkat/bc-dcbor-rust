@@ -98,14 +98,20 @@ and finite completion. Eventual completion alone is insufficient.
 - Bound observation must itself be bounded and must not advance the operation:
   a source's shape is walked under admission, allocation-free.
 - A source breaking its schema contract (a counted field map visiting another
-  count, a counted unordered map ending before its count, an entry past its
-  bucket window, an encoding longer when prepared than when its shape was
-  walked) must be classified as a defect, separately from caller refusal, and
+  count, a counted unordered map ending before its count, an entry offered
+  where no scanning unordered map takes one, a cursor or a hash table handed
+  over after a map's entries began, an encoding longer when prepared than
+  when its shape was walked) must be classified as a defect, separately from
+  caller refusal, and
   detected before the work it would leave unbounded: the plan's arena refuses
   growth past the walked extent.
 - A counted unordered map ends once its declared entries are yielded: its
-  source is asked for nothing further, so no bucket after its last entry is
-  scanned. Its source is trusted to state the count of the entries it holds:
+  source is asked for nothing further, and a hash table's bucket cursor
+  completes without inspecting a bucket after its last entry, the rest of
+  that window's admitted controls forfeited. A hash table's buckets are
+  inspected only by the engine's one traversal, a window of controls
+  admitted before any of it is inspected and each control admitted at most
+  once. Its source is trusted to state the count of the entries it holds:
   entries beyond the declared count are never requested, so a source
   declaring fewer than it holds is not detected.
 - Deadline schedules must cover expiration before the first admission and
@@ -128,7 +134,12 @@ and finite completion. Eventual completion alone is insufficient.
   `InPlace`, `Reclaim`, `Resumable`) are trusted to admit their own work, as
   those traits document. A `Schema` (and an `Entries` cursor) is trusted to
   keep each instruction to constant work and to announce what it examines
-  beyond it (`Instruction::Inspect`, `Entries::moves`). Test code standing in
+  beyond it (`Instruction::Inspect`, `Entries::moves`). No source inspects a
+  hash table's buckets: it hands the table to the engine
+  (`Instruction::Buckets`), whose bucket accessors are a sealed set (std's
+  `HashMap` on the forked library, hashbrown's `HashMap` and `HashTable`),
+  so no implementation outside this crate can scan more than the engine
+  admits or report a state the table does not hold. Test code standing in
   for such an implementation says so at the item that does it.
 - A direct `Budget::traverse` call fails `clippy -D warnings` at its span
   (`clippy.toml`). Each sanctioned call carries an item-level

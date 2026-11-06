@@ -23,10 +23,10 @@ standard-library hash map and ordered-collection schemas.
 | Preparation and emission refusal/cancellation, exact prefixes, shared pool | `native_pipeline.rs` |
 | Retained schema encoding, nested generics, enum representations, optional omission, tags, fixed arrays, map-header finalization, physical allocation failures | `native_schema_encoding.rs` |
 | `BTreeMap`, `dcbor::Map` and symbolic `CBOR` schemas: canonical key order, canonical collisions, nested and multi-level trees, every major type, out-of-profile negatives, nesting limit, physical allocation failures; walked by the tree's iterator on stable and by the stepped cursor on the forked std | `native_schema_encoding.rs::ordered` |
-| Sparse bucket scans ending at the last entry, dynamic-key ordering, canonical duplicate rejection, refusal traces, cancellation, physical allocation failures | `native_dynamic_maps.rs` |
-| Deleted-bucket hash maps, entry-advance validation | `native_hash_map_schema.rs` (hashbrown and standard-library maps) |
+| The one bucket traversal: every call against its charge rule (a window of controls admitted when the credit is spent, none inspected unadmitted), sparse and deletion-sparse tables ending at the last entry, every call and the completion refused and resumed with the cursor and its credit unchanged; dynamic-key ordering, canonical duplicate rejection, refusal traces, cancellation, physical allocation failures | `native_dynamic_maps.rs` |
+| Deleted-bucket hash maps; an entry offered to a field map refused | `native_hash_map_schema.rs` (hashbrown and standard-library maps) |
 | Nested dynamic tables as keys and values, derived-field composition, header-gap compaction, repeated refusal, canonical collisions, physical allocation failures | `native_nested_maps.rs` |
-| Batched sparse scanning, constant-work plain-data truncation, root map permuted in place under refusal at every preparation and emission step and published only once canonical, shorter-run merge scratch, early duplicate rejection, bytes-times-depth total work | `native_map_review.rs` |
+| Window-at-a-time vacant scanning, each window's admission refused and resumed at its exact position, constant-work plain-data truncation, root map permuted in place under refusal at every preparation and emission step and published only once canonical, shorter-run merge scratch, early duplicate rejection, bytes-times-depth total work | `native_map_review.rs` |
 | Literal composition, reordering, leading marks, decomposition, Hangul, radix ordering over both digits of the combining class | `native_text_matrix.rs` |
 | Long combining runs with linear turn limits | `native_text_matrix.rs::long_combining_run_requires_retained_progress_not_whole_run_admission` |
 | A 100,000-mark canonical sequence accepted, and rejected by one late disordered mark | `native_text_matrix.rs::long_valid_combining_sequence_is_accepted_and_one_late_disordered_mark_rejects_it` |
@@ -41,7 +41,7 @@ standard-library hash map and ordered-collection schemas.
 | Deadline expiration before and between admissions | `native_deadlines.rs` |
 | Source-contract defects classified apart from caller refusal; a caller refusal within a write keeps its class and paid prefix | `native_bound_defects.rs` |
 | Wrong-sized destinations refused before any admission, refused segments preserving prefix and position, checked work composition | `native_output_bounds.rs` |
-| Schema-contract defects (arena cap, counted heads, entry windows, endless nesting), publication in place within the retained bound | `../bounded_adversarial.rs`, `../bounded_extended.rs` |
+| Schema-contract defects (arena cap, counted heads, an entry offered to a field map, endless nesting), publication in place within the retained bound | `../bounded_adversarial.rs`, `../bounded_extended.rs` |
 | Measured step latency for payload decoding and normalization | `native_latency.rs` |
 | Large-operation quanta, typed copies, canonical semantics, shared recovery | `native_tests.rs` |
 | Concurrent retained decoding and exact capacity reacquisition | `native_schedules.rs::capacity_pool_survives_concurrent_success_and_every_refused_constructor` |
@@ -158,16 +158,26 @@ abort witnesses in both domains, and the tests chosen to reach what those
 do not. Every selection line is listed before any test runs and must name
 a test, by its full path or its module; no test is named twice. The tests
 that race threads (`race` lines) run once per seed, each seed one schedule.
-The union of the classes each model's runs reach must equal the native
-run's: a class the native run reaches and Miri does not is a missed unsafe
-transition. The gate publishes, per test, model, domain and seed, its
-outcome class (`pass`, `undefined_behavior`, `unsupported`, `failed`,
-`not_run`), seconds and peak memory in `results.tsv`, under its identity.
+The union of each model's runs' inventories must equal the native run's
+(`../gate`, `inventory`, `miri coverage`): the stop classes each matrix
+reaches and the boundary predicate valuations its runs reach
+(`src/bounded/boundary.rs`). A class or valuation the native run reaches and
+Miri does not is a missed unsafe transition or edge; one Miri alone reaches
+is a path the native evidence never took. The gate tool (`miri results`)
+publishes, per test,
+model, domain and seed, its outcome (`outcome::Outcome`: `pass`,
+`undefined_behavior`, `unsupported`, `memory_leaked`,
+`abnormal_termination`, `failed`, `not_run`), seconds and peak memory in
+`results.tsv`, a record under its identity, and fails the gate on any row
+that did not pass.
 
 `../reach-map.sh` holds the selection to its target: every function of a
 module holding `unsafe`, outside test code, reached by some test Miri runs,
 and the minimal witness sizes Miri runs executing every region the full
-sizes do. The gate refuses to run without a passing map of the same source
+sizes do and reaching exactly the boundary predicate valuations the full
+sizes reach (spec P3). The fast layer's matrices reach every valuation the
+exhaustive layer's do, checked natively under exhaustive rigor
+(`support::pipeline::matrix`). The gate refuses to run without a passing map of the same source
 and toolchain (`DCBOR_REACH_DIR`): set cover chose the fewest tests, so a
 map of other source says nothing of this one.
 
@@ -223,7 +233,7 @@ rounding. Joint witnesses are named runs, never positions in a suite.
 | `encoding::prepare_bound` | `src/bounded/encoding.rs::bound_tests::attribution` | coverage of every engine path, every engine path's total recorded, the shape walk's counts and admission, overflow |
 | `encoding::emit_bound` | `src/bounded/encoding/writer.rs`: a borrowed write, a caller-owned write (`encode_owned`) and publication in place | coverage of every plan shape, tightness on its worst plans |
 | `encode_bound` | composed from the walk (`walk_work`), `prepare_bound` and `emit_bound`; retains the plan's byte arena alone | monotone in every shape count (`src/bounded.rs::places`); every published encoding of `bounded_adversarial.rs` and `bounded_extended.rs` held within its retained bytes; erased controls before a map's last entry charged, the scan ending at its declared count, a refused run within the complete bound (`../hashbrown_scan.rs`) |
-| `encoding::buckets::bucket_bound` | `src/bounded/encoding/buckets.rs::attribution`: empty, sparse and dense tables, one bucket at a time and batched, the dense table's last entry in its last bucket | completion at the last entry (`enumeration_completes_at_the_last_entry`); the group scan (`next_full_bucket`) against the per-index scan in the hashbrown fork and in the forked standard library |
+| `encoding::buckets::bucket_bound` | `src/bounded/encoding/buckets.rs::attribution`: empty, sparse, dense and tombstoned tables enumerated by the one traversal, the dense table's last entry in its last bucket, every control admitted at most once | a window admitted once, its credit surviving refusal (`a_window_is_admitted_once_and_its_credit_survives_refusal`); completion at the last entry, the rest of the window forfeited (`enumeration_completes_at_the_last_entry`); the `Buckets` valuations each window crossed (`bucket_predicates_name_what_each_window_crossed`); the walk and the preparation each charging the same traversal (`encoding::bucket_work`, `PreparationPlace::Buckets`); the group scan (`next_full_bucket`) and `bucket_state` against the per-index scan in the hashbrown fork and in the forked standard library |
 | `scope_bound`, `copy_bound`, `borrow_bound`, `parse_bound`, `construction_bound` | `src/bounded/decode/construction.rs::attribution`: every operation at its operation's places, summed over the operations a run touches, and each task at its own places within its operation's task | turn limits |
 | `InPlace::COST` | at the construction's `Build` place in the owned lifecycle check | `reclamation_owner.rs::every_built_in_construction_is_within_its_cost`, `reclamation/schema.rs::every_derived_construction_is_within_its_cost` |
 | `typed_decode_bound`, `owned_prepare_bound` | composed from the bounds above | turn limits of every retained suite and fuzz target |

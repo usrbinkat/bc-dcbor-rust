@@ -50,15 +50,16 @@ fn fixture(source: &str, expected: &[u8]) {
         baseline.calls(),
         &[LimitRefusal::Storage],
         |stop, reason| {
-            encode_run(
+            let run = encode_run(
                 source,
                 expected,
                 Fault {
                     refusal: Refusal::For(stop, reason),
                     cancel: false,
                 },
-            )
-            .resumed(&baseline, stop, reason);
+            );
+            run.resumed(&baseline, stop, reason);
+            run.reached()
         },
     );
     // Independent decoder oracles.

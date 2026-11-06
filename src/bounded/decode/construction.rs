@@ -27,7 +27,7 @@ pub use operation::{Operation, Position};
 pub use parse::{DocumentDecoder, OwnedDocument, ParseDetail, ParsePhase, parse_bound};
 pub use reclamation::{
     Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, Reclaim, Reclaimed,
-    Reduction, ScopePosition, Written, scope_bound,
+    Reduction, ScopePosition, Uniform, Written, scope_bound,
 };
 
 pub fn node_at<'d, 'a, P>(document: &'d Document<'a, P>, index: usize) -> Option<Node<'d, 'a>> {

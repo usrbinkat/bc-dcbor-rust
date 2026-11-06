@@ -171,7 +171,8 @@ impl<'a> Bignum<'a> {
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         let digits = self.count();
-        let count = self.digits.len().min(DIGITS_PER_UNIT);
+        // At most a quantum of digit bytes: the emission's chunk holds them.
+        let count = Bound::new(Predicate::Quantum, DIGITS_PER_UNIT).clamp(a, self.digits.len());
         DIGITS.admit(a, widen(count * 8)?)?;
         match self.phase {
             Phase::Scan => {
@@ -214,7 +215,7 @@ impl<'a> Bignum<'a> {
                         }
                     }
                 }
-                staged.fill(&chunk[..filled])?;
+                staged.fill(&chunk[..filled], a)?;
                 Ok(self.digits.len() == 0)
             }
         }

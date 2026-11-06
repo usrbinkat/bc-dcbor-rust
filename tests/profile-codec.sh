@@ -2,7 +2,9 @@
 # Standalone codec evidence; no downstream workload or acceptance target.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-: "${TMPDIR:?set TMPDIR to the session scratch directory}"
+# shellcheck source=tests/gate-common.sh
+source tests/gate-common.sh
+: "${TMPDIR:?required: the profile log directory}"
 : "${DCBOR_CONFIGURATION:?run in the identified development shell}"
 logs="$(mktemp -d "$TMPDIR/dcbor-codec-profile.XXXXXX")"
 printf 'Codec profile logs: %s\n' "$logs"
@@ -16,24 +18,31 @@ for value in "$operations" "$repetitions" "${workers[@]}"; do
 	}
 done
 [[ "${#workers[@]}" -gt 0 ]] || exit 2
-snapshot() {
-	find src dcbor-derive/src -type f -name '*.rs' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
-	sha256sum Cargo.toml dcbor-derive/Cargo.toml examples/codec_profile.rs examples/reclamation_profile.rs tests/profile-codec.sh
-	for file in Cargo.lock flake.nix flake.lock nix/btree-in-place.patch; do
-		if [[ -f "$file" ]]; then sha256sum "$file"; fi
-	done
-}
+# The profile is evidence of the source it started on: every gate's one
+# input closure (tests/gate-common.sh, `source_identity`), checked unchanged
+# after every run, the difference written when it moved.
 unchanged() {
-	snapshot >"$logs/current-source.sha256"
-	diff -u "$logs/source.sha256" "$logs/current-source.sha256" >"$logs/source-diff.log"
+	if ! same_source "$logs"; then
+		source_identity >"$logs/current-identity-inputs.txt"
+		diff -u "$logs/identity-inputs.txt" "$logs/current-identity-inputs.txt" >"$logs/source-diff.log" || true
+		return 1
+	fi
 }
+# The profile's identity: the gates' one identity, with its dimensions, its
+# build and every variable cargo reads for it.
 {
-	printf 'configuration=%s\n' "$DCBOR_CONFIGURATION"
-	printf 'operations=%s repetitions=%s workers=%s processes_per_case=3\n' "$operations" "$repetitions" "${workers[*]}"
-	printf 'features=default profile=release allocator=System\n'
+	printf 'operations\t%s\trepetitions\t%s\tworkers\t%s\tprocesses_per_case\t3\n' \
+		"$operations" "$repetitions" "${workers[*]}"
+	printf 'features\tdefault\tprofile\trelease\tallocator\tSystem\n'
+	for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET CARGO_TARGET_DIR CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS; do
+		printf '%s\t%s\n' "$name" "${!name-}"
+	done
+} | identity "$logs"
+printf 'Codec profile identity: %s\n' "$(cat "$logs/identity.txt")"
+# The host the measurements were taken on, beside the identity: the
+# measurements depend on it, the source's evidence does not.
+{
 	date -u
-	rustc -Vv
-	cargo -V
 	uname -a
 	if command -v lscpu >/dev/null; then lscpu; fi
 	for file in /sys/devices/system/cpu/smt/active /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -42,11 +51,7 @@ unchanged() {
 			cat "$file"
 		fi
 	done
-	for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET CARGO_TARGET_DIR CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS; do
-		printf '%s=%s\n' "$name" "${!name-}"
-	done
-} >"$logs/environment.log" 2>&1
-snapshot >"$logs/source.sha256"
+} >"$logs/host.log" 2>&1
 printf 'STARTED\n' >"$logs/results.txt"
 # The exit status every run ends with, recorded beside its results.
 finished() {

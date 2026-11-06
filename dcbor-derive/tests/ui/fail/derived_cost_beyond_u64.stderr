@@ -1,0 +1,21 @@
+error[E0080]: evaluation panicked: a construction cost exceeds u64
+  --> tests/ui/fail/derived_cost_beyond_u64.rs:11:10
+   |
+11 | #[derive(dcbor::CBORBoundedDecodable)]
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_::<impl dcbor::bounded::decode::construction::in_place::InPlace<dcbor::bounded::Limits> for Pair<huge::Huge>>::COST::{constant#0}` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the derive macro `dcbor::CBORBoundedDecodable` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui/fail/derived_cost_beyond_u64.rs:11:10
+   |
+11 | #[derive(dcbor::CBORBoundedDecodable)]
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this note originates in the macro `dcbor::const_cost` which comes from the expansion of the derive macro `dcbor::CBORBoundedDecodable` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui/fail/derived_cost_beyond_u64.rs:20:13
+   |
+20 |     let _ = <Pair<huge::Huge> as InPlace<Limits>>::COST;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

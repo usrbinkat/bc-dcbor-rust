@@ -1,4 +1,4 @@
-use hashbrown::HashTable;
+use dcbor::hashbrown::HashTable;
 
 #[derive(dcbor::CBORBoundedEncodable)]
 struct Record<T> {

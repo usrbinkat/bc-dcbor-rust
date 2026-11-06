@@ -145,7 +145,7 @@ impl std::hash::Hasher for Last {
 /// window admitted before it is inspected: a large table whose one entry lies
 /// in its last bucket is refused under a budget short of that scan, holding
 /// nothing. A table of no entries ends at its head, whatever its size: its
-/// walk asks for no window, only the map's end.
+/// enumeration completes at once, inspecting no control.
 #[test]
 #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
 fn sparse_hash_map_iteration_is_admitted() {
@@ -167,9 +167,23 @@ fn sparse_hash_map_iteration_is_admitted() {
     let empty = HashMap::<u64, u64, Hashed>::with_capacity_and_hasher(100_000, Hashed::default());
     let source: &dyn Schema = &empty;
     let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
+    // A counted map of no entries ends at its head, before its table is asked
+    // for, in the walk as in the preparation: no table is counted.
     assert_eq!(
-        shape.dynamic, 1,
-        "an empty map's walk asks only for its end"
+        (shape.bucket_tables, shape.buckets, shape.bucket_entries),
+        (0, 0, 0),
+        "an empty map ends at its head"
+    );
+    let mut limits = Limits::unlimited();
+    let mut cursor = encoding::buckets::BucketCursor::new();
+    assert!(matches!(
+        cursor.step(&empty as &dyn encoding::buckets::Buckets, &mut limits),
+        Ok(encoding::buckets::BucketStep::Complete)
+    ));
+    assert_eq!(
+        limits.used(),
+        WriteWork::new(1, 0),
+        "an empty map's enumeration inspected a control"
     );
     let mut limits = policy();
     let encoded = encode(&empty, &mut limits).unwrap();

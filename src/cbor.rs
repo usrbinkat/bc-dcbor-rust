@@ -1,16 +1,12 @@
 import_stdlib!();
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(all(not(feature = "multithreaded"), not(feature = "std")))]
-use alloc::rc::Rc as RefCounted;
-#[cfg(all(feature = "multithreaded", not(feature = "std")))]
-use alloc::sync::Arc as RefCounted;
-#[cfg(all(not(feature = "multithreaded"), feature = "std"))]
-use std::rc::Rc as RefCounted;
-#[cfg(all(feature = "multithreaded", feature = "std"))]
-use std::sync::Arc as RefCounted;
+/// The pointer a [`CBOR`] shares its case through: `Arc` under the
+/// `multithreaded` feature, `Rc` otherwise, each the standard library's or
+/// `alloc`'s as the build selects ([`crate::stdlib`]).
+#[cfg(not(feature = "multithreaded"))]
+type RefCounted<T> = Rc<T>;
+#[cfg(feature = "multithreaded")]
+type RefCounted<T> = Arc<T>;
 
 use unicode_normalization::UnicodeNormalization;
 

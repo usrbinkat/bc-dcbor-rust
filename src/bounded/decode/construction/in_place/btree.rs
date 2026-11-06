@@ -4,12 +4,15 @@ extern crate alloc;
 mod cleanup;
 mod cost;
 use super::*;
+use crate::bounded::boundary::{Bound, Predicate, Valuation, boundary, units};
 use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place};
 use crate::bounded::decode::construction::stable::{self, Installed};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::storage::{Storage, StoragePosition};
+use crate::sync::{Atomics, Representation};
 use alloc::collections::{BTreeMap, btree_map::InPlaceNode};
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::{ManuallyDrop, MaybeUninit, size_of};
 use core::ptr::addr_of_mut;
@@ -37,7 +40,7 @@ pub unsafe trait TreeKey: Ord {
 // records cover every initialized prefix. Publication never moves a child.
 // A build from any phase past publication is refused and changes nothing.
 unsafe impl<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator> InPlace<A> for BTreeMap<K, V> {
-    const COST: ConstructionCost = cost::cost::<K, V, A>();
+    const COST: ConstructionCost = crate::const_cost!(cost::cost::<K, V, A>());
     fn build_step(
         document: &Document<'_, A::Permit>,
         index: usize,
@@ -226,6 +229,19 @@ pub struct State<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
 
 type MetadataBlock<K, V, A> = Installed<MaybeUninit<Meta<K, V, A>>, <A as Allocator>::Permit>;
 
+impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Representation for Meta<K, V, A> {
+    type In<S: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds
+/// ([`stable::Contract`]): the permit alone written, every field following
+/// in a unit of its own; and the whole block. The one definition its
+/// installation and the tree's cost read.
+const fn contract<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>()
+-> stable::Contract<(), MaybeUninit<Meta<K, V, A>>, A::Permit> {
+    stable::Contract::of()
+}
+
 /// What a tree's construction holds, by stage: no metadata block, with the
 /// admissions held toward it; the block held with a prefix of its fields
 /// written, each a plain value or an empty arena released with the block;
@@ -352,6 +368,7 @@ fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
         // admitted unit of its own.
         unsafe {
             stable::install::<MaybeUninit<Meta<K, V, A>>, (), A>(
+                const { contract::<K, V, A>() },
                 &mut state.meta,
                 &mut state.admitted,
                 // Uninitialized bytes already form a valid MaybeUninit. Do
@@ -432,8 +449,14 @@ fn compare<K: TreeKey, A: Allocator>(
     match (left, right) {
         (TreeKeyView::Integer(l), TreeKeyView::Integer(r)) => Ok(Some(l.cmp(&r))),
         (TreeKeyView::Bytes(l), TreeKeyView::Bytes(r)) => {
-            let common = l.len().min(r.len());
-            let end = common.min(offset.saturating_add(32));
+            const WINDOW: usize = 32;
+            let common = Bound::new(Predicate::Payload, r.len()).clamp(a, l.len());
+            if *offset == 0 {
+                // The comparison windows the shorter key spans.
+                boundary!(a, Predicate::KeySpan => units(common.div_ceil(WINDOW)));
+            }
+            let end =
+                Bound::new(Predicate::Payload, common).clamp(a, offset.saturating_add(WINDOW));
             let ordering = l[*offset..end].cmp(&r[*offset..end]);
             *offset = end;
             Ok(if ordering != Ordering::Equal {
@@ -446,6 +469,92 @@ fn compare<K: TreeKey, A: Allocator>(
         }
         _ => Err(wrong_type()),
     }
+}
+
+/// The most entries a tree one level taller holds than one holding at most
+/// `maximum`: a node of `CAPACITY + 1` children of `maximum` each and
+/// `CAPACITY` keys between them, `(maximum + 1) * 12 - 1` for this node
+/// representation; saturated at `usize::MAX`, which no count exceeds. The one
+/// recurrence construction's `Height` phase and [`planned`] raise a tree's
+/// height by.
+const fn raised(maximum: usize) -> usize {
+    match maximum.checked_add(1) {
+        Some(n) => match n.checked_mul(12) {
+            Some(n) => n - 1,
+            None => usize::MAX,
+        },
+        None => usize::MAX,
+    }
+}
+
+/// A tree's occupancy class: whether it is empty, and otherwise its height.
+/// Every branch planning and building a tree of a count takes is selected
+/// by these alone. Construction branches on emptiness (`PlanRoot` publishes
+/// an empty map at once), on the height (the `Height` loop, leaf against
+/// internal in [`shape`], [`Shape::rank`] and the node's layout) and on root
+/// against non-root, which the height fixes per level; every other
+/// condition is a loop bound over a node's keys, edges or slots, each taken
+/// for every nonempty tree. The fork's node code (`InPlaceNode`) branches
+/// only on leaf against internal. The arithmetic within a class, every
+/// node's keys, span and ranks for each count, is certified for every count
+/// separately ([`planned`], its tests), so one tree per class, and the
+/// counts on each side of a class's edge, witness every planning path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Occupancy {
+    Empty,
+    Height(u8),
+}
+
+/// The occupancy class of a tree of `count` entries ([`Occupancy`]).
+pub fn occupancy(count: usize) -> Occupancy {
+    if count == 0 {
+        Occupancy::Empty
+    } else {
+        Occupancy::Height(planned(count).0)
+    }
+}
+
+/// The boundary valuation of a tree of `count` entries planned at `height`
+/// ([`Predicate::TreeOccupancy`]): its occupancy class ([`Occupancy`]), the
+/// event every planning path is selected by.
+fn occupancy_valuation(count: usize, height: u8) -> Valuation {
+    match (count, height) {
+        (0, _) => Valuation::Empty,
+        (_, 0) => Valuation::Height0,
+        (_, 1) => Valuation::Height1,
+        (_, 2) => Valuation::Height2,
+        _ => Valuation::Taller,
+    }
+}
+
+/// The height and every node's shape construction plans for a tree of
+/// `count` entries: the height raised by [`raised`] until `count` fits, as
+/// the `Height` phase does, then the root planned by [`shape`], as
+/// `PlanRoot` does, and each internal node's children by [`Shape::child`],
+/// as `Expand` does. The root comes first; the rest follow in a walk of the
+/// tree, not construction's breadth-first order, on which nothing here
+/// depends.
+pub(crate) fn planned(count: usize) -> (u8, Vec<Shape>) {
+    let (mut height, mut maximum, mut child_max) = (0u8, InPlaceNode::<(), ()>::CAPACITY, 0);
+    while count > maximum {
+        child_max = maximum;
+        maximum = raised(maximum);
+        height += 1;
+    }
+    let mut shapes = Vec::new();
+    if count == 0 {
+        return (height, shapes);
+    }
+    let mut pending = Vec::from([shape(count, 0, height, child_max, true)]);
+    while let Some(node) = pending.pop() {
+        if node.height > 0 {
+            for edge in 0..=usize::from(node.keys) {
+                pending.push(node.child(edge));
+            }
+        }
+        shapes.push(node);
+    }
+    (height, shapes)
 }
 
 fn shape(span: usize, first: usize, height: u8, child_max: usize, root: bool) -> Shape {
@@ -501,7 +610,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
     a: &mut A,
 ) -> ConstructResult<Built, A> {
     let (place, state) = slot.parts();
-    if state.initialized < INIT {
+    if Bound::new(Predicate::Prefix, INIT).below(a, state.initialized) {
         initialize(state, a)?;
         return Ok(Built::Progress);
     }
@@ -517,7 +626,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             m.phase = Phase::Gather;
         }
         Phase::Gather => {
-            if m.order[0].len() == m.count {
+            if boundary!(a, Predicate::ArenaLength, m.order[0].len(), m.count).is_eq() {
                 STEP.admit(a)?;
                 m.sort.width = 1;
                 m.phase = Phase::SortStart;
@@ -543,12 +652,13 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::SortStart => {
             STEP.admit(a)?;
-            if m.sort.width >= m.count {
+            let runs = Bound::new(Predicate::ArenaLength, m.count);
+            if runs.reached(a, m.sort.width) {
                 m.phase = Phase::Height;
             } else {
                 let s = &mut m.sort;
-                s.mid = m.count.min(s.left.saturating_add(s.width));
-                s.end = m.count.min(s.mid.saturating_add(s.width));
+                s.mid = runs.clamp(a, s.left.saturating_add(s.width));
+                s.end = runs.clamp(a, s.mid.saturating_add(s.width));
                 s.i = s.left;
                 s.j = s.mid;
                 s.out = s.left;
@@ -613,21 +723,17 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Height => {
             STEP.admit(a)?;
-            if m.count <= m.maximum {
+            if Bound::new(Predicate::TreeOccupancy, m.maximum).admits(a, m.count) {
                 m.phase = Phase::PlanRoot;
             } else {
                 m.pending_shape.child_max = m.maximum;
-                m.maximum = m
-                    .maximum
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(12))
-                    .and_then(|n| n.checked_sub(1))
-                    .unwrap_or(usize::MAX);
+                m.maximum = raised(m.maximum);
                 m.height += 1;
             }
         }
         Phase::PlanRoot => {
             STEP.admit(a)?;
+            boundary!(a, Predicate::TreeOccupancy => occupancy_valuation(m.count, m.height));
             if m.count == 0 {
                 m.phase = Phase::Publish;
             } else {
@@ -671,7 +777,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             };
             const { cost::link::<K, V>() }.admit(a)?;
             let nodes = nodes.as_mut_slice();
-            if nodes.len() > 1 {
+            if boundary!(a, Predicate::ArenaLength, nodes.len(), 1).is_gt() {
                 let parent = &nodes[m.parent];
                 // SAFETY: the new allocation is unparented and one level below
                 // its parent; this edge is initialized exactly once.
@@ -695,7 +801,15 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
                 m.phase = Phase::Entry;
             } else {
                 let node = &nodes.as_slice()[m.parent];
-                if node.shape.height == 0 || node.shape.edge > node.shape.keys {
+                if node.shape.height == 0
+                    || boundary!(
+                        a,
+                        Predicate::TreeOccupancy,
+                        node.shape.edge,
+                        node.shape.keys
+                    )
+                    .is_gt()
+                {
                     m.parent += 1;
                 } else {
                     m.pending_shape = node.shape.child(usize::from(node.shape.edge));
@@ -817,6 +931,146 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
     Ok(Built::Progress)
 }
 
+/// The plan's certification: for every count, the shapes construction plans
+/// form the tree `BTreeMap::from_in_place` requires, so the occupancy
+/// classes ([`Occupancy`]) need one witness per class end to end.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use alloc::format;
+
+    /// The fewest keys a node other than the root holds: the standard
+    /// occupancy, `B - 1` of a node of `CAPACITY = 2B - 1` keys.
+    const MINIMUM: usize = (InPlaceNode::<(), ()>::CAPACITY - 1) / 2;
+
+    /// Every way the plan `(height, shapes)` for `count` entries fails the
+    /// tree `from_in_place` requires: the root first, spanning every entry;
+    /// every node within capacity, every node but the root at the standard
+    /// occupancy and the root holding a key; a leaf's span its keys; an
+    /// internal node's children one level lower, contiguous, each key ranked
+    /// between the two children beside it, their spans and its keys its own
+    /// span; and the keys, over every node, exactly the entries, each ranked
+    /// once.
+    fn violations(count: usize, height: u8, shapes: &[Shape]) -> Vec<String> {
+        let mut found = Vec::new();
+        let capacity = InPlaceNode::<(), ()>::CAPACITY;
+        if count == 0 {
+            if !shapes.is_empty() {
+                found.push(format!("{count}: an empty tree plans nodes"));
+            }
+            return found;
+        }
+        let root = shapes[0];
+        if root.span != count || root.first != 0 || root.height != height {
+            found.push(format!("{count}: the root is {root:?}"));
+        }
+        let mut ranks = Vec::new();
+        for (at, node) in shapes.iter().enumerate() {
+            let keys = usize::from(node.keys);
+            if keys > capacity {
+                found.push(format!("{count}: {node:?} exceeds the capacity"));
+            }
+            if at == 0 && keys == 0 {
+                found.push(format!("{count}: the root holds no key"));
+            }
+            if at != 0 && keys < MINIMUM {
+                found.push(format!("{count}: {node:?} is below the standard occupancy"));
+            }
+            for slot in 0..keys {
+                ranks.push(node.rank(slot));
+            }
+            if node.height == 0 {
+                if node.span != keys {
+                    found.push(format!(
+                        "{count}: the leaf {node:?} spans other than its keys"
+                    ));
+                }
+                continue;
+            }
+            let mut spanned = keys;
+            let mut next = node.first;
+            for edge in 0..=keys {
+                let child = node.child(edge);
+                if child.height + 1 != node.height || child.first != next {
+                    found.push(format!("{count}: {node:?} edge {edge} plans {child:?}"));
+                }
+                spanned += child.span;
+                next = child.first + child.span;
+                if edge < keys {
+                    if node.rank(edge) != next {
+                        found.push(format!(
+                            "{count}: {node:?} key {edge} is not ranked after edge {edge}"
+                        ));
+                    }
+                    next += 1;
+                }
+            }
+            if spanned != node.span || next != node.first + node.span {
+                found.push(format!(
+                    "{count}: {node:?} spans other than its children and keys"
+                ));
+            }
+        }
+        ranks.sort_unstable();
+        if ranks != (0..count).collect::<Vec<_>>() {
+            found.push(format!("{count}: the keys are not each entry ranked once"));
+        }
+        found
+    }
+
+    /// Every count through 20,000, four heights, plans a tree
+    /// `from_in_place` accepts, and its occupancy class is its height; the
+    /// height rises exactly where `raised` says.
+    #[test]
+    fn every_count_plans_a_valid_tree_of_its_occupancy() {
+        let mut maximum = InPlaceNode::<(), ()>::CAPACITY;
+        let mut height = 0u8;
+        for count in 0..=20_000usize {
+            if count > maximum {
+                maximum = raised(maximum);
+                height += 1;
+            }
+            let (planned_height, shapes) = planned(count);
+            let found = violations(count, planned_height, &shapes);
+            assert!(found.is_empty(), "{found:#?}");
+            assert_eq!(planned_height, height, "{count}");
+            let expected = if count == 0 {
+                Occupancy::Empty
+            } else {
+                Occupancy::Height(height)
+            };
+            assert_eq!(occupancy(count), expected, "{count}");
+        }
+        assert_eq!(height, 3, "the counts reach a fourth level");
+        assert_eq!(raised(usize::MAX), usize::MAX);
+    }
+
+    /// The plan check's planted controls: a root holding a key more than it
+    /// spans, a child's span moved to its sibling, and a node below the
+    /// standard occupancy are each refused.
+    #[test]
+    fn a_planted_plan_defect_is_refused() {
+        let (height, shapes) = planned(144);
+        let mut extra = shapes.clone();
+        extra[0].keys += 1;
+        assert!(
+            !violations(144, height, &extra).is_empty(),
+            "an extra root key"
+        );
+        let mut moved = shapes.clone();
+        moved[0].span -= 1;
+        assert!(!violations(144, height, &moved).is_empty(), "a span moved");
+        let mut sparse = shapes;
+        let last = sparse.len() - 1;
+        sparse[last].keys = 1;
+        sparse[last].span = 1;
+        assert!(
+            !violations(144, height, &sparse).is_empty(),
+            "a sparse node"
+        );
+    }
+}
+
 /// The tree's declared cost against what its whole construction and cleanup
 /// measure, recorded exactly ([`places::Tightness`]): a change to the cost's
 /// arithmetic, in either direction, changes a recorded ratio and fails the
@@ -859,9 +1113,11 @@ mod attribution {
         let mut parser = Ledgered::new();
         let document = decode(wire, 8, &mut parser).expect("the map decodes");
         // The tree's `COST`, evaluated here at run time: the engine evaluates
-        // it only in constants, which coverage does not observe.
+        // it only in constants, which coverage does not observe. Composed at
+        // run time, an overflow is a refusal ([`BoundedError::Overflow`]).
         let cost = cost::cost::<K, u64, Ledgered>()
-            .bound::<()>(wire.len() as u64)
+            .ok_or(BoundedError::<()>::Overflow)
+            .and_then(|cost| cost.bound::<()>(wire.len() as u64))
             .expect("the cost of a fixture fits in u64");
         let mut policy = Ledgered::new();
         let mut destination = MaybeUninit::<BTreeMap<K, u64>>::uninit();

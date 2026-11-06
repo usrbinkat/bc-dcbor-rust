@@ -6,8 +6,12 @@
 //! as `[T; N]` encodes.
 extern crate alloc;
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Peek, Place};
+use crate::bounded::boundary::{Bound, Predicate, boundary};
+use crate::bounded::decode::construction::reclamation::{
+    Admitted, Custody, Peek, Place, Reduction, Uniform,
+};
 use crate::bounded::decode::construction::stable::{self, Installed, Stack};
+use crate::sync::{Atomics, Representation};
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
 use core::ptr::{self, NonNull};
@@ -59,10 +63,21 @@ struct Meta<E, P> {
     payload: MaybeUninit<Option<P>>,
 }
 
-/// Acquisition writes the header, whole, and the allocation permit. The
-/// payload slot has no initialized bytes until `Initializing` advances.
-const fn metadata<E, P>() -> stable::Metadata {
-    stable::Metadata::header::<Head<E, P>, Meta<E, P>, P>()
+impl<E, P> Representation for Head<E, P> {
+    type In<S: Atomics> = Self;
+}
+
+impl<E, P> Representation for Meta<E, P> {
+    type In<S: Atomics> = Self;
+}
+
+/// What the metadata block's acquisition admits and holds
+/// ([`stable::Contract`]): the header, whole, and the allocation permit
+/// written, the payload slot holding no initialized bytes until
+/// `Initializing` advances; and the whole block. The one definition its
+/// installation and the sequence's cost read.
+const fn contract<E, P>() -> stable::Contract<Head<E, P>, Meta<E, P>, P> {
+    stable::Contract::of()
 }
 
 /// The construction state of a sequence whose elements' states are `E`, with
@@ -152,6 +167,90 @@ impl<E: Custody, P> Custody for State<E, P> {
                 element: child.state.state.observe(),
             }),
         })
+    }
+}
+
+/// The cleanup classes of a sequence ([`Reduction`]), `C` its elements'
+/// class. A written container's classes keep what its cleanup reads:
+/// whether its payload's permit is held, the elements committed, and the
+/// newest record's element, whether committed and its class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SequenceClass<C> {
+    /// No metadata: one unit completes cleanup.
+    Unallocated,
+    /// The block alone, its payload slot unwritten: released without
+    /// admission, completing cleanup.
+    Initializing,
+    /// No container written: one unit marks it freed.
+    Empty,
+    /// The container written, in any phase before cleanup: one unit enters
+    /// cleanup, keeping everything else.
+    Written {
+        payload: bool,
+        committed: usize,
+        newest: Option<(bool, C)>,
+    },
+    /// In cleanup: the newest record's element reclaimed, popped, then the
+    /// next; with none, the container released.
+    Reclaim {
+        payload: bool,
+        committed: usize,
+        newest: Option<(bool, C)>,
+    },
+    /// The container released: the permit, if held, and the metadata are
+    /// released without admission, completing cleanup.
+    Freed { payload: bool },
+}
+
+// Cleanup (`reclaim`) reads the metadata's presence and the phase, grouped as
+// above; in `Reclaim`, the newest record's element through its own cleanup,
+// then, once it is done, whether that record was committed (its slot leaves
+// the committed prefix) and the committed count (the container is released
+// only with none). Only the newest record can be uncommitted: a record is
+// pushed in `Next` once the one before it is committed. So every record below
+// the newest holds a committed element, complete, and of the elements' one
+// complete class ([`Uniform`]): the committed count and the newest record fix
+// every record. The element's own relation is a simulation of its cleanup,
+// and a record is popped exactly when its element's cleanup reports done,
+// after which the newest is the committed record below it, of the complete
+// class, or none. The payload's permit is released in `Freed` without
+// admission and never read before. The document position, the admissions
+// held toward the next record and the records' count (the committed count and
+// whether the newest is uncommitted) are never read by cleanup apart from
+// what the class keeps, so the relation is a simulation of cleanup.
+impl<E: Uniform, P> Reduction for State<E, P> {
+    type Class = SequenceClass<E::Class>;
+
+    fn class(observation: &Self::Observation) -> Self::Class {
+        let custody = match observation {
+            SequenceObservation::Unallocated(_) => return SequenceClass::Unallocated,
+            SequenceObservation::Held(custody) => custody,
+        };
+        let newest = custody
+            .newest
+            .map(|newest| (newest.committed, E::class(&newest.element)));
+        let (payload, committed) = (custody.payload, custody.committed);
+        match custody.phase {
+            Phase::Initializing => SequenceClass::Initializing,
+            Phase::Empty => SequenceClass::Empty,
+            Phase::BufferFreed => SequenceClass::Freed { payload },
+            Phase::Reclaim => SequenceClass::Reclaim {
+                payload,
+                committed,
+                newest,
+            },
+            Phase::Initialized
+            | Phase::ReleasePayload
+            | Phase::AllocatePayload
+            | Phase::Next
+            | Phase::Child
+            | Phase::Commit
+            | Phase::Complete => SequenceClass::Written {
+                payload,
+                committed,
+                newest,
+            },
+        }
     }
 }
 
@@ -327,42 +426,33 @@ unsafe impl<T, const N: usize> Sequence<T> for [T; N] {
 /// release and the metadata's. Per element, each at least one byte: its
 /// custody record, held, and its commit; its record's release; and its
 /// storage, held when it is not the destination's own. The elements' own
-/// costs compose as children ([`ConstructionCost::children`]).
-const fn sequence_cost<T, Q: Sequence<T>, E, P>(element: ConstructionCost) -> ConstructionCost {
-    let meta = size_of::<stable::Held<Meta<E, P>, P>>();
-    let child = stable::Metadata::whole::<stable::Child<Element<E>, P>, P>().bytes();
+/// costs compose as children ([`ConstructionCost::checked_children`]). None
+/// when a quantity does not fit in `u64`.
+const fn sequence_cost<T, Q: Sequence<T>, E, P>(
+    element: ConstructionCost,
+) -> Option<ConstructionCost> {
+    let meta = contract::<E, P>();
+    let child = Stack::<Element<E>, P>::RECORD;
     let release = stable::release_cost::<P>();
     let storage = if Q::INLINE { 0 } else { size_of::<T>() };
     let payload = if Q::INLINE {
         ConstructionCost::ZERO.fixed
     } else {
-        plus(STEP_COST, release)
+        cost!(STEP_COST.checked_add(release))
     };
-    let build = plus(
-        plus(
-            plus(
-                stable::acquire_cost(metadata::<E, P>()),
-                sized::<Option<P>>().bound(),
-            ),
-            Q::HEADER.bound(),
-        ),
-        plus(payload, STEP_COST),
+    let header = cost!(
+        cost!(meta.write().checked_add(sized::<Option<P>>().bound()))
+            .checked_add(Q::HEADER.bound())
     );
+    let build = cost!(header.checked_add(cost!(payload.checked_add(STEP_COST))));
     // The transition, the container's release and the metadata's.
-    let cleanup = plus(plus(STEP_COST, Q::RELEASE.bound()), release);
-    let each = plus(
-        plus(
-            plus(
-                stable::install_cost::<stable::Child<Element<E>, P>, P>(),
-                STEP_COST,
-            ),
-            release,
-        ),
-        plus(held(child), held(storage)),
-    );
-    ConstructionCost::fixed(plus(plus(build, cleanup), held(meta)))
-        .plus(ConstructionCost::per_byte(each))
-        .plus(element.children())
+    let cleanup = cost!(cost!(STEP_COST.checked_add(Q::RELEASE.bound())).checked_add(release));
+    let record = cost!(cost!(child.write().checked_add(STEP_COST)).checked_add(release));
+    let each = cost!(record.checked_add(cost!(held(child.block()).checked_add(held(storage)))));
+    let fixed = cost!(cost!(build.checked_add(cleanup)).checked_add(held(meta.block())));
+    let per_byte = cost!(ConstructionCost::checked_per_byte(each));
+    let own = cost!(ConstructionCost::fixed(fixed).checked_add(per_byte));
+    own.checked_add(cost!(element.checked_children()))
 }
 
 /// One admitted construction unit of sequence `Q` in `slot` from the array
@@ -385,6 +475,7 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
         // until the next phase.
         unsafe {
             stable::install::<Meta<T::State, A::Permit>, Head<T::State, A::Permit>, A>(
+                const { contract::<T::State, A::Permit>() },
                 &mut state.meta,
                 &mut state.admitted,
                 || Head {
@@ -465,7 +556,7 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
             state.phase = Phase::Next;
         }
         Phase::Next => {
-            if meta.head.committed == count {
+            if boundary!(a, Predicate::ArenaLength, meta.head.committed, count).is_eq() {
                 STEP.admit(a)?;
                 state.phase = Phase::Complete;
                 return Ok(Built::Done);
@@ -484,7 +575,7 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
             // The element's slot lies within the storage reserved: a count
             // read at a later step that would pass it is refused here, before
             // any place outside the storage exists.
-            if meta.head.committed >= capacity {
+            if Bound::new(Predicate::ArenaLength, capacity).reached(a, meta.head.committed) {
                 return Err(BoundedError::PlanMismatch.into());
             }
             let child = meta.head.children.top().ok_or(BoundedError::PlanMismatch)?;
@@ -573,10 +664,10 @@ fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
             };
             let committed = child.state.committed;
             let slot = if committed {
-                meta.head
-                    .committed
-                    .checked_sub(1)
-                    .ok_or(BoundedError::PlanMismatch)?
+                if boundary!(a, Predicate::ArenaLength, meta.head.committed, 0).is_eq() {
+                    return Err(BoundedError::PlanMismatch);
+                }
+                meta.head.committed - 1
             } else {
                 meta.head.committed
             };
@@ -663,7 +754,8 @@ fn remaining<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
 // child in final storage; a child record is pushed before its element acquires
 // anything and describes that element until reclamation, including partials.
 unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for Vec<T> {
-    const COST: ConstructionCost = sequence_cost::<T, Self, T::State, A::Permit>(T::COST);
+    const COST: ConstructionCost =
+        crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
 
     fn build_step(
         document: &Document<'_, A::Permit>,
@@ -692,7 +784,8 @@ unsafe impl<T: Reclaim<A>, A: Allocator> Reclaim<A> for Vec<T> {
 
 // SAFETY: as for Vec, with each element built in the destination's own slot.
 unsafe impl<T: InPlace<A>, A: Allocator, const N: usize> InPlace<A> for [T; N] {
-    const COST: ConstructionCost = sequence_cost::<T, Self, T::State, A::Permit>(T::COST);
+    const COST: ConstructionCost =
+        crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
 
     fn build_step(
         document: &Document<'_, A::Permit>,
@@ -733,9 +826,9 @@ mod tests {
     // full-size permit without Reservation's pointer niche, including its
     // stronger alignment on targets that give it 16-byte alignment.
     fn layouts<E, P>() {
-        let _ = const { metadata::<E, P>() };
+        let _ = const { contract::<E, P>() };
         let _ = const { sized::<Option<P>>() };
-        let _ = const { stable::Metadata::whole::<stable::Child<Element<State<E, P>>, P>, P>() };
+        let _ = const { Stack::<Element<State<E, P>>, P>::RECORD };
     }
 
     #[test]
@@ -746,7 +839,9 @@ mod tests {
         layouts::<Written, [u8; 16]>();
         layouts::<Written, u128>();
         layouts::<State<Written, u128>, u128>();
-        let cost = const { sequence_cost::<u8, Vec<u8>, Written, u128>(ConstructionCost::ZERO) };
+        let cost = crate::const_cost!(sequence_cost::<u8, Vec<u8>, Written, u128>(
+            ConstructionCost::ZERO
+        ));
         assert!(cost.bound::<()>(1).is_ok());
     }
 
@@ -758,14 +853,16 @@ mod tests {
     #[test]
     fn a_vectors_cost_exceeds_an_arrays_by_its_own_storage() {
         let element = <u64 as InPlace<Limits>>::COST;
-        let vector = sequence_cost::<u64, Vec<u64>, Written, Reservation>(element);
-        let array = sequence_cost::<u64, [u64; 3], Written, Reservation>(element);
+        let vector = sequence_cost::<u64, Vec<u64>, Written, Reservation>(element)
+            .expect("a vector's cost fits in u64");
+        let array = sequence_cost::<u64, [u64; 3], Written, Reservation>(element)
+            .expect("an array's cost fits in u64");
         assert_eq!(vector, <Vec<u64> as InPlace<Limits>>::COST);
         assert_eq!(array, <[u64; 3] as InPlace<Limits>>::COST);
-        assert_eq!(
-            metadata::<Written, Reservation>().bytes(),
-            const { metadata::<Written, Reservation>() }.bytes()
-        );
+        let meta = contract::<Written, Reservation>();
+        let constant = const { contract::<Written, Reservation>() };
+        assert_eq!(meta.write(), constant.write());
+        assert_eq!(meta.block(), constant.block());
         assert_eq!(
             vector.per_byte.allocated - array.per_byte.allocated,
             PER_BYTE_SCALE * size_of::<u64>() as u64,

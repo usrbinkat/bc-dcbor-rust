@@ -19,3 +19,8 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 dcbor = { path = "..", features = ["derive"] }
 rustversion = "1"
 trybuild = "1"
+
+# The workspace's one lint policy: an unknown cfg is a defect, and the
+# derive crate names no model checker's (tests/unsafe_census.rs).
+[lints]
+workspace = true

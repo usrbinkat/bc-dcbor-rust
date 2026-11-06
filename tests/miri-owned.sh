@@ -37,13 +37,20 @@
 # Both modes require DCBOR_REACH_DIR, a passing reach map of this source and
 # toolchain (tests/reach-map.sh), checked before anything runs. The gate
 # lists every selection line first and runs nothing unless each names a
-# test; it publishes its outcome per test, model and domain in
-# results.tsv under its identity.
+# test. Every run is classified, every row written and the verdict given by
+# the gate tool (tests/gate: `classify cargo`, `classify miri`, `miri
+# results`), which publishes results.tsv under the run's identity.
+#
+# The judge requires a clean tree: it judges the commit, applying each
+# mutant to a copy of it made by `git archive` (tests/gate-common.sh,
+# `copy_of`), never to the checkout, and the gate tool decides whether the
+# baseline holds each mutant's tests and what the runs show (`miri
+# baseline`, `miri judge`).
 #
 # Usage:
 #   tests/miri-owned.sh                          the gate
 #   tests/miri-owned.sh --judge PLAN OUT BASELINE
-#       judge the mutants of PLAN (tests/mutation-evidence.py, `miri-plan`)
+#       judge the mutants of PLAN (tests/gate, `mutation miri-plan`)
 #       against BASELINE, a gate run of the same identity, writing their
 #       verdicts to OUT/verdicts.tsv
 set -uo pipefail
@@ -51,12 +58,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
-for tool in cargo rustc patch time sha256sum; do
+for tool in cargo rustc patch time sha256sum git tar; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Miri gate prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
 		exit 127
 	fi
 done
+gate_prepare || exit 2
 mode=gate
 if [[ "${1:-}" == --judge ]]; then
 	if (($# != 4)); then
@@ -129,44 +137,12 @@ miri_prepare >"$logs/miri-setup.log" 2>&1 || {
 	exit 1
 }
 
-# Capture only the structured inventory emitted by the shared matrix and
-# binding-simulation checks. Sort full records, never hashes or samples.
+# The inventory a run's log `$1` reports, written to `$2`: each matrix's stop
+# classes and the boundary valuations its runs reached, read by the gate
+# tool's one reader of them (tests/gate, `miri inventory`); a malformed line
+# fails the run.
 inventory() {
-	local line
-	while IFS= read -r line; do
-		case "$line" in
-		*DCBOR_CLASSES$'\t'*) printf 'DCBOR_CLASSES\t%s\n' "${line#*DCBOR_CLASSES$'\t'}" ;;
-		*DCBOR_CLASS$'\t'*) printf 'DCBOR_CLASS\t%s\n' "${line#*DCBOR_CLASS$'\t'}" ;;
-		esac
-	done <"$1" | LC_ALL=C sort -u >"$2"
-}
-
-# The outcome class of a Miri run that did not do what its kind requires,
-# from its log `$1`: undefined behavior reported, an operation Miri does not
-# support, or any other failure (a failed assertion, a panic, a scenario
-# that returned instead of aborting).
-outcome_of() {
-	if grep -Fq 'Undefined Behavior' "$1"; then
-		echo undefined_behavior
-	elif grep -Fq 'unsupported operation' "$1"; then
-		echo unsupported
-	else
-		echo failed
-	fi
-}
-
-# Whether the run of log `$2`, of suite kind `$1`, under Miri when `$3` is
-# `miri`, did what its kind requires: a test passed, or a scenario aborted.
-fulfilled() {
-	case "$1:$3" in
-	test:* | race:*) executed "$2" ;;
-	abort:native) aborted_natively "$2" ;;
-	abort:miri) aborted_under_miri "$2" ;;
-	*)
-		echo "unknown suite kind or runner: $1, $3" >&2
-		return 2
-		;;
-	esac
+	gate miri inventory "$1" "$2"
 }
 
 # Miri interprets one thread at a time, so a suite run in one process takes
@@ -201,7 +177,7 @@ give() {
 
 # One run of a test of kind `$5` under one model, under seed `$6` (`-` for
 # Miri's default seed): its own Miri process, its own log, verdict, outcome,
-# measurement and class inventory, in `$1` by `$3`, its run index there.
+# measurement and inventory, in `$1` by `$3`, its run index there.
 test_run() {
 	local dir="$1" model="$2" index="$3" test="$4" kind="$5" seed="$6" flags started
 	shift 6
@@ -223,47 +199,51 @@ test_run() {
 	event "START $dir $test ($dir/$index.log)"
 	env MIRIFLAGS="$flags" time -f '%M %e' -o "$dir/$index.measure" \
 		"${miri_cmd[@]}" "$@" -- "${select[@]}" --nocapture --test-threads=1 >"$dir/$index.log" 2>&1
-	local status=$?
-	if { [[ "$kind" == abort ]] || ((status == 0)); } &&
-		fulfilled "$kind" "$dir/$index.log" miri &&
-		inventory "$dir/$index.log" "$dir/$index.classes"; then
+	local status=$? outcome
+	# The one classifier of a Miri run (tests/gate, `outcome::miri`): what
+	# Miri reported first, then what the run's kind requires.
+	outcome="$(gate classify miri "$kind" "$status" "$dir/$index.log")" || return 2
+	printf '%s\n' "$outcome" >"$dir/$index.outcome"
+	if [[ "$outcome" == pass ]] && inventory "$dir/$index.log" "$dir/$index.inventory"; then
 		event "PASS $dir $test ($((SECONDS - started))s, $(tail -n 1 "$dir/$index.measure") kB s)"
-		echo pass >"$dir/$index.outcome"
 		echo pass >"$dir/$index.verdict"
 	else
-		outcome_of "$dir/$index.log" >"$dir/$index.outcome"
-		event "FAIL $dir $test: $(cat "$dir/$index.outcome") ($((SECONDS - started))s, $dir/$index.log)"
+		event "FAIL $dir $test: $outcome ($((SECONDS - started))s, $dir/$index.log)"
 		echo fail >"$dir/$index.verdict"
 	fi
 }
 
 # A model's verdict over a suite: every run passed, and the union of their
-# class inventories equals the native run's.
+# inventories, classes and boundary valuations, equals the native run's
+# (tests/gate, `miri coverage`).
 model_verdict() {
 	local base="$1" model="$2" count="$3" dir index
 	dir="$logs/$base-$model"
+	local inventories=()
 	for ((index = 0; index < count; index++)); do
 		if [[ "$(cat "$dir/$index.verdict" 2>/dev/null)" != pass ]]; then
 			event "FAIL $base-$model: run $index ($(sed -n "$((index + 1))p" "$logs/$base.runs")) did not pass"
 			echo fail >"$logs/$base-$model.verdict"
 			return
 		fi
+		inventories+=("$dir/$index.inventory")
 	done
-	cat "$dir"/*.classes | LC_ALL=C sort -u >"$logs/$base-$model.classes"
-	if diff -u "$logs/$base-native.classes" "$logs/$base-$model.classes" >"$logs/$base-$model-coverage.diff"; then
-		event "PASS $base-$model ($count tests), class coverage equals native"
+	if gate miri coverage "$logs/$base-native.inventory" "$logs/$base-$model.inventory" \
+		"$logs/$base-$model-coverage.diff" "${inventories[@]}" >/dev/null 2>&1; then
+		event "PASS $base-$model ($count tests), inventory equals native"
 		echo pass >"$logs/$base-$model.verdict"
 	else
-		event "FAIL $base-$model class coverage, $logs/$base-$model-coverage.diff"
+		event "FAIL $base-$model inventory, $logs/$base-$model-coverage.diff"
 		echo fail >"$logs/$base-$model.verdict"
 	fi
 }
 
 # The native baseline of a suite of kind `$2`, its tests `$3...` up to `--`,
 # then its selection: a `test` suite's tests in one process; an `abort`
-# suite's scenarios each in a process of its own, since each ends it.
+# suite's scenarios each in a process of its own, since each ends it. Each
+# process classified by the gate tool (`classify cargo`).
 native_run() {
-	local base="$1" kind="$2"
+	local base="$1" kind="$2" status outcome
 	shift 2
 	local listed=()
 	while [[ "$1" != -- ]]; do
@@ -273,8 +253,10 @@ native_run() {
 	shift
 	case "$kind" in
 	test | race)
-		cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1 &&
-			executed "$logs/$base-native.log"
+		cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1
+		status=$?
+		outcome="$(gate classify cargo "$kind" "$status" "$logs/$base-native.log")" || return 2
+		[[ "$outcome" == pass ]]
 		;;
 	abort)
 		local index=0 name
@@ -282,8 +264,10 @@ native_run() {
 		for name in "${listed[@]}"; do
 			cargo test "$@" -- --ignored --exact "$name" --nocapture --test-threads=1 \
 				>"$logs/$base-native-$index.log" 2>&1
+			status=$?
 			cat "$logs/$base-native-$index.log" >>"$logs/$base-native.log"
-			aborted_natively "$logs/$base-native-$index.log" || return 1
+			outcome="$(gate classify cargo "$kind" "$status" "$logs/$base-native-$index.log")" || return 2
+			[[ "$outcome" == pass ]] || return 1
 			index=$((index + 1))
 		done
 		;;
@@ -312,9 +296,9 @@ runs_of() {
 }
 
 # One suite: the tests the listing pass found it names (`$logs/$base.tests`),
-# their native baseline, then every run of each (`runs_of`, written to
-# `$logs/$base.runs`) under both models in processes of their own, then each
-# model's verdict over the suite.
+# their native baseline, then every run of each (`$logs/$base.runs`, written
+# by the listing pass) under both models in processes of their own, then
+# each model's verdict over the suite.
 suite_run() {
 	local suite="$1" base="$2" kind="$4" started passed count index model run test seed
 	shift 5
@@ -322,12 +306,11 @@ suite_run() {
 	take
 	local names=() runs=()
 	mapfile -t names <"$logs/$base.tests"
-	runs_of "$kind" "${names[@]}" >"$logs/$base.runs"
 	mapfile -t runs <"$logs/$base.runs"
 	event "PLAN $base: ${#names[@]} tests, ${#runs[@]} Miri runs under each of ${#MIRI_MODELS[@]} models"
 	event "START $base-native ($logs/$base-native.log)"
 	native_run "$base" "$kind" "${names[@]}" -- "$@" &&
-		inventory "$logs/$base-native.log" "$logs/$base-native.classes"
+		inventory "$logs/$base-native.log" "$logs/$base-native.inventory"
 	passed=$?
 	give
 	if ((passed != 0)); then
@@ -337,8 +320,8 @@ suite_run() {
 	fi
 	case "$suite" in
 	owned_btree | owned_lifecycle_matrix | owned_pipeline_matrix | reclamation_owner)
-		if [[ ! -s "$logs/$base-native.classes" ]]; then
-			event "FAIL $base-native: missing class inventory"
+		if [[ ! -s "$logs/$base-native.inventory" ]]; then
+			event "FAIL $base-native: missing inventory"
 			echo fail >"$logs/$base-native.verdict"
 			return
 		fi
@@ -384,20 +367,23 @@ selection_of() {
 	((${#selection[@]} > 0))
 }
 
-# The mutation campaign's Miri layer: each mutant of the plan applied in
-# place, judged on the tests that reach it under both models, then reverted.
-# Plan lines are `mutant<TAB>index<TAB>name<TAB>diff` and
-# `test<TAB>index<TAB>base<TAB>test`. A mutant is caught under Miri when any
-# of its tests fails under either model, missed when all pass; without a
-# baseline pass of every one of its tests under both models in BASELINE, of
-# this run's identity, it is `no_baseline`.
+# The mutation campaign's Miri layer: each mutant of the plan applied to a
+# copy of the commit (`copy_of`, `apply_diff`), judged on the tests that
+# reach it under both models, the copy then discarded. Plan lines are
+# `mutant<TAB>index<TAB>name<TAB>diff` and `test<TAB>index<TAB>base<TAB>test`.
+# The gate tool decides each verdict, written to OUT/verdicts.tsv: without a
+# baseline pass of every run of every one of its tests under both models in
+# BASELINE, of this run's identity, `no_baseline` (`miri baseline`); else
+# caught under Miri when any run did not pass, missed when all passed (`miri
+# judge`).
 judge() {
 	if ! cmp -s "$baseline/identity.txt" "$logs/identity.txt"; then
 		echo "the baseline $baseline is of another identity than this run: $(cat "$baseline/identity.txt" 2>/dev/null) and $(cat "$logs/identity.txt")" >&2
 		exit 1
 	fi
-	snapshot >"$logs/source.sha256"
-	local kind index name diff base test
+	clean_commit "$logs" || exit 1
+	local copies="$PWD/target/miri-copies"
+	local kind index name diff base test seed
 	local -A names diffs
 	local -a tests_of
 	while IFS=$'\t' read -r kind index name diff; do
@@ -413,14 +399,6 @@ judge() {
 			;;
 		esac
 	done <"$plan"
-	applied=""
-	restore() {
-		if [[ -n "$applied" ]]; then
-			patch -R -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$applied" || exit 1
-			applied=""
-		fi
-	}
-	trap restore EXIT
 	: >"$logs/verdicts.tsv"
 	# An empty plan judges nothing; printf over no keys would yield one empty
 	# index.
@@ -431,74 +409,55 @@ judge() {
 	for index in "${order[@]}"; do
 		name="${names[$index]}"
 		diff="${diffs[$index]}"
-		local outcome=missed_under_miri
-		# Every run of every selected test, each seed of a race test, has a
-		# baseline pass under both models.
-		local runs_judged=()
-		while IFS=$'\t' read -r base test; do
-			[[ -z "$base" ]] && continue
-			local found=0 at=0 listed seed
-			while IFS=$'\t' read -r listed seed; do
-				if [[ "$listed" == "$test" ]]; then
-					found=1
-					runs_judged+=("$base"$'\t'"$test"$'\t'"$seed")
-					for model in "${MIRI_MODELS[@]}"; do
-						if [[ "$(cat "$baseline/$base-$model/$at.verdict" 2>/dev/null)" != pass ]]; then
-							outcome=no_baseline
-						fi
-					done
-				fi
-				at=$((at + 1))
-			done <"$baseline/$base.runs"
-			((found == 1)) || outcome=no_baseline
-		done <<<"${tests_of[index]:-}"
-		if [[ "$outcome" == no_baseline ]]; then
-			printf '%s\t%s\n' "$name" "$outcome" >>"$logs/verdicts.tsv"
+		local dir="$logs/mutant-$index"
+		mkdir -p "$dir"
+		printf '%s' "${tests_of[index]:-}" >"$dir/tests.tsv"
+		gate miri baseline "$baseline" "$dir/tests.tsv" "$dir/runs.tsv" "$logs/verdicts.tsv" "$name" "${MIRI_MODELS[@]}"
+		case $? in
+		0) ;;
+		1)
 			event "NO_BASELINE $name"
 			continue
-		fi
-		event "START mutant $index: $name"
-		patch -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$diff" || {
-			echo "the mutant does not apply: $name ($diff)" >&2
+			;;
+		*) exit 2 ;;
+		esac
+		local copy="$copies/mutant-$index"
+		copy_of "$copy" "$commit" || exit 2
+		apply_diff "$diff" "$copy" || {
+			echo "the mutant does not apply to $commit: $name ($diff)" >&2
 			exit 1
 		}
-		applied="$diff"
-		local dir="$logs/mutant-$index"
-		local run=0 judged
-		for judged in "${runs_judged[@]}"; do
-			IFS=$'\t' read -r base test seed <<<"$judged"
+		event "START mutant $index: $name ($copy)"
+		local judged=() run=0 line
+		mapfile -t judged <"$dir/runs.tsv"
+		for line in "${judged[@]}"; do
+			IFS=$'\t' read -r base test seed <<<"$line"
 			selection_of "$base" || {
 				echo "the plan names a suite the gate does not run: $base" >&2
 				exit 2
 			}
 			for model in "${MIRI_MODELS[@]}"; do
 				mkdir -p "$dir/$model"
-				printf '%s\t%s\t%s\n' "$base" "$test" "$seed" >"$dir/$model/$run.test"
+				printf '%s\n' "$line" >"$dir/$model/$run.test"
 				(
 					take
-					test_run "$dir/$model" "$model" "$run" "$test" "$selected_kind" "$seed" "${selection[@]}"
+					test_run "$dir/$model" "$model" "$run" "$test" "$selected_kind" "$seed" \
+						"${selection[@]}" --manifest-path "$copy/Cargo.toml"
 					give
 				) &
 			done
 			run=$((run + 1))
 		done
 		wait
-		restore
-		snapshot | diff -u "$logs/source.sha256" - >/dev/null || {
-			echo "the source differs from its snapshot after reverting $name" >&2
-			exit 1
-		}
-		for model in "${MIRI_MODELS[@]}"; do
-			for verdict in "$dir/$model"/*.verdict; do
-				if [[ "$(cat "$verdict")" != pass ]]; then
-					outcome=caught_under_miri
-				fi
-			done
-		done
-		printf '%s\t%s\n' "$name" "$outcome" >>"$logs/verdicts.tsv"
-		event "${outcome^^} $name"
+		rm -rf "$copy"
+		local judgement
+		judgement="$(gate miri judge "$dir" "$logs/verdicts.tsv" "$name" "${MIRI_MODELS[@]}")" || exit 2
+		event "${judgement^^} $name"
 	done
-	trap - EXIT
+	if ! still_at_commit; then
+		echo "the checkout moved off $commit during the judgement" >&2
+		exit 1
+	fi
 }
 
 if [[ "$mode" == judge ]]; then
@@ -514,6 +473,9 @@ fi
 listing=()
 planned=0
 declare -A domain_of suite_of kind_of
+# Each line in selection order, its base name, domain and kind: the lines the
+# gate tool writes the results of (`miri results`).
+: >"$logs/lines.tsv"
 list_line() {
 	local suite="$1" base="$2" filter="$3" kind="$4" domain="$5"
 	shift 5
@@ -521,6 +483,7 @@ list_line() {
 	domain_of[$base]="$domain"
 	suite_of[$base]="$suite"
 	kind_of[$base]="$kind"
+	printf '%s\t%s\t%s\n' "$base" "$domain" "$kind" >>"$logs/lines.tsv"
 	rm -f "$logs/$base.tests.err"
 	(
 		take
@@ -552,82 +515,36 @@ for base in "${listing[@]}"; do
 			unlisted=1
 		fi
 		named_by[$key]="$base"
-		if [[ "${kind_of[$base]}" == race ]]; then
-			planned=$((planned + ${#seeds[@]}))
-		else
-			planned=$((planned + 1))
-		fi
 	done <"$logs/$base.tests"
 done
 if ((unlisted != 0)); then
 	event "DONE the selection does not list; nothing was run"
 	exit 1
 fi
+# Every run of every listed line, written before any runs, so a line whose
+# suite never starts still has each of its runs reported, not run.
+for base in "${listing[@]}"; do
+	names=()
+	mapfile -t names <"$logs/$base.tests"
+	runs_of "${kind_of[$base]}" "${names[@]}" >"$logs/$base.runs" || exit 2
+	mapfile -t lines_of_runs <"$logs/$base.runs"
+	planned=$((planned + ${#lines_of_runs[@]}))
+done
 event "LISTED ${#listing[@]} lines, ${#named_by[@]} tests, $((planned * ${#MIRI_MODELS[@]})) Miri runs"
 
-expected=()
 gate_suite() {
-	local base="$2"
-	expected+=("$base-native" "${MIRI_MODELS[@]/#/$base-}")
 	suite_run "$@" &
 }
 each_suite gate_suite || exit 2
 wait
 
-# The gate's result, published whole: one row per test, model and domain,
-# its outcome class (pass, undefined_behavior, unsupported, failed, or
-# not_run when its suite's native baseline failed or it never started), its
-# seconds and peak memory; and one row per suite and runner, its verdict
-# (the native baseline; each model's tests together with its class coverage
-# equal to the native run's). Written beside the identity it was run under,
-# then renamed into place.
-publish_results() {
-	local out="$logs/results.tsv" base model index test seed outcome peak seconds dir
-	local temporary="$out.$$.tmp"
-	{
-		printf '#\tidentity\t%s\n' "$(cat "$logs/identity.txt")"
-		printf 'domain\tline\trunner\ttest\tseed\toutcome\tseconds\tpeak_kB\n'
-		for base in "${listing[@]}"; do
-			for model in native "${MIRI_MODELS[@]}"; do
-				outcome="$(cat "$logs/$base-$model.verdict" 2>/dev/null || echo not_run)"
-				printf '%s\t%s\t%s\t(suite)\t-\t%s\t-\t-\n' "${domain_of[$base]}" "$base" "$model" "$outcome"
-			done
-			# A suite that never started wrote no runs: each of its tests'
-			# runs is reported not run.
-			if [[ ! -s "$logs/$base.runs" ]]; then
-				local names=()
-				mapfile -t names <"$logs/$base.tests"
-				runs_of "${kind_of[$base]}" "${names[@]}" >"$logs/$base.runs"
-			fi
-			index=0
-			while IFS=$'\t' read -r test seed; do
-				for model in "${MIRI_MODELS[@]}"; do
-					dir="$logs/$base-$model"
-					outcome="$(cat "$dir/$index.outcome" 2>/dev/null || echo not_run)"
-					peak=-
-					seconds=-
-					if [[ -s "$dir/$index.measure" ]]; then
-						read -r peak seconds < <(tail -n 1 "$dir/$index.measure")
-					fi
-					printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${domain_of[$base]}" "$base" "$model" "$test" "$seed" "$outcome" "$seconds" "$peak"
-				done
-				index=$((index + 1))
-			done <"$logs/$base.runs"
-		done
-	} >"$temporary" && mv "$temporary" "$out"
-}
-
-# Every expected run has a verdict, and every verdict passed: a run that
-# never started (its suite's native run failed) is a failure, not an
-# omission.
-status=0
-failed=0
-for name in "${expected[@]}"; do
-	if [[ "$(cat "$logs/$name.verdict" 2>/dev/null)" != pass ]]; then
-		status=1
-		failed=$((failed + 1))
-	fi
-done
-publish_results || status=1
-event "DONE ${#expected[@]} suite verdicts, $failed not passed; results $logs/results.tsv"
+# The gate's result, published whole by the gate tool (`miri results`): one
+# row per run of each test under each model, its outcome, seed, seconds and
+# peak memory, a run that never started not run; one row per line and
+# runner, its verdict (the native baseline; each model's runs with their
+# inventory equal to the native run's); under the run's identity. Its verdict:
+# every row passed.
+gate miri results "$logs" "${MIRI_MODELS[@]}"
+status=$?
+event "DONE ${#listing[@]} lines, status $status; results $logs/results.tsv"
 exit "$status"

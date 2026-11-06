@@ -1,5 +1,6 @@
 #![cfg(feature = "hashbrown")]
 
+use dcbor::bounded::encoding::buckets::{BucketCursor, BucketStep, Buckets};
 use dcbor::bounded::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -35,11 +36,12 @@ fn last_occupied(map: &Colliding) -> usize {
 }
 
 /// A map whose table keeps the controls of 1023 erased entries beside its
-/// one live entry, the last inserted. The scan inspects bucket controls in
-/// windows of [`encoding::BUCKET_WINDOW`], each admitted before it is
-/// inspected, from the first bucket until the map's declared entries are
-/// yielded: every control before the live entry is charged, erased ones
-/// included, and none after it. A map of no entries scans nothing. A budget
+/// one live entry, the last inserted. The engine's one bucket traversal
+/// ([`BucketCursor`]) inspects bucket controls in windows of
+/// [`encoding::BUCKET_WINDOW`], each admitted once before it is inspected,
+/// from the first bucket until the map's declared entries are yielded:
+/// every control before the live entry is charged, erased ones included,
+/// and none after it. A map of no entries scans nothing. A budget
 /// short of the controls before the live entry is refused; work is consumed
 /// as admitted, never refunded: the refused run keeps what it was admitted,
 /// at most the complete operation's bound, its walk included; the refusal
@@ -76,14 +78,47 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
         "the live entry lies past the first window, behind erased controls"
     );
 
-    // The scan stops at the declared entry: one instruction per window
-    // before the live entry's, that window's, and the map's end; no window
-    // of the tail after it.
+    // The walk counts one table of every bucket and its one entry: the
+    // bound of a table not yet scanned covers its last entry in its last
+    // bucket.
     let walked = shape(&map);
-    assert_eq!(walked.dynamic, (last / window) as u64 + 2);
-    assert!(
-        (walked.dynamic as usize - 1) * window < buckets,
-        "the walk scanned the tail"
+    assert_eq!(
+        (walked.bucket_tables, walked.buckets, walked.bucket_entries),
+        (1, buckets as u64, 1)
+    );
+
+    // The traversal stops at the declared entry: one call per window before
+    // the live entry's, each a full window of erased or vacant controls, the
+    // call that finds the entry within its own window, and the completion;
+    // every control up to the entry's window's end admitted once, none of
+    // the tail after it.
+    let table: &dyn Buckets = &map;
+    let windows = last / window + 1;
+    let mut limits = Limits::unlimited();
+    let mut cursor = BucketCursor::new();
+    for _ in 1..windows {
+        assert!(matches!(
+            cursor.step(table, &mut limits),
+            Ok(BucketStep::Vacant { .. })
+        ));
+    }
+    assert!(matches!(
+        cursor.step(table, &mut limits),
+        Ok(BucketStep::Entry { index, .. }) if index == last
+    ));
+    assert!(matches!(
+        cursor.step(table, &mut limits),
+        Ok(BucketStep::Complete)
+    ));
+    assert_eq!(
+        cursor.position(),
+        last + 1,
+        "the traversal scanned the tail"
+    );
+    assert_eq!(
+        limits.used(),
+        WriteWork::new(windows as u64 + 1, (windows * window) as u64),
+        "a control admitted twice or one inspected unadmitted"
     );
 
     // Erased controls before the live entry are charged: the complete
@@ -105,10 +140,28 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
     );
 
     // A map of no entries, however large its table, scans nothing: its end
-    // follows its head.
+    // follows its head. A counted map whose declared entries are all yielded
+    // ends before its table is asked for, in the walk as in the preparation,
+    // so the walk counts no table; the traversal over it, driven directly,
+    // completes at once.
     let empty = Colliding::with_capacity_and_hasher(1024, Default::default());
     assert!(empty.num_buckets() >= 1024);
-    assert_eq!(shape(&empty).dynamic, 1);
+    let walked = shape(&empty);
+    assert_eq!(
+        (walked.bucket_tables, walked.buckets, walked.bucket_entries),
+        (0, 0, 0)
+    );
+    let mut limits = Limits::unlimited();
+    let mut cursor = BucketCursor::new();
+    assert!(matches!(
+        cursor.step(&empty as &dyn Buckets, &mut limits),
+        Ok(BucketStep::Complete)
+    ));
+    assert_eq!(
+        limits.used(),
+        WriteWork::new(1, 0),
+        "an empty table's completion inspected a control"
+    );
     let mut limits = Limits::new(1_000_000, 1_000_000, 100_000);
     let encoded = encode(&empty, &mut limits).unwrap();
     assert_eq!(encoded.as_ref(), &[0xa0]);

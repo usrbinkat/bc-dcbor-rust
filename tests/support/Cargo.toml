@@ -15,3 +15,19 @@ path = "lifecycle.rs"
 # would silently turn every --no-default-features no_std test into a std test
 # through Cargo feature unification.
 dcbor = { path = "../..", default-features = false }
+# The record format, its one implementation (`rigor`'s cost records), and
+# the model-bounds rows the model runner reads.
+dcbor-record = { path = "../record" }
+dcbor-model-bounds = { path = "../model-bounds" }
+
+# The model runner (`model`) configures each checker's model under that
+# checker's cfg, as the library selects its atomics by it; the pins are the
+# workspace's, one for every crate.
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+[lints]
+workspace = true

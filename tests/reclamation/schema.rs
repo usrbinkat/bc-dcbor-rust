@@ -215,7 +215,7 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
     use dcbor::bounded::decode::construction::in_place::enumeration::{
         self, EnumObservation, EnumPhase, Variants,
     };
-    use dcbor::bounded::decode::construction::in_place::{Built, STEP_COST, times};
+    use dcbor::bounded::decode::construction::in_place::{Built, STEP_COST};
     #[derive(dcbor::CBORBoundedDecodable)]
     #[repr(C, u8)]
     enum Choice {
@@ -280,7 +280,7 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
     assert_eq!(charged, selecting, "one value per selection call");
     assert_eq!(
         enumeration::selection(count),
-        times(STEP_COST, selecting),
+        STEP_COST.checked_mul(selecting),
         "the declared selection against the measured"
     );
     let declared = enumeration::remaining::<Choice, Limits>(slot.observe());
@@ -372,8 +372,8 @@ where
 /// record of one field and of four.
 #[test]
 fn an_unknown_key_takes_exactly_the_declared_entry() {
+    use dcbor::bounded::decode::construction::in_place::STEP_COST;
     use dcbor::bounded::decode::construction::in_place::fields;
-    use dcbor::bounded::decode::construction::in_place::{STEP_COST, times};
     #[derive(dcbor::CBORBoundedDecodable)]
     struct One {
         #[cbor(n = 1)]
@@ -398,12 +398,17 @@ fn an_unknown_key_takes_exactly_the_declared_entry() {
     ] {
         assert_eq!(
             fields::entry(count),
-            times(STEP_COST, measured),
+            STEP_COST.checked_mul(measured),
             "the declared entry of {count} fields against the measured"
         );
         assert_eq!(
-            fields::entries(count).bound::<()>(2).unwrap(),
-            times(STEP_COST, measured),
+            fields::entries(count)
+                .expect("an entry's cost fits in u64")
+                .bound::<()>(2)
+                .unwrap(),
+            STEP_COST
+                .checked_mul(measured)
+                .expect("the measured entry fits in u64"),
             "the per-byte entry term over a two-byte entry of {count} fields"
         );
     }
@@ -457,7 +462,9 @@ fn every_key_position_takes_its_search_path_within_the_declared_entry() {
         e: Option<u64>,
     }
     let keys = [2u64, 4, 6, 8, 10];
-    let declared = fields::entry(keys.len()).values;
+    let declared = fields::entry(keys.len())
+        .expect("an entry's cost fits in u64")
+        .values;
     let mut worst = 0;
     // Each integer key 0 through 11 as a one-entry map {key: 7}, then a text
     // key, {"x": 7}.

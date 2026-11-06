@@ -1,4 +1,5 @@
 use super::*;
+use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::construction::reclamation::Slot;
 use crate::bounded::decode::initialization::{init_field, init_part};
 
@@ -21,12 +22,14 @@ impl<I: Copy, P> ParserContinuation<I, P> {
     ) -> BoundedResult<bool, A> {
         let entries = Storage::<Entry, P>::INIT_STEPS;
         let stack = Storage::<Frame, P>::INIT_STEPS;
-        if *slot.custody() < entries {
-            init_part!(slot, entries, 0, |part| Storage::initialize_step(part, a)?);
+        if Bound::new(Predicate::Prefix, entries).below(a, *slot.custody()) {
+            init_part!(slot, entries, 0, a, |part| Storage::initialize_step(
+                part, a
+            )?);
             return Ok(false);
         }
-        if *slot.custody() < entries + stack {
-            init_part!(slot, stack, entries, |part| Storage::initialize_step(
+        if Bound::new(Predicate::Prefix, entries + stack).below(a, *slot.custody()) {
+            init_part!(slot, stack, entries, a, |part| Storage::initialize_step(
                 part, a
             )?);
             return Ok(false);

@@ -7,8 +7,8 @@ use dcbor::bounded::decode::cursor::Decoder;
 /// releases nothing more, and the document, outside the parser's custody
 /// once published, releases the rest. Within the retained parse's bound,
 /// which covers its cleanup. The turns the parse took to publish, when it
-/// published within `stop`.
-fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
+/// published within `stop`, and the boundary valuations the run reached.
+fn cancelled(wire: &[u8], stop: usize) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
     use dcbor::bounded::decode::Kind;
     let bound = support::decode_turns(wire.len());
     let mut m = meter();
@@ -70,7 +70,7 @@ fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
         drop(document);
         assert_eq!(m.live_bytes(), 0);
     }
-    published
+    (published, m.reached())
 }
 
 /// A leading combining acute accent is already NFC but needs the Maybe
@@ -80,13 +80,17 @@ fn cancelled(wire: &[u8], stop: usize) -> Option<usize> {
 #[test]
 fn normalization_cancellation_at_every_parser_boundary() {
     let wire = [0x81, 0x62, 0xcc, 0x81];
-    let boundaries = cancelled(&wire, usize::MAX).expect("normalization never reached publication");
+    let boundaries = cancelled(&wire, usize::MAX)
+        .0
+        .expect("normalization never reached publication");
     support::stop_matrix("cancelled normalizing parse", boundaries, |stop| {
+        let (published, reached) = cancelled(&wire, stop);
         assert_eq!(
-            cancelled(&wire, stop).is_some(),
+            published.is_some(),
             stop == boundaries,
             "a stop after {stop} turns"
         );
+        reached
     });
 }
 

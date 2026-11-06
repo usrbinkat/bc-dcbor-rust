@@ -1,4 +1,5 @@
 use super::*;
+use crate::bounded::boundary::{Bound, Predicate, boundary};
 use crate::bounded::text::QuickCheck;
 
 /// Validating one scalar, or a text's end: one value and a scalar's most
@@ -25,7 +26,7 @@ impl Utf8 {
         budget: &mut B,
     ) -> Result<Option<&'a str>, DecodeError<B::Refusal>> {
         SCALAR.admit(budget)?;
-        if self.position == bytes.len() {
+        if boundary!(budget, Predicate::Payload, self.position, bytes.len()).is_eq() {
             // SAFETY: position advances only across complete scalar slices
             // accepted by str::from_utf8 below. It began at zero and now equals
             // the entire slice length. The enclosing parser always supplies
@@ -40,7 +41,7 @@ impl Utf8 {
             _ => 1,
         };
         let remaining = bytes.len() - self.position;
-        let end = self.position + width.min(remaining);
+        let end = self.position + Bound::new(Predicate::Payload, remaining).clamp(budget, width);
         let scalar =
             core::str::from_utf8(&bytes[self.position..end]).map_err(Error::InvalidUtf8)?;
         let ch = scalar.chars().next().ok_or(Error::Underrun)?;

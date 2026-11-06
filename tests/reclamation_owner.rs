@@ -803,6 +803,7 @@ fn stable_publication_and_every_cleanup_admission_refusal() {
                 owner.allocate_step::<Payload>(&mut m, &mut Acquisition::new()),
                 Err(BoundedError::PlanMismatch)
             ));
+            m.reached()
         },
     );
 }
@@ -864,14 +865,17 @@ fn text_build_publication_and_cancellation_keep_per_allocation_custody() {
     // Literal canonical text containing 65 ASCII bytes crosses a copy quantum.
     let mut wire = vec![0x78, 65];
     wire.extend_from_slice(&[b'x'; 65]);
-    let boundaries =
-        retired_text(&wire, usize::MAX).expect("text construction never reached publication");
+    let boundaries = retired_text(&wire, usize::MAX)
+        .0
+        .expect("text construction never reached publication");
     support::stop_matrix("retired text construction", boundaries, |stop| {
+        let (published, reached) = retired_text(&wire, stop);
         assert_eq!(
-            retired_text(&wire, stop).is_some(),
+            published.is_some(),
             stop == boundaries,
             "a stop after {stop} turns"
         );
+        reached
     });
 }
 
@@ -879,8 +883,9 @@ fn text_build_publication_and_cancellation_keep_per_allocation_custody() {
 /// turns: retirement releases nothing, since handle drops only transfer
 /// custody, and the scope's queued cleanup never acquires storage and
 /// recovers everything, all within the decode's bound. The turns
-/// construction took to publish, when it published within `stop`.
-fn retired_text(wire: &[u8], stop: usize) -> Option<usize> {
+/// construction took to publish, when it published within `stop`, and the
+/// boundary valuations the run reached.
+fn retired_text(wire: &[u8], stop: usize) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
     let bound = support::typed_turns::<String>(wire.len());
     let mut m = meter();
     let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
@@ -920,7 +925,7 @@ fn retired_text(wire: &[u8], stop: usize) -> Option<usize> {
     }
     assert!(drained, "text cleanup exceeded its bound of {bound} turns");
     assert_eq!(m.live_bytes(), 0);
-    published
+    (published, m.reached())
 }
 
 #[test]

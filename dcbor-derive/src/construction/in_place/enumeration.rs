@@ -312,13 +312,13 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
             }
             unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
                 const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost =
-                    dcbor::bounded::decode::construction::in_place::enumeration::cost::<
+                    dcbor::const_cost!(dcbor::bounded::decode::construction::in_place::enumeration::cost::<
                         <Self as dcbor::bounded::decode::construction::in_place::enumeration::Variants<#a>>::Payload,
                         #permit,
                     >(
                         core::mem::size_of::<#tag_name>(),
                         &[#(#costs),*],
-                    );
+                    ));
 
                 fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
                     slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,

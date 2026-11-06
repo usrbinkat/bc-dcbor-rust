@@ -1,0 +1,39 @@
+[package]
+name = "dcbor-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The evidence gates' one implementation: outcomes, results rows, run classification, bound derivation and verdicts."
+license = "BSD-2-Clause-Patent"
+
+# The library is what the gates and the test support crate share; the
+# binary is what the gate scripts launch.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gate"
+path = "src/main.rs"
+
+[dependencies]
+# The record format, its one implementation. Never `dcbor-test-support`:
+# its heap observer is a global allocator, which would make the gate run,
+# and measure, under test instrumentation.
+dcbor-record = { path = "../record" }
+# The model-bounds rows the gate derives, writes and verifies.
+dcbor-model-bounds = { path = "../model-bounds" }
+# The census rows the reach map and the mutation plan read.
+dcbor-census = { path = "../census" }
+# The boundary predicates and valuations a run's inventory names
+# (`dcbor::bounded::boundary`), their one definition, which the inventory's
+# reader parses its rows with.
+dcbor = { path = "../.." }
+# The tool outputs the gates read are JSON: cargo-mutants' plans and
+# outcomes, llvm-cov's coverage export and cargo's build messages; so are
+# the reach map, the mutation comparison and the Miri plan this crate writes
+# and reads back.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

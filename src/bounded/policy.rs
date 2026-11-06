@@ -4,11 +4,12 @@
 //! enabled with [`Limits::logged`]. Counters measure requested capacities, not
 //! process RSS.
 extern crate alloc;
+use super::boundary::{Boundary, Predicate, Reached};
 use super::{Allocator, Budget, WriteWork};
 use crate::bounded::decode::construction::TypedPosition;
 use crate::bounded::decode::construction::reclamation::AbortOnUnwind;
+use crate::sync::{AtomicU64, Ordering};
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The quantum of one bounded turn: three values and 64 bytes.
 pub const TURN: WriteWork = WriteWork::new(3, 64);
@@ -51,6 +52,12 @@ struct Counters {
     live: AtomicU64,
     peak: AtomicU64,
     release_observer: Option<fn(u64)>,
+    /// The boundary valuations reached by every policy over this storage,
+    /// shared and terminal ones included, one bit per valuation by predicate
+    /// ([`Reached`]): set by one relaxed `fetch_or`, which allocates nothing
+    /// and cannot unwind, so cleanup and terminal steps record too. Read once
+    /// the run is over ([`Limits::reached`]).
+    reached: [AtomicU64; Predicate::COUNT],
 }
 
 /// Storage admission released when its owning allocation is released. A
@@ -588,6 +595,16 @@ impl Limits {
         self.counters.peak.load(Ordering::Acquire)
     }
 
+    /// Every boundary valuation reached by the policies over this storage,
+    /// this one, those it shares with and their terminal policies, since the
+    /// first of them was made ([`super::boundary`]). Not reset by
+    /// [`Self::measure`]: a run's predicates include its setup's.
+    pub fn reached(&self) -> Reached {
+        Reached::from_bits(core::array::from_fn(|predicate| {
+            self.counters.reached[predicate].load(Ordering::Relaxed)
+        }))
+    }
+
     /// Cumulative bytes of granted allocation requests.
     pub fn requested_bytes(&self) -> u64 {
         self.requested
@@ -796,11 +813,18 @@ impl Budget for Limits {
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
         self.admit_traced(Call::Work { values, bytes })
     }
+
+    fn boundary(&mut self, boundary: Boundary) {
+        self.counters.reached[boundary.predicate.index()]
+            .fetch_or(1u64 << boundary.valuation.index(), Ordering::Relaxed);
+    }
 }
 
 // SAFETY: constructing this policy only clones an existing Arc. Terminal
 // admissions bypass logging and counters, never refuse work, and reject all
-// allocation requests. Its fields have allocation-free, non-unwinding drops.
+// allocation requests. Recording a boundary is one relaxed `fetch_or` on the
+// shared counters, allocation-free and non-unwinding. Its fields have
+// allocation-free, non-unwinding drops.
 unsafe impl super::TerminalAllocator for Limits {
     fn terminal(permit: &Reservation) -> Self {
         let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, permit.counters.clone());

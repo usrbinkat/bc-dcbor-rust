@@ -1,7 +1,35 @@
 [workspace]
-members = [".", "dcbor-derive", "tests/support"]
+# The record format is a leaf (tests/record), and the model-bounds and census
+# rows leaves over it (tests/model-bounds, tests/census); the test support
+# crate, this package's tests and the gate tool (tests/gate) each depend on
+# them, and the tests never on the gate nor the gate on them.
+members = [
+    ".",
+    "dcbor-derive",
+    "tests/record",
+    "tests/model-bounds",
+    "tests/census",
+    "tests/support",
+    "tests/gate",
+]
 # The fuzz crate builds with cargo-fuzz on nightly; it is its own package.
 exclude = ["fuzz"]
+
+# Model checkers of the decode scope's atomic protocol (src/sync.rs), one pin
+# for the library, whose atomics each replaces under its cfg, and for the
+# test support crate, whose runner configures every model
+# (tests/support/model.rs). Exact: the models' claims and their recorded
+# bounds (tests/data/model-bounds.txt) rest on these releases' semantics
+# (loom's exhaustive search, branch store and thread limit, shuttle's seeded
+# PCT scheduler and step bound).
+[workspace.dependencies]
+loom = "=0.7.2"
+shuttle = "=0.9.9"
+
+# Each checker's cfg is set by RUSTFLAGS alone (`--cfg loom`, `--cfg
+# shuttle`); any other unknown cfg is a defect.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
 
 [package]
 name = "dcbor"
@@ -30,12 +58,16 @@ categories = [
 chrono = { version = "^0.4.28", default-features = true }
 half = { version = "^2.4.1", default-features = false }
 # usrbinkat/hashbrown branch feat/map-bucket-index: adds HashMap::num_buckets,
-# HashMap::get_bucket and the group-scanned HashMap::next_full_bucket and
-# HashTable::next_full_bucket (src/map_buckets.rs) on top of upstream main.
-hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "0fbe75be38372034b884d347419994d5fec0bc7d", optional = true }
+# HashMap::get_bucket, the group-scanned HashMap::next_full_bucket and
+# HashTable::next_full_bucket, and HashMap::bucket_state and
+# HashTable::bucket_state, which tell deleted buckets from vacant ones
+# (src/map_buckets.rs), on top of upstream main past the 0.17.1 release. The
+# rev is the identity: the version string names the release the fork still
+# declares, not its contents. The same revision is vendored into the
+# usrbinkat/rust std fork (library/hashbrown, flake.lock's rust-fork).
+hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "ccb26a32445a94dbf228acf518efa216c6dbfeef", optional = true }
 hex = { version = "^0.4.3", default-features = true }
 num-bigint = { version = "0.4.6", default-features = false, optional = true }
-spin = { version = "0.10.0", optional = true }
 thiserror = { version = "^2.0", default-features = false, optional = true }
 # Exact: src/bounded/text.rs restates this release's composition algorithm
 # over its character primitives; another release is adopted only after the
@@ -45,6 +77,15 @@ paste = "^1.0.12"
 dcbor-derive = { version = "0.1.0", path = "dcbor-derive", optional = true }
 
 [dev-dependencies]
+# The record format every recorded oracle of this package's tests uses: the
+# tightness ratchet (`src/bounded.rs`, `places`) and the admission traces.
+dcbor-record = { path = "tests/record" }
+# The one table of model entry points the census checks
+# (tests/unsafe_census.rs) and the gate runs.
+dcbor-model-bounds = { path = "tests/model-bounds" }
+# The census rows tests/unsafe_census.rs writes and the gate's reach map and
+# mutation plan read.
+dcbor-census = { path = "tests/census" }
 dcbor-test-support = { path = "tests/support" }
 hex-literal = "^1.1.0"
 indoc = "^2.0.0"
@@ -57,10 +98,22 @@ quote = "1"
 syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 version-sync = "^0.9.0"
 
+# Each model checker is a dependency only under its cfg, and then replaces
+# the library's atomics in every build of it, its unit tests and every test
+# that links it, as loom documents its own setup ([workspace.dependencies]).
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+[lints]
+workspace = true
+
 [features]
 default = ["std"]
 multithreaded = []
-no_std = ["hashbrown", "thiserror", "spin"]
+no_std = ["hashbrown", "thiserror"]
 num-bigint = ["dep:num-bigint"]
 std = ["half/std", "chrono/std", "hex/std", "thiserror/std"]
 # Requires a rebuilt standard library exposing hashmap_bucket_access.

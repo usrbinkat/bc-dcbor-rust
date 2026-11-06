@@ -58,6 +58,7 @@ fn every_actual_admission_refusal_is_observed_and_stops_execution() {
         assert_eq!(m.calls(), &baseline.calls()[..=index]);
         drop(result);
         assert_eq!(m.live_bytes(), 0);
+        m.reached()
     });
 }
 
@@ -169,6 +170,7 @@ fn text_semantics_use_literal_composition_reordering_and_hangul_oracles() {
                 );
                 assert_eq!(m.first_refusal(), Some((index, reason)));
                 assert_eq!(m.live_bytes(), 0);
+                m.reached()
             },
         );
         drop(encoded);

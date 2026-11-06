@@ -5,10 +5,12 @@
 //! relocation, so every state an admission can suspend in is a valid value
 //! owning each allocation exactly once, and every transition writes the
 //! whole state in one unit of at most a quantum.
+use super::super::boundary::{Valuation, boundary, position};
 use super::super::*;
 use super::construction::reclamation::Slot;
 use super::construction::stable::{self, Admitted, Installed};
 use super::initialization::init_field;
+use crate::sync::{Atomics, Representation};
 use core::mem::{self, MaybeUninit, size_of};
 
 /// The old allocation's elements still to relocate, and its permit. Field
@@ -21,6 +23,12 @@ struct Moving<T, P> {
 /// A stable block holding an arena: where a grown allocation is built and
 /// kept until it is published.
 type Block<T, P> = Installed<Owned<T, P>, P>;
+
+// An arena holds no primitive of an atomics family: its staging block is
+// the same in every build.
+impl<T, P> Representation for Owned<T, P> {
+    type In<S: Atomics> = Self;
+}
 
 /// A growth of a settled arena, staged beside it, each stage holding exactly
 /// what it has acquired: nothing, the admissions of the staging block, the
@@ -162,9 +170,10 @@ impl<T, P> Spare<'_, T, P> {
 
 impl<T: Copy, P> Spare<'_, T, P> {
     /// Fill as many free slots as `values` and the room allow, in order;
-    /// the number filled.
-    pub fn extend(self, values: &[T]) -> usize {
-        let count = values.len().min(self.room());
+    /// the number filled. Whether `values` fits the room is a boundary
+    /// predicate recorded to `budget`.
+    pub fn extend<B: Budget + ?Sized>(self, values: &[T], budget: &mut B) -> usize {
+        let count = Bound::new(Predicate::ArenaLength, self.room()).clamp(budget, values.len());
         self.owned.items.extend_from_slice(&values[..count]);
         count
     }
@@ -191,6 +200,20 @@ impl<T, P> Storage<T, P> {
 
     /// The bytes writing a grown arena into its block writes.
     const ARENA_BYTES: u64 = write_extent(size_of::<Owned<T, P>>());
+
+    /// What a growth's staging block admits and holds ([`stable::Contract`]):
+    /// the empty arena written whole with the permit, and the block, which
+    /// is at most a quantum, the bytes [`crate::bounded::storage_growth`]
+    /// counts for every staging block. Checked where the arena grows, so an
+    /// arena whose block would exceed it fails to compile there.
+    pub(crate) const STAGING: stable::Contract<Owned<T, P>, Owned<T, P>, P> = {
+        let staging = stable::Contract::of();
+        assert!(
+            staging.block() <= TURN.bytes as usize,
+            "a staging block exceeds the quantum storage_growth counts for it"
+        );
+        staging
+    };
 
     /// One element drained, or relocated into a grown allocation: one
     /// admitted unit of its bytes.
@@ -263,7 +286,7 @@ impl<T, P> Storage<T, P> {
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         let (place, units) = slot.parts();
-        if *units >= Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, *units) {
             return Err(BoundedError::PlanMismatch);
         }
         // SAFETY: the slot's place is valid, aligned and writable for the
@@ -468,13 +491,13 @@ impl<T, P> Storage<T, P> {
         // mutable borrow the grant returns is taken in a statement of its
         // own: a borrow returned from one match arm while another arm uses
         // the storage is rejected by the stable borrow checker.
-        let free = matches!(
-            &self.state,
+        let free = match &self.state {
             State::Settled {
                 arena,
                 growth: Growth::Idle,
-            } if arena.items.len() < arena.capacity
-        );
+            } => Bound::new(Predicate::ArenaLength, arena.capacity).below(a, arena.items.len()),
+            _ => false,
+        };
         if !free {
             self.grow_step(maximum, a)?;
             return Ok(None);
@@ -533,19 +556,23 @@ impl<T, P> Storage<T, P> {
                 // SAFETY: the header is the empty arena, written whole.
                 match unsafe {
                     stable::installed::<Owned<T, P>, Owned<T, P>, A>(
+                        Self::STAGING,
                         &mut admitted,
                         Owned::new,
                         |owned| owned,
                         a,
                     )
                 } {
-                    Ok(block) => (
-                        State::Settled {
-                            arena,
-                            growth: Growth::Staged(block, Admitted::Nothing),
-                        },
-                        Ok(()),
-                    ),
+                    Ok(block) => {
+                        boundary!(a, Predicate::Growth => Valuation::Stage);
+                        (
+                            State::Settled {
+                                arena,
+                                growth: Growth::Staged(block, Admitted::Nothing),
+                            },
+                            Ok(()),
+                        )
+                    }
                     Err(error) => (
                         State::Settled {
                             arena,
@@ -562,13 +589,16 @@ impl<T, P> Storage<T, P> {
                 arena,
                 growth: Growth::Staged(mut block, mut admitted),
             } => match Self::allocate_grown(&arena, block.get(), &mut admitted, maximum, a) {
-                Ok(()) => (
-                    State::Settled {
-                        arena,
-                        growth: Growth::Ready(block),
-                    },
-                    Ok(()),
-                ),
+                Ok(()) => {
+                    boundary!(a, Predicate::Growth => Valuation::Allocate);
+                    (
+                        State::Settled {
+                            arena,
+                            growth: Growth::Ready(block),
+                        },
+                        Ok(()),
+                    )
+                }
                 Err(error) => (
                     State::Settled {
                         arena,
@@ -591,6 +621,8 @@ impl<T, P> Storage<T, P> {
                 // An empty arena has nothing to relocate: the grown one is
                 // settled at once, the old allocation released.
                 Ok(()) if arena.items.is_empty() => {
+                    boundary!(a, Predicate::Growth => Valuation::Publish);
+                    boundary!(a, Predicate::Relocation => Valuation::Empty);
                     let (grown, vacated) = block.vacate();
                     drop(arena);
                     (
@@ -602,6 +634,7 @@ impl<T, P> Storage<T, P> {
                     )
                 }
                 Ok(()) => {
+                    boundary!(a, Predicate::Growth => Valuation::Publish);
                     let Owned { items, permit, .. } = arena;
                     (
                         State::Relocating {
@@ -619,6 +652,7 @@ impl<T, P> Storage<T, P> {
                 arena,
                 growth: Growth::Retired(vacated),
             } => {
+                boundary!(a, Predicate::Growth => Valuation::Retire);
                 // The block's release was paid for by its acquisition.
                 vacated.free();
                 (
@@ -632,6 +666,9 @@ impl<T, P> Storage<T, P> {
             State::Relocating { mut from, mut into } => match Self::ELEMENT.admit(a) {
                 Err(error) => (State::Relocating { from, into }, Err(error)),
                 Ok(()) => {
+                    let moved = into.peek().items.len();
+                    boundary!(a, Predicate::Growth => Valuation::Relocate);
+                    boundary!(a, Predicate::Relocation => position(moved, moved + from.remaining.len()));
                     // The grown allocation reserved more than every old
                     // element, so the push never reallocates.
                     if let Some(value) = from.remaining.next() {
@@ -650,6 +687,7 @@ impl<T, P> Storage<T, P> {
             State::Relocated { into } => match WRITE.admit(a, Self::STATE_BYTES) {
                 Err(error) => (State::Relocated { into }, Err(error)),
                 Ok(()) => {
+                    boundary!(a, Predicate::Growth => Valuation::Settle);
                     let (arena, vacated) = into.vacate();
                     (
                         State::Settled {
@@ -683,8 +721,8 @@ impl<T, P> Storage<T, P> {
                 .checked_mul(2)
                 .ok_or(BoundedError::Overflow)?
         };
-        let capacity = capacity.min(maximum);
-        if capacity <= arena.items.len() {
+        let capacity = Bound::new(Predicate::ArenaLength, maximum).clamp(a, capacity);
+        if Bound::new(Predicate::ArenaLength, arena.items.len()).admits(a, capacity) {
             return Err(BoundedError::PlanMismatch);
         }
         let bytes = mul(widen(capacity)?, widen(size_of::<T>())?)?;
@@ -756,6 +794,16 @@ impl<T, P> Storage<T, P> {
             State::Relocating { mut from, mut into } => match Self::ELEMENT.admit(a) {
                 Err(error) => (State::Relocating { from, into }, Err(error)),
                 Ok(()) => {
+                    // The drained element: the grown allocation's newest
+                    // while it holds any, otherwise the old one's last.
+                    let relocated = into.peek().items.len();
+                    let held = relocated + from.remaining.len();
+                    let drained = if relocated == 0 {
+                        held - 1
+                    } else {
+                        relocated - 1
+                    };
+                    boundary!(a, Predicate::Relocation => position(drained, held));
                     if into.get().items.pop().is_none() {
                         from.remaining.next_back();
                     }
@@ -834,7 +882,7 @@ impl<T, P> Storage<T, P> {
         mut destination: Slot<'_, Owned<T, P>, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        if *destination.custody() >= Self::TRANSFER.len() {
+        if Bound::new(Predicate::Prefix, Self::TRANSFER.len()).reached(a, *destination.custody()) {
             return Err(BoundedError::PlanMismatch);
         }
         let Some(arena) = self.settle_step(a)? else {
@@ -864,7 +912,9 @@ impl<T: Copy, P> Storage<T, P> {
             return Ok(false);
         };
         Self::STEP.admit(a)?;
-        arena.items.truncate(len);
+        if boundary!(a, Predicate::ArenaLength, len, arena.items.len()).is_lt() {
+            arena.items.truncate(len);
+        }
         Ok(true)
     }
 

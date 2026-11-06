@@ -27,7 +27,7 @@ failing requirement, not a passing compile-fail test. No contract is ignored.
 | Physical failure | `owned_physical_failure`: return null at each real decoder allocation following admission |
 | Lifetimes | `owned_lifetimes`: positive import/borrow control plus escaping-reference, use-after-retirement, and mutation compile failures |
 | Fuzz | `owned_lifecycle`: symbolic String oracle, observed refusal, trace conservation, cancellation, drain |
-| Memory model | `miri-owned.sh`: each selected test (`miri-suites.txt`) in a Miri process of its own, strict provenance, Stacked and Tree Borrows, its log, verdict and class inventory per run, every model's classes equal to the native run's |
+| Memory model | `miri-owned.sh`: each selected test (`miri-suites.txt`) in a Miri process of its own, strict provenance, Stacked and Tree Borrows, its log, verdict and inventory per run (stop classes and boundary predicate valuations reached), every model's inventory equal to the native run's |
 | Safe pipeline failure matrix | `owned_pipeline_matrix`: every observed work/allocation callback refuses; every observed physical acquisition returns null, from scope setup through safe acquisition, decode, preparation and emission |
 | Plan and controller retirement | `owned_pipeline_matrix`: drop/unwind at every discovered phase boundary, including published plan; no synchronous reservation release, no retirement allocation, allocation-free drain |
 | Interleaved operations | `owned_pipeline_interleavings`: retire A at each preparation boundary under four named interleavings (A's retirement before B begins, after B publishes, and while B is in flight with either leading) while B completes with literal output |
@@ -73,10 +73,13 @@ the lifetime fixtures in the fork shell, where the evidence was recorded:
 nix develop .#custom-std -c bash tests/run-contribution-contracts.sh
 ```
 
-Run the memory-model checks in the same shell, whose toolchain carries Miri:
+Run the memory-model checks in the same shell, whose toolchain carries Miri,
+after a reach map of the same source (`tests/reach-map.sh`), which the gate
+requires:
 
 ```sh
-nix develop .#custom-std -c bash tests/miri-owned.sh
+nix develop .#custom-std -c env DCBOR_REACH_DIR=<reach directory> bash tests/reach-map.sh
+nix develop .#custom-std -c env DCBOR_REACH_DIR=<reach directory> MIRI_LOG_DIR=<log directory> bash tests/miri-owned.sh
 ```
 
 The recorded fuzz campaign includes `owned_lifecycle` and hashes its shared

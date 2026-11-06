@@ -26,11 +26,11 @@
     "rust-fork": {
       "flake": false,
       "locked": {
-        "lastModified": 1792763390,
-        "narHash": "sha256-KF0h5r+1P0GdIlafqPZV6N3PjFBpogSOSm5RCUcwL9A=",
+        "lastModified": 1793941974,
+        "narHash": "sha256-K5ZjMEvQ6lFGkXfEu8RORErGdg8U92mv2nbiagiJsFE=",
         "owner": "usrbinkat",
         "repo": "rust",
-        "rev": "25a7f40eee405a92f5d34758a496919a22546967",
+        "rev": "b0f2ead83480ccdaec13ed32a22a14279e8099e9",
         "type": "github"
       },
       "original": {

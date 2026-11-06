@@ -8,8 +8,8 @@ use std::ops::{Add, Sub};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc};
 
 use crate::{
-    CBOR, CBORTagged, CBORTaggedDecodable, CBORTaggedEncodable, Error, Result, TAG_DATE, Tag,
-    tags_for_values,
+    CBOR, CBORTagged, CBORTaggedDecodable, CBORTaggedEncodable, Error, Result, TAG_DATE,
+    TAG_NAME_DATE, Tag,
 };
 
 /// A CBOR-friendly representation of a date and time.
@@ -428,13 +428,15 @@ impl CBORTagged for Date {
     /// Returns the CBOR tags associated with the `Date` type.
     ///
     /// For dates, this is always tag 1, which is the standard CBOR tag for
-    /// date/time values represented as seconds since the Unix epoch.
+    /// date/time values represented as seconds since the Unix epoch, named
+    /// `date` statically: converting a date reads no tag store, so its tag
+    /// and its name are the same whatever any store registers.
     ///
     /// # Returns
     ///
-    /// A vector containing tag 1
+    /// A vector containing tag 1, named `date`
     fn cbor_tags() -> Vec<Tag> {
-        tags_for_values(&[TAG_DATE])
+        vec![Tag::with_static_name(TAG_DATE, TAG_NAME_DATE)]
     }
 }
 

@@ -16,6 +16,7 @@ use super::reclamation::{
     Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
     ScopeRef, Slot, reclaim_within, slot_place,
 };
+use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::{ConstructResult, DecodeError, Options};
 use crate::bounded::{
@@ -147,7 +148,7 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     const INITIAL: Prefix = Prefix::EMPTY;
 
     fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        if slot.custody().initialized() < Self::INIT_STEPS {
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, slot.custody().initialized()) {
             if let Some(document) = Self::document(&mut slot)
                 && document.is_some()
             {

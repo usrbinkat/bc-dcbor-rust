@@ -17,20 +17,30 @@ use crate::bounded::{Caller, Places, ResourceBound, Unit, widen};
 use core::cell::Cell;
 
 /// What the scope block's acquisition writes, whole: its queue and its
-/// reference count, every field an atomic.
-struct ScopeHead<A: Allocator> {
-    owner: Reclaimer<A>,
-    references: AtomicUsize,
+/// reference count, every field an atomic of the family `S`
+/// ([`crate::sync`]): the build stores `Shipped`'s, and every contract
+/// quantity reads `Core`'s ([`scope_contract`]).
+struct ScopeHead<A: Allocator, S: Atomics = Shipped> {
+    owner: Reclaimer<A, S>,
+    references: S::Counter,
 }
 
 /// The scope block's value: its header, then its terminal dispatch, written
 /// in an admitted unit of its own before any reference is exposed.
-struct Scope<A: Allocator> {
-    head: ScopeHead<A>,
+struct Scope<A: Allocator, S: Atomics = Shipped> {
+    head: ScopeHead<A, S>,
     terminal: MaybeUninit<unsafe fn(NonNull<ScopeBlock<A>>)>,
 }
 
-type ScopeBlock<A> = Held<Scope<A>, <A as Allocator>::Permit>;
+type ScopeBlock<A, S = Shipped> = Held<Scope<A, S>, <A as Allocator>::Permit>;
+
+impl<A: Allocator, S: Atomics> Representation for ScopeHead<A, S> {
+    type In<F: Atomics> = ScopeHead<A, F>;
+}
+
+impl<A: Allocator, S: Atomics> Representation for Scope<A, S> {
+    type In<F: Atomics> = Scope<A, F>;
+}
 
 places! {
     /// The places a decode scope's own lifecycle charges ([`DecodeOwner`]),
@@ -72,10 +82,12 @@ pub(crate) struct ScopeTerms {
 
 impl ScopeTerms {
     pub(crate) fn of<A: Allocator, R>() -> Result<Self, BoundedError<R>> {
-        let block = widen(size_of::<ScopeBlock<A>>())?;
-        // The whole block written, as `initialize_step` acquires it, and its
+        let contract = const { scope_contract::<A>() };
+        let block = widen(contract.block())?;
+        // The header written, as `initialize_step` acquires it, and its
         // release, admitted with it.
-        let work = stable::acquire_cost(const { scope_metadata::<A>() })
+        let work = contract
+            .write()
             .work()
             .then(stable::release_cost::<A::Permit>().work())?
             .then(
@@ -108,10 +120,88 @@ impl Places for ScopeTerms {
 /// Invariant in `'s`: a scope can be neither shortened nor extended.
 type Lifetime<'s> = PhantomData<Cell<&'s ()>>;
 
-/// What the scope block's acquisition writes: its header, whole, and the
-/// permit.
-const fn scope_metadata<A: Allocator>() -> stable::Metadata {
-    stable::Metadata::header::<ScopeHead<A>, Scope<A>, A::Permit>()
+/// What the scope block's acquisition admits ([`stable::Contract`]): its
+/// header, whole, and the permit, written in one unit, and its whole block;
+/// read from the production representation, so the same in every build,
+/// whatever atomics the build stores.
+const fn scope_contract<A: Allocator>() -> stable::Contract<ScopeHead<A>, Scope<A>, A::Permit> {
+    stable::Contract::of()
+}
+
+/// The production representation's scope write and block, read directly
+/// from `Core`'s types and not through [`scope_contract`]: the oracle the
+/// I3 witness (`crate::sync::models`) holds what a scope admits to in every
+/// build.
+#[cfg(test)]
+pub(crate) fn production_scope<A: Allocator>() -> (usize, usize) {
+    use crate::sync::Core;
+    (
+        core::mem::size_of::<ScopeHead<A, Core>>() + core::mem::size_of::<A::Permit>(),
+        core::mem::size_of::<ScopeBlock<A, Core>>(),
+    )
+}
+
+/// The I3 witness: a scope's initialization and a record's acquisition
+/// admit exactly what their production representation holds, whatever
+/// atomics the build stores. Their allocation requests are the production
+/// blocks, in order, and their header writes the production headers with
+/// their permits, against `size_of` read directly from `Core`'s types
+/// ([`production_scope`], `production_record`), never through the contract
+/// functions the admissions use. Run natively by this module's tests and,
+/// inside a model, under each checker (`crate::sync::models`), where a
+/// contract read from the build's own atomics fails it.
+#[cfg(test)]
+pub(crate) fn admits_its_production_representation() {
+    use crate::bounded::{Call, Limits};
+    let mut m = Limits::unlimited().logged();
+    let mut owner = DecodeOwner::<'static, Limits>::new();
+    owner
+        .initialize_step(&mut m)
+        .expect("an unlimited policy admits the scope");
+    let record = owner
+        .allocate_step::<u64>(&mut m, &mut Acquisition::new())
+        .expect("an unlimited policy admits a record");
+    let (scope_write, scope_block) = production_scope::<Limits>();
+    let (record_write, record_block) = super::production_record::<u64, Limits>();
+    let mut allocations = m.admitted().iter().filter_map(|call| match call {
+        Call::Allocate(bytes) => Some(*bytes),
+        Call::Work { .. } => None,
+    });
+    assert_eq!(
+        allocations.next(),
+        Some(scope_block as u64),
+        "the scope's allocation request is not its production block"
+    );
+    assert_eq!(
+        allocations.next(),
+        Some(record_block as u64),
+        "the record's allocation request is not its production block"
+    );
+    assert_eq!(allocations.next(), None, "an allocation beyond the two");
+    for (what, write) in [("scope", scope_write), ("record", record_write)] {
+        assert!(
+            m.admitted().contains(&Call::Work {
+                values: 1,
+                bytes: write as u64
+            }),
+            "the {what}'s header write of {write} production bytes was not admitted: {:?}",
+            m.admitted()
+        );
+    }
+    drop(record);
+    let mut done = false;
+    for _ in 0..8 {
+        if owner
+            .shutdown_step(&mut m)
+            .expect("an unlimited policy admits every cleanup unit")
+            == Reclaimed::Done
+        {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "the scope did not shut down");
+    assert_eq!(m.live_bytes(), 0, "the record or the scope was kept");
 }
 
 /// The scope's terminal dispatch, written into its block so a reference that
@@ -462,6 +552,7 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
             // the final admitted write.
             let block = at(ScopePlace::Initialization, || unsafe {
                 stable::acquire::<Scope<A>, ScopeHead<A>, A>(
+                    const { scope_contract::<A>() },
                     admitted,
                     || true,
                     || ScopeHead {
@@ -526,6 +617,41 @@ impl<'s, A: Allocator> DecodeOwner<'s, A> {
     /// Allocate one record for a custom resource binding. Initialize it through
     /// [`OwnedRecord::destination`] and publish it; retain `acquisition` across
     /// refusals.
+    ///
+    /// A record is acquired in one admitted unit of at most a quantum: its
+    /// header, its state and the permit, read from the production
+    /// representation in every build. A binding whose state does not fit
+    /// fails to compile where it is allocated:
+    /// ```compile_fail,E0080
+    /// use dcbor::bounded::decode::construction::reclamation::{
+    ///     Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+    /// };
+    /// use dcbor::bounded::decode::construction::{Acquisition, DecodeOwner};
+    /// use dcbor::bounded::{BoundedResult, Limits};
+    /// struct Wide;
+    /// struct Words([u64; 8]);
+    /// impl Custody for Words {
+    ///     type Observation = u64;
+    ///     fn observe(&mut self) -> u64 {
+    ///         self.0[0]
+    ///     }
+    /// }
+    /// // SAFETY: the binding owns nothing; its one cleanup unit is `Done`.
+    /// unsafe impl Reclaim<Limits> for Wide {
+    ///     type State = Words;
+    ///     const INITIAL: Words = Words([0; 8]);
+    ///     fn reclaim_step(_: Slot<'_, Self, Words>, _: &mut Limits) -> BoundedResult<Reclaimed, Limits> {
+    ///         Ok(Reclaimed::Done)
+    ///     }
+    ///     fn remaining(_: PeekSlot<'_, Self, Words>) -> u64 {
+    ///         1
+    ///     }
+    /// }
+    /// let mut m = Limits::unlimited();
+    /// let mut owner = DecodeOwner::<'static, Limits>::new();
+    /// owner.initialize_step(&mut m).unwrap();
+    /// let _ = owner.allocate_step::<Wide>(&mut m, &mut Acquisition::new());
+    /// ```
     pub fn allocate_step<T: Reclaim<A> + Send + 's>(
         &self,
         a: &mut A,
@@ -843,6 +969,78 @@ mod tests {
         assert_eq!(m.live_bytes(), 0, "the record or the scope was kept");
     }
 
+    /// FF-13's premise that workers are interchangeable, which the models'
+    /// claims beyond the worker counts they explore rest on: no thread's
+    /// identity enters the protocol, so which thread performs an operation
+    /// changes nothing it admits, reports or leaves. Six operations (two
+    /// allocations, two retirements, two steps), each on the main thread or
+    /// on a thread of its own, in every one of the 64 assignments and in the
+    /// same order: the admitted calls, every position and every step's
+    /// result equal the run on the main thread alone. The census holds the
+    /// structural half: the protocol's state is its atomics family's
+    /// primitives alone, and no shipped code names a thread
+    /// (`tests/unsafe_census.rs`).
+    #[cfg(feature = "std")]
+    #[test]
+    fn which_thread_performs_an_operation_changes_nothing() {
+        use crate::bounded::Call;
+        use std::vec::Vec;
+        const OPERATIONS: u32 = 6;
+        fn on<R: Send>(spawned: bool, operation: impl FnOnce() -> R + Send) -> R {
+            if spawned {
+                std::thread::scope(|threads| {
+                    threads
+                        .spawn(operation)
+                        .join()
+                        .expect("an operation's thread panicked")
+                })
+            } else {
+                operation()
+            }
+        }
+        fn run(placement: u32) -> (Vec<Call>, Vec<ScopePosition>, Vec<Reclaimed>) {
+            let spawned = |operation: u32| placement & (1 << operation) != 0;
+            let mut m = Limits::unlimited().logged();
+            let mut owner = DecodeOwner::<'static, Limits>::new();
+            owner.initialize_step(&mut m).unwrap();
+            let mut positions = Vec::new();
+            let mut steps = Vec::new();
+            let first = on(spawned(0), || {
+                owner
+                    .allocate_step::<u64>(&mut m, &mut Acquisition::new())
+                    .unwrap()
+            });
+            let second = on(spawned(1), || {
+                owner
+                    .allocate_step::<u64>(&mut m, &mut Acquisition::new())
+                    .unwrap()
+            });
+            positions.push(owner.position());
+            on(spawned(2), || drop(first));
+            positions.push(owner.position());
+            steps.push(on(spawned(3), || owner.step(&mut m).unwrap()));
+            positions.push(owner.position());
+            on(spawned(4), || drop(second));
+            positions.push(owner.position());
+            steps.push(on(spawned(5), || owner.step(&mut m).unwrap()));
+            positions.push(owner.position());
+            loop {
+                let step = owner.shutdown_step(&mut m).unwrap();
+                steps.push(step);
+                if step == Reclaimed::Done {
+                    break;
+                }
+                assert!(steps.len() < 32, "the scope did not shut down");
+            }
+            assert_eq!(m.live_bytes(), 0, "the record or the scope was kept");
+            (m.admitted().to_vec(), positions, steps)
+        }
+        let local = run(0);
+        for placement in 1..(1 << OPERATIONS) {
+            assert_eq!(run(placement), local, "placement {placement:06b}");
+        }
+    }
+
     /// The defaults are the empty forms: an authority that holds no scope,
     /// and an acquisition that holds no admission, with which a record is
     /// acquired as with a new one; the scope's metadata evaluated at run
@@ -877,8 +1075,12 @@ mod tests {
         assert!(done, "the scope did not shut down");
         assert_eq!(m.live_bytes(), 0);
         assert_eq!(
-            scope_metadata::<Limits>().bytes(),
-            const { scope_metadata::<Limits>() }.bytes()
+            scope_contract::<Limits>().write(),
+            const { scope_contract::<Limits>() }.write()
+        );
+        assert_eq!(
+            scope_contract::<Limits>().block(),
+            const { scope_contract::<Limits>() }.block()
         );
     }
 }

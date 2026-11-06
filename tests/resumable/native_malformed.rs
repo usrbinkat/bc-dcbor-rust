@@ -76,6 +76,7 @@ fn reasons(name: &str, wire: &[u8], baseline: &[Call]) {
         assert_eq!(m.calls(), &baseline[..=stop], "{reason:?} at call {stop}");
         drop(operation);
         assert_eq!(pool.live_bytes(), 0);
+        m.reached()
     });
 }
 

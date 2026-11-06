@@ -29,8 +29,12 @@ fn expired_before_first_admission_executes_no_work_and_allocates_nothing() {
 /// is observed there, at the clock it names; once the deadline is lifted the
 /// same operation resumes to the literal document, attempting the
 /// unobstructed run's calls with only the expired one repeated. Returns the
-/// calls attempted.
-fn expire_at(wire: &[u8], baseline: &Limits, stop: usize) -> Vec<Call> {
+/// calls admitted and the boundary valuations the decode reached.
+fn expire_at(
+    wire: &[u8],
+    baseline: &Limits,
+    stop: usize,
+) -> (Vec<Call>, dcbor::bounded::boundary::Reached) {
     let mut m = meter();
     m.deadline(Some(u64::try_from(stop).expect("a call index fits in u64")));
     let pool = m.share();
@@ -63,7 +67,7 @@ fn expire_at(wire: &[u8], baseline: &Limits, stop: usize) -> Vec<Call> {
     assert!(pool.live_bytes() > 0);
     drop(document);
     assert_eq!(pool.live_bytes(), 0);
-    m.admitted().to_vec()
+    (m.admitted().to_vec(), m.reached())
 }
 
 #[test]
@@ -97,11 +101,13 @@ fn expiration_between_admissions_preserves_paid_work_and_can_resume() {
         baseline.calls(),
         &[LimitRefusal::Deadline],
         |stop, _| {
+            let (admitted, reached) = expire_at(&wire, &baseline, stop);
             assert_eq!(
-                expire_at(&wire, &baseline, stop),
+                admitted,
                 baseline.admitted(),
                 "deadline recovery at call {stop} replayed paid work"
             );
+            reached
         },
     );
 }
