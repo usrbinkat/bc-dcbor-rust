@@ -19,20 +19,28 @@ const SCHEDULES: &str = "DCBOR_MODEL_SCHEDULES";
 const DESCRIPTION: &str = "DCBOR_MODEL";
 
 /// A command whose environment holds nothing a model run may not read: no
-/// `LOOM_*` or `SHUTTLE_*` variable, backtraces off, no model value.
+/// `LOOM_*`, `SHUTTLE_*`, or `DCBOR_RECORD_*` variable, backtraces off,
+/// no model value. Control runs cannot inherit permission to rewrite evidence.
 fn controlled(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    for (name, _) in std::env::vars_os() {
+    isolate(&mut command, std::env::vars_os().map(|(name, _)| name));
+    command.env("RUST_BACKTRACE", "0");
+    command
+}
+
+/// Clear inherited execution and publication permissions before a run adds
+/// its explicitly selected inputs.
+fn isolate(command: &mut Command, names: impl IntoIterator<Item = std::ffi::OsString>) {
+    for name in names {
         let text = name.to_string_lossy();
         if text.starts_with("LOOM_")
             || text.starts_with("SHUTTLE_")
+            || text.starts_with("DCBOR_RECORD_")
             || [BOUND, STACK, DESCRIBE].contains(&text.as_ref())
         {
             command.env_remove(&name);
         }
     }
-    command.env("RUST_BACKTRACE", "0");
-    command
 }
 
 /// The RUSTFLAGS of `checker`'s build, the caller's own before them.
@@ -372,7 +380,29 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTION, SCHEDULES, marked};
+    use super::{DESCRIPTION, SCHEDULES, isolate, marked};
+
+    #[test]
+    fn controls_cannot_inherit_recording_authorization() {
+        let names = [
+            "DCBOR_RECORD_BUDGETS",
+            "DCBOR_RECORD_FACTORS",
+            "DCBOR_RECORD_TRACES",
+        ];
+        let mut command = std::process::Command::new("sh");
+        for name in names {
+            command.env(name, "planted");
+        }
+        isolate(&mut command, names.map(std::ffi::OsString::from));
+        let output = command
+            .args(["-c", "test -z \"${DCBOR_RECORD_BUDGETS+x}${DCBOR_RECORD_FACTORS+x}${DCBOR_RECORD_TRACES+x}\""])
+            .output()
+            .expect("run the isolated child");
+        assert!(
+            output.status.success(),
+            "a control inherited recording authorization: {output:?}"
+        );
+    }
 
     /// A marker is found where libtest leaves it, after the test's name on
     /// its line, and at a line's start; each marker reads only its own

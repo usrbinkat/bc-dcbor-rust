@@ -242,10 +242,8 @@ fn key_comparison_quantum_is_checked_separately_from_payload_scans() {
 fn arena_growth_quantum_is_checked_without_text_or_payload_processing() {
     let mut wire = vec![0x99, 0x10, 0x00];
     wire.extend(std::iter::repeat_n(0x01, 4096));
-    // An array of 4,096 integers decoded, its node arena growing through
-    // every capacity: 65,884 observations and 26 permit records, measured.
-    let capacity = super::support::measured(65_884, 26);
-    super::support::recorded_run_capacity(capacity, |run| {
+    let mut budgets = budgets("arena-growth", &["integers/4096/decode"]);
+    budgets.run("integers/4096/decode", |run| {
         let policy = run.policy(POOL);
         run.holding(
             decoder(&wire),
@@ -280,6 +278,7 @@ fn arena_growth_quantum_is_checked_without_text_or_payload_processing() {
         run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
         Ok::<_, Finding>(())
     });
+    budgets.finish();
 }
 
 // Prior art: tokio-util/tests/length_delimited.rs, read_multi_frame_multi_packet:

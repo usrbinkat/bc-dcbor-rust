@@ -55,7 +55,7 @@ pub const UNINHERITED: [&str; 5] = [
     "DCBOR_RECORD_TRACES",
     "DCBOR_CLASS_COVERAGE",
     "DCBOR_WITNESS",
-    "DCBOR_MEASURE_RECORDING",
+    "DCBOR_RECORD_BUDGETS",
 ];
 
 /// The marker each checked or recorded cost record's digest follows in a

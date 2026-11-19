@@ -22,7 +22,7 @@ fn cancellation_at_every_actual_constructor_admission_returns_capacity() {
     const QUARTER: usize = 256 * 1024;
     let capacity = 4 * QUARTER as u64;
     refusal_matrix("string decode in a fixed pool", rigor(), |fault: Fault| {
-        suite_with(capacity, support::CAPACITY, |run, pool| {
+        suite_with(capacity, |run, pool| {
             let decoding = run.shared_policy(pool);
             run.holding(
                 string_decoder(&wire),
@@ -513,7 +513,7 @@ fn failed_growth_keeps_old_reservation_until_a_successful_replacement() {
             ])
         }
     }
-    suite_with(4096, support::CAPACITY, |run, pool| {
+    suite_with(4096, |run, pool| {
         let owner = run.with_policy(pool, |m| m.owner().expect("a recorded owner"));
         let tenant = run.with_policy(pool, |m| m.owner().expect("a recorded owner"));
         let first = run.shared_policy(pool);

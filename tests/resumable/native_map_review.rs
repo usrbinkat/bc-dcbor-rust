@@ -22,9 +22,9 @@ use hashbrown::HashTable;
 fn vacant_bucket_batches_retain_exact_positions_and_bound_total_steps() {
     // Multiple vacant windows and the final occupied window in both layers;
     // the million-entry capacity is the exhaustive scan-volume witness.
-    let (capacity, recording) = match rigor() {
-        Rigor::Fast => (128, super::support::CAPACITY),
-        Rigor::Exhaustive => (1_000_000, super::support::measured(196_611, 0)),
+    let capacity = match rigor() {
+        Rigor::Fast => 128,
+        Rigor::Exhaustive => 1_000_000,
     };
     let mut table = HashTable::<(u64, u64)>::with_capacity(capacity);
     let buckets = table.num_buckets();
@@ -33,9 +33,9 @@ fn vacant_bucket_batches_retain_exact_positions_and_bound_total_steps() {
     // Hashed to itself: its home bucket is the last, free as it is inserted.
     table.insert_unique(last, (last, last), |pair| pair.0);
     assert_eq!(table.get_bucket(buckets - 1), Some(&(last, last)));
-    // Exhaustive: every vacant window refused and resumed, then completion,
-    // measured at 196,611 recorded events and no allocation permits.
-    suite_with(POOL, recording, |run, policy| {
+    let key = format!("buckets/{buckets}/refuse-resume");
+    let mut budgets = budgets("vacant-buckets", &[&key]);
+    budget_suite(&mut budgets, &key, POOL, |run, policy| {
         let owner = run.with_policy(policy, |m| m.owner().expect("the meter makes an owner"));
         run.holding(
             EnumerationCustody {
@@ -93,6 +93,7 @@ fn vacant_bucket_batches_retain_exact_positions_and_bound_total_steps() {
             },
         )
     });
+    budgets.finish();
 }
 
 #[test]
@@ -420,47 +421,31 @@ impl Schema for Nested {
 
 #[test]
 fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
-    let measuring = match std::env::var("DCBOR_MEASURE_RECORDING") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        other => panic!("DCBOR_MEASURE_RECORDING must be 1 or unset: {other:?}"),
-    };
     // Fast covers ordered/reordered maps, single/nested ancestors and both
     // payload head widths. Exhaustive retains the depth and volume stress.
     let (depths, lengths): (&[usize], &[usize]) = match rigor() {
         Rigor::Fast => (&[1, 8], &[64, 256]),
         Rigor::Exhaustive => (&[1, 8, 32], &[64, 256, 4096]),
     };
+    let key =
+        |reordered, depth, length| format!("reordered/{reordered}/depth/{depth}/bytes/{length}");
+    let keys: Vec<String> = [false, true]
+        .into_iter()
+        .flat_map(|reordered| {
+            depths.iter().flat_map(move |&depth| {
+                lengths
+                    .iter()
+                    .map(move |&length| key(reordered, depth, length))
+            })
+        })
+        .collect();
+    let mut budgets = budgets(
+        "nested-payload",
+        &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
     for reordered in [false, true] {
         for &depth in depths {
             for &length in lengths {
-                // Finished recordings include preparation, emission and retirement.
-                let (events, permits) = match (reordered, depth, length) {
-                    (false, 1, 64) => (649, 24),
-                    (false, 1, 256) => (1_485, 28),
-                    (false, 1, 4096) => (17_197, 36),
-                    (false, 8, 64) => (1_605, 42),
-                    (false, 8, 256) => (2_199, 44),
-                    (false, 8, 4096) => (18_751, 52),
-                    (false, 32, 64) => (3_957, 60),
-                    (false, 32, 256) => (5_211, 62),
-                    (false, 32, 4096) => (23_591, 68),
-                    (true, 1, 64) => (1_133, 32),
-                    (true, 1, 256) => (2_905, 40),
-                    (true, 1, 4096) => (36_145, 56),
-                    (true, 8, 64) => (5_729, 92),
-                    (true, 8, 256) => (13_811, 126),
-                    (true, 8, 4096) => (170_587, 198),
-                    (true, 32, 64) => (27_633, 288),
-                    (true, 32, 256) => (57_783, 384),
-                    (true, 32, 4096) => (637_059, 646),
-                    case => panic!("no measured recording budget for nested payload {case:?}"),
-                };
-                let capacity = if measuring {
-                    super::support::measured(1 << 20, 1 << 14)
-                } else {
-                    super::support::measured(events, permits)
-                };
                 let mut source: Box<dyn Schema> =
                     Box::new(dcbor::ByteString::from(vec![0xaa; length]));
                 for _ in 0..depth {
@@ -473,36 +458,27 @@ fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
                 // bitmap scan; and the bitmap's and arenas' growth.
                 let byte_bound = 64 * wire_length * (depth + 1) + 512 * (depth + 1);
                 let turns = prepare_turns(shape(source.as_ref()));
-                suite_with(POOL, capacity, |run, policy| {
-                    if measuring {
-                        run.inspect_evidence(move |observed, _| {
-                            use dcbor::bounded::{Answer, Call, Event};
-                            let permits = observed.iter().filter(|observation| matches!(
-                                observation.event,
-                                Event::Call(Call::Allocate(_), Answer::Granted(_)) | Event::Split { .. }
-                            )).count();
-                            eprintln!(
-                                "nested payload reordered={reordered}, depth={depth}, length={length}: {} events, {permits} permits",
-                                observed.len()
-                            );
-                        });
-                    }
-                    let mut moves = 0;
-                    let mut expected = Vec::new();
-                    for _ in 0..depth {
-                        if reordered {
-                            expected.extend([0xa2, 0, 0, 1]);
-                        } else {
-                            expected.extend([0xa1, 0]);
+                budget_suite(
+                    &mut budgets,
+                    &key(reordered, depth, length),
+                    POOL,
+                    |run, policy| {
+                        let mut moves = 0;
+                        let mut expected = Vec::new();
+                        for _ in 0..depth {
+                            if reordered {
+                                expected.extend([0xa2, 0, 0, 1]);
+                            } else {
+                                expected.extend([0xa1, 0]);
+                            }
                         }
-                    }
-                    if length < 256 {
-                        expected.extend([0x58, length as u8]);
-                    } else {
-                        expected.extend([0x59, (length >> 8) as u8, length as u8]);
-                    }
-                    expected.extend(vec![0xaa; length]);
-                    run.holding(Preparation::new(source.as_ref()), Retirement::Released, &Unwitnessed, |operation| {
+                        if length < 256 {
+                            expected.extend([0x58, length as u8]);
+                        } else {
+                            expected.extend([0x59, (length >> 8) as u8, length as u8]);
+                        }
+                        expected.extend(vec![0xaa; length]);
+                        run.holding(Preparation::new(source.as_ref()), Retirement::Released, &Unwitnessed, |operation| {
                         operation.controlled(policy, turns, Retirement::Released, true, |_, operation, _| {
                         if operation.position().dynamic.permutation.phase
                             == dcbor::bounded::encoding::PermutationPhase::Move
@@ -530,15 +506,16 @@ fn nested_payload_work_is_bounded_by_bytes_times_dynamic_depth() {
                         })?.expect("the payload controller never stops")?;
                         Ok::<_, Finding>(())
                     })?;
-                    assert!(
-                        moves <= wire_length * depth,
-                        "a byte moved more than once per dynamic ancestor"
-                    );
-                    run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
-                    Ok(())
-                });
+                        assert!(
+                            moves <= wire_length * depth,
+                            "a byte moved more than once per dynamic ancestor"
+                        );
+                        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+                        Ok(())
+                    },
+                );
             }
         }
     }
-    assert!(!measuring, "recording measurement is not qualification");
+    budgets.finish();
 }

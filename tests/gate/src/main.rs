@@ -175,7 +175,7 @@ use dcbor_gate::records;
 use dcbor_gate::rows::{self, Evidence, Physical, Purpose, Row};
 use dcbor_model_bounds::{Bounds, Checker, PATH, RECORD_WITH};
 
-const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE | ours FILE | variants | \
+const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE | ours FILE | variants | budgets | \
                      manifest FEATURES DIGESTS OUT | models derive ROOT PAGE LOGS | \
                      models evidence ROOT PAGE LOGS | \
                      models control ROOT LOGS NAME CHECKER | \
@@ -860,6 +860,23 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
         ["variants"] => {
             for (suffix, features) in records::VARIANTS {
                 println!("{features}\t{suffix}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        // Every recording budget to record and check, one per line: its
+        // file name, its projection's features, its test target and exact
+        // test, and its layer and witness sizes.
+        ["budgets"] => {
+            for selection in dcbor_record::budgets::inventory() {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    selection.name,
+                    selection.features,
+                    selection.target,
+                    selection.test,
+                    selection.rigor.name(),
+                    selection.witness.name()
+                );
             }
             Ok(ExitCode::SUCCESS)
         }

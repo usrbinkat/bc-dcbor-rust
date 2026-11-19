@@ -23,6 +23,11 @@ dcbor-model-bounds = { path = "../model-bounds" }
 # (`recorded_run`): the one permit, obligation and custody lifecycle.
 dcbor-refinement = { path = "../refinement" }
 
+# The build script compiles the recording budgets in (`build.rs`), naming
+# them through the record crate's one inventory of them.
+[build-dependencies]
+dcbor-record = { path = "../record" }
+
 # The model runner (`model`) configures each checker's model under that
 # checker's cfg, as the library selects its atomics by it; the pins are the
 # workspace's, one for every crate.

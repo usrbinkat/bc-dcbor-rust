@@ -1,0 +1,7 @@
+--- tests/support/budgets.rs
++++ tests/support/budgets.rs
+@@ -37,3 +37,3 @@
+         Err(std::env::VarError::NotPresent) => false,
+-        Ok(value) if value == name => true,
++        Ok(_) => true,
+         other => panic!("{RECORD} must name {name} exactly or be unset: {other:?}"),

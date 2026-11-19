@@ -80,45 +80,15 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-/// The variant of the recorded baselines the standard library's collections
-/// select: ordered trees walked by their iterator, or by the forked library's
-/// stepped cursor.
-#[cfg(not(feature = "custom-std-collections"))]
-macro_rules! collections_variant {
-    () => {
-        ""
-    };
-}
-#[cfg(feature = "custom-std-collections")]
-macro_rules! collections_variant {
-    () => {
-        ".custom-std"
-    };
-}
-
-/// The variant of the recorded baselines bignums select: whether the
-/// preparation record holds one.
-#[cfg(not(feature = "num-bigint"))]
-macro_rules! bignum_variant {
-    () => {
-        ""
-    };
-}
-#[cfg(feature = "num-bigint")]
-macro_rules! bignum_variant {
-    () => {
-        ".num-bigint"
-    };
-}
-
-/// The recorded baselines, relative to this package: their admissions depend
-/// on which collections walk ordered trees and on whether bignums are
-/// encoded.
+/// The recorded baselines, relative to this package, of this build's variant
+/// (`variant!`, `dcbor_record::declare_variant`): their admissions depend on
+/// which collections walk ordered trees (the standard library's iterator, or
+/// the forked library's stepped cursor) and on whether bignums are encoded
+/// (the preparation record holds one).
 const RECORDED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/admission-traces",
-    collections_variant!(),
-    bignum_variant!(),
+    variant!(),
     ".txt"
 );
 

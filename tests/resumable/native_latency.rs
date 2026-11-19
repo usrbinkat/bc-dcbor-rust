@@ -122,16 +122,15 @@ where
 fn large_payload_decode_meets_measured_step_ceiling_and_ownership_contract() {
     let text = "x".repeat(65536);
     let wire = text_wire(&text);
-    // A 64 KiB text decoded in units of a quantum: 131,121 observations and
-    // 2 permit records, measured.
-    let recording = super::support::measured(131_121, 2);
-    suite_with(POOL, recording, |run, policy| {
+    let mut budgets = budgets("payload-latency", &["text/65536/timed"]);
+    budget_suite(&mut budgets, "text/65536/timed", POOL, |run, policy| {
         timed(run, policy, decoder(&wire), wire.len() * 4, |output, m| {
             // The decoder is retired; the document holds its arena.
             assert!(m.live_bytes() > 0);
             assert_eq!(output.root().encoded(), wire);
         })
     });
+    budgets.finish();
 }
 
 #[test]

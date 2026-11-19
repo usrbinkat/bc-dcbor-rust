@@ -142,49 +142,53 @@ fn long_combining_run_requires_retained_progress_not_whole_run_admission() {
     let source = format!("q{}", "\u{301}\u{316}".repeat(4096));
     let normal = format!("q{}{}", "\u{316}".repeat(4096), "\u{301}".repeat(4096));
     let expected = text_wire(&normal);
-    // A combining run of 8,193 scalars normalized and encoded a quantum per
-    // turn: 279,243 observations and 53 permit records, measured.
-    let recording = super::support::measured(279_243, 53);
-    suite_with(POOL, recording, |run, policy| {
-        // One quantum before the first refusal; every later turn is one
-        // quantum.
-        run.with_policy(policy, |m| {
-            m.set_limit(WriteWork::new(TURN.values, TURN.bytes))
-        });
-        run.holding(
-            text_encoder(&source),
-            Retirement::Released,
-            &Unwitnessed,
-            |operation| {
-                operation.suspend(
-                    policy,
-                    LimitRefusal::Work,
-                    normalize_turns(&source),
-                    TurnSchedule::Retained,
-                    Retirement::Released,
-                )?;
-                // The encoder retired before its output is consumed: the
-                // output holds its bytes beyond the encoder's life.
-                operation.drive_faulted(
-                    policy,
-                    normalize_turns(&source),
-                    Retirement::Released,
-                    Fault::NONE,
-                    |_, _| {},
-                    |output| {
-                        output.with_policy(policy, |output, m| {
-                            assert_eq!(output.as_ref(), expected);
-                            m.assert_units(TURN);
-                            assert!(m.live_bytes() >= expected.len() as u64);
-                        });
-                    },
-                )?;
-                Ok::<_, Finding>(())
-            },
-        )?;
-        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
-        Ok(())
-    });
+    let mut budgets = budgets("combining-progress", &["alternating-marks/4096/suspend"]);
+    budget_suite(
+        &mut budgets,
+        "alternating-marks/4096/suspend",
+        POOL,
+        |run, policy| {
+            // One quantum before the first refusal; every later turn is one
+            // quantum.
+            run.with_policy(policy, |m| {
+                m.set_limit(WriteWork::new(TURN.values, TURN.bytes))
+            });
+            run.holding(
+                text_encoder(&source),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    operation.suspend(
+                        policy,
+                        LimitRefusal::Work,
+                        normalize_turns(&source),
+                        TurnSchedule::Retained,
+                        Retirement::Released,
+                    )?;
+                    // The encoder retired before its output is consumed: the
+                    // output holds its bytes beyond the encoder's life.
+                    operation.drive_faulted(
+                        policy,
+                        normalize_turns(&source),
+                        Retirement::Released,
+                        Fault::NONE,
+                        |_, _| {},
+                        |output| {
+                            output.with_policy(policy, |output, m| {
+                                assert_eq!(output.as_ref(), expected);
+                                m.assert_units(TURN);
+                                assert!(m.live_bytes() >= expected.len() as u64);
+                            });
+                        },
+                    )?;
+                    Ok::<_, Finding>(())
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
+        },
+    );
+    budgets.finish();
 }
 
 #[test]
@@ -195,51 +199,14 @@ fn long_valid_combining_sequence_is_accepted_and_one_late_disordered_mark_reject
         Rigor::Fast => 128,
         Rigor::Exhaustive => 100_000,
     };
-    let measuring = match std::env::var("DCBOR_MEASURE_RECORDING") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        other => panic!("DCBOR_MEASURE_RECORDING must be 1 or unset: {other:?}"),
-    };
-    let capacity = |events, permits| {
-        if measuring {
-            dcbor::bounded::Capacity {
-                events: 1 << 23,
-                permits: super::support::CAPACITY.permits,
-            }
-        } else {
-            match rigor() {
-                Rigor::Fast => super::support::CAPACITY,
-                Rigor::Exhaustive => super::support::measured(events, permits),
-            }
-        }
-    };
-    let inspect = move |run: &mut super::support::RecordedRun, name: &'static str| {
-        if measuring {
-            run.inspect_evidence(move |observed, _| {
-                use dcbor::bounded::{Answer, Call, Event};
-                let permits = observed
-                    .iter()
-                    .filter(|observation| {
-                        matches!(
-                            observation.event,
-                            Event::Call(Call::Allocate(_), Answer::Granted(_))
-                                | Event::Split { .. }
-                        )
-                    })
-                    .count();
-                eprintln!(
-                    "long combining {name}, {marks} marks: {} events, {permits} permits",
-                    observed.len()
-                );
-            });
-        }
-    };
+    let accepted = format!("marks/{marks}/valid");
+    let rejected = format!("marks/{marks}/disordered");
+    let mut budgets = budgets("combining-validation", &[&accepted, &rejected]);
     // q composes with no mark, and every mark has the same combining class:
     // the text is NFC however long the run.
     let valid = format!("q{}", "\u{301}".repeat(marks));
     let wire = text_wire(&valid);
-    suite_with(POOL, capacity(3_331_604, 67), |run, policy| {
-        inspect(run, "valid");
+    budget_suite(&mut budgets, &accepted, POOL, |run, policy| {
         run.holding(
             Decoder::new(&wire, Options::normalizing(8)),
             Retirement::Released,
@@ -266,8 +233,7 @@ fn long_valid_combining_sequence_is_accepted_and_one_late_disordered_mark_reject
     // steps its own cleanup to its end.
     let disordered = format!("{valid}\u{316}");
     let wire = text_wire(&disordered);
-    suite_with(POOL, capacity(200_026, 0), |run, policy| {
-        inspect(run, "disordered");
+    budget_suite(&mut budgets, &rejected, POOL, |run, policy| {
         run.holding(
             Decoder::new(&wire, Options::normalizing(8)),
             Retirement::Released,
@@ -295,5 +261,5 @@ fn long_valid_combining_sequence_is_accepted_and_one_late_disordered_mark_reject
         run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
         Ok(())
     });
-    assert!(!measuring, "recording measurement is not qualification");
+    budgets.finish();
 }

@@ -3,6 +3,10 @@
 #![cfg(feature = "std")]
 #![cfg_attr(feature = "custom-std-collections", feature(hashmap_bucket_access))]
 
+// `variant!()`: this build's record suffix ([`dcbor_record::declare_variant`]),
+// declared before every module so each reads its own build's records.
+dcbor_record::declare_variant!(variant);
+
 #[path = "resumable/native_bindings.rs"]
 mod bindings;
 

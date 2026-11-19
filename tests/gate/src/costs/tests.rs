@@ -433,7 +433,7 @@ fn a_leg_inherits_no_other_recording_mode() {
         "DCBOR_RECORD_TRACES",
         "DCBOR_CLASS_COVERAGE",
         "DCBOR_WITNESS",
-        "DCBOR_MEASURE_RECORDING",
+        "DCBOR_RECORD_BUDGETS",
     ] {
         expected.insert(name.to_string(), None);
     }

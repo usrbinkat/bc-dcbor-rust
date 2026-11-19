@@ -34,35 +34,10 @@ use std::fmt::Display;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// The layer, its variable and its one reading, defined in the record crate
-/// (`tests/record`), which the library's own unit tests also read.
-pub use dcbor_record::{RIGOR as VARIABLE, Rigor, rigor};
-
-/// The variable naming the witness sizes.
-pub const WITNESS: &str = "DCBOR_WITNESS";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Witness {
-    /// The native layers' sizes.
-    Full,
-    /// The boundary-minimal size of every class a matrix covers.
-    Minimal,
-}
-
-/// The witness sizes this run carries: `DCBOR_WITNESS` read once, `full`
-/// when unset.
-pub fn witness() -> Witness {
-    static WITNESS_SIZES: OnceLock<Witness> = OnceLock::new();
-    *WITNESS_SIZES.get_or_init(|| match std::env::var(WITNESS) {
-        Err(std::env::VarError::NotPresent) => Witness::Full,
-        Ok(value) => match value.as_str() {
-            "full" => Witness::Full,
-            "minimal" => Witness::Minimal,
-            other => panic!("{WITNESS}={other:?}: the witness sizes are full and minimal"),
-        },
-        Err(error) => panic!("{WITNESS}: {error}"),
-    })
-}
+/// The layer and the witness sizes, their variables and their one reading
+/// each, defined in the record crate (`tests/record`), which the library's
+/// own unit tests and the recording budgets' inventory also read.
+pub use dcbor_record::{RIGOR as VARIABLE, Rigor, WITNESS, Witness, rigor, witness};
 
 /// `full` in a run of full witnesses, `minimal` in a run of minimal ones: a
 /// fixture's size, its minimal one still reaching every class and boundary

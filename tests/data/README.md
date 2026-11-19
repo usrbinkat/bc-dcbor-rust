@@ -98,9 +98,9 @@ other ceiling observed; `dcbor_record::Evidence`), and a row claiming another is
 requirement is the case's eligibility, separate from the representation projection the file suffix
 names: `-` for a case every build executes, or the one capability the case needs
 (`dcbor_record::capabilities`, the one definition of `derive` and `hashbrown`, shared with the
-admission-trace feature column). A build checks every row whose requirement it satisfies and
-ignores the rest; a missing eligible row, a changed requirement, an unknown one, and a measurement
-taken without its capability are refused; recording requires every capability. Outcomes distinguish
+admission-trace feature column). A build checks every row whose requirement it satisfies and ignores
+the rest; a missing eligible row, a changed requirement, an unknown one, and a measurement taken
+without its capability are refused; recording requires every capability. Outcomes distinguish
 publication, invalid input, and cancellation; analytical tightness calculations use `exact`. A
 defect cannot be recorded or accepted by the ratchet, even when its numeric result matches an
 existing record. Diagnostics name cases rather than their indices.
@@ -135,6 +135,54 @@ install or switch tools.
 Review deltas against their mechanisms: FF-17 moves release charges to acquisition; staged arenas
 add metadata acquisition and release; merge scratch grows geometrically across retained runs.
 Observation-only changes and one-pass refusal must leave successful admission traces unchanged.
+
+### Recording budgets
+
+A recording budget is the observation storage a fixture whose recording outgrows the default
+capacity (`support::CAPACITY`) was measured to need: the session preallocated before the fixture
+runs, never an expected accounting total. No test states one; each is a row of its family's record.
+
+`bash tests/record-evidence.sh record-budgets` records every budget record, then checks each with
+recording disabled. `gate budgets` names every record to hold, one line each: its file name, its
+projection's features, its test target and exact test, and its rigor layer and witness size. That
+list is `dcbor_record::budgets::inventory`: every family of `budgets/families.rs` in every variant
+it is compiled in (`dcbor_record::VARIANTS`; a family of the forked collections in the custom-std
+variants alone), at both layers and both witness sizes. The support crate's build compiles the same
+list in (`tests/support/build.rs`) and `gate evidence` requires each record current.
+
+Each `budgets/{family}{variant}.{rigor}.{witness}.txt` holds the configuration line, then one
+tab-separated row per fixture: its identity, the events and the permit records its finished
+recording held. Every selection has its own record, the fixtures that selection runs, so a fast or
+minimal run is never sized by another selection's fixtures. A reader refuses a record with no
+configuration line, a malformed or impossible count (no event, more permit records than events), a
+fixture twice, and a family missing a fixture or holding one it does not declare.
+
+`support::budgets::Budgets` is a family's one source of capacity. Each fixture runs through it
+(`Budgets::run`, `Budgets::construction`, or `Budgets::encode_checked`), measured from the evidence
+its recording finished with; a fixture undeclared, measured twice, or begun before the last finished
+is refused; `Budgets::finish` requires every declared fixture measured, and a family dropped
+unfinished is refused. `DCBOR_RECORD_BUDGETS` names the one record a run records: under it every
+fixture runs at the fixed bootstrap capacity, never grown or retried, and the finished family is
+published whole, a family incomplete or failed leaving the previous record intact; any other family
+it reaches refuses to run. Every finished family reports `budget finalized: <record>`, and the
+recorder requires exactly one per run. Publication across families is not a transaction.
+
+The capacity of a recorded fixture is its counts each padded by a quarter and rounded up to a power
+of two, never below the default (`support::measured`, private to the support crate, so no
+integration test can size a recording by hand); an overflowing count is refused. Apart from a
+budget, a recording is never enlarged: a pipeline schedule states no capacity, and the one public
+sizing, `support::recorded_run_short`, only shrinks the default, to witness a recording's
+exhaustion. The library's own unit tests, which cannot reach the support crate, make their sessions
+directly, each sized for its own test: the session module's capacity tests and the exhaustion
+witnesses at the exact sizes they test, the rest at sizes well below the default, kept small
+because the Miri gate runs most of them (`tests/miri-suites.txt`) and a session initializes every
+slot it holds. A record absent from the build is compiled in as absent, which only its own
+recording run accepts: the first recording needs no placeholder file. Cost qualification clears the
+recording flag, and the launcher sets it for one record at a time.
+
+Driver selection and observation extraction are private to the budget authority. Fixtures supply
+inputs and semantic inspections; they cannot supply a replacement observation stream to the
+recorder.
 
 ### Matrix cost evidence
 
@@ -415,10 +463,38 @@ its first recording-loss snapshot with each later turn's;
 `drained_cleanup_keeps_the_loss_turn_when_its_bound_is_exceeded` requires the snapshot of the turn
 the loss occurred at. `cleanup-later-loss-discarded.patch` drops a recording loss found after an
 earlier observer failure; `drained_cleanup_retains_loss_after_an_earlier_observer_unwind` requires
-both returned together. `ratchet-eligibility-unfiltered.patch` holds every recorded tightness row
-to every build, its requirement ignored; `the_ratchet_holds_each_row_to_its_cases_eligibility`
-requires a build without `hashbrown` to pass its own record. Automated red/restored-green
-qualification of these controls is pending.
+both returned together. `ratchet-eligibility-unfiltered.patch` holds every recorded tightness row to
+every build, its requirement ignored; `the_ratchet_holds_each_row_to_its_cases_eligibility` requires
+a build without `hashbrown` to pass its own record. Automated red/restored-green qualification of
+these controls is pending.
+
+The recording-budget controls cover its authority and publication boundaries.
+`budget-raw-evidence-public.patch` makes `Budgets::measure`, which pairs a capacity with the
+evidence measured under it, public; `execution_cleanup_and_worker_startup_have_one_authority` names
+the raw budget evidence it exposes. `budget-construction-capacity-public.patch` makes the
+construction driver's capacity-taking entry public; the same census refuses every public capacity
+parameter, return type, callback type and field, `support::recorded_run_short` its one exception,
+and `short-recording-enlarged.patch` lets that entry size a recording at or past the default;
+`a_short_recording_never_enlarges_the_default` requires each refused.
+`budget-membership-unchecked.patch` lets an undeclared fixture reach capacity selection;
+`an_undeclared_or_unmeasured_fixture_is_refused` requires it refused as undeclared.
+`budget-duplicate-accepted.patch` lets a fixture begin again after it was measured;
+`a_fixture_measured_twice_is_refused_and_keeps_its_measurement` requires the second run refused.
+`budget-observer-measured-prematurely.patch` measures a fixture before its driver and its evidence
+observers return; `a_failed_evidence_observer_measures_nothing` requires a failed observer to leave
+no measurement. `budget-unfinished-drop-accepted.patch` accepts a family dropped unfinished;
+`a_family_dropped_unfinished_is_refused` requires the drop refused.
+`budget-incomplete-family-published.patch` publishes a family missing a fixture;
+`incomplete_publication_preserves_previous_evidence` requires the publication refused and the
+previous record intact. `budget-authorization-unchecked.patch` accepts any recording flag;
+`recording_requires_the_exact_selection_name` requires other families, representations, rigor
+layers, witness sizes and non-filename values refused.
+`budget-control-authorization-inherited.patch` lets gate subprocesses inherit recording flags;
+`controls_cannot_inherit_recording_authorization` requires them absent in the child.
+`budget-family-unlisted.patch` removes a family from the launch inventory;
+`every_budget_family_has_one_fixture_entry_and_one_launch_identity` requires every family a test
+declares listed exactly once and every record and launch identity unique. Automated
+red/restored-green qualification of these controls is pending.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both

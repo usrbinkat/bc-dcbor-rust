@@ -7,8 +7,10 @@
 //! Unsafe code here implements an instrumented input resource, never a
 //! decoder. Compiled once as the `dcbor-test-support` crate and shared by
 //! every integration test and fuzz target; [`heap`] is the physical heap
-//! observer, [`legality`] holds the bindings' successor relations, and
-//! [`model`] configures every model of a checker build.
+//! observer, [`legality`] holds the bindings' successor relations,
+//! [`model`] configures every model of a checker build, and [`budgets`]
+//! sizes the recordings of the fixtures that outgrow [`CAPACITY`].
+pub mod budgets;
 pub mod classes;
 pub mod heap;
 pub mod legality;
@@ -77,9 +79,14 @@ pub const CAPACITY: Capacity = Capacity {
 /// measurement is taken again and its budget restated, never raised
 /// blindly. Every budget stays preallocated whole before the run, as
 /// [`CAPACITY`] is: an event slot is 15 words, 120 bytes on a 64-bit target.
-pub const fn measured(events: usize, permits: usize) -> Capacity {
+const fn measured(events: usize, permits: usize) -> Capacity {
     const fn budget(measured: usize, floor: usize) -> usize {
-        let budget = (measured + measured.div_ceil(4)).next_power_of_two();
+        let Some(padded) = measured.checked_add(measured.div_ceil(4)) else {
+            panic!("recording budget margin overflows usize");
+        };
+        let Some(budget) = padded.checked_next_power_of_two() else {
+            panic!("recording budget rounding overflows usize");
+        };
         if budget < floor { floor } else { budget }
     }
     Capacity {
@@ -3439,16 +3446,26 @@ impl RecordedRun {
 /// finished as ([`describe`]); acceptance stays strict, any finding alone
 /// failing the run.
 pub fn recorded_run<R>(body: impl FnOnce(&mut RecordedRun) -> Result<R, Finding>) -> R {
-    recorded_run_capacity(CAPACITY, body)
+    recorded_run_with(CAPACITY, ExpectedVerdict::Accepted, body)
 }
 
-/// Preallocate a workload's complete recording before running its body.
-/// Exhaustion remains a failed recording; finalization is identical to
-/// [`recorded_run`].
-pub fn recorded_run_capacity<R>(
+/// [`recorded_run`] into a recording shorter than the default: `capacity`
+/// within [`CAPACITY`] in both dimensions and below it in at least one, so
+/// the run can witness its recording's exhaustion. The one public sizing of
+/// a recording apart from a measured budget ([`budgets`]): a recording no
+/// fixture outgrows by design is never enlarged by hand. Exhaustion remains
+/// a failed recording; finalization is identical to [`recorded_run`].
+pub fn recorded_run_short<R>(
     capacity: Capacity,
     body: impl FnOnce(&mut RecordedRun) -> Result<R, Finding>,
 ) -> R {
+    assert!(
+        capacity.events <= CAPACITY.events
+            && capacity.permits <= CAPACITY.permits
+            && (capacity.events < CAPACITY.events || capacity.permits < CAPACITY.permits),
+        "a short recording of {capacity:?} is not shorter than the default {CAPACITY:?}: \
+         a recording is enlarged only by its measured budget (budgets::Budgets)"
+    );
     recorded_run_with(capacity, ExpectedVerdict::Accepted, body)
 }
 
@@ -3868,7 +3885,7 @@ impl<T> Custodial<Permit> for Destination<T> {
 /// under another policy of the same recorded run, held by the run until the
 /// construction is reclaimed, its parse not measured; no scope record is
 /// involved; the run records into the default capacity ([`CAPACITY`],
-/// [`construction_in`] for a stated one). The work, requests and
+/// [`budgets::Budgets::construction`] for a measured one). The work, requests and
 /// storage measured are exactly what `InPlace::COST` bounds, which refusals
 /// do not change. The state is observed after every build step and every
 /// cleanup unit ([`Custody`]), and the construction's custody, its one
@@ -3895,7 +3912,7 @@ pub fn construction<T: InPlace<Limits>>(
 /// [`construction`] of the whole value into a recording of `capacity`, the
 /// budget its fixture was measured to need ([`measured`]): a construction
 /// whose session outgrows [`CAPACITY`].
-pub fn construction_in<T: InPlace<Limits>>(
+fn construction_in<T: InPlace<Limits>>(
     wire: &[u8],
     capacity: Capacity,
     inspect: impl FnOnce(&T),
@@ -5891,8 +5908,12 @@ where
 {
     let mut completed = false;
     let mut first = None;
+    let mut first_loss = None;
     let result = (|| {
         for at in 0..turns {
+            if first_loss.is_none() {
+                first_loss = lost(m, at);
+            }
             if let Err(stop) = require_evidence(m, at) {
                 first.get_or_insert(stop);
             }
@@ -5906,6 +5927,9 @@ where
             } else {
                 turned
             };
+            if first_loss.is_none() {
+                first_loss = turned.lost.clone();
+            }
             let outcome = match turned.checked() {
                 Ok(outcome) => Some(outcome),
                 Err(stop) if finished || progressing => {
@@ -5960,16 +5984,30 @@ where
     })();
     let result = match (first, result) {
         (None, result) => result,
+        (
+            Some(Stopped::Violated {
+                output,
+                outcome,
+                lost,
+                report,
+            }),
+            Ok(()),
+        ) => Err(Stopped::Violated {
+            output,
+            outcome,
+            lost: first_loss.or(lost),
+            report,
+        }),
         (Some(first), Ok(())) => Err(first),
         (Some(first), Err(next)) => {
             let report = format!("cleanup continued after {first:?}; subsequent stop: {next:?}");
-            let first_loss = match &first {
+            let first_loss = first_loss.or_else(|| match &first {
                 Stopped::Lost(loss, _)
                 | Stopped::Violated {
                     lost: Some(loss), ..
                 } => Some(loss.clone()),
                 _ => None,
-            };
+            });
             let (output, outcome, loss) = match next {
                 Stopped::Published(output) => (Some(output), None, None),
                 Stopped::Lost(loss, outcome) => (None, Some(outcome), Some(loss)),
@@ -7193,6 +7231,62 @@ mod tests {
     use dcbor::bounded::{Allocator, Budget};
 
     #[test]
+    fn recording_budget_overflow_is_refused_before_allocation() {
+        for count in [usize::MAX, usize::MAX / 2] {
+            for (events, permits) in [(count, 0), (0, count)] {
+                assert!(
+                    std::panic::catch_unwind(|| measured(events, permits)).is_err(),
+                    "overflowing counts produced a recording capacity"
+                );
+            }
+        }
+        let capacity = measured(CAPACITY.events, CAPACITY.permits);
+        assert!(capacity.events >= CAPACITY.events);
+        assert!(capacity.permits >= CAPACITY.permits);
+    }
+
+    /// A short recording is shorter than the default in one dimension and
+    /// longer in none: the default itself, and a recording enlarged in
+    /// either dimension, are refused before the run begins, naming the
+    /// budget authority that alone enlarges one.
+    #[test]
+    fn a_short_recording_never_enlarges_the_default() {
+        for capacity in [
+            CAPACITY,
+            Capacity {
+                events: CAPACITY.events * 2,
+                permits: 1,
+            },
+            Capacity {
+                events: 64,
+                permits: CAPACITY.permits * 2,
+            },
+        ] {
+            let refused = std::panic::catch_unwind(|| {
+                recorded_run_short(capacity, |run| {
+                    run.policy(u64::MAX);
+                    Ok(())
+                })
+            })
+            .expect_err("a recording not shorter than the default ran");
+            assert!(
+                panic_report(refused.as_ref()).contains("is not shorter than the default"),
+                "{capacity:?}"
+            );
+        }
+        recorded_run_short(
+            Capacity {
+                events: 64,
+                permits: CAPACITY.permits,
+            },
+            |run| {
+                run.policy(u64::MAX);
+                Ok(())
+            },
+        );
+    }
+
+    #[test]
     fn joined_batch_collects_every_worker_panic() {
         let mut visited = [false; 3];
         let failures = joined_batch(&mut visited, |worker, visited| {
@@ -7226,7 +7320,7 @@ mod tests {
     fn exhausted_copy(capacity: Capacity) -> (Finding, String) {
         let returned = std::sync::Mutex::new(None);
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recorded_run_capacity(capacity, |run| {
+            recorded_run_short(capacity, |run| {
                 let policy = run.policy(u64::MAX);
                 let copied: Result<(), Finding> = run.holding(
                     DecodeOwner::new(),
@@ -7337,7 +7431,7 @@ mod tests {
     fn concurrent_workers_each_name_the_first_invalidation() {
         let stops = std::sync::Mutex::new(Vec::new());
         let finalization = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recorded_run_capacity(
+            recorded_run_short(
                 Capacity {
                     permits: 8,
                     events: CAPACITY.events,
@@ -9149,6 +9243,82 @@ mod tests {
     }
 
     #[test]
+    fn operation_cleanup_retains_first_loss_after_observer_failure() {
+        struct Cleanup(usize);
+        impl Resumable<Limits> for Cleanup {
+            type Output = ();
+            type Error = BoundedError<LimitRefusal>;
+            type Position = usize;
+
+            fn step(&mut self, m: &mut Limits) -> Result<Step<()>, Self::Error> {
+                if self.0 == 1 {
+                    assert_eq!(
+                        m.validate_owner(&dcbor::bounded::Owner::unobserved()),
+                        Err(LimitRefusal::Unrecorded)
+                    );
+                }
+                self.0 += 1;
+                Ok(if self.0 == 3 {
+                    Step::Finished
+                } else {
+                    Step::Progress
+                })
+            }
+
+            fn position(&mut self) -> usize {
+                self.0
+            }
+        }
+
+        for turns in [2, 3] {
+            let session = Recording::new(CAPACITY);
+            let mut m = recorded_policy(&session, u64::MAX, false);
+            let mut operation = Cleanup(0);
+            let mut snapshot = None;
+            let (completed, result) = wound_by(
+                &mut m,
+                &mut operation,
+                turns,
+                false,
+                |_, _| panic!("planted operation cleanup observer failure"),
+                Execution {
+                    step: |m: &mut Limits, operation: &mut Cleanup, _, at| {
+                        let outcome = operation.step(m);
+                        let loss = lost(m, at);
+                        if snapshot.is_none() {
+                            snapshot = loss.clone();
+                        }
+                        Turned {
+                            outcome,
+                            lost: loss,
+                            violation: None,
+                        }
+                    },
+                    end: |m: &mut Limits, _: &mut Cleanup, _, at| Turned {
+                        outcome: Some(Ok(Step::Finished)),
+                        lost: lost(m, at),
+                        violation: None,
+                    },
+                },
+            );
+            assert_eq!(completed, turns == 3);
+            assert_eq!(operation.0, turns, "failure interrupted physical cleanup");
+            match result {
+                Err(Stopped::Violated {
+                    lost: Some(loss),
+                    report,
+                    ..
+                }) => {
+                    assert_eq!(loss.turn, 1, "cleanup replaced its first loss");
+                    assert_eq!(Some(loss), snapshot);
+                    assert!(report.contains("planted operation cleanup observer failure"));
+                }
+                other => panic!("cleanup discarded failure evidence: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn cleanup_terminal_probe_runs_in_the_supplied_window() {
         struct Finished<'a>(&'a std::cell::Cell<bool>);
         impl Resumable<Limits> for Finished<'_> {
@@ -9790,30 +9960,28 @@ pub mod pipeline {
     }
 
     /// What one run of the pipeline injects: its refusals, the physical
-    /// request it fails, and the boundary it stops at; whether it observes
-    /// its operations' positions, to class boundaries and check each step's
-    /// contract, or reads none, as the no-effect check runs it; and the
-    /// recording capacity its workload was measured to need
-    /// ([`super::measured`]), preallocated whole before the run, as every
-    /// recorded run's is.
+    /// request it fails, and the boundary it stops at; and whether it
+    /// observes its operations' positions, to class boundaries and check
+    /// each step's contract, or reads none, as the no-effect check runs it.
+    /// A run records into the default capacity ([`CAPACITY`]); a fixture
+    /// that outgrows it runs through its measured budget
+    /// ([`crate::budgets::Budgets::encode_checked`]), never a capacity a
+    /// schedule states.
     #[derive(Clone, Copy, Debug)]
     pub struct Schedule {
         pub refusal: Refusal,
         pub physical: Option<usize>,
         pub stop: Option<(Phase, usize, Stop)>,
         pub observed: bool,
-        pub capacity: Capacity,
     }
 
     impl Schedule {
-        /// Nothing injected, every position observed, the default recording
-        /// capacity ([`CAPACITY`]).
+        /// Nothing injected, every position observed.
         pub const BASELINE: Self = Self {
             refusal: Refusal::None,
             physical: None,
             stop: None,
             observed: true,
-            capacity: CAPACITY,
         };
     }
 
@@ -10524,13 +10692,15 @@ pub mod pipeline {
         }
     }
 
-    /// Run `body` in one scope under observation, injecting what `schedule`
-    /// names, then drain the scope: draining allocates nothing and recovers
-    /// every reservation, every admission fits one quantum, and, where `P`
-    /// witnesses physical requests, none was unadmitted.
+    /// Run `body` in one scope under observation, recorded into `capacity`,
+    /// injecting what `schedule` names, then drain the scope: draining
+    /// allocates nothing and recovers every reservation, every admission fits
+    /// one quantum, and, where `P` witnesses physical requests, none was
+    /// unadmitted.
     fn observe<P: Physical>(
         wire: &[u8],
         schedule: &Schedule,
+        capacity: Capacity,
         body: impl FnOnce(
             &Context<P>,
             &mut Holding<'_, '_, DecodeOwner<'static, Limits>, P>,
@@ -10539,7 +10709,7 @@ pub mod pipeline {
     ) -> Report {
         let stop = schedule.stop;
         let (mut report, observed) =
-            recorded_evidence(schedule.capacity, ExpectedVerdict::Accepted, |run| {
+            recorded_evidence(capacity, ExpectedVerdict::Accepted, |run| {
                 let policy = run.witnessed_policy::<P>();
                 let heap = P::begin(None);
                 let context = Context {
@@ -10649,7 +10819,7 @@ pub mod pipeline {
         /// (`observe`), its boundaries classed by `classes`; complete once
         /// the published copy equals it.
         pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
-            observe::<P>(wire, schedule, |context, owner, _| {
+            observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
                 acquisition(context, owner, wire, classes)
             })
         }
@@ -10658,7 +10828,7 @@ pub mod pipeline {
         /// observed (`observe`), its boundaries classed by `classes`;
         /// complete once the document's root is the input.
         pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
-            observe::<P>(wire, schedule, |context, owner, _| {
+            observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
                 inspection(context, owner, wire, classes)
             })
         }
@@ -10685,7 +10855,22 @@ pub mod pipeline {
         where
             T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
         {
-            observe::<P>(wire, schedule, |context, owner, output| {
+            Self::encode_checked_in::<T>(wire, schedule, classes, CAPACITY, inspect)
+        }
+
+        /// [`Self::encode_checked`] recorded into `capacity`: the budget
+        /// authority's alone ([`crate::budgets::Budgets::encode_checked`]).
+        pub(crate) fn encode_checked_in<T>(
+            wire: &[u8],
+            schedule: &Schedule,
+            classes: &Classes<Typed<T>>,
+            capacity: Capacity,
+            inspect: impl FnOnce(&T),
+        ) -> Report
+        where
+            T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
+        {
+            observe::<P>(wire, schedule, capacity, |context, owner, output| {
                 let reached = encoding::<T, P>(context, owner, wire, output, classes, inspect);
                 if matches!(reached, Reached::Complete) {
                     assert_eq!(output.as_slice(), wire, "emission diverged from the input");
@@ -10706,7 +10891,7 @@ pub mod pipeline {
             inspect: impl FnOnce(&T),
         ) -> Report {
             let released = Arc::new(AtomicUsize::new(0));
-            let report = observe::<P>(wire, schedule, |context, owner, _| {
+            let report = observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
                 decoding::<T, P>(context, owner, wire, options, classes, &released, inspect)
             });
             assert_eq!(
@@ -10716,6 +10901,38 @@ pub mod pipeline {
             );
             report
         }
+    }
+
+    /// `wire`, a canonical encoding, round-tripped through the owned encoding
+    /// pipeline unobstructed ([`Under::encode_checked`], admission oracle
+    /// alone), its decoded value read by `check`, recorded into the default
+    /// capacity: the run's report, complete, or the run fails.
+    pub fn round_trip<T>(wire: &[u8], check: impl FnOnce(&T)) -> Report
+    where
+        T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
+    {
+        round_trip_in(wire, CAPACITY, check)
+    }
+
+    /// [`round_trip`] recorded into `capacity`: the budget authority's alone
+    /// ([`crate::budgets::Budgets::encode_checked`]).
+    pub(crate) fn round_trip_in<T>(
+        wire: &[u8],
+        capacity: Capacity,
+        check: impl FnOnce(&T),
+    ) -> Report
+    where
+        T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
+    {
+        let report = Under::<Unwitnessed>::encode_checked_in::<T>(
+            wire,
+            &Schedule::BASELINE,
+            &Classes::none(),
+            capacity,
+            check,
+        );
+        assert!(report.complete, "the canonical round trip did not complete");
+        report
     }
 
     /// [`Under::acquire`] under the heap guard.
@@ -11165,6 +11382,7 @@ pub mod pipeline {
                     stop: Some((Phase::Scope, 0, Stop::Unwind)),
                     ..Schedule::BASELINE
                 },
+                CAPACITY,
                 |_, _, _| panic!("unexpected production panic"),
             );
         }

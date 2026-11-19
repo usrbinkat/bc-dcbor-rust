@@ -18,15 +18,15 @@ if (($# > 2)) || [[ -n "$resume" && "$mode" != record-costs && "$mode" != check-
 	exit 2
 fi
 case "$mode" in
-check | record | check-costs | record-costs) ;;
+check | record | record-budgets | check-costs | record-costs) ;;
 *)
-	echo "usage: bash tests/record-evidence.sh [check|record|check-costs|record-costs]" >&2
+	echo "usage: bash tests/record-evidence.sh [check|record|record-budgets|check-costs|record-costs]" >&2
 	exit 2
 	;;
 esac
 # The command selects the recording mode; inherited flags must not let a cost
 # check or recording rewrite the independent trace and tightness baselines.
-unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECTORY DCBOR_COST_VARIANT DCBOR_CLASS_COVERAGE
+unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECTORY DCBOR_COST_VARIANT DCBOR_CLASS_COVERAGE DCBOR_RECORD_BUDGETS
 : "${DCBOR_CONFIGURATION:?the development shell must identify the configuration}"
 export DCBOR_RIGOR="${DCBOR_RIGOR:-fast}"
 case "$DCBOR_RIGOR" in
@@ -77,6 +77,56 @@ record-costs)
 	exit 0
 	;;
 esac
+
+# The recording budgets (tests/gate, `budgets`, from the record crate's one
+# inventory): each record recorded by its family's own test with
+# DCBOR_RECORD_BUDGETS naming that record alone, its currency checked, then
+# the same test run with recording disabled against the record just
+# published. Each run's whole output is kept under TMPDIR, judged by the
+# gate's one classifier, and required to name the record it finalized
+# exactly once.
+if [[ "$mode" == record || "$mode" == record-budgets ]]; then
+	budget_logs="$(mktemp -d "${TMPDIR:?required: budget execution logs}/dcbor-budgets.XXXXXXXX")"
+	echo "budget execution logs: $budget_logs"
+	budget_run() {
+		local phase="$1"
+		local log="$budget_logs/$name.$phase.log"
+		cargo test -p dcbor --no-default-features --features "$projection" \
+			--test "$target" "$test" -- --exact --nocapture 2>&1 | tee "$log"
+		local outcome
+		outcome="$(gate classify cargo test 0 "$log")"
+		[[ "$outcome" == pass ]] || {
+			echo "$name: $phase did not execute a passing test ($outcome)" >&2
+			exit 1
+		}
+		local line receipts=0
+		while IFS= read -r line; do
+			if [[ "$line" == "budget finalized: $name" ||
+				"$line" == "test $test ... budget finalized: $name" ]]; then
+				receipts=$((receipts + 1))
+			fi
+		done <"$log"
+		[[ "$receipts" == 1 ]] || {
+			echo "$name: $phase finalized $receipts families, expected one" >&2
+			exit 1
+		}
+	}
+	budgets="$(gate budgets)"
+	[[ -n "$budgets" ]] || {
+		echo "the gate names no budget family" >&2
+		exit 2
+	}
+	while IFS=$'\t' read -r name projection target test rigor witness; do
+		DCBOR_RECORD_BUDGETS="$name" DCBOR_RIGOR="$rigor" DCBOR_WITNESS="$witness" \
+			budget_run record
+		gate current "tests/data/budgets/$name"
+		DCBOR_RIGOR="$rigor" DCBOR_WITNESS="$witness" \
+			budget_run check
+	done <<<"$budgets"
+	if [[ "$mode" == record-budgets ]]; then
+		exit 0
+	fi
+fi
 
 if [[ "$mode" == record ]]; then
 	for index in "${!suffixes[@]}"; do

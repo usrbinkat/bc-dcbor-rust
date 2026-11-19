@@ -10,10 +10,14 @@ use dcbor::bounded::decode::construction::in_place::{
     EntryObservation, TreeCustody, TreeObservation, TreePhase,
 };
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
-use dcbor_test_support::{self as support, pipeline::Unwitnessed};
+use dcbor_test_support as support;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use support::budgets::{Budgets, counts};
 use support::legality::{Legality, initial, not_last, storage_build, storage_clean};
+
+// `variant!()`: this build's record suffix ([`dcbor_record::declare_variant`]).
+dcbor_record::declare_variant!(variant);
 
 /// The occupancy witnesses through `limit` entries: both counts on each side
 /// of every edge between occupancy classes
@@ -128,176 +132,67 @@ fn expensive_occupancy_maps_require_exhaustive_rigor() {
 fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
     let maps = occupancy_maps(support::rigor::rigor(), support::rigor::sized(1728, 144));
     let maps = maps.as_slice();
+    let key = |count, padding| format!("round-trip/{count}/{padding}");
+    let mut budgets = Budgets::new(
+        "btree-occupancy",
+        variant!(),
+        maps.iter()
+            .map(|&(count, padding)| key(count, padding))
+            .collect(),
+    );
     // Each map reported as it runs, with the time since the first: which
     // boundary's map dominates the interpreted run is measured, not assumed.
     let mut progress = support::rigor::Progress::new("node occupancy boundaries");
     progress.stage("maps", maps.len(), maps.len());
-    let mut unmeasured = Vec::new();
     for &(count, padding) in maps {
         progress.case(format!("{count} entries, values padded by {padding} bytes"));
-        let expected: BTreeMap<String, String> = (0..count)
-            .map(|n| {
-                (
-                    format!("{n:x}"),
-                    format!("value-{n}{}", "x".repeat(padding)),
-                )
-            })
-            .collect();
-        let mut symbolic = dcbor::Map::new();
-        for (key, value) in &expected {
-            symbolic.insert(key.clone(), value.clone()).unwrap();
-        }
-        let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
-        if (count, padding) == WIDE {
-            assert!(
-                count >= 256 && wire.len() >= 21_846,
-                "the wide map of {count} entries and {} bytes no longer reaches the two-byte \
-                 count head and the four-byte bound head",
-                wire.len()
-            );
-        }
-        let budget = recording_budget((count, padding));
-        let capacity = match (budget, measuring()) {
-            (Some(budget), _) => budget,
-            (None, true) => MEASURING,
-            (None, false) => panic!(
-                "no recording budget is stated for the map of {count} entries padded by \
-                 {padding}: measure it with {MEASURE}=1 and state it in recording_budget"
-            ),
-        };
-        let report = round_trip(&wire, capacity, |value: &BTreeMap<String, String>| {
-            assert_eq!(value, &expected, "{count} entries");
-            for (key, wanted) in &expected {
-                assert_eq!(value.get(key), Some(wanted));
-            }
-        });
+        let key = key(count, padding);
+        let report = occupancy_round_trip(count, padding, &mut budgets, &key);
         let turns = report.boundaries.len();
-        let phases: Vec<String> = report
-            .bounds
-            .iter()
-            .map(|&(phase, bound)| {
-                let taken = report
-                    .boundaries
-                    .iter()
-                    .filter(|boundary| boundary.phase == phase)
-                    .count();
-                format!("{phase:?} {taken} of {bound} turns")
-            })
-            .collect();
         eprintln!(
             "[node occupancy boundaries] {count} entries padded by {padding}: {} events, {} \
-             permit records, {turns} turns, {:.2} events per turn; {}",
+             permit records, {turns} turns",
             report.observed.len(),
-            permit_records(&report.observed),
-            report.observed.len() as f64 / turns as f64,
-            phases.join(", ")
+            counts(&report.observed).permits,
         );
-        if budget.is_none() {
-            unmeasured.push(format!(
-                "({count}, {padding}) => Some(support::measured({}, {}))",
-                report.observed.len(),
-                permit_records(&report.observed)
-            ));
-        }
     }
-    // A measurement run is never a qualification: it names every budget it
-    // measured, to be stated, and fails.
-    assert!(
-        unmeasured.is_empty(),
-        "{MEASURE}: state these measured budgets in recording_budget: {unmeasured:#?}"
-    );
+    budgets.finish();
 }
 
-/// The variable that has the occupancy run measure the maps whose recording
-/// budget is not yet stated ([`recording_budget`]) instead of refusing them:
-/// `1`, or unset. A measuring run records those maps at [`MEASURING`],
-/// reports what each recorded, and fails naming the budgets to state; it is
-/// never a qualification, and no gate leg inherits it.
-const MEASURE: &str = "DCBOR_MEASURE_RECORDING";
-
-/// Whether this run measures the unstated budgets ([`MEASURE`]).
-fn measuring() -> bool {
-    match std::env::var(MEASURE) {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        other => panic!("{MEASURE} must be 1 or unset: {other:?}"),
-    }
-}
-
-/// The recording each occupancy map was measured to need, from its finished
-/// recording's events and permit records ([`support::measured`]): the fast
-/// layer's maps, at most 4,211 events and 119 permit records, within the
-/// default capacity; each exhaustive map's own measurement. `None` for a map
-/// whose budget is not yet stated: refused before it runs, or measured
-/// under [`MEASURE`]; never run at a guessed budget.
-fn recording_budget(map: (usize, usize)) -> Option<dcbor::bounded::Capacity> {
-    match map {
-        (0 | 1 | 11 | 12, 0) => Some(support::CAPACITY),
-        (143, 0) => Some(support::measured(67_746, 727)),
-        (144, 0) => Some(support::measured(68_379, 734)),
-        _ => None,
-    }
-}
-
-/// The recording each integer tree's whole construction was measured to
-/// need ([`support::construction_in`]), its document's parse recorded beside
-/// it in the same session: the two-level boundaries within the default
-/// capacity, the fast layer's and the minimal witnesses' sizes, seen passing
-/// there; each three-level boundary its own measurement. `None` for a tree
-/// whose budget is not yet stated: refused before it runs, or measured under
-/// [`MEASURE`]; never run at a guessed budget.
-fn construction_budget(count: usize) -> Option<dcbor::bounded::Capacity> {
-    match count {
-        143 | 144 => Some(support::CAPACITY),
-        _ => None,
-    }
-}
-
-/// The capacity a map or tree construction with no stated budget is
-/// measured at under [`MEASURE`]: large enough to finish any map of the
-/// occupancy run and any construction of the tree run.
-const MEASURING: dcbor::bounded::Capacity = support::measured(1 << 20, 1 << 14);
-
-/// The permit records a finished recording claimed: one per grant and one
-/// per split child ([`support::measured`]).
-fn permit_records(observed: &[dcbor::bounded::Observed]) -> usize {
-    use dcbor::bounded::{Answer, Call, Event};
-    observed
-        .iter()
-        .filter(|observation| {
-            matches!(
-                observation.event,
-                Event::Call(Call::Allocate(_), Answer::Granted(_)) | Event::Split { .. }
+/// The same complete round-trip schedule for qualification and recording.
+fn occupancy_round_trip(
+    count: usize,
+    padding: usize,
+    budgets: &mut Budgets,
+    key: &str,
+) -> support::pipeline::Report {
+    let expected: BTreeMap<String, String> = (0..count)
+        .map(|n| {
+            (
+                format!("{n:x}"),
+                format!("value-{n}{}", "x".repeat(padding)),
             )
         })
-        .count()
-}
-
-/// The map `wire` encodes, decoded from a copy in a scope of its own, read
-/// back by `check`, prepared and emitted to its own bytes through the owned
-/// pipeline, the scope drained, in one recorded run of `capacity`
-/// ([`support::measured`]): the run's report.
-fn round_trip<T>(
-    wire: &[u8],
-    capacity: dcbor::bounded::Capacity,
-    check: impl FnOnce(&T),
-) -> support::pipeline::Report
-where
-    T: dcbor::bounded::decode::construction::in_place::Transferable<Limits>
-        + dcbor::bounded::encoding::TransferableSchema
-        + 'static,
-{
-    let report = support::pipeline::Under::<Unwitnessed>::encode_checked::<T>(
-        wire,
-        &support::pipeline::Schedule {
-            capacity,
-            ..support::pipeline::Schedule::BASELINE
-        },
-        &support::classes::Classes::none(),
-        check,
-    );
-    assert!(report.complete, "the canonical round trip did not complete");
-    report
+        .collect();
+    let mut symbolic = dcbor::Map::new();
+    for (key, value) in &expected {
+        symbolic.insert(key.clone(), value.clone()).unwrap();
+    }
+    let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
+    if (count, padding) == WIDE {
+        assert!(
+            count >= 256 && wire.len() >= 21_846,
+            "the wide map of {count} entries and {} bytes no longer reaches the two-byte \
+                 count head and the four-byte bound head",
+            wire.len()
+        );
+    }
+    budgets.encode_checked(key, &wire, |value: &BTreeMap<String, String>| {
+        assert_eq!(value, &expected, "{count} entries");
+        for (key, wanted) in &expected {
+            assert_eq!(value.get(key), Some(wanted));
+        }
+    })
 }
 
 /// A map's declared dispatch depth is one more than the deeper of its key's
@@ -337,7 +232,7 @@ fn integer_keys_are_built_in_numeric_order() {
         map.insert(n, n).unwrap();
     }
     let wire = dcbor::CBOR::from(map).to_cbor_data();
-    round_trip(&wire, support::CAPACITY, |value: &BTreeMap<i64, i64>| {
+    support::pipeline::round_trip(&wire, |value: &BTreeMap<i64, i64>| {
         assert_eq!(
             value.keys().copied().collect::<Vec<_>>(),
             [i64::MIN, -100, -2, -1, 0, 1, 24, 100, i64::MAX]
@@ -362,13 +257,9 @@ fn byte_keys_preserve_prefix_order_and_embedded_zeroes() {
         map.insert(key.clone(), *value).unwrap();
     }
     let wire = dcbor::CBOR::from(map).to_cbor_data();
-    round_trip(
-        &wire,
-        support::CAPACITY,
-        |value: &BTreeMap<ByteString, bool>| {
-            assert_eq!(value, &expected);
-        },
-    );
+    support::pipeline::round_trip(&wire, |value: &BTreeMap<ByteString, bool>| {
+        assert_eq!(value, &expected);
+    });
 }
 
 /// The arenas of a tree's custody, in its observation's order: the two
@@ -733,7 +624,7 @@ fn map_wire<K: dcbor::CBOREncodable, V: dcbor::CBOREncodable>(
 /// regions as at full sizes. Fast runs check the complete build and cleanup
 /// transitions; exhaustive runs additionally rebuild and cancel at every
 /// construction prefix for each small text-keyed fixture. Each height
-/// boundary records into its stated budget ([`construction_budget`]).
+/// boundary records into its configuration's measured budget ([`Budgets`]).
 #[test]
 fn tree_construction_is_complete_and_its_transitions_legal() {
     use support::legality::{buffer, written};
@@ -761,42 +652,26 @@ fn tree_construction_is_complete_and_its_transitions_legal() {
         Rigor::Fast => &[143, 144],
         Rigor::Exhaustive => sized(&[143, 144, 1727, 1728], &[143, 144]),
     };
-    let mut unmeasured = Vec::new();
+    let key = |count| format!("integer-construction/{count}");
+    let mut budgets = Budgets::new(
+        "btree-construction",
+        variant!(),
+        boundaries.iter().map(|&count| key(count)).collect(),
+    );
     for &count in boundaries {
         let wire = map_wire(count, |n| n as u64, |n| n as u64);
         let name = format!("BTreeMap<u64, u64> of {count} entries");
-        let budget = construction_budget(count);
-        let capacity = match (budget, measuring()) {
-            (Some(budget), _) => budget,
-            (None, true) => MEASURING,
-            (None, false) => panic!(
-                "no recording budget is stated for the construction of {count} integer \
-                 entries: measure it with {MEASURE}=1 and state it in construction_budget"
-            ),
-        };
-        let built = support::construction_in::<BTreeMap<u64, u64>>(&wire, capacity, |map| {
-            assert_eq!(map.len(), count, "{count} entries");
+        let built = budgets.construction::<BTreeMap<u64, u64>>(&key(count), &wire, |map| {
+            assert_eq!(map.len(), count, "{count} entries")
         });
         eprintln!(
             "[tree construction] {count} integer entries: {} events, {} permit records",
             built.observed.len(),
-            permit_records(&built.observed)
+            counts(&built.observed).permits
         );
-        if budget.is_none() {
-            unmeasured.push(format!(
-                "{count} => Some(support::measured({}, {}))",
-                built.observed.len(),
-                permit_records(&built.observed)
-            ));
-        }
         legal(&name, &[built], &tree(written(), written()));
     }
-    // A measurement run is never a qualification: it names every budget it
-    // measured, to be stated, and fails.
-    assert!(
-        unmeasured.is_empty(),
-        "{MEASURE}: state these measured budgets in construction_budget: {unmeasured:#?}"
-    );
+    budgets.finish();
     let mut integers = dcbor::Map::new();
     for n in [-2i64, 0, 24, 100] {
         integers.insert(n, n).unwrap();

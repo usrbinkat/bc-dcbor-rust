@@ -1,0 +1,7 @@
+--- tests/support/budgets.rs
++++ tests/support/budgets.rs
+@@ -185,3 +185,3 @@
+     /// cannot substitute observations or obtain a budget's raw capacity.
+-    fn measure<T>(
++    pub fn measure<T>(
+         &mut self,

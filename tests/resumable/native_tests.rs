@@ -117,9 +117,8 @@ fn decoder_continuation_retains_completed_arena_on_work_refusal() {
 #[test]
 fn decoder_payload_operations_fit_three_value_sixty_four_byte_quantum() {
     let wire = text_wire(&"x".repeat(65536));
-    // A 64 KiB text decoded in units of a quantum: 131,121 observations and
-    // 2 permit records, measured.
-    suite_with(POOL, support::measured(131_121, 2), |run, policy| {
+    let mut budgets = budgets("payload-decode", &["text/65536/quantum"]);
+    budget_suite(&mut budgets, "text/65536/quantum", POOL, |run, policy| {
         run.holding(
             decoder(&wire),
             Retirement::Released,
@@ -141,6 +140,7 @@ fn decoder_payload_operations_fit_three_value_sixty_four_byte_quantum() {
         run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
         Ok(())
     });
+    budgets.finish();
 }
 
 #[test]
@@ -229,31 +229,35 @@ fn text_semantics_use_literal_composition_reordering_and_hangul_oracles() {
 fn long_normalization_has_bounded_preparation_and_emission_units() {
     let input = format!("q{}", "\u{301}\u{316}".repeat(4096));
     let normal = format!("q{}{}", "\u{316}".repeat(4096), "\u{301}".repeat(4096));
-    // A combining run of 8,193 scalars normalized and encoded: 279,242
-    // observations and 53 permit records, measured.
-    let recording = support::measured(279_242, 53);
-    suite_with(POOL, recording, |run, policy| {
-        run.holding(
-            text_encoder(&input),
-            Retirement::Released,
-            &Unwitnessed,
-            |operation| {
-                operation.drive(
-                    policy,
-                    normalize_turns(&input),
-                    Retirement::Released,
-                    |output| {
-                        output.with_policy(policy, |output, m| {
-                            assert_eq!(output.as_ref(), text_wire(&normal));
-                            m.assert_units(TURN);
-                        });
-                    },
-                )
-            },
-        )?;
-        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
-        Ok(())
-    });
+    let mut budgets = budgets("normalization", &["alternating-marks/4096/quantum"]);
+    budget_suite(
+        &mut budgets,
+        "alternating-marks/4096/quantum",
+        POOL,
+        |run, policy| {
+            run.holding(
+                text_encoder(&input),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    operation.drive(
+                        policy,
+                        normalize_turns(&input),
+                        Retirement::Released,
+                        |output| {
+                            output.with_policy(policy, |output, m| {
+                                assert_eq!(output.as_ref(), text_wire(&normal));
+                                m.assert_units(TURN);
+                            });
+                        },
+                    )
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
+        },
+    );
+    budgets.finish();
 }
 
 #[test]
@@ -320,14 +324,14 @@ fn shared_pool_thousand_real_decodes_restore_exact_capacity() {
     // decodes until all have joined. Two decodes per worker reach both of a
     // worker's classes, its first decode and one after a value it holds; the
     // exhaustive layer's 125 per worker, a thousand decodes, stress the same
-    // classes. A thousand decodes of a three-text array, then the pool
-    // occupied whole: 466,017 observations and 21,001 permit records,
-    // measured; sixteen fit the default recording.
-    let (per_worker, recording) = match rigor() {
-        Rigor::Fast => (2, support::CAPACITY),
-        Rigor::Exhaustive => (125, support::measured(466_017, 21_001)),
+    // classes.
+    let per_worker = match rigor() {
+        Rigor::Fast => 2,
+        Rigor::Exhaustive => 125,
     };
-    suite_with(4 * EIGHTH as u64, recording, |run, policy| {
+    let key = format!("workers/8/decodes/{per_worker}");
+    let mut budgets = budgets("shared-pool", &[&key]);
+    budget_suite(&mut budgets, &key, 4 * EIGHTH as u64, |run, policy| {
         let barrier = std::sync::Barrier::new(8);
         let workers: Vec<_> = (0..8).map(|_| run.shared_policy(policy)).collect();
         run.workers(
@@ -356,11 +360,12 @@ fn shared_pool_thousand_real_decodes_restore_exact_capacity() {
         run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
         Ok(())
     });
+    budgets.finish();
 }
 
 #[test]
 fn real_capacity_exhaustion_is_distinct_from_work_and_invalid_input() {
-    suite_with(4096, support::CAPACITY, |run, policy| {
+    suite_with(4096, |run, policy| {
         // Another tenant holding the pool's whole 4096 bytes.
         let owner = run.with_policy(policy, |pool| pool.owner().expect("a recorded owner"));
         let held = run.with_policy(policy, |pool| occupy::<1024>(pool, &owner));

@@ -3448,13 +3448,18 @@ pub(crate) mod places {
     /// which recorded rows it must measure ([`Requirement`]).
     const CAPABILITIES: Capabilities = record::capabilities!();
 
+    // `variant!()`: this build's record suffix, from the one mapping of the
+    // projections' features to their suffixes (`record::declare_variant`).
+    record::declare_variant!(variant);
+
     /// This build's variant: [`VARIANT`], the suffix of each record's name,
     /// and [`RECORDS`], every suite's record of that variant compiled in. The
     /// features that change what this crate's bounds charge, and so the
     /// ratios its suites record: with bignums, the preparation's record holds
     /// a bignum and its witness encodes them; over the forked collections,
     /// trees are walked by their stepped cursor and built in place (`btree`,
-    /// a suite of those builds alone). Each build records and checks its own.
+    /// a suite of those builds alone, compiled only there). Each build records
+    /// and checks its own.
     ///
     /// A record is compiled in, not read at run time, so a check needs no
     /// filesystem, the interpreter's host isolation included, and a suite
@@ -3467,28 +3472,24 @@ pub(crate) mod places {
             every: [$($every:literal),* $(,)?],
             custom_std: [$($custom:literal),* $(,)?] $(,)?
         ) => {
-            #[cfg(not(any(feature = "custom-std-collections", feature = "num-bigint")))]
-            variant!(""; $($every),*);
-            #[cfg(all(not(feature = "custom-std-collections"), feature = "num-bigint"))]
-            variant!(".num-bigint"; $($every),*);
-            #[cfg(all(feature = "custom-std-collections", not(feature = "num-bigint")))]
-            variant!(".custom-std"; $($every,)* $($custom),*);
-            #[cfg(all(feature = "custom-std-collections", feature = "num-bigint"))]
-            variant!(".custom-std.num-bigint"; $($every,)* $($custom),*);
+            #[cfg(not(feature = "custom-std-collections"))]
+            suites!($($every),*);
+            #[cfg(feature = "custom-std-collections")]
+            suites!($($every,)* $($custom),*);
         };
     }
 
-    /// The variant of `suffix` and its suites, each with its record.
-    macro_rules! variant {
-        ($suffix:literal; $($suite:literal),* $(,)?) => {
-            const VARIANT: &str = $suffix;
+    /// This build's suites, each with its record of this build's variant.
+    macro_rules! suites {
+        ($($suite:literal),* $(,)?) => {
+            const VARIANT: &str = variant!();
             const RECORDS: &[(&str, &str)] = &[$((
                 $suite,
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/tests/data/tightness/",
                     $suite,
-                    $suffix,
+                    variant!(),
                     ".txt"
                 )),
             )),*];

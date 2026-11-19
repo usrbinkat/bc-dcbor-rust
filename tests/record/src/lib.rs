@@ -1,7 +1,8 @@
 //! The one form of every recorded oracle of this repository: the admission
 //! traces (`tests/resumable/native_traces.rs`), the tightness ratios
 //! (`src/bounded.rs`, `places`), the matrix costs (`tests/support/rigor.rs`),
-//! the model checkers' derived bounds and the gates' results
+//! the recording budgets ([`budgets`], `tests/support/budgets.rs`), the
+//! model checkers' derived bounds and the gates' results
 //! (`tests/gate`). A record names the configuration it was recorded under on
 //! its first line, [`CONFIGURATION_LINE`] and the development shell's
 //! `DCBOR_CONFIGURATION` (the toolchain and the standard library it builds
@@ -21,6 +22,65 @@ use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod budgets;
+
+// Generate both the consuming crate's literal selection and the launch
+// inventory from the same rows; neither can introduce a suffix independently.
+macro_rules! variants {
+    ($(($cfg:meta, $suffix:literal, $features:literal)),* $(,)?) => {
+        /// Declare `$name!()` as this build's record suffix, a literal usable
+        /// in `concat!` and `include_str!`. Feature selection occurs in the
+        /// invoking crate; the launch inventory is [`VARIANTS`].
+        #[macro_export]
+        macro_rules! declare_variant {
+            ($name:ident) => {
+                $(
+                    #[cfg($cfg)]
+                    macro_rules! $name {
+                        () => { $suffix };
+                    }
+                )*
+            };
+        }
+
+        /// Every record projection's suffix and comma-separated Cargo features.
+        /// Generated with [`declare_variant`] from the same projection table.
+        pub const VARIANTS: &[(&str, &str)] = &[$(($suffix, $features)),*];
+    };
+}
+
+variants!(
+    (
+        all(
+            not(feature = "custom-std-collections"),
+            not(feature = "num-bigint")
+        ),
+        "",
+        "std,derive,hashbrown,multithreaded"
+    ),
+    (
+        all(
+            not(feature = "custom-std-collections"),
+            feature = "num-bigint"
+        ),
+        ".num-bigint",
+        "std,derive,hashbrown,multithreaded,num-bigint"
+    ),
+    (
+        all(
+            feature = "custom-std-collections",
+            not(feature = "num-bigint")
+        ),
+        ".custom-std",
+        "std,derive,hashbrown,multithreaded,custom-std-collections"
+    ),
+    (
+        all(feature = "custom-std-collections", feature = "num-bigint"),
+        ".custom-std.num-bigint",
+        "std,derive,hashbrown,multithreaded,custom-std-collections,num-bigint"
+    ),
+);
+
 pub mod capabilities;
 
 /// The variable naming the verification layer a run carries.
@@ -37,19 +97,74 @@ pub enum Rigor {
     Exhaustive,
 }
 
+impl Rigor {
+    pub const ALL: [Self; 2] = [Self::Fast, Self::Exhaustive];
+
+    /// The layer's name, as [`RIGOR`] and records write it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Exhaustive => "exhaustive",
+        }
+    }
+}
+
 /// The layer this run carries: [`RIGOR`] read once, `fast` when unset; any
 /// other value is an error naming the two.
 pub fn rigor() -> Rigor {
     static LAYER: OnceLock<Rigor> = OnceLock::new();
-    *LAYER.get_or_init(|| match std::env::var(RIGOR) {
-        Err(std::env::VarError::NotPresent) => Rigor::Fast,
-        Ok(value) => match value.as_str() {
-            "fast" => Rigor::Fast,
-            "exhaustive" => Rigor::Exhaustive,
-            other => panic!("{RIGOR}={other:?}: the layers are fast and exhaustive"),
-        },
-        Err(error) => panic!("{RIGOR}: {error}"),
-    })
+    *LAYER.get_or_init(|| selected(RIGOR, Rigor::ALL, Rigor::name, Rigor::Fast))
+}
+
+/// The variable naming the witness sizes a run carries.
+pub const WITNESS: &str = "DCBOR_WITNESS";
+
+/// The witness sizes a run carries: `full`, the default, which the native
+/// layers run; or `minimal`, the boundary-minimal size of every class a
+/// matrix covers, which the Miri gate and the reach map run
+/// (`tests/support/rigor.rs`, `sized`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witness {
+    Full,
+    Minimal,
+}
+
+impl Witness {
+    pub const ALL: [Self; 2] = [Self::Full, Self::Minimal];
+
+    /// The sizes' name, as [`WITNESS`] and records write it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+        }
+    }
+}
+
+/// The witness sizes this run carries: [`WITNESS`] read once, `full` when
+/// unset; any other value is an error naming the two.
+pub fn witness() -> Witness {
+    static SIZES: OnceLock<Witness> = OnceLock::new();
+    *SIZES.get_or_init(|| selected(WITNESS, Witness::ALL, Witness::name, Witness::Full))
+}
+
+/// The member of `all` that `variable` names by `name`, `default` when it
+/// is unset; any other value, or a value that is not Unicode, is an error
+/// naming every member. The one reading of a selection variable.
+fn selected<T: Copy, const N: usize>(
+    variable: &str,
+    all: [T; N],
+    name: fn(T) -> &'static str,
+    default: T,
+) -> T {
+    match std::env::var(variable) {
+        Err(std::env::VarError::NotPresent) => default,
+        Ok(value) => all
+            .into_iter()
+            .find(|member| name(*member) == value)
+            .unwrap_or_else(|| panic!("{variable}={value:?}: the values are {:?}", all.map(name))),
+        Err(error) => panic!("{variable}: {error}"),
+    }
 }
 
 /// The variable the development shells export naming the configuration a

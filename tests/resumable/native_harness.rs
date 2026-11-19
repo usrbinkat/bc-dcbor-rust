@@ -277,23 +277,52 @@ where
 pub fn suite<R>(
     body: impl FnOnce(&mut super::support::RecordedRun, super::support::PolicyId) -> Result<R, Finding>,
 ) -> R {
-    suite_with(POOL, super::support::CAPACITY, body)
+    suite_with(POOL, body)
 }
 
-/// [`suite`] over a policy of `capacity` live bytes and a recording of
-/// `recording`, preallocated before anything runs. The policy is the
-/// admission oracle's with the heap observer's feed (`observed_policy`): a
-/// no-op unless an observation is armed, so one entry serves physical
-/// witnesses and admission-only fixtures alike.
+/// [`suite`] over a policy of `capacity` live bytes, recorded into the
+/// default capacity ([`super::support::CAPACITY`]).
 pub fn suite_with<R>(
     capacity: u64,
-    recording: dcbor::bounded::Capacity,
     body: impl FnOnce(&mut super::support::RecordedRun, super::support::PolicyId) -> Result<R, Finding>,
 ) -> R {
-    super::support::recorded_run_capacity(recording, |run| {
+    super::support::recorded_run(pooled(capacity, body))
+}
+
+/// [`suite_with`] as fixture `key` of the budget family `budgets`: recorded
+/// into the capacity its record states, and measured
+/// ([`super::support::budgets::Budgets::run`]).
+pub fn budget_suite<R>(
+    budgets: &mut super::support::budgets::Budgets,
+    key: &str,
+    capacity: u64,
+    body: impl FnOnce(&mut super::support::RecordedRun, super::support::PolicyId) -> Result<R, Finding>,
+) -> R {
+    budgets.run(key, pooled(capacity, body))
+}
+
+/// The body of a suite's recorded run: its policy of `capacity` live bytes
+/// made first, the admission oracle's with the heap observer's feed
+/// (`observed_policy`), a no-op unless an observation is armed, so one entry
+/// serves physical witnesses and admission-only fixtures alike; then `body`.
+fn pooled<R>(
+    capacity: u64,
+    body: impl FnOnce(&mut super::support::RecordedRun, super::support::PolicyId) -> Result<R, Finding>,
+) -> impl FnOnce(&mut super::support::RecordedRun) -> Result<R, Finding> {
+    move |run| {
         let policy = run.observed_policy(capacity);
         body(run, policy)
-    })
+    }
+}
+
+/// The budget family `family` of the fixtures `keys` under this build's
+/// representation ([`variant`]) and this run's selection.
+pub fn budgets(family: &str, keys: &[&str]) -> super::support::budgets::Budgets {
+    super::support::budgets::Budgets::new(
+        family,
+        variant!(),
+        keys.iter().map(|key| (*key).to_owned()).collect(),
+    )
 }
 
 /// Another tenant of a pool: four elements of `K` bytes, which the growth
@@ -480,7 +509,7 @@ fn aggregated(
     + Sync,
 ) -> String {
     let finalization = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::support::recorded_run_capacity(
+        super::support::recorded_run_short(
             dcbor::bounded::Capacity {
                 permits: super::support::CAPACITY.permits,
                 events: 64,

@@ -333,10 +333,8 @@ fn writer_refusals_preserve_literal_prefix_guards_and_plan_ownership() {
 fn emission_is_bounded_independently_of_preparation() {
     use dcbor::bounded::text_cursor::pipeline::TextPreparation;
     let source = "x".repeat(65536);
-    // A 64 KiB text prepared, then emitted a quantum per turn: 1,180,428
-    // observations and 60 permit records, measured.
-    let capacity = super::support::measured(1_180_428, 60);
-    super::support::recorded_run_capacity(capacity, |run| {
+    let mut budgets = budgets("emission", &["text/65536/prepare-emit"]);
+    budgets.run("text/65536/prepare-emit", |run| {
         let preparing = run.policy(POOL);
         let emitting = run.policy(POOL);
         run.holding(
@@ -375,6 +373,7 @@ fn emission_is_bounded_independently_of_preparation() {
         )?;
         Ok(())
     });
+    budgets.finish();
 }
 
 #[test]
@@ -382,11 +381,8 @@ fn capacity_pool_survives_concurrent_success_and_every_refused_constructor() {
     // The pool: four elements of eight mebibytes of one tenant.
     const EIGHTH: usize = 8 * 1024 * 1024;
     let wire = text_wire("q\u{301}\u{1f600}");
-    // A baseline decode, then about a thousand decodes over eight workers,
-    // every call refused once in turn: 313,542 observations and 9,449
-    // permit records, measured.
-    let recording = super::support::measured(313_542, 9_449);
-    super::support::recorded_run_capacity(recording, |run| {
+    let mut budgets = budgets("concurrent-constructors", &["workers/8/refusals/1000"]);
+    budgets.run("workers/8/refusals/1000", |run| {
         let unobstructed = run.policy(POOL);
         run.holding(
             string_decoder(&wire),
@@ -428,6 +424,7 @@ fn capacity_pool_survives_concurrent_success_and_every_refused_constructor() {
             },
         )
     });
+    budgets.finish();
 }
 
 #[test]
@@ -511,7 +508,7 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
          release would not let it finish"
     );
     let options = Options::normalizing(8);
-    suite_with(capacity, support::CAPACITY, |run, pool| {
+    suite_with(capacity, |run, pool| {
         // The decode's policy: a share of the pool, its own trace over the
         // pool's storage.
         let decoding = run.shared_policy(pool);

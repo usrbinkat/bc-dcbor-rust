@@ -27,25 +27,8 @@ macro_rules! families {
 
 include!("../../data/tightness/families.rs");
 
-/// The record variants: the suffix each feature projection records under,
-/// and the projection's features, comma-separated as `--features` takes
-/// them. The recorders run each (`tests/record-evidence.sh`, `gate
-/// variants`).
-pub const VARIANTS: &[(&str, &str)] = &[
-    ("", "std,derive,hashbrown,multithreaded"),
-    (
-        ".num-bigint",
-        "std,derive,hashbrown,multithreaded,num-bigint",
-    ),
-    (
-        ".custom-std",
-        "std,derive,hashbrown,multithreaded,custom-std-collections",
-    ),
-    (
-        ".custom-std.num-bigint",
-        "std,derive,hashbrown,multithreaded,custom-std-collections,num-bigint",
-    ),
-];
+/// The record variants, from their one definition ([`dcbor_record::VARIANTS`]).
+pub use dcbor_record::VARIANTS;
 
 /// Why a file is not a current record.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,7 +107,7 @@ pub fn current_file(path: &Path, configuration: &str) -> Result<(), Fault> {
 
 /// Every record the configuration must hold under `root`, the repository:
 /// for each variant, its admission traces and each family's tightness
-/// ratios.
+/// ratios; and every recording budget ([`dcbor_record::budgets::inventory`]).
 pub fn inventory(root: &Path) -> Vec<std::path::PathBuf> {
     let data = root.join("tests").join("data");
     let mut paths = Vec::new();
@@ -138,6 +121,10 @@ pub fn inventory(root: &Path) -> Vec<std::path::PathBuf> {
             paths.push(data.join("tightness").join(format!("{family}{suffix}.txt")));
         }
     }
+    paths.extend(
+        dcbor_record::budgets::inventory()
+            .map(|selection| data.join("budgets").join(selection.name)),
+    );
     paths
 }
 
@@ -218,10 +205,18 @@ mod tests {
         let paths = inventory(&root);
         assert_eq!(
             paths.len(),
-            VARIANTS.len() * (1 + FAMILIES.len()) + 2 * CUSTOM_STD_FAMILIES.len()
+            VARIANTS.len() * (1 + FAMILIES.len())
+                + 2 * CUSTOM_STD_FAMILIES.len()
+                + dcbor_record::budgets::inventory().count()
         );
         assert!(paths.contains(&root.join("tests/data/tightness/btree.custom-std.txt")));
         assert!(!paths.contains(&root.join("tests/data/tightness/btree.txt")));
+        assert!(
+            paths.contains(
+                &root.join("tests/data/budgets/btree-occupancy.custom-std.fast.full.txt")
+            )
+        );
+        assert!(!paths.contains(&root.join("tests/data/budgets/btree-occupancy.fast.full.txt")));
         for path in &paths {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, dcbor_record::render("this", ["row"])).unwrap();

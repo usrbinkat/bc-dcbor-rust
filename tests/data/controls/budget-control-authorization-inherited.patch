@@ -1,0 +1,6 @@
+--- tests/gate/src/process.rs
++++ tests/gate/src/process.rs
+@@ -37,3 +37,2 @@
+             || text.starts_with("SHUTTLE_")
+-            || text.starts_with("DCBOR_RECORD_")
+             || [BOUND, STACK, DESCRIBE].contains(&text.as_ref())
