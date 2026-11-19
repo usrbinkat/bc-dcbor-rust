@@ -1,7 +1,7 @@
 use super::harness::*;
 use super::support::{
-    Fault, Finding, Retirement, pipeline::Unwitnessed, prepare_turns, refusal_matrix,
-    rigor::rigor, shape,
+    Fault, Finding, Retirement, pipeline::Unwitnessed, prepare_turns, refusal_matrix, rigor::rigor,
+    shape,
 };
 use dcbor::bounded::{
     BoundedError,

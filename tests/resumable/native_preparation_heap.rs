@@ -22,27 +22,21 @@ fn preparation_physical_failures_preserve_independent_plan_ownership() {
                 Retirement::Released,
                 &observer,
                 |preparation| {
-                    match preparation.drive(
-                        preparing,
-                        bound,
-                        Retirement::Released,
-                        |plan| {
-                            // The preparation is retired before the surviving
-                            // plan is lent to its writer.
-                            let stats = observer.snapshot();
-                            let reached = plan.with_policy(preparing, |_, meter| {
-                                assert!(meter.live_bytes() > 0);
-                                assert!(stats.live <= meter.live_bytes() as usize);
-                                assert!(stats.peak <= meter.peak_bytes() as usize);
-                                meter.reached()
-                            });
-                            let expected = text_wire(&"q\u{316}\u{301}".repeat(32));
-                            emit_held(plan, preparing, emitting, &expected, Fault::NONE)?;
-                            let emitted =
-                                plan.with_policy(emitting, |_, emission| emission.reached());
-                            Ok::<_, Finding>((false, stats, reached.union(emitted)))
-                        },
-                    ) {
+                    match preparation.drive(preparing, bound, Retirement::Released, |plan| {
+                        // The preparation is retired before the surviving
+                        // plan is lent to its writer.
+                        let stats = observer.snapshot();
+                        let reached = plan.with_policy(preparing, |_, meter| {
+                            assert!(meter.live_bytes() > 0);
+                            assert!(stats.live <= meter.live_bytes() as usize);
+                            assert!(stats.peak <= meter.peak_bytes() as usize);
+                            meter.reached()
+                        });
+                        let expected = text_wire(&"q\u{316}\u{301}".repeat(32));
+                        emit_held(plan, preparing, emitting, &expected, Fault::NONE)?;
+                        let emitted = plan.with_policy(emitting, |_, emission| emission.reached());
+                        Ok::<_, Finding>((false, stats, reached.union(emitted)))
+                    }) {
                         Ok(result) => result,
                         Err(Stopped::Operation(BoundedError::Allocation { .. })) => {
                             preparation.finish(preparing, bound, Retirement::Released)?;

@@ -70,11 +70,14 @@ Each is its own test binary under `tests/`, driven by `dcbor-test-support`.
   (`turns`): `decode_turns`, `typed_turns`, `string_turns`, `normalize_turns`, `prepare_turns` with
   `shape`, `emit_turns` and `text_emit_turns`. The owned pipeline driver takes its phases' limits
   from `copy_bound`, `parse_bound`, `typed_decode_bound` and `owned_prepare_bound`.
-- Execution is entered through holdings, or parent-held worker custody; no public free execution
-  driver accepts an unowned operation and policy. Standalone construction retains its document,
-  destination and driver in nested holdings, builds through the shared execution schedule, and
-  reclaims through `tests/support/reclamation.rs`'s `reclaim_by`. Consumer unwinding is contained
-  while that custody survives for cleanup and finalization.
+- Complete execution schedules enter through holdings or parent-held worker custody and use one
+  `Course` contract, with explicit production or already-expanded turn bounds. Single turns enter
+  through `Holding::step`; scope cleanup enters through `Holding::scope_step`, which returns only
+  non-owning cleanup outcomes. Owning stops cannot convert into findings or discard publications
+  through error classification. Standalone construction retains its document, destination and driver
+  in nested holdings, builds through the shared execution schedule, and reclaims through
+  `tests/support/reclamation.rs`'s `reclaim_by`. Consumer unwinding is contained while that custody
+  survives for cleanup and finalization.
 - One matrix seam drives every fault schedule, in the layer `DCBOR_RIGOR` selects (`CONTRACT.md`,
   Test independence): `refusal_matrix` for a single resumable operation, `synchronous_matrix` for
   one that ends at its first refusal, `physical_matrix` and `stop_matrix`, and `support::pipeline`'s

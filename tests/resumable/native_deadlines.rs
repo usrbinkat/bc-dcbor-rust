@@ -119,12 +119,7 @@ fn expiration_between_admissions_preserves_paid_work_and_can_resume() {
     // The engine sees an expired deadline as a refusal like any other: the
     // refusal matrix covers every admission.
     refusal_matrix("decoder of a flat array", rigor(), |fault: Fault| {
-        retained_case(
-            decoder(&wire),
-            decode_turns(wire.len()),
-            fault,
-            |_, _| {},
-        )
+        retained_case(decoder(&wire), decode_turns(wire.len()), fault, |_, _| {})
     });
     let mut used = WriteWork::default();
     let calls = retained_case(

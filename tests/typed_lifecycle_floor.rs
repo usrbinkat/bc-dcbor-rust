@@ -205,14 +205,15 @@ fn construction_initialization_requires_an_admitted_turn() {
 
 #[test]
 fn publication_preserves_the_initialized_value_address() {
-    let (constructed, published) = decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |output| {
-        assert_eq!(output.value().inline, [0x5a; 256]);
-        assert_eq!(output.bytes(), [0xf6]);
-        (
-            output.value().construction_address,
-            std::ptr::from_ref(output.value()) as usize,
-        )
-    });
+    let (constructed, published) =
+        decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |output| {
+            assert_eq!(output.value().inline, [0x5a; 256]);
+            assert_eq!(output.bytes(), [0xf6]);
+            (
+                output.value().construction_address,
+                std::ptr::from_ref(output.value()) as usize,
+            )
+        });
     assert_eq!(
         constructed, published,
         "completion moved the initialized value"

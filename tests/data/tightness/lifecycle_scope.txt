@@ -1,9 +1,9 @@
 #	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
-88	88	measured	observed	published	scope: Initialization allocated
-104	104	measured	observed	published	scope: Initialization bytes
-88	88	measured	observed	published	scope: Initialization peak
+112	112	measured	observed	published	scope: Initialization allocated
+128	128	measured	observed	published	scope: Initialization bytes
+112	112	measured	observed	published	scope: Initialization peak
 4	4	measured	observed	published	scope: Initialization values
-88	88	joint	observed	published	scope: total allocated
-104	104	joint	observed	published	scope: total bytes
-88	88	joint	observed	published	scope: total peak
+112	112	joint	observed	published	scope: total allocated
+128	128	joint	observed	published	scope: total bytes
+112	112	joint	observed	published	scope: total peak
 4	4	joint	observed	published	scope: total values

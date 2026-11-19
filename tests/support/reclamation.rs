@@ -13,6 +13,41 @@ pub(crate) enum Goal {
     Quiescent,
 }
 
+impl crate::RecordedRun {
+    /// Retain a parsed document and standalone destination across computation
+    /// and explicit or fallback cleanup. Parsing uses its own recorded policy.
+    pub fn standalone<T: InPlace<Limits>, R, W: pipeline::Physical>(
+        &mut self,
+        policy: PolicyId,
+        wire: &[u8],
+        window: &W,
+        body: impl FnOnce(
+            &mut Holding<'_, '_, Standalone<'_, '_, '_, T, Limits>, W>,
+        ) -> Result<R, Finding>,
+    ) -> Result<R, Finding> {
+        let bound = crate::turns(crate::root_bound::<T>(wire));
+        let parsing = self.policy(u64::MAX);
+        let document = self.with_policy(parsing, |m| {
+            dcbor::bounded::decode::decode(wire, 64, m).expect("the fixture parses")
+        });
+        self.holding(
+            document,
+            Retirement::Released,
+            &pipeline::Unwitnessed,
+            |document| {
+                document.lending(Retirement::Exhausted, crate::Lent::new, |document| {
+                    let source = document.value().get();
+                    document.holding(
+                        crate::Destination(core::mem::MaybeUninit::<T>::uninit()),
+                        Retirement::Exhausted,
+                        |destination| destination.standalone(source, policy, bound, window, body),
+                    )
+                })
+            },
+        )
+    }
+}
+
 impl<T: InPlace<Limits>, W: pipeline::Physical> Holding<'_, '_, crate::Destination<T>, W> {
     /// Keep the destination outside the consumer's unwinding frame, and finish
     /// its standalone cleanup before releasing the exclusive slot borrow.
@@ -82,7 +117,7 @@ pub(crate) fn reclaim_by<C>(
     m: &mut Limits,
     turns: usize,
     goal: Goal,
-    mut observe: impl FnMut(&mut C, &Limits),
+    mut observe: impl FnMut(&mut C, &Limits, &BoundedResult<Reclaimed, Limits>),
     mut step: impl FnMut(&mut C, &mut Limits) -> BoundedResult<Reclaimed, Limits>,
 ) -> Result<(), Scoped<BoundedResult<Reclaimed, Limits>>> {
     let mut failure = None;
@@ -95,21 +130,17 @@ pub(crate) fn reclaim_by<C>(
         }
         let injected = m.injected_refusals();
         let result = step(custody, m);
-        if let Some(lost) = lost(m, at) {
-            let error = Stopped::Lost(lost, result.clone());
+        let turned = crate::scope_turn(m, result.clone(), at);
+        let turned = if failure.is_none() {
+            turned.observed(m, at, |result| observe(custody, m, result))
+        } else {
+            turned
+        };
+        if let Err(error) = turned.checked() {
             if matches!(goal, Goal::Quiescent) {
                 return Err(error);
             }
             failure.get_or_insert(error);
-        } else {
-            observe(custody, m);
-            if let Some(lost) = lost(m, at) {
-                let error = Stopped::Lost(lost, result.clone());
-                if matches!(goal, Goal::Quiescent) {
-                    return Err(error);
-                }
-                failure.get_or_insert(error);
-            }
         }
         match result {
             Ok(Reclaimed::Done) => return failure.map_or(Ok(()), Err),
@@ -192,12 +223,12 @@ impl<T: Custodial<Permit>, W: pipeline::Physical> Holding<'_, '_, Reclaiming<T>,
         let bound = allowed(m, turns);
         let surrounding = &mut *self.surrounding;
         let window = self.window;
-        reclaim_by(
+        let result = reclaim_by(
             self.value.get(),
             m,
             bound,
             Goal::Drained,
-            |slot, _| {
+            |slot, _, _| {
                 let before = run.defects.len();
                 capture(
                     &run.session,
@@ -220,13 +251,17 @@ impl<T: Custodial<Permit>, W: pipeline::Physical> Holding<'_, '_, Reclaiming<T>,
                 }
             },
             |slot, m| crate::checked(m, |m| window.window(|| (slot.step)(&mut slot.slot, m))),
-        )?;
-        assert!(
-            self.value.get().slot.is_none(),
-            "cleanup completed with a live handle"
         );
-        self.retirement = Retirement::Exhausted;
-        Ok(())
+        if result.is_ok() {
+            assert!(
+                self.value.get().slot.is_none(),
+                "cleanup completed with a live handle"
+            );
+        }
+        if self.value.get().slot.is_none() {
+            self.retirement = Retirement::Exhausted;
+        }
+        result.map_err(Finding::from)
     }
 }
 
@@ -242,7 +277,7 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
             m,
             TURNS,
             Goal::Quiescent,
-            |scope, _| {
+            |scope, _, _| {
                 let before = run.defects.len();
                 capture(
                     &run.session,
@@ -277,6 +312,44 @@ impl<'d, 'a, 'v, T: InPlace<Limits>, W: pipeline::Physical>
         policy: PolicyId,
         turns: usize,
         cancel: Option<usize>,
+        observe: impl FnMut(
+            &mut Standalone<'d, 'a, 'v, T, Limits>,
+            &Limits,
+            &crate::StepOf<Standalone<'d, 'a, 'v, T, Limits>>,
+        ),
+    ) -> Result<Option<()>, crate::Driven<Standalone<'d, 'a, 'v, T, Limits>>> {
+        self.build_standalone_by(policy, crate::Course::within(turns), cancel, observe)
+    }
+
+    /// Build under a recorded refusal schedule, stopping at its selected
+    /// refusal when cancellation is requested.
+    pub fn build_standalone_faulted(
+        &mut self,
+        policy: PolicyId,
+        turns: usize,
+        fault: crate::Fault,
+        observe: impl FnMut(
+            &mut Standalone<'d, 'a, 'v, T, Limits>,
+            &Limits,
+            &crate::StepOf<Standalone<'d, 'a, 'v, T, Limits>>,
+        ),
+    ) -> Result<Option<()>, crate::Driven<Standalone<'d, 'a, 'v, T, Limits>>> {
+        self.build_standalone_by(
+            policy,
+            crate::Course {
+                fault: Some(fault),
+                ..crate::Course::of(turns)
+            },
+            None,
+            observe,
+        )
+    }
+
+    fn build_standalone_by(
+        &mut self,
+        policy: PolicyId,
+        course: crate::Course,
+        cancel: Option<usize>,
         mut observe: impl FnMut(
             &mut Standalone<'d, 'a, 'v, T, Limits>,
             &Limits,
@@ -289,7 +362,7 @@ impl<'d, 'a, 'v, T: InPlace<Limits>, W: pipeline::Physical>
         crate::drive_controlled(
             &mut run.policies[policy.0],
             self.value.get(),
-            crate::Pacing::resuming(turns),
+            course,
             |_, _, at| cancel == Some(at),
             |m, driver, result| {
                 let before = run.defects.len();
@@ -338,7 +411,7 @@ impl<'d, 'a, 'v, T: InPlace<Limits>, W: pipeline::Physical>
             m,
             bound,
             Goal::Drained,
-            |driver, _| {
+            |driver, m, result| {
                 let before = run.defects.len();
                 capture(
                     &run.session,
@@ -356,14 +429,9 @@ impl<'d, 'a, 'v, T: InPlace<Limits>, W: pipeline::Physical>
                     before,
                     "standalone custody observation failed"
                 );
+                observe(driver, m, result);
             },
-            |driver, m| {
-                let result = crate::checked(m, |m| window.window(|| driver.reclaim_step(m)));
-                if lost(m, 0).is_none() {
-                    observe(driver, m, &result);
-                }
-                result
-            },
+            |driver, m| crate::checked(m, |m| window.window(|| driver.reclaim_step(m))),
         );
         if self.value().stage() == dcbor::bounded::decode::construction::in_place::Stage::Released {
             self.retirement = Retirement::Exhausted;
@@ -381,11 +449,101 @@ mod tests {
     use std::mem::MaybeUninit;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    #[test]
+    fn drained_cleanup_preserves_observer_unwind_and_finishes() {
+        recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            run.with_policy(policy, |m| {
+                let mut remaining = 3;
+                let mut observations = 0;
+                let result = reclaim_by(
+                    &mut remaining,
+                    m,
+                    3,
+                    Goal::Drained,
+                    |_, _, _| {
+                        observations += 1;
+                        panic!("planted cleanup observer unwind");
+                    },
+                    |remaining, _| {
+                        *remaining -= 1;
+                        Ok(if *remaining == 0 {
+                            Reclaimed::Done
+                        } else {
+                            Reclaimed::Progress
+                        })
+                    },
+                );
+                assert_eq!(remaining, 0, "observer failure interrupted defined cleanup");
+                assert_eq!(observations, 1, "failed observation was retried");
+                match result {
+                    Err(Stopped::Violated {
+                        outcome: Some(Ok(Reclaimed::Progress)),
+                        report,
+                        ..
+                    }) => {
+                        assert!(
+                            report.contains("planted cleanup observer unwind"),
+                            "{report}"
+                        );
+                    }
+                    other => panic!("cleanup replaced the first observer failure: {other:?}"),
+                }
+            });
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn completed_handle_cleanup_marks_exhausted_despite_recording_loss() {
+        let completed = Cell::new(false);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            recorded_run(|run| {
+                let policy = run.policy(u64::MAX);
+                run.holding(
+                    Reclaiming::new((), |slot, m| {
+                        assert_eq!(
+                            m.validate_owner(&Owner::unobserved()),
+                            Err(LimitRefusal::Unrecorded)
+                        );
+                        slot.take();
+                        Ok(Reclaimed::Done)
+                    }),
+                    Retirement::Released,
+                    &pipeline::Unwitnessed,
+                    |held| {
+                        let result = held.reclaim(policy, 1, |_| {
+                            panic!("invalid recording reached the cleanup observer");
+                        });
+                        assert!(result.is_err(), "cleanup accepted a lost recording");
+                        assert!(held.value().value().is_none(), "cleanup kept its handle");
+                        assert_eq!(
+                            held.retirement,
+                            Retirement::Exhausted,
+                            "completed cleanup kept its pre-cleanup retirement"
+                        );
+                        completed.set(true);
+                        result
+                    },
+                )
+            });
+        }))
+        .expect_err("recording loss must fail finalization");
+        assert!(completed.get(), "completed cleanup did not retain its loss");
+        let report = crate::panic_report(failure.as_ref());
+        assert!(report.contains("ForeignOwner"), "{report}");
+        assert!(
+            !report.contains("finished and refined the protocol"),
+            "{report}"
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum Exit {
         Error,
         Lost,
         LostUnwind,
+        PartialUnwind,
     }
 
     fn standalone_exit(exit: Exit) {
@@ -420,11 +578,15 @@ mod tests {
                                                 driver.build_standalone(
                                                     policy,
                                                     bound,
-                                                    None,
+                                                    matches!(exit, Exit::PartialUnwind)
+                                                        .then_some(3),
                                                     |_, _, _| {},
                                                 )?;
                                                 driver.with_policy(policy, |driver, m| {
-                                                    assert!(driver.value().is_some());
+                                                    assert_eq!(
+                                                        driver.value().is_some(),
+                                                        !matches!(exit, Exit::PartialUnwind)
+                                                    );
                                                     assert!(m.live_bytes() > 0);
                                                     if matches!(exit, Exit::Lost | Exit::LostUnwind)
                                                     {
@@ -434,6 +596,9 @@ mod tests {
                                                         );
                                                     }
                                                 });
+                                                if matches!(exit, Exit::PartialUnwind) {
+                                                    panic!("planted partial construction unwind");
+                                                }
                                                 if matches!(exit, Exit::LostUnwind) {
                                                     panic!("planted standalone loss unwind");
                                                 }
@@ -475,9 +640,13 @@ mod tests {
         );
         let report = crate::panic_report(failure.as_ref());
         match exit {
-            Exit::Error => {
+            Exit::Error | Exit::PartialUnwind => {
                 assert!(
-                    report.contains("planted standalone consumer error"),
+                    report.contains(if matches!(exit, Exit::PartialUnwind) {
+                        "planted partial construction unwind"
+                    } else {
+                        "planted standalone consumer error"
+                    }),
                     "{report}"
                 );
                 assert!(
@@ -515,5 +684,10 @@ mod tests {
     #[test]
     fn standalone_recording_loss_preserves_consumer_unwind() {
         standalone_exit(Exit::LostUnwind);
+    }
+
+    #[test]
+    fn standalone_partial_construction_unwind_reclaims_before_finalization() {
+        standalone_exit(Exit::PartialUnwind);
     }
 }

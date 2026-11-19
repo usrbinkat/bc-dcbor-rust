@@ -1,6 +1,6 @@
 --- tests/support/reclamation.rs
 +++ tests/support/reclamation.rs
-@@ -89,7 +89,7 @@
+@@ -124,7 +124,7 @@
      for at in 0..turns {
          if let Err(error) = require_evidence(m, at) {
              if matches!(goal, Goal::Quiescent) {

@@ -165,16 +165,12 @@ fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
                  {padding}: measure it with {MEASURE}=1 and state it in recording_budget"
             ),
         };
-        let report = round_trip(
-            &wire,
-            capacity,
-            |value: &BTreeMap<String, String>| {
-                assert_eq!(value, &expected, "{count} entries");
-                for (key, wanted) in &expected {
-                    assert_eq!(value.get(key), Some(wanted));
-                }
-            },
-        );
+        let report = round_trip(&wire, capacity, |value: &BTreeMap<String, String>| {
+            assert_eq!(value, &expected, "{count} entries");
+            for (key, wanted) in &expected {
+                assert_eq!(value.get(key), Some(wanted));
+            }
+        });
         let turns = report.boundaries.len();
         let phases: Vec<String> = report
             .bounds

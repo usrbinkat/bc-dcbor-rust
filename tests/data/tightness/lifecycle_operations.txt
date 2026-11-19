@@ -21,24 +21,24 @@
 309	309	joint	observed	published	copy: total peak
 309	309	joint	observed	published	copy: total retained
 17	11	joint	observed	published	copy: total values
-1825697	1647221	joint	observed	published	owned preparation of 16 texts of 400 pairs: public bytes
-455204	401837	joint	observed	published	owned preparation of 16 texts of 400 pairs: public values
-144077	124365	joint	observed	published	owned preparation of 4 texts of 100 pairs: public bytes
-29475	25693	joint	observed	published	owned preparation of 4 texts of 100 pairs: public values
-18116	13732	joint	observed	published	owned preparation of 4000 empty strings: public allocated
-10985	10728	joint	observed	published	owned preparation of 4000 empty strings: public peak
-10985	8616	joint	observed	published	owned preparation of 4000 empty strings: public retained
-7256	6372	joint	observed	published	owned preparation of 500 empty strings: public allocated
-5609	5352	joint	observed	published	owned preparation of 500 empty strings: public peak
-5609	5032	joint	observed	published	owned preparation of 500 empty strings: public retained
+1827521	1648133	joint	observed	published	owned preparation of 16 texts of 400 pairs: public bytes
+455220	401837	joint	observed	published	owned preparation of 16 texts of 400 pairs: public values
+145325	124701	joint	observed	published	owned preparation of 4 texts of 100 pairs: public bytes
+29491	25693	joint	observed	published	owned preparation of 4 texts of 100 pairs: public values
+18756	13924	joint	observed	published	owned preparation of 4000 empty strings: public allocated
+11369	10920	joint	observed	published	owned preparation of 4000 empty strings: public peak
+11369	8808	joint	observed	published	owned preparation of 4000 empty strings: public retained
+7896	6564	joint	observed	published	owned preparation of 500 empty strings: public allocated
+5993	5544	joint	observed	published	owned preparation of 500 empty strings: public peak
+5993	5224	joint	observed	published	owned preparation of 500 empty strings: public retained
 1	1	measured	observed	exact	retired copy: Release values
-39118049	1702383	joint	observed	published	typed decode chain of 16 texts of 400 pairs: public bytes
+39528785	1703199	joint	observed	published	typed decode chain of 16 texts of 400 pairs: public bytes
 2490503	382633	joint	observed	published	typed decode chain of 16 texts of 400 pairs: public values
-2477081	124047	joint	observed	published	typed decode chain of 4 texts of 100 pairs: public bytes
+2503049	124287	joint	observed	published	typed decode chain of 4 texts of 100 pairs: public bytes
 157104	24457	joint	observed	published	typed decode chain of 4 texts of 100 pairs: public values
-1604716	848307	joint	observed	published	typed decode chain of 4000 empty strings: public allocated
-659273	650931	joint	observed	published	typed decode chain of 4000 empty strings: public peak
-659273	650931	joint	observed	published	typed decode chain of 4000 empty strings: public retained
-204936	108551	joint	observed	published	typed decode chain of 500 empty strings: public allocated
-84741	83399	joint	observed	published	typed decode chain of 500 empty strings: public peak
-84741	83399	joint	observed	published	typed decode chain of 500 empty strings: public retained
+1604812	848403	joint	observed	published	typed decode chain of 4000 empty strings: public allocated
+659369	651027	joint	observed	published	typed decode chain of 4000 empty strings: public peak
+659369	651027	joint	observed	published	typed decode chain of 4000 empty strings: public retained
+205032	108647	joint	observed	published	typed decode chain of 500 empty strings: public allocated
+84837	83495	joint	observed	published	typed decode chain of 500 empty strings: public peak
+84837	83495	joint	observed	published	typed decode chain of 500 empty strings: public retained

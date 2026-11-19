@@ -247,9 +247,9 @@ fail on the scope's allocation request.
 `text-allocation-retried.patch` makes the text encoder's driver (`TextEncoder::step`,
 `text_cursor.rs`) send a failed output reservation back to `ReleaseOutput` instead of into cleanup:
 the retry the `Resumable` contract forbids after a terminal error. The cleanup driver's next step
-(`tests/support/lifecycle.rs`, `finish_within`, reached through the test's `encoded`) re-admits the
-output's release, requests the output again (the next physical request, which is not failed) and
-publishes; the driver returns the publication as its stop, the output inside it, so
+(`tests/support/lifecycle.rs`, `Holding::finish`, reached through the test's `encoded`) re-admits
+the output's release, requests the output again (the next physical request, which is not failed) and
+publishes; the holding retains and retires the unexpected output before returning its stop, so
 `tests/resumable/native_heap.rs`
 `every_real_normalization_and_output_allocation_can_fail_without_leaking` must fail naming
 `the operation published where its schedule admits none`, before the oracle's release count is read.
@@ -380,13 +380,29 @@ requires both the original consumer panic and a finished, refined recording: the
 destination must be reclaimed before its driver, document and slot retire. Automated
 red/restored-green qualification is pending.
 
-`standalone-loss-cleanup-skipped.patch` makes the drained cleanup schedule (`tests/support/reclamation.rs`,
-`reclaim_by`) return at the first turn whose recording is no evidence, instead of retaining that
-failure and draining on. `standalone_recording_loss_reclaims_without_accepting_evidence` invalidates
-the session after a completed construction, then requires the payload's storage released and its
-credit conserved before finalization, beside the loss the finalizer still refuses: it must fail
-naming `standalone cleanup did not finish before finalization`. Automated red/restored-green
-qualification is pending.
+`standalone-loss-cleanup-skipped.patch` makes the drained cleanup schedule
+(`tests/support/reclamation.rs`, `reclaim_by`) return at the first turn whose recording is no
+evidence, instead of retaining that failure and draining on.
+`standalone_recording_loss_reclaims_without_accepting_evidence` invalidates the session after a
+completed construction, then requires the payload's storage released and its credit conserved before
+finalization, beside the loss the finalizer still refuses: it must fail naming
+`standalone cleanup did not finish before finalization`. Automated red/restored-green qualification
+is pending.
+
+`lost-turn-observer-invoked.patch` presents an already-invalid recording to a turn observer.
+`lost_turn_skips_history_observation_and_retains_its_publication` requires the observer skipped, the
+publication retained, and the original loss snapshot returned without changing its turn.
+`observer-invalidation-unchecked.patch` removes the shared outcome guard's post-observer integrity
+read. `observer_invalidation_and_unwind_retain_the_acquired_outcome` invalidates the recording
+inside observation, both returning and unwinding, and requires the outcome and loss together.
+Automated red/restored-green qualification of both controls is pending.
+
+`free-scheduler-restored.patch` restores a free scheduling entry point; the `lifecycle_authority`
+source census rejects it. `cleanup-observer-unwind-propagated.patch` lets an observer unwind
+interrupt a defined drain; the cleanup witness requires all remaining units executed and the
+original observer failure returned. `worker-join-failures-discarded.patch` discards the shared
+worker batch's join failures; its witness requires every worker panic collected after every join.
+Automated red/restored-green qualification of these controls is pending.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both

@@ -222,7 +222,7 @@ credit-spend-twice	tests/data/controls/credit-spend-twice.patch	native	nightly	d
 # the output again (the next physical request, not failed) and publishes,
 # which the cleanup driver returns as its stop before the oracle's release
 # count is read (text_cursor.rs, TextEncoder::step; tests/support/lifecycle.rs,
-# finish_within, reached through native_heap.rs `encoded`).
+# Holding::finish, reached through native_heap.rs `encoded`).
 text-allocation-retried	tests/data/controls/text-allocation-retried.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::every_real_normalization_and_output_allocation_can_fail_without_leaking	-	failed	the operation published where its schedule admits none
 # The second operation's delta begun once it already holds credit: its
 # admissions before the snapshot fall outside the delta, whose settlements
@@ -556,3 +556,10 @@ standalone-unwind-cleanup-skipped	tests/data/controls/standalone-unwind-cleanup-
 # Recording loss aborting cleanup before its first unit leaves the initialized
 # destination's payload held, independently of the finalizer's evidence refusal.
 standalone-loss-cleanup-skipped	tests/data/controls/standalone-loss-cleanup-skipped.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::standalone_recording_loss_reclaims_without_accepting_evidence	-	failed	standalone cleanup did not finish before finalization
+# Invalid history presented to an observer, and observation-induced loss left
+# unread: the shared outcome guard must retain the original outcome and loss.
+lost-turn-observer-invoked	tests/data/controls/lost-turn-observer-invoked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::lost_turn_skips_history_observation_and_retains_its_publication	-	failed	loss check did not complete
+observer-invalidation-unchecked	tests/data/controls/observer-invalidation-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::observer_invalidation_and_unwind_retain_the_acquired_outcome	-	failed	observer check did not complete
+free-scheduler-restored	tests/data/controls/free-scheduler-restored.patch	native	nightly	dcbor	all	lifecycle_authority	execution_cleanup_and_worker_startup_have_one_authority	-	failed	free custody execution
+cleanup-observer-unwind-propagated	tests/data/controls/cleanup-observer-unwind-propagated.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::drained_cleanup_preserves_observer_unwind_and_finishes	-	failed	planted cleanup observer unwind
+worker-join-failures-discarded	tests/data/controls/worker-join-failures-discarded.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::joined_batch_collects_every_worker_panic	-	failed	a join discarded a worker panic

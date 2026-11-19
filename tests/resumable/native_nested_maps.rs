@@ -1,7 +1,5 @@
 use super::harness::*;
-use super::support::{
-    Fault, Finding, Retirement, Stopped, pipeline::Unwitnessed, shape,
-};
+use super::support::{Fault, Finding, Retirement, Stopped, pipeline::Unwitnessed, shape};
 use dcbor::bounded::{
     BoundedError,
     encoding::{Preparation, Schema},

@@ -20,7 +20,7 @@
 1549635	787264	joint	observed	published	large flat array: total allocated
 590080	590080	joint	observed	published	large flat array: total peak
 393216	393216	joint	observed	published	large flat array: total retained
-5279626	243803	joint	observed	published	long undecided run: total bytes
+5343658	243851	joint	observed	published	long undecided run: total bytes
 339036	58350	joint	observed	published	long undecided run: total values
 3723	2717	measured	observed	published	many keys (Keys): Keys bytes
 1920	999	measured	observed	published	many keys (Keys): Keys values
@@ -33,9 +33,9 @@
 382314	27363	measured	observed	published	undecided run (Normalization): Normalization bytes
 10304	2624	measured	observed	published	undecided run (Normalization): Normalization peak
 24344	5813	measured	observed	published	undecided run (Normalization): Normalization values
-546794	29643	joint	observed	published	undecided run (Normalization): total bytes
+553226	29691	joint	observed	published	undecided run (Normalization): total bytes
 34806	6074	joint	observed	published	undecided run (Normalization): total values
-248024	243900	measured	observed	published	undecided texts (NormalizerInit): NormalizerInit bytes
+262472	258300	measured	observed	published	undecided texts (NormalizerInit): NormalizerInit bytes
 11438	11400	measured	observed	published	undecided texts (NormalizerInit): NormalizerInit values
 903	900	measured	observed	published	undecided texts (TextCheck): TextCheck bytes
 316	300	measured	observed	published	undecided texts (TextCheck): TextCheck values

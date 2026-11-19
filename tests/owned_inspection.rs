@@ -13,8 +13,7 @@ use dcbor_test_support::classes::{self, Class, Classes};
 use dcbor_test_support::pipeline::{Expected, inspect, matrix};
 use dcbor_test_support::rigor::{Progress, Rigor, rigor, sized};
 use dcbor_test_support::{
-    self as support, Finding, Holding, Lent, PolicyId, Retirement, heap,
-    pipeline::Unwitnessed,
+    self as support, Finding, Holding, Lent, PolicyId, Retirement, heap, pipeline::Unwitnessed,
 };
 
 /// What the options both inspections parse under.
@@ -76,8 +75,10 @@ fn shared_owner(cut: Option<usize>) -> Run {
                         // The second inspection runs while the first's
                         // document is held: every turn's checkpoint observes
                         // the document's custody beside the second's.
-                        let inspected =
-                            document.holding(Lent::new(scope), Retirement::Exhausted, |view| {
+                        let inspected = document.holding(
+                            Lent::new(scope),
+                            Retirement::Exhausted,
+                            |view| {
                                 view.copied(policy, &source, |second| {
                                     second.transfer(
                                         |second| DocumentDecoder::parse(second, OPTIONS),
@@ -85,13 +86,13 @@ fn shared_owner(cut: Option<usize>) -> Run {
                                         |second| inspect_second(second, policy, cut, source.len()),
                                     )
                                 })
-                            })??;
+                            },
+                        )??;
                         // The second retired before the first: the first's
                         // bytes and arena remain readable.
                         let document = document.value();
-                        document.with_document(|view| {
-                            assert_eq!(view.root().encoded(), first_wire)
-                        });
+                        document
+                            .with_document(|view| assert_eq!(view.root().encoded(), first_wire));
                         assert_eq!(document.root().encoded(), first_wire);
                         assert_eq!(document.bytes(), first_wire);
                         Ok::<_, Finding>(inspected)
@@ -154,7 +155,9 @@ fn inspect_second(
         true,
         |m, operation, at| {
             inspected.turns += 1;
-            inspected.classes.push(classes::parse(&operation.position()));
+            inspected
+                .classes
+                .push(classes::parse(&operation.position()));
             if cut == Some(at) {
                 inspected.cut_at = Some(m.admitted_calls().len());
                 operation.cancel();

@@ -1,0 +1,10 @@
+--- tests/support/lifecycle.rs
++++ tests/support/lifecycle.rs
+@@ -5056,7 +5056,6 @@
+                     None => self.violation = Some(observation),
+                 }
+             }
+-            self.lost = lost(m, at);
+         }
+         self
+     }

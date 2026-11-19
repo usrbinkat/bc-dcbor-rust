@@ -21,15 +21,14 @@ static HEAP: support::heap::Heap = support::heap::Heap;
 use dcbor::ByteString;
 use dcbor::bounded::decode::construction::{DecodeOwner, DocumentDecoder, ParsePhase, parse_bound};
 use dcbor::bounded::decode::{DecodeError, Options};
-use dcbor::bounded::{BoundedError, Custodial, Identity, Limits, Step};
+use dcbor::bounded::{BoundedError, Custodial, Identity, LimitRefusal, Limits};
 use dcbor_test_support::{
-    self as support, Finding, Holding, PolicyId, Retirement, pipeline::Unwitnessed,
+    self as support, Finding, Holding, PolicyId, Retirement, Stepped, pipeline::Unwitnessed,
 };
 use std::collections::BTreeSet;
 
 /// The held parse of [`WIRE`].
-type Parse<'r, 's> =
-    Holding<'r, 's, DocumentDecoder<'static, ByteString, Limits>, Unwitnessed>;
+type Parse<'r, 's> = Holding<'r, 's, DocumentDecoder<'static, ByteString, Limits>, Unwitnessed>;
 
 const OPTIONS: Options = Options::normalizing(8);
 
@@ -168,26 +167,23 @@ fn transferred(
         }
         let transferring = detail.phase == Some(ParsePhase::Transfer);
         if transferring {
-            let refused = decoder.with_policy(a, |decoder, m| {
+            // The refused call is the next attempt under the exhausted policy.
+            let call = decoder.with_policy(a, |_, m| {
                 m.clear_refusal();
                 m.exhaust();
-                support::contracted(m, decoder)
+                m.attempts()
             });
-            match refused {
-                Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-                Ok(Step::Complete(document)) => {
-                    decoder.holding(document, Retirement::Published, |_| ());
-                    return Err(Finding::Driver(
-                        "a transfer part published under an exhausted policy".to_owned(),
-                    ));
-                }
-                other => {
-                    return Err(Finding::Driver(format!(
-                        "a transfer part was not refused under an exhausted policy: {}",
-                        support::label(&other)
-                    )));
-                }
-            }
+            assert_eq!(
+                decoder.suspend(
+                    a,
+                    LimitRefusal::Work,
+                    1,
+                    support::TurnSchedule::Retained,
+                    Retirement::Published
+                )?,
+                call,
+                "the transfer part must refuse its first attempt under the exhausted policy"
+            );
             assert_eq!(
                 decoder.value().position().detail,
                 detail,
@@ -207,13 +203,14 @@ fn transferred(
             decoder.checkpoint();
         }
         let policy = if transferring { b } else { a };
-        match decoder.with_policy(policy, |decoder, m| support::scheduled(m, decoder, at))? {
-            Ok(Step::Complete(document)) => {
-                decoder.holding(document, Retirement::Published, |document| {
-                    document.checkpoint();
-                });
-                decoder.with_policy(a, |decoder, m| support::exhausted(m, decoder));
-                decoder.retirement(Retirement::Exhausted);
+        match decoder.step(
+            policy,
+            at,
+            Retirement::Published,
+            |_, _| {},
+            |document| document.checkpoint(),
+        )? {
+            Stepped::Published(()) => {
                 assert!(
                     refused_at.len() >= 2,
                     "the transfer took {} parts: no storage part before its owner's",
@@ -226,12 +223,10 @@ fn transferred(
                 );
                 return Ok(());
             }
-            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
+            Stepped::Progress
+            | Stepped::Failed(DecodeError::Resource(BoundedError::Refused(_))) => {}
             other => {
-                return Err(Finding::Driver(format!(
-                    "the parse failed: {}",
-                    support::label(&other)
-                )));
+                return Err(Finding::Driver(format!("the parse failed: {other:?}")));
             }
         }
         decoder.checkpoint();
@@ -288,8 +283,7 @@ fn cancelled_at(cut: usize) -> (bool, Option<Cleanup>) {
                                 true,
                                 |_, decoder, _| {
                                     let detail = decoder.position().detail;
-                                    let transferring = detail.phase
-                                        == Some(ParsePhase::Transfer)
+                                    let transferring = detail.phase == Some(ParsePhase::Transfer)
                                         && detail.transferred == cut;
                                     let past = matches!(
                                         detail.phase,

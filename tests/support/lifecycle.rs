@@ -95,8 +95,23 @@ pub const fn measured(events: usize, permits: usize) -> Capacity {
 /// which matches it against the physical requests an armed observation
 /// sees. Configured whole before any reservation or share can escape.
 fn recorded_policy(session: &Recording, capacity: u64, physical: bool) -> Limits {
+    recorded_allowance(
+        session,
+        WriteWork::new(u64::MAX, u64::MAX),
+        capacity,
+        physical,
+    )
+}
+
+fn recorded_allowance(
+    session: &Recording,
+    work: WriteWork,
+    capacity: u64,
+    physical: bool,
+) -> Limits {
     let limits =
-        heap::observe_releases(Limits::recorded(u64::MAX, u64::MAX, capacity, session)).strict();
+        heap::observe_releases(Limits::recorded(work.values, work.bytes, capacity, session))
+            .strict();
     if physical {
         limits.observe(heap::admitted)
     } else {
@@ -471,7 +486,7 @@ where
         match drive_controlled(
             m,
             operation,
-            Pacing::resuming(turns),
+            Course::within(turns),
             |_, _, _| false,
             |_, _, _| {},
             &pipeline::Unwitnessed,
@@ -1082,14 +1097,22 @@ terminal!(Released:
 
 terminal!(Wraps: [O: Terminal] Traced<O> => O);
 
-/// What one holding schedule runs ([`Holding::drive_with`]): at most `turns`,
-/// allowed under the policy's refusals ([`allowed`]); the refusal schedule
+/// The turn bound supplied to the shared execution schedule.
+#[derive(Clone, Copy, Debug)]
+enum TurnBound {
+    /// A production bound to expand under the policy's refusal schedule.
+    Allowed(usize),
+    /// An execution bound whose refusal allowance is already included.
+    Exact(usize),
+}
+
+/// What the shared execution schedule runs: its turn bound; the refusal schedule
 /// of `fault` applied first, cancelling at its refusal when the fault does;
 /// each step's contract observed through the operation's position when
 /// `observed`; each turn's admission first refused `repeats` times.
 #[derive(Clone, Copy, Debug)]
 struct Course {
-    turns: usize,
+    turns: TurnBound,
     fault: Option<Fault>,
     observed: bool,
     repeats: usize,
@@ -1099,17 +1122,37 @@ impl Course {
     /// An observed course of `turns`, no fault, no repeated refusal.
     const fn of(turns: usize) -> Self {
         Self {
-            turns,
+            turns: TurnBound::Allowed(turns),
             fault: None,
             observed: true,
             repeats: 0,
         }
     }
+
+    /// A schedule bounded by an already-computed execution allowance.
+    const fn within(turns: usize) -> Self {
+        Self {
+            turns: TurnBound::Exact(turns),
+            ..Self::of(turns)
+        }
+    }
+}
+
+/// What one held turn of a fixture's own schedule reached
+/// ([`Holding::step`]): progress; a finished operation; a publication,
+/// consumed under the output's own holding, its result; or the operation's
+/// own error, a refusal included, for the fixture to classify.
+#[derive(Debug)]
+pub enum Stepped<E, R> {
+    Progress,
+    Finished,
+    Published(R),
+    Failed(E),
 }
 
 /// The holding scope's execution: the held value is an operation, driven by
 /// the one execution schedule ([`drive_controlled`]) and the one cleanup schedule
-/// ([`wound`]), each turn inside the holding's physical window, the
+/// ([`wound_by`]), each turn inside the holding's physical window, the
 /// complete holding stack checkpointed after every turn whose recording is
 /// still evidence: the surroundings, the operation, and the turn's output.
 impl<T, W> Holding<'_, '_, T, W>
@@ -1312,6 +1355,95 @@ where
         }
     }
 
+    /// One fresh checked turn of the held operation under `policy` for a
+    /// fixture's own schedule (a handwritten loop over the operation's own
+    /// steps), the `at`-th of it: the shared turn ([`turn_in`]) inside the
+    /// holding's physical window, its contract checked through its position;
+    /// then, while the recording is still evidence, the holding stack
+    /// checkpointed beside the turn's output and `observe` reading the
+    /// operation while it is still held, the publishing turn's included. A
+    /// publication is probed terminal ([`terminal`]) while its publisher is
+    /// held, then handed over as every schedule's is ([`Self::hand_over`]) to
+    /// `consume`. The operation's own error, a refusal included, is returned
+    /// for the fixture to classify; a lost recording, a contract violation
+    /// and a failed terminal probe are the stop, any output it carries held
+    /// first ([`Self::halted`]).
+    pub fn step<R>(
+        &mut self,
+        policy: PolicyId,
+        at: usize,
+        published: Retirement,
+        observe: impl FnOnce(&Limits, &mut T),
+        consume: impl FnOnce(&mut Holding<'_, '_, T::Output, W>) -> R,
+    ) -> Result<Stepped<T::Error, R>, Halt<T>> {
+        let window = self.window;
+        let mut publication = None;
+        let stepped = {
+            let RecordedRun {
+                session,
+                policies,
+                checkpoints,
+                defects,
+                ..
+            } = &mut *self.run;
+            let m = policies
+                .get_mut(policy.0)
+                .expect("a policy handle names a policy of the run that issued it");
+            let surrounding = &mut *self.surrounding;
+            let operation = self.value.get();
+            require_evidence(m, at).and_then(|()| {
+                let turned = turn_in(m, operation, true, at, window);
+                let outcome = observe_turn(m, operation, turned, at, |m, operation, outcome| {
+                    let checkpoint = stack_checkpoint(
+                        session,
+                        checkpoints,
+                        defects,
+                        surrounding,
+                        operation,
+                        outcome,
+                    );
+                    if matches!(outcome, Ok(Step::Complete(_))) {
+                        publication = Some(checkpoint);
+                    }
+                    observe(m, operation);
+                })?;
+                match outcome {
+                    Ok(Step::Complete(output)) => {
+                        let Turned {
+                            outcome,
+                            lost,
+                            violation,
+                        } = terminal(m, operation, true, at + 1, window);
+                        if violation.is_some() || lost.is_some() {
+                            return Err(Stopped::Violated {
+                                output: Some(output),
+                                outcome,
+                                lost,
+                                report: violation
+                                    .unwrap_or_else(|| "terminal probe lost recording".to_owned()),
+                            });
+                        }
+                        Ok(Ok(Step::Complete(output)))
+                    }
+                    other => Ok(other),
+                }
+            })
+        };
+        match stepped {
+            Ok(Ok(Step::Progress)) => Ok(Stepped::Progress),
+            Ok(Ok(Step::Finished)) => Ok(Stepped::Finished),
+            Ok(Ok(Step::Complete(output))) => Ok(Stepped::Published(self.handed_over(
+                T::PUBLISHED,
+                output,
+                published,
+                publication,
+                consume,
+            ))),
+            Ok(Err(error)) => Ok(Stepped::Failed(error)),
+            Err(stop) => Err(self.halted(stop, published)),
+        }
+    }
+
     /// The one schedule body of every holding schedule, run as `course`
     /// declares ([`Course`]): a publication handed over to `consume`, the
     /// publisher retired first, as its type declares
@@ -1363,12 +1495,6 @@ where
         E: FnMut(&mut Limits, &mut T, bool, usize) -> Turned<Option<StepOf<T>>>,
     {
         let (course, execution) = execution;
-        let Course {
-            turns,
-            fault,
-            observed,
-            repeats,
-        } = course;
         // The checkpoint the publishing turn stored, which observed its
         // output ([`Self::publication`]).
         let mut publication = None;
@@ -1383,25 +1509,11 @@ where
             let m = policies
                 .get_mut(policy.0)
                 .expect("a policy handle names a policy of the run that issued it");
-            let cancel = match fault {
-                Some(fault) => {
-                    refuse(m, fault.refusal);
-                    fault.cancel
-                }
-                None => false,
-            };
-            let bound = allowed(m, turns);
             let surrounding = &mut *self.surrounding;
             drive_executed(
                 m,
                 self.value.get(),
-                Pacing {
-                    turns: bound,
-                    cancel,
-                    observed,
-                    repeats,
-                    publication: true,
-                },
+                course,
                 stop_before,
                 |m, operation, outcome| {
                     let checkpoint = stack_checkpoint(
@@ -1437,7 +1549,7 @@ where
     }
 
     /// Drive the held operation's own cleanup to `Finished` under `policy`
-    /// within `turns` ([`wound`]), each turn inside the holding's physical
+    /// within `turns` ([`wound_by`]), each turn inside the holding's physical
     /// window, the holding stack checkpointed after each. Finished, the
     /// operation holds nothing and retires as [`Retirement::Exhausted`]. A
     /// publication cleanup admits none of is a stop, its output held and
@@ -1476,7 +1588,7 @@ where
         observed: bool,
         mut observe: impl FnMut(&mut T),
     ) -> Result<(), Halt<T>> {
-        let result = {
+        let (completed, result) = {
             let RecordedRun {
                 session,
                 policies,
@@ -1506,9 +1618,19 @@ where
                     );
                     observe(operation);
                 },
-                |m, operation, observed, at| turn_in(m, operation, observed, at, window),
+                Execution {
+                    step: |m: &mut Limits, operation: &mut T, observed, at| {
+                        turn_in(m, operation, observed, at, window)
+                    },
+                    end: |m: &mut Limits, operation: &mut T, observed, at| {
+                        terminal(m, operation, observed, at, window)
+                    },
+                },
             )
         };
+        if completed {
+            self.retirement = Retirement::Exhausted;
+        }
         match result {
             Ok(()) => {
                 self.retirement = Retirement::Exhausted;
@@ -1645,6 +1767,99 @@ where
     }
 }
 
+impl<W: pipeline::Physical> Holding<'_, '_, dcbor::bounded::Prepared<Permit>, W> {
+    /// Consume a synchronous plan through its production in-place publication,
+    /// retaining the resulting encoding before observation or fixture execution.
+    pub fn publish<R>(
+        &mut self,
+        policy: PolicyId,
+        consume: impl FnOnce(&mut Holding<'_, '_, dcbor::bounded::Encoded<Permit>, W>) -> R,
+    ) -> Result<R, Finding> {
+        self.run.with_policy(policy, |m| {
+            require_evidence::<(), BoundedError<LimitRefusal>, Rendered>(m, 0)
+        })?;
+        let plan = self
+            .value
+            .0
+            .take()
+            .expect("a plan is held until publication");
+        let result = self
+            .run
+            .with_policy(policy, |m| self.window.window(|| plan.publish(m)));
+        let loss = self.run.with_policy(policy, |m| lost(m, 0));
+        match result {
+            Ok(output) => self.holding(output, Retirement::Released, |output| {
+                output.checkpoint();
+                match loss {
+                    Some(lost) => Err(Finding::Lost {
+                        lost,
+                        outcome: "published encoding".to_owned(),
+                    }),
+                    None => Ok(consume(output)),
+                }
+            }),
+            Err(error) => {
+                self.checkpoint();
+                Err(match loss {
+                    Some(lost) => Finding::Lost {
+                        lost,
+                        outcome: format!("Err({error:?})"),
+                    },
+                    None => Finding::Driver(format!("plan publication failed: {error:?}")),
+                })
+            }
+        }
+    }
+}
+
+/// Start a complete borrowed batch before admitting any job, then join every
+/// worker. Partial startup leaves all unexecuted custody with the caller.
+fn joined_batch<J: Send>(jobs: &mut [J], task: impl Fn(usize, &mut J) + Sync) -> Vec<Finding> {
+    let count = jobs.len();
+    let mut failures = Vec::new();
+    std::thread::scope(|threads| {
+        let mut workers = Vec::with_capacity(count);
+        for (worker, job) in jobs.iter_mut().enumerate() {
+            let task = &task;
+            let (start, ready) = std::sync::mpsc::sync_channel(1);
+            let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                threads.spawn(move || match ready.recv() {
+                    Ok(true) => task(worker, job),
+                    Ok(false) => {}
+                    Err(error) => panic!("worker {worker} startup disconnected: {error}"),
+                })
+            }));
+            match spawned {
+                Ok(handle) => workers.push((worker, handle, start)),
+                Err(payload) => {
+                    failures.push(Finding::Defect(format!(
+                        "worker {worker} spawn panicked: {}",
+                        panic_report(payload.as_ref())
+                    )));
+                    break;
+                }
+            }
+        }
+        let complete = workers.len() == count;
+        for (worker, _, start) in &workers {
+            if let Err(error) = start.send(complete) {
+                failures.push(Finding::Defect(format!(
+                    "worker {worker} startup failed: {error}"
+                )));
+            }
+        }
+        for (worker, handle, _) in workers {
+            if let Err(payload) = handle.join() {
+                failures.push(Finding::Defect(format!(
+                    "worker {worker} join panicked: {}",
+                    panic_report(payload.as_ref())
+                )));
+            }
+        }
+    });
+    failures
+}
+
 impl<T: Custodial<Permit> + Send> Holding<'_, '_, CustodyBatch<T>, pipeline::Unwitnessed> {
     /// Retire the held batch now, as the holding declared it, every member
     /// destroyed on a worker thread of its own, the workers released
@@ -1654,6 +1869,7 @@ impl<T: Custodial<Permit> + Send> Holding<'_, '_, CustodyBatch<T>, pipeline::Unw
     /// panic is the destruction's, kept as the run's defect. The holding then
     /// holds nothing.
     pub fn retire_concurrently(&mut self) {
+        let mut failures = Vec::new();
         let batch = self
             .value
             .0
@@ -1675,27 +1891,25 @@ impl<T: Custodial<Permit> + Send> Holding<'_, '_, CustodyBatch<T>, pipeline::Unw
             },
             self.window,
             |batch| {
-                let members: Vec<T> = batch.into_members().collect();
-                let barrier = std::sync::Barrier::new(members.len());
-                std::thread::scope(|threads| {
-                    let workers: Vec<_> = members
-                        .into_iter()
-                        .map(|member| {
-                            let barrier = &barrier;
-                            threads.spawn(move || {
-                                barrier.wait();
-                                drop(member);
-                            })
-                        })
-                        .collect();
-                    for worker in workers {
-                        if let Err(payload) = worker.join() {
-                            std::panic::resume_unwind(payload);
-                        }
+                let mut members: Vec<_> = batch.into_members().map(Some).collect();
+                failures.extend(joined_batch(&mut members, |_, member| drop(member.take())));
+                // A partial startup admits no jobs. Retire each remaining
+                // member independently so one destructor cannot skip another.
+                for (worker, member) in members.iter_mut().enumerate() {
+                    if let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            drop(member.take());
+                        }))
+                    {
+                        failures.push(Finding::Defect(format!(
+                            "worker {worker} fallback retirement panicked: {}",
+                            panic_report(payload.as_ref())
+                        )));
                     }
-                });
+                }
             },
         );
+        self.run.defects.extend(failures);
     }
 }
 
@@ -1875,6 +2089,30 @@ impl<'s> Scope<'s> for Lent<'_, DecodeOwner<'s, Limits>> {
 /// ([`Scope`]), each a nested holding of its own, so a fixture supplies only
 /// its wire, its options, its policy and its assertions.
 impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
+    /// One fresh checked turn of a step of the held scope under `policy` for
+    /// a fixture's own schedule, the `at`-th of it ([`scope_checked`]), the
+    /// step inside the holding's physical window; then the recording's
+    /// integrity read ([`scope_turn`]) and the holding stack checkpointed.
+    /// The step's outcome as the scope returned it, for the fixture to
+    /// classify; a lost recording is the run's finding, that outcome kept in
+    /// it ([`Stopped::Lost`]).
+    pub fn scope_step(
+        &mut self,
+        policy: PolicyId,
+        at: usize,
+        step: impl FnOnce(&mut D, &mut Limits) -> BoundedResult<Reclaimed, Limits>,
+    ) -> Result<BoundedResult<Reclaimed, Limits>, Finding> {
+        let window = self.window;
+        let outcome = self.with_policy(policy, |scope, m| {
+            let outcome = scope_checked(m, scope, |scope, m| window.window(|| step(scope, m)));
+            scope_turn(m, outcome, at)
+                .checked::<(), BoundedError<LimitRefusal>>()
+                .map_err(Finding::from)
+        })?;
+        self.checkpoint();
+        Ok(outcome)
+    }
+
     /// Acquire an input under this holding and retain its publication for `body`.
     pub fn input<S: Source<'s>, R>(
         &mut self,
@@ -3004,97 +3242,49 @@ impl RecordedRun {
                 assigned.sort_by_key(|(worker, _)| *worker);
                 let mut reports: Vec<Vec<Finding>> =
                     (0..policies.len()).map(|_| Vec::new()).collect();
-                let mut failures = Vec::new();
-                std::thread::scope(|threads| {
-                    let mut workers = Vec::with_capacity(assigned.len());
-                    for (((worker, policy), held), findings) in assigned
-                        .into_iter()
-                        .zip(batch.value.get().held())
-                        .zip(&mut reports)
-                    {
-                        let task = &task;
-                        let (start, ready) = std::sync::mpsc::sync_channel(1);
-                        let spawned =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                threads.spawn(move || {
-                                    // Fixture barriers require the whole batch.
-                                    // A failed spawn releases earlier workers
-                                    // without entering any fixture.
-                                    match ready.recv() {
-                                        Ok(true) => {}
-                                        Ok(false) => return,
-                                        Err(error) => {
-                                            findings.push(Finding::Defect(format!(
-                                                "worker {worker} startup disconnected: {error}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-                                    for fixture in 0..repetitions {
-                                        if let Some(lost) = lost(policy, fixture) {
-                                            findings.push(Finding::Lost {
-                                                lost,
-                                                outcome: format!(
-                                                    "worker {worker} stopped before fixture {fixture}"
-                                                ),
-                                            });
-                                            break;
-                                        }
-                                        let result = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                task(worker, fixture, held, policy)
-                                            }),
-                                        );
-                                        match result {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(finding @ Finding::Lost { .. })) => {
-                                                findings.push(finding);
-                                                break;
-                                            }
-                                            Ok(Err(finding)) => {
-                                                findings.push(Finding::Defect(format!(
-                                                    "worker {worker}, fixture {fixture}: {finding}"
-                                                )));
-                                            }
-                                            Err(payload) => {
-                                                findings.push(Finding::Defect(format!(
-                                                    "worker {worker}, fixture {fixture}: {}",
-                                                    panic_report(payload.as_ref())
-                                                )));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                })
-                            }));
-                        match spawned {
-                            Ok(handle) => workers.push((worker, handle, start)),
-                            Err(payload) => {
-                                failures.push(Finding::Defect(format!(
-                                    "worker {worker} spawn panicked: {}",
-                                    panic_report(payload.as_ref())
-                                )));
+                let mut jobs: Vec<_> = assigned
+                    .into_iter()
+                    .zip(batch.value.get().held())
+                    .zip(&mut reports)
+                    .collect();
+                let failures =
+                    joined_batch(&mut jobs, |_, (((worker, policy), held), findings)| {
+                        for fixture in 0..repetitions {
+                            if let Some(lost) = lost(policy, fixture) {
+                                findings.push(Finding::Lost {
+                                    lost,
+                                    outcome: format!(
+                                        "worker {worker} stopped before fixture {fixture}"
+                                    ),
+                                });
                                 break;
                             }
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    task(*worker, fixture, held, policy)
+                                }));
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(finding @ Finding::Lost { .. })) => {
+                                    findings.push(finding);
+                                    break;
+                                }
+                                Ok(Err(finding)) => {
+                                    findings.push(Finding::Defect(format!(
+                                        "worker {worker}, fixture {fixture}: {finding}"
+                                    )));
+                                }
+                                Err(payload) => {
+                                    findings.push(Finding::Defect(format!(
+                                        "worker {worker}, fixture {fixture}: {}",
+                                        panic_report(payload.as_ref())
+                                    )));
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    let complete = workers.len() == policies.len();
-                    for (worker, _, start) in &workers {
-                        if let Err(error) = start.send(complete) {
-                            failures.push(Finding::Defect(format!(
-                                "worker {worker} startup failed: {error}"
-                            )));
-                        }
-                    }
-                    for (worker, handle, _) in workers {
-                        if let Err(payload) = handle.join() {
-                            failures.push(Finding::Defect(format!(
-                                "worker {worker} join panicked: {}",
-                                panic_report(payload.as_ref())
-                            )));
-                        }
-                    }
-                });
+                    });
+                drop(jobs);
                 let mut findings = reports.into_iter().flatten().chain(failures);
                 let first = findings.next();
                 batch.run.defects.extend(findings);
@@ -3130,6 +3320,11 @@ impl RecordedRun {
     /// oracle's ([`recorded_policy`]).
     pub fn policy(&mut self, capacity: u64) -> PolicyId {
         self.adopt(recorded_policy(&self.session, capacity, false))
+    }
+
+    /// A recorded cumulative work allowance for synchronous bounded calls.
+    pub fn budget(&mut self, work: WriteWork, capacity: u64) -> PolicyId {
+        self.adopt(recorded_allowance(&self.session, work, capacity, false))
     }
 
     /// A new policy of this run, `capacity` live bytes, that also reports
@@ -3625,7 +3820,7 @@ impl<O> Constructed<O> {
 /// The bound of constructing `T` at the root from `wire` and cleaning it up:
 /// its cost and its root session's transitions
 /// (`in_place::root_cost`), as the standalone driver charges them.
-fn root_bound<T: InPlace<Limits>>(wire: &[u8]) -> dcbor::bounded::ResourceBound {
+pub fn root_bound<T: InPlace<Limits>>(wire: &[u8]) -> dcbor::bounded::ResourceBound {
     dcbor::bounded::decode::construction::in_place::root_cost(T::COST)
         .expect("the root cost of a fixture fits in u64")
         .bound::<()>(wire.len() as u64)
@@ -4839,6 +5034,33 @@ struct Turned<R> {
 }
 
 impl<R> Turned<R> {
+    /// Observe a valid recorded outcome without moving it into the observer's
+    /// unwind frame. Preserve the first loss and any pre-existing violation.
+    fn observed(mut self, m: &Limits, at: usize, observe: impl FnOnce(&mut R)) -> Self {
+        if self.lost.is_none() {
+            self.lost = lost(m, at);
+        }
+        if self.lost.is_none() {
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observe(&mut self.outcome)
+            })) {
+                let observation = format!(
+                    "turn observation panicked: {}",
+                    panic_report(payload.as_ref())
+                );
+                match &mut self.violation {
+                    Some(report) => {
+                        report.push_str("; ");
+                        report.push_str(&observation);
+                    }
+                    None => self.violation = Some(observation),
+                }
+            }
+            self.lost = lost(m, at);
+        }
+        self
+    }
+
     /// Preserve the production outcome when integrity and contract checks fail
     /// together. Classification never destroys an outcome.
     fn checked<T, E>(self) -> Result<R, Stopped<T, E, R>> {
@@ -4983,106 +5205,9 @@ fn observe_turn<O: Resumable<Limits>>(
 where
     O::Error: Debug,
 {
-    let Turned {
-        mut outcome,
-        lost: prior_loss,
-        mut violation,
-    } = turned;
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        after_turn(m, operation, &mut outcome)
-    })) {
-        let observation = format!(
-            "turn observation panicked: {}",
-            panic_report(payload.as_ref())
-        );
-        match &mut violation {
-            Some(report) => {
-                report.push_str("; ");
-                report.push_str(&observation);
-            }
-            None => violation = Some(observation),
-        }
-    }
-    // Recording invalidation is sticky. Preserve the first loss, including
-    // its turn diagnostic, while also detecting loss caused by observation.
-    let observed_loss = lost(m, at);
-    Turned {
-        outcome,
-        lost: prior_loss.or(observed_loss),
-        violation,
-    }
-    .checked()
-}
-
-/// One fresh checked turn of `operation` for a fixture's own schedule (a
-/// handwritten loop over the operation's own steps), the `at`-th of it: the
-/// shared turn ([`turn`]), observed, so its contract is checked through its
-/// position and the recording's integrity read after it. The turn's outcome
-/// as the operation returned it, for the fixture to classify; or, once the
-/// recording is no evidence, its loss as the run's finding, that turn's
-/// outcome kept in it ([`Stopped::Lost`]): no later turn is evidence, so the
-/// fixture's schedule takes none.
-pub fn scheduled<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    at: usize,
-) -> Result<StepOf<O>, Finding>
-where
-    O::Error: Debug,
-    O::Position: Debug,
-{
-    kept::<O>(turn(m, operation, true, at))
-}
-
-/// A fixture schedule's turn of `O` as the fixture receives it: the turn's
-/// outcome, or the recording's loss at it as the run's finding, the outcome
-/// kept in it ([`Stopped::Lost`]).
-fn kept<O: Resumable<Limits>>(turned: Turned<StepOf<O>>) -> Result<StepOf<O>, Finding>
-where
-    O::Error: Debug,
-    O::Position: Debug,
-{
     turned
-        .checked::<O::Output, O::Error>()
-        .map_err(Finding::from)
-}
-
-/// One fresh checked turn of a step of `owner`'s scope for a fixture's own
-/// schedule, the `at`-th of it ([`scope_checked`], then [`scope_turn`]): the
-/// step's outcome as the scope returned it; or, once the recording is no
-/// evidence, its loss as the run's finding, that turn's outcome kept in it.
-pub fn scheduled_scope<'s, D: Scope<'s>, R: Outcome + Labelled>(
-    m: &mut Limits,
-    owner: &mut D,
-    at: usize,
-    step: impl FnOnce(&mut D, &mut Limits) -> R,
-) -> Result<R, Finding> {
-    let outcome = scope_checked(m, owner, step);
-    intact(m, outcome, at)
-}
-
-/// One fresh checked turn of `step` for a fixture's own schedule, the
-/// `at`-th of it ([`checked`]): a production step that is no [`Resumable`]
-/// (a handle's operation-local cleanup step, one unit of a standalone
-/// driver), its outcome as it returned it; or, once the recording is no
-/// evidence, its loss as the run's finding, that outcome kept in it.
-pub fn scheduled_step<R: Outcome + Labelled>(
-    m: &mut Limits,
-    at: usize,
-    step: impl FnOnce(&mut Limits) -> R,
-) -> Result<R, Finding> {
-    let outcome = checked(m, step);
-    intact(m, outcome, at)
-}
-
-/// The recording's integrity read after a fixture schedule's `at`-th turn,
-/// which returned `outcome` ([`scope_turn`]): the outcome, or the loss as
-/// the run's finding, the outcome kept in it ([`Stopped::Lost`]). The one
-/// tail of [`scheduled_scope`] and [`scheduled_step`].
-fn intact<R: Labelled>(m: &Limits, outcome: R, at: usize) -> Result<R, Finding> {
-    scope_turn(m, outcome, at)
-        .checked::<(), BoundedError<LimitRefusal>>()
-        .map_err(Finding::from)
+        .observed(m, at, |outcome| after_turn(m, operation, outcome))
+        .checked()
 }
 
 /// Why a driver's schedule ended short of its goal: the one vocabulary of
@@ -5093,6 +5218,19 @@ fn intact<R: Labelled>(m: &Limits, outcome: R, at: usize) -> Result<R, Finding> 
 /// caller to own and drop before its run finalizes. `R` is the driver's
 /// production outcome of one turn ([`Turned`]), a [`Resumable`] step's by
 /// default.
+///
+/// Owning stops cannot be consumed as detached findings:
+/// ```compile_fail
+/// use dcbor_test_support::{Finding, Stopped};
+/// let stop: Stopped<Vec<u8>, ()> = Stopped::Published(vec![1]);
+/// let _: Finding = stop.into();
+/// ```
+/// Nor can classification discard their publications:
+/// ```compile_fail
+/// use dcbor_test_support::Stopped;
+/// let stop: Stopped<Vec<u8>, ()> = Stopped::Published(vec![1]);
+/// let _ = stop.operation();
+/// ```
 pub enum Stopped<T, E, R = Result<Step<T>, E>> {
     /// The operation's own error, as the operation returned it: terminal, or
     /// a refusal no fresh turn satisfies ([`retryable`]).
@@ -5247,14 +5385,13 @@ impl<T: Custodial<Permit>> Custodial<Permit> for Publications<T> {
 /// any output it published already held and retired by the scope.
 pub type Halt<O> = Stopped<(), <O as Resumable<Limits>>::Error, Rendered>;
 
-impl<T, E, R> Stopped<T, E, R> {
+impl<E> Stopped<(), E, Rendered> {
     /// The operation's own error, for a caller that expects the operation to
     /// fail and classifies how; any other stop is a finding ([`Finding`]),
-    /// a published output among it dropped.
+    /// with publication custody already retired by its holding.
     pub fn operation(self) -> Result<E, Finding>
     where
         E: Debug,
-        R: Labelled,
     {
         match self {
             Self::Operation(error) => Ok(error),
@@ -5306,8 +5443,7 @@ impl<T, E: Debug, R: Labelled> Debug for Stopped<T, E, R> {
 /// A finding a recorded run carries to its finalization as detached data
 /// ([`recorded_run`], [`concluded`]): what a fixture's body returns, or
 /// records, once it released what it held. A driver's stop becomes one at
-/// the caller that classifies it as the run's failure (`From`), dropping a
-/// published output there; the recording's loss keeps the recorder's
+/// the holding after it retires publication custody; the recording's loss keeps the recorder's
 /// snapshot ([`Lost`]), with diagnostics rendered before custody retires.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finding {
@@ -5353,7 +5489,21 @@ impl From<String> for Finding {
     }
 }
 
-impl<T, E: Debug, R: Labelled> From<Stopped<T, E, R>> for Finding {
+/// Closed vocabulary of outcomes that carry diagnostics but no publication.
+trait DetachedOutcome: Labelled {}
+
+/// Non-owning production observations, never permits or published handles.
+trait DetachedValue {}
+impl DetachedValue for () {}
+impl DetachedValue for Reclaimed {}
+
+impl DetachedOutcome for Rendered {}
+impl DetachedOutcome for Emission {}
+impl<E: Debug> DetachedOutcome for Result<(), E> {}
+impl<E: Debug> DetachedOutcome for Result<Reclaimed, E> {}
+impl<T: DetachedValue, E: Debug> DetachedOutcome for Result<Step<T>, E> {}
+
+impl<T: DetachedValue, E: Debug, R: DetachedOutcome> From<Stopped<T, E, R>> for Finding {
     fn from(stopped: Stopped<T, E, R>) -> Self {
         Self::from(&stopped)
     }
@@ -5476,37 +5626,7 @@ pub fn ordinary_exhaustion<E: Failure<Refusal = LimitRefusal>>(m: &Limits, error
 pub type StepOf<O> =
     Result<Step<<O as Resumable<Limits>>::Output>, <O as Resumable<Limits>>::Error>;
 
-/// How the shared execution schedule ([`drive_controlled`]) paces its
-/// turns: at most `turns` of them; stopping at the first injected refusal
-/// when it `cancel`s; each step's contract checked through the operation's
-/// position when `observed`, or stepped without its position read; and each
-/// turn's next admission first refused `repeats` times
-/// ([`repeated_refusal`]), zero for none.
-#[derive(Clone, Copy, Debug)]
-struct Pacing {
-    turns: usize,
-    cancel: bool,
-    observed: bool,
-    repeats: usize,
-    /// A rejection schedule returns an unexpected publication without probing
-    /// or executing another production step.
-    publication: bool,
-}
-
-impl Pacing {
-    /// An observed schedule of `turns` that resumes every refusal.
-    const fn resuming(turns: usize) -> Self {
-        Self {
-            turns,
-            cancel: false,
-            observed: true,
-            repeats: 0,
-            publication: true,
-        }
-    }
-}
-
-/// Shared execution schedule, paced by `pacing` ([`Pacing`]). A boundary
+/// Shared execution steps governed by [`Course`]. A boundary
 /// controller may stop before a turn; it never owns the operation or any
 /// publication. Observation and production execution retain the same
 /// boundaries for pipeline and single-operation runs. With repeats, every
@@ -5522,7 +5642,7 @@ struct Execution<S, E> {
 fn drive_controlled<O: Resumable<Limits>, W: pipeline::Physical>(
     m: &mut Limits,
     operation: &mut O,
-    pacing: Pacing,
+    course: Course,
     stop_before: impl FnMut(&Limits, &mut O, usize) -> bool,
     after_turn: impl FnMut(&Limits, &mut O, &mut StepOf<O>),
     window: &W,
@@ -5533,7 +5653,7 @@ where
     drive_executed(
         m,
         operation,
-        pacing,
+        course,
         stop_before,
         after_turn,
         window,
@@ -5551,7 +5671,7 @@ where
 fn drive_executed<O: Resumable<Limits>, W: pipeline::Physical, S, E>(
     m: &mut Limits,
     operation: &mut O,
-    pacing: Pacing,
+    course: Course,
     mut stop_before: impl FnMut(&Limits, &mut O, usize) -> bool,
     mut after_turn: impl FnMut(&Limits, &mut O, &mut StepOf<O>),
     window: &W,
@@ -5562,13 +5682,23 @@ where
     S: FnMut(&mut Limits, &mut O, bool, usize) -> Turned<StepOf<O>>,
     E: FnMut(&mut Limits, &mut O, bool, usize) -> Turned<Option<StepOf<O>>>,
 {
-    let Pacing {
+    let Course {
         turns,
-        cancel,
+        fault,
         observed,
         repeats,
-        publication,
-    } = pacing;
+    } = course;
+    let cancel = match fault {
+        Some(fault) => {
+            refuse(m, fault.refusal);
+            fault.cancel
+        }
+        None => false,
+    };
+    let turns = match turns {
+        TurnBound::Allowed(turns) => allowed(m, turns),
+        TurnBound::Exact(turns) => turns,
+    };
     let injected_before = m.injected_refusals();
     for at in 0..turns {
         require_evidence(m, at)?;
@@ -5592,9 +5722,6 @@ where
         };
         let outcome = observe_turn(m, operation, turned, at, &mut after_turn)?;
         match outcome {
-            Ok(Step::Complete(output)) if !publication => {
-                return Err(Stopped::Published(output));
-            }
             Ok(Step::Complete(output)) => {
                 let Turned {
                     outcome,
@@ -5736,29 +5863,6 @@ where
     Ok(None)
 }
 
-/// [`finish_within`] the general bound of [`TURNS`].
-pub fn finish<O: Resumable<Limits>>(m: &mut Limits, operation: &mut O) -> Result<(), Driven<O>>
-where
-    O::Error: Debug,
-{
-    finish_within(m, operation, TURNS)
-}
-
-/// Drive a cancelled or failed `operation` through its own cleanup to
-/// `Finished`, in at most `turns` fresh checked observed turns
-/// ([`wound`]). The operation is left as its cleanup left it, for the
-/// caller to drop.
-pub fn finish_within<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    turns: usize,
-) -> Result<(), Driven<O>>
-where
-    O::Error: Debug,
-{
-    wound(m, operation, turns, true, |_, _| {})
-}
-
 /// The one cleanup driver: a cancelled or failed `operation` through its
 /// own cleanup to `Finished`, in at most `turns` fresh checked turns, each
 /// observed or not ([`turn`]). `after_turn` is given the operation
@@ -5772,128 +5876,121 @@ where
 /// terminal error are the operation's ([`Stopped::Operation`]); a recording
 /// that became no evidence stops at the turn it is found
 /// ([`Stopped::Lost`]).
-fn wound<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    turns: usize,
-    observed: bool,
-    after_turn: impl FnMut(&mut O, &mut StepOf<O>),
-) -> Result<(), Driven<O>>
-where
-    O::Error: Debug,
-{
-    wound_by(m, operation, turns, observed, after_turn, turn::<O>)
-}
-
-/// Cleanup's shared schedule with a physical window around each turn.
-/// Checkpoint collection runs outside that window.
-fn wound_by<O: Resumable<Limits>>(
+fn wound_by<O: Resumable<Limits>, S, E>(
     m: &mut Limits,
     operation: &mut O,
     turns: usize,
     observed: bool,
     mut after_turn: impl FnMut(&mut O, &mut StepOf<O>),
-    mut step: impl FnMut(&mut Limits, &mut O, bool, usize) -> Turned<StepOf<O>>,
-) -> Result<(), Driven<O>>
+    mut execution: Execution<S, E>,
+) -> (bool, Result<(), Driven<O>>)
 where
     O::Error: Debug,
+    S: FnMut(&mut Limits, &mut O, bool, usize) -> Turned<StepOf<O>>,
+    E: FnMut(&mut Limits, &mut O, bool, usize) -> Turned<Option<StepOf<O>>>,
 {
-    for at in 0..turns {
-        require_evidence(m, at)?;
-        let injected = m.injected_refusals();
-        let turned = step(m, operation, observed, at);
-        let outcome = observe_turn(m, operation, turned, at, |_, operation, outcome| {
-            after_turn(operation, outcome)
-        })?;
-        match outcome {
-            Ok(Step::Finished) => {
-                let attempts = m.attempts();
-                let position = observed.then(|| operation.position());
-                let turned = step(m, operation, observed, at + 1);
-                let outcome =
-                    observe_turn(m, operation, turned, at + 1, |_, operation, outcome| {
-                        after_turn(operation, outcome)
-                    })?;
-                match outcome {
-                    Ok(Step::Finished) => {}
-                    Ok(Step::Complete(output)) => return Err(Stopped::Published(output)),
-                    Err(error) => return Err(Stopped::Operation(error)),
-                    Ok(Step::Progress) => panic!("a finished operation stepped to Progress"),
+    let mut completed = false;
+    let mut first = None;
+    let result = (|| {
+        for at in 0..turns {
+            if let Err(stop) = require_evidence(m, at) {
+                first.get_or_insert(stop);
+            }
+            let injected = m.injected_refusals();
+            let turned = (execution.step)(m, operation, observed, at);
+            let finished = matches!(&turned.outcome, Ok(Step::Finished));
+            let progressing = matches!(&turned.outcome, Ok(Step::Progress))
+                || matches!(&turned.outcome, Err(error) if error.refused() && retryable(m, error, injected));
+            let turned = if first.is_none() {
+                turned.observed(m, at, |outcome| after_turn(operation, outcome))
+            } else {
+                turned
+            };
+            let outcome = match turned.checked() {
+                Ok(outcome) => Some(outcome),
+                Err(stop) if finished || progressing => {
+                    first.get_or_insert(stop);
+                    None
                 }
-                assert_eq!(m.attempts(), attempts, "a finished operation admitted work");
-                if let Some(position) = position {
-                    assert_eq!(operation.position(), position, "a finished operation moved");
+                Err(stop) => return Err(stop),
+            };
+            if finished {
+                completed = true;
+                let probe = (execution.end)(m, operation, observed, at + 1);
+                let probe = if first.is_none() {
+                    probe.observed(m, at + 1, |outcome| {
+                        if let Some(outcome) = outcome {
+                            after_turn(operation, outcome);
+                        }
+                    })
+                } else {
+                    probe
+                };
+                if probe.violation.is_some() || probe.lost.is_some() {
+                    return Err(Stopped::Violated {
+                        output: None,
+                        outcome: probe.outcome,
+                        lost: probe.lost,
+                        report: probe
+                            .violation
+                            .unwrap_or_else(|| "cleanup terminal probe lost recording".to_owned()),
+                    });
                 }
                 return Ok(());
             }
-            Ok(Step::Progress) => {}
-            Ok(Step::Complete(output)) => return Err(Stopped::Published(output)),
-            Err(error) if error.refused() => {
-                if !retryable(m, &error, injected) {
-                    return Err(Stopped::Operation(error));
+            let Some(outcome) = outcome else { continue };
+            match outcome {
+                Ok(Step::Progress) => {}
+                Ok(Step::Finished) => unreachable!("finished cleanup was probed"),
+                Ok(Step::Complete(output)) => return Err(Stopped::Published(output)),
+                Err(error) if error.refused() => {
+                    if !retryable(m, &error, injected) {
+                        return Err(Stopped::Operation(error));
+                    }
+                    if lost(m, at).is_none()
+                        && let Some(stall) = stalled(m, operation, observed)
+                    {
+                        return Err(stall);
+                    }
                 }
-                if let Some(stall) = stalled(m, operation, observed) {
-                    return Err(stall);
-                }
+                Err(error) => return Err(Stopped::Operation(error)),
             }
-            Err(error) => return Err(Stopped::Operation(error)),
         }
-    }
-    Err(Stopped::Exceeded(turns))
-}
-
-/// [`fail_within`] the general bound of [`TURNS`].
-pub fn fail<O: Resumable<Limits>>(m: &mut Limits, operation: &mut O) -> Result<O::Error, Driven<O>>
-where
-    O::Error: Debug,
-{
-    fail_within(m, operation, TURNS)
-}
-
-/// Drive `operation` in at most `turns` fresh checked observed turns
-/// ([`turn`]) until it fails terminally, without publishing. Returns the
-/// terminal error, or a refusal no fresh turn satisfies, which is the
-/// failure itself; the operation is then in its own cleanup, which
-/// [`finish`] performs under whichever policy the caller chooses, so a
-/// measured trace can end at the failure. A publication, `Finished`, a lost
-/// recording, a stall and the bound spent are stops ([`Stopped`]).
-pub fn fail_within<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    turns: usize,
-) -> Result<O::Error, Driven<O>>
-where
-    O::Error: Debug,
-{
-    match drive_controlled(
-        m,
-        operation,
-        Pacing {
-            publication: false,
-            ..Pacing::resuming(turns)
-        },
-        |_, _, _| false,
-        |_, _, _| {},
-        &pipeline::Unwitnessed,
-    ) {
-        Err(Stopped::Operation(error)) => Ok(error),
-        Err(stop) => Err(stop),
-        Ok(_) => unreachable!("a rejection schedule cannot publish or cancel"),
-    }
-}
-
-/// Step `operation` under the policy's current allowance, without new
-/// turns, until it reports the injected refusal `reason`. Every earlier step
-/// made progress. Returns the refused call's index.
-pub fn suspend<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    reason: LimitRefusal,
-) -> Result<usize, Driven<O>>
-where
-    O::Error: Debug,
-{
-    suspend_within(m, operation, reason, TURNS, TurnSchedule::Retained)
+        Err(Stopped::Exceeded(turns))
+    })();
+    let result = match (first, result) {
+        (None, result) => result,
+        (Some(first), Ok(())) => Err(first),
+        (Some(first), Err(next)) => {
+            let report = format!("cleanup continued after {first:?}; subsequent stop: {next:?}");
+            let first_loss = match &first {
+                Stopped::Lost(loss, _)
+                | Stopped::Violated {
+                    lost: Some(loss), ..
+                } => Some(loss.clone()),
+                _ => None,
+            };
+            let (output, outcome, loss) = match next {
+                Stopped::Published(output) => (Some(output), None, None),
+                Stopped::Lost(loss, outcome) => (None, Some(outcome), Some(loss)),
+                Stopped::Violated {
+                    output,
+                    outcome,
+                    lost,
+                    ..
+                } => (output, outcome, lost),
+                Stopped::Operation(error) => (None, Some(Err(error)), None),
+                _ => (None, None, None),
+            };
+            Err(Stopped::Violated {
+                output,
+                outcome,
+                lost: first_loss.or(loss),
+                report,
+            })
+        }
+    };
+    (completed, result)
 }
 
 /// Whether a suspension fixture keeps an externally imposed allowance or
@@ -5902,34 +5999,6 @@ where
 pub enum TurnSchedule {
     Retained,
     Fresh,
-}
-
-/// Suspend within the operation's supplied bound and explicit turn policy:
-/// each step contract-checked ([`contracted`]), under a fresh turn
-/// ([`turn`]) or the retained allowance, then the recording's integrity
-/// read ([`lost`]). The injected refusal of `reason` returns its call's
-/// index; a refusal of another reason fails the suspension's assertion. A
-/// publication, `Finished`, a terminal error, a lost recording, a stall and
-/// the bound spent are stops ([`Stopped`]).
-pub fn suspend_within<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
-    reason: LimitRefusal,
-    turns: usize,
-    schedule: TurnSchedule,
-) -> Result<usize, Driven<O>>
-where
-    O::Error: Debug,
-{
-    suspend_by(
-        m,
-        operation,
-        reason,
-        turns,
-        schedule,
-        |_, _, _| {},
-        &pipeline::Unwitnessed,
-    )
 }
 
 /// Suspension shares the checked turn and observation boundary with execution.
@@ -6490,29 +6559,7 @@ fn emit_step<'w, I: DecodeInput<Limits>, T: InPlace<Limits>, W: pipeline::Physic
     })
 }
 
-/// One fresh checked turn of `writer` for a fixture's own schedule, the
-/// `at`-th of it ([`emit_step`]), its chunk borrowing the writer; then the
-/// recording's integrity read, which reads the policy alone, so the borrow
-/// is unaffected: the step, or, once the recording is no evidence, its loss
-/// as the run's finding, the step kept in it rendered by its own `Debug`.
-pub fn emit_turn<'w, I: DecodeInput<Limits>, T: InPlace<Limits>>(
-    m: &mut Limits,
-    writer: &'w mut OwnedWriter<'_, I, T, Limits>,
-    at: usize,
-) -> Result<BoundedResult<OwnedEmitStep<'w>, Limits>, Finding> {
-    let step = emit_step(m, writer, &pipeline::Unwitnessed);
-    match lost(m, at) {
-        None => Ok(step),
-        Some(lost) => {
-            let stop: Stopped<(), BoundedError<LimitRefusal>, Rendered> =
-                Stopped::Lost(lost, Rendered(format!("{step:?}")));
-            Err(stop.into())
-        }
-    }
-}
-
-/// A turn's outcome already rendered at its turn, inside a borrow the stop
-/// cannot keep ([`emit_turn`]): its [`Labelled`] rendering is that text.
+/// A turn's diagnostic rendered before its publication leaves the stop.
 pub struct Rendered(String);
 
 impl Rendered {
@@ -6596,9 +6643,9 @@ impl Labelled for Emission {
 /// [`Emission`].
 pub type Emitted = Stopped<(), BoundedError<LimitRefusal>, Emission>;
 
-/// One fresh checked emission turn of `writer` ([`emit_turn`]), the `at`-th
+/// One fresh checked emission turn of `writer` ([`emit_step`]), the `at`-th
 /// of its driver, `injected` the policy's injected refusals before it: the
-/// one emission turn of every emission driver here ([`emit`], `pipeline`).
+/// one emission turn of the held writer schedule ([`Holding::emit`]).
 /// Its step borrows the writer until its chunk is consumed (`OwnedWriter`'s
 /// contract: the sink consumes each chunk before the next step), so the
 /// step is classified inside that borrow: a chunk (at most 64 bytes,
@@ -6653,30 +6700,7 @@ fn emission_turn<I: DecodeInput<Limits>, T: InPlace<Limits>, W: pipeline::Physic
     flow
 }
 
-/// Emit `writer`'s plan of `len` bytes under fresh checked turns within
-/// [`emit_turns`] ([`emission_turn`]), then its completion checked
-/// ([`emitted`]). Returns the emitted bytes, or the emission's stop: a
-/// refusal no fresh turn satisfies and a terminal error are the emission's
-/// own ([`Stopped::Operation`]); a lost recording, `Finished` without
-/// completion and the bound spent are the driver's.
-pub fn emit<I: DecodeInput<Limits>, T: InPlace<Limits>>(
-    m: &mut Limits,
-    writer: &mut OwnedWriter<'_, I, T, Limits>,
-    len: usize,
-) -> Result<Vec<u8>, Emitted> {
-    let mut bytes = Vec::with_capacity(len);
-    emit_by(
-        m,
-        writer,
-        &mut bytes,
-        len,
-        &pipeline::Unwitnessed,
-        |_, _, _| false,
-    )?;
-    Ok(bytes)
-}
-
-/// The emission schedule shared by held pipelines and direct writer fixtures.
+/// The emission schedule shared by held pipelines and writer fixtures.
 /// The controller observes custody outside physical windows and may stop before
 /// a turn; recording loss prevents both execution and the terminal probe.
 fn emit_by<I: DecodeInput<Limits>, T: InPlace<Limits>, W: pipeline::Physical>(
@@ -6832,11 +6856,9 @@ fn initialize_by<'s>(
         require_evidence(m, at)?;
         let injected = m.injected_refusals();
         let step = step(owner, m);
-        let outcome = scope_turn(m, step, at).checked()?;
-        after_turn(owner);
-        if let Some(lost) = lost(m, at) {
-            return Err(Stopped::Lost(lost, outcome));
-        }
+        let outcome = scope_turn(m, step, at)
+            .observed(m, at, |_| after_turn(owner))
+            .checked()?;
         match outcome {
             Ok(()) => return Ok(()),
             Err(error) if error.refused() && retryable(m, &error, injected) => {}
@@ -6883,8 +6905,11 @@ where
         m.turn();
         let injected = m.injected_refusals();
         let step = step(acquisition, m);
-        let mut outcome = scope_turn(m, step, at).checked()?;
-        after_turn(acquisition, outcome.as_mut().ok());
+        let outcome = scope_turn(m, step, at)
+            .observed(m, at, |outcome| {
+                after_turn(acquisition, outcome.as_mut().ok())
+            })
+            .checked()?;
         match outcome {
             Ok(record) => return Ok(record),
             Err(error) if error.refused() && retryable(m, &error, injected) => {}
@@ -6915,7 +6940,7 @@ fn drain_by<'s>(
         m,
         TURNS,
         reclamation::Goal::Drained,
-        |owner, _| after_turn(owner),
+        |owner, _, _| after_turn(owner),
         |owner, m| step(owner, m),
     )
 }
@@ -7166,6 +7191,25 @@ mod tests {
     // The tests request permits directly; the driver above holds and names
     // permits only (`Releasing`), and requests none itself.
     use dcbor::bounded::{Allocator, Budget};
+
+    #[test]
+    fn joined_batch_collects_every_worker_panic() {
+        let mut visited = [false; 3];
+        let failures = joined_batch(&mut visited, |worker, visited| {
+            *visited = true;
+            panic!("planted worker {worker}");
+        });
+        assert_eq!(visited, [true; 3], "a worker panic skipped another job");
+        assert_eq!(failures.len(), 3, "a join discarded a worker panic");
+        for (worker, failure) in failures.iter().enumerate() {
+            assert!(
+                failure
+                    .to_string()
+                    .contains(&format!("planted worker {worker}")),
+                "worker {worker}: {failure}"
+            );
+        }
+    }
 
     /// The report of a run's failure, caught: the finalization's ([`panic_report`]).
     fn message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -8868,6 +8912,107 @@ mod tests {
         assert!(retired.get(), "returned publication was not retired");
     }
 
+    #[test]
+    fn lost_turn_skips_history_observation_and_retains_its_publication() {
+        use std::cell::Cell;
+
+        struct Publication<'a>(&'a Cell<bool>);
+        impl Drop for Publication<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let retired = Cell::new(false);
+        let checked = Cell::new(false);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recorded_run(|run| {
+                let policy = run.policy(u64::MAX);
+                run.with_policy(policy, |m| {
+                    assert_eq!(
+                        m.validate_owner(&dcbor::bounded::Owner::unobserved()),
+                        Err(LimitRefusal::Unrecorded),
+                    );
+                    let first = lost(m, 7).expect("the pairing invalidated the recording");
+                    let outcome: Result<Publication<'_>, BoundedError<LimitRefusal>> =
+                        Ok(Publication(&retired));
+                    let stopped = Turned {
+                        outcome,
+                        lost: Some(first.clone()),
+                        violation: None,
+                    }
+                    .observed(m, 8, |_| panic!("invalid history reached the observer"))
+                    .checked::<(), BoundedError<LimitRefusal>>();
+                    assert!(!retired.get(), "loss destroyed the publication");
+                    match stopped {
+                        Err(Stopped::Lost(actual, Ok(publication))) => {
+                            assert_eq!(actual, first, "observation replaced failure-time evidence");
+                            drop(publication);
+                        }
+                        _ => panic!("loss discarded its exact outcome"),
+                    }
+                    checked.set(true);
+                });
+                Ok(())
+            });
+        }))
+        .expect_err("recording loss must fail finalization");
+        assert!(checked.get(), "loss check did not complete");
+        assert!(retired.get(), "retained publication was not retired");
+        assert!(panic_report(failure.as_ref()).contains("ForeignOwner"));
+    }
+
+    #[test]
+    fn observer_invalidation_and_unwind_retain_the_acquired_outcome() {
+        use std::cell::Cell;
+
+        for panic in [false, true] {
+            let checked = Cell::new(false);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recorded_run(|run| {
+                    let policy = run.policy(u64::MAX);
+                    let mut invalidator = recorded_policy(&run.session, u64::MAX, false);
+                    run.with_policy(policy, |m| {
+                        let outcome: Result<usize, BoundedError<LimitRefusal>> = Ok(73);
+                        let stopped = scope_turn(m, outcome, 4)
+                            .observed(m, 4, |outcome| {
+                                assert_eq!(*outcome, Ok(73));
+                                assert_eq!(
+                                    invalidator
+                                        .validate_owner(&dcbor::bounded::Owner::unobserved()),
+                                    Err(LimitRefusal::Unrecorded),
+                                );
+                                if panic {
+                                    panic!("planted acquisition observer unwind");
+                                }
+                            })
+                            .checked::<(), BoundedError<LimitRefusal>>();
+                        match stopped {
+                            Err(Stopped::Lost(lost, Ok(73))) if !panic => {
+                                assert_eq!(lost.turn, 4);
+                            }
+                            Err(Stopped::Violated {
+                                outcome: Some(Ok(73)),
+                                lost: Some(lost),
+                                report,
+                                ..
+                            }) if panic => {
+                                assert_eq!(lost.turn, 4);
+                                assert!(report.contains("planted acquisition observer unwind"));
+                            }
+                            _ => panic!("observer failure discarded acquisition evidence"),
+                        }
+                        checked.set(true);
+                    });
+                    Ok(())
+                });
+            }))
+            .expect_err("observer invalidation must fail finalization");
+            assert!(checked.get(), "observer check did not complete");
+            assert!(panic_report(failure.as_ref()).contains("ForeignOwner"));
+        }
+    }
+
     /// Publication and its illegal second publication must both reach the
     /// holding's observer before either destructor runs.
     #[test]
@@ -9019,7 +9164,7 @@ mod tests {
             fn position(&mut self) {}
         }
         let inside = std::cell::Cell::new(false);
-        let mut windows = 0;
+        let windows = std::cell::Cell::new(0);
         let mut observations = 0;
         let mut m = Limits::unlimited();
         wound_by(
@@ -9031,17 +9176,28 @@ mod tests {
                 assert!(!inside.get(), "checkpoint ran inside the physical window");
                 observations += 1;
             },
-            |m, operation, observed, at| {
-                inside.set(true);
-                windows += 1;
-                let result = turn(m, operation, observed, at);
-                inside.set(false);
-                result
+            Execution {
+                step: |m: &mut Limits, operation: &mut Finished<'_>, observed, at| {
+                    inside.set(true);
+                    windows.set(windows.get() + 1);
+                    let result = turn(m, operation, observed, at);
+                    inside.set(false);
+                    result
+                },
+                end: |m: &mut Limits, operation: &mut Finished<'_>, observed, at| {
+                    inside.set(true);
+                    windows.set(windows.get() + 1);
+                    let result = terminal(m, operation, observed, at, &pipeline::Unwitnessed);
+                    inside.set(false);
+                    result
+                },
             },
         )
+        .1
         .expect("finished cleanup and its probe succeed");
         assert_eq!(
-            windows, 2,
+            windows.get(),
+            2,
             "cleanup and its terminal probe each use a window"
         );
         assert_eq!(

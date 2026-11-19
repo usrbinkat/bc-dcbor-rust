@@ -14,53 +14,55 @@ fn production_comparison_retains_exact_offsets_across_every_refusal() {
     right[256] = b'b';
     let left = [b'a'; 257];
     let baseline = refusal_matrix("key comparison", rigor(), |fault: Fault| {
-        suite(|run, policy| run.with_policy(policy, |m| {
-            let mut cursor = KeyComparison::new(&left, &right);
-            refuse(m, fault.refusal);
-            let mut turn = 0;
-            // Five units, each possibly refused once.
-            for _ in 0..11 {
-                m.turn();
-                assert_eq!(cursor.position(), turn * 64);
-                let bound = cursor.next_work().expect("a unit remains");
-                assert!(TURN.covers(&bound));
-                let before = m.used();
-                match contracted(m, &mut cursor) {
-                    Err(error) if error.refused() => {
-                        assert_eq!(cursor.position(), turn * 64);
-                        assert_eq!(cursor.next_work(), Some(bound));
-                        if fault.cancel && m.injected_refusals() > 0 {
-                            return Ok(super::support::RefusalRun::of(m));
+        suite(|run, policy| {
+            run.with_policy(policy, |m| {
+                let mut cursor = KeyComparison::new(&left, &right);
+                refuse(m, fault.refusal);
+                let mut turn = 0;
+                // Five units, each possibly refused once.
+                for _ in 0..11 {
+                    m.turn();
+                    assert_eq!(cursor.position(), turn * 64);
+                    let bound = cursor.next_work().expect("a unit remains");
+                    assert!(TURN.covers(&bound));
+                    let before = m.used();
+                    match contracted(m, &mut cursor) {
+                        Err(error) if error.refused() => {
+                            assert_eq!(cursor.position(), turn * 64);
+                            assert_eq!(cursor.next_work(), Some(bound));
+                            if fault.cancel && m.injected_refusals() > 0 {
+                                return Ok(super::support::RefusalRun::of(m));
+                            }
                         }
-                    }
-                    Ok(outcome) => {
-                        let after = m.used();
-                        assert!(bound.covers(&WriteWork::new(
-                            after.values - before.values,
-                            after.bytes - before.bytes
-                        )));
-                        if turn == 4 {
-                            assert_eq!(outcome, Step::Complete(Ordering::Less));
-                            assert_eq!(cursor.position(), 257);
-                            assert_eq!(m.used(), WriteWork::new(5, 257));
-                            assert_eq!(cursor.next_work(), None);
-                            exhausted(m, &mut cursor);
-                            assert_eq!(m.live_bytes(), 0);
-                            return Ok(super::support::RefusalRun::of(m));
+                        Ok(outcome) => {
+                            let after = m.used();
+                            assert!(bound.covers(&WriteWork::new(
+                                after.values - before.values,
+                                after.bytes - before.bytes
+                            )));
+                            if turn == 4 {
+                                assert_eq!(outcome, Step::Complete(Ordering::Less));
+                                assert_eq!(cursor.position(), 257);
+                                assert_eq!(m.used(), WriteWork::new(5, 257));
+                                assert_eq!(cursor.next_work(), None);
+                                exhausted(m, &mut cursor);
+                                assert_eq!(m.live_bytes(), 0);
+                                return Ok(super::support::RefusalRun::of(m));
+                            }
+                            assert_eq!(outcome, Step::Progress);
+                            turn += 1;
+                            assert_eq!(cursor.position(), turn * 64);
                         }
-                        assert_eq!(outcome, Step::Progress);
-                        turn += 1;
-                        assert_eq!(cursor.position(), turn * 64);
-                    }
-                    Err(error) => {
-                        return Err(Finding::Driver(format!("comparison failed: {error:?}")));
+                        Err(error) => {
+                            return Err(Finding::Driver(format!("comparison failed: {error:?}")));
+                        }
                     }
                 }
-            }
-            Err(Finding::Driver(
-                "the comparison exceeded its five units".to_owned(),
-            ))
-        }))
+                Err(Finding::Driver(
+                    "the comparison exceeded its five units".to_owned(),
+                ))
+            })
+        })
     });
     assert_eq!(
         baseline.calls().len(),
@@ -74,24 +76,26 @@ fn comparison_exact_position_is_not_the_admitted_chunk_end() {
     let left = [0; 64];
     let mut right = [0; 64];
     right[3] = 1;
-    suite(|run, policy| run.with_policy(policy, |m| {
-        let mut cursor = KeyComparison::new(&left, &right);
-        assert_eq!(
-            contracted(m, &mut cursor).unwrap(),
-            Step::Complete(Ordering::Less)
-        );
-        assert_eq!(
-            cursor.position(),
-            4,
-            "observation must report executed comparisons"
-        );
-        assert_eq!(
-            m.used().bytes,
-            64,
-            "admission is an upper bound, not measured execution"
-        );
-        Ok(())
-    }));
+    suite(|run, policy| {
+        run.with_policy(policy, |m| {
+            let mut cursor = KeyComparison::new(&left, &right);
+            assert_eq!(
+                contracted(m, &mut cursor).unwrap(),
+                Step::Complete(Ordering::Less)
+            );
+            assert_eq!(
+                cursor.position(),
+                4,
+                "observation must report executed comparisons"
+            );
+            assert_eq!(
+                m.used().bytes,
+                64,
+                "admission is an upper bound, not measured execution"
+            );
+            Ok(())
+        })
+    });
 }
 
 #[test]
@@ -102,16 +106,18 @@ fn comparison_literal_empty_prefix_and_equal_key_cases() {
         (&b"ab"[..], &b"a"[..], Ordering::Greater),
         (&b"abc"[..], &b"abc"[..], Ordering::Equal),
     ] {
-        suite(|run, policy| run.with_policy(policy, |m| {
-            let mut cursor = KeyComparison::new(left, right);
-            assert_eq!(
-                contracted(m, &mut cursor).unwrap(),
-                Step::Complete(expected)
-            );
-            assert_eq!(cursor.position(), left.len().min(right.len()));
-            exhausted(m, &mut cursor);
-            assert_eq!(m.live_bytes(), 0);
-            Ok(())
-        }));
+        suite(|run, policy| {
+            run.with_policy(policy, |m| {
+                let mut cursor = KeyComparison::new(left, right);
+                assert_eq!(
+                    contracted(m, &mut cursor).unwrap(),
+                    Step::Complete(expected)
+                );
+                assert_eq!(cursor.position(), left.len().min(right.len()));
+                exhausted(m, &mut cursor);
+                assert_eq!(m.live_bytes(), 0);
+                Ok(())
+            })
+        });
     }
 }

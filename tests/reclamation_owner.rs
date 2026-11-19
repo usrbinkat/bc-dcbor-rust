@@ -144,60 +144,45 @@ fn an_operation_reports_the_scope_count_and_a_closing_scope_reports_closed() {
 #[cfg(feature = "custom-std-collections")]
 #[test]
 fn a_tree_declares_no_less_cleanup_than_it_takes() {
-    use dcbor::bounded::decode::construction::Standalone;
-    use dcbor::bounded::decode::construction::in_place::{Built, InPlace, root_cost};
     use std::collections::BTreeMap;
-    use std::mem::MaybeUninit;
     for count in [0u64, 1, 11, 12, 13] {
         let mut symbolic = dcbor::Map::new();
         for n in 0..count {
             symbolic.insert(n, n).unwrap();
         }
         let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
-        let mut parser = Limits::unlimited();
-        let document = dcbor::bounded::decode::decode(&wire, 8, &mut parser).unwrap();
-        let mut a = Limits::unlimited();
-        let mut value = MaybeUninit::<BTreeMap<u64, u64>>::uninit();
-        // The tree at the root, through the engine's standalone driver; its
-        // declared cleanup includes the root session's begin unit.
-        let mut driver = Standalone::<BTreeMap<u64, u64>, Limits>::new(&document, &mut value);
-        let mut built = false;
-        // The map's root cost bounds its build steps; the unlimited policy
-        // never refuses, so no refusal allowance is added.
-        let steps = support::turns(
-            root_cost(<BTreeMap<u64, u64> as InPlace<Limits>>::COST)
-                .expect("the root cost of a fixture fits in u64")
-                .bound::<()>(wire.len() as u64)
-                .expect("the cost of a fixture fits in u64"),
-        );
-        for _ in 0..steps {
-            let step = driver.build_step(&mut a).expect("the tree builds");
-            if step == Built::Done {
-                built = true;
-                break;
+        support::recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            let steps = support::turns(support::root_bound::<BTreeMap<u64, u64>>(&wire));
+            run.standalone::<BTreeMap<u64, u64>, _, _>(policy, &wire, &Unwitnessed, |held| {
+                assert!(
+                    held.build_standalone(policy, steps, None, |_, _, _| {})?
+                        .is_some(),
+                    "a tree of {count} entries was not built"
+                );
+                let driver = held.value();
+                assert_eq!(
+                    driver.value().expect("a built tree is readable").len() as u64,
+                    count
+                );
+                let first = driver
+                    .remaining()
+                    .expect("a tree's cleanup count fits in u64");
+                let mut declared = first;
+                let mut taken = 0u64;
+                held.reclaim_standalone(policy, steps, |driver, _, reclaimed| {
+            if matches!(reclaimed, Err(BoundedError::Refused(_))) {
+                return;
             }
-        }
-        assert!(built, "a tree of {count} entries was not built");
-        assert_eq!(
-            driver.value().expect("a built tree is readable").len() as u64,
-            count
-        );
-        let first = driver
-            .remaining()
-            .expect("a tree's cleanup count fits in u64");
-        let mut declared = first;
-        let mut taken = 0u64;
-        loop {
             taken += 1;
             assert!(
                 taken <= first,
                 "a tree of {count} entries took more than the {first} calls it declared"
             );
-            let reclaimed = driver.reclaim_step(&mut a).unwrap();
             match reclaimed {
-                Reclaimed::Done => break,
-                Reclaimed::Progress => {}
-                Reclaimed::Waiting => panic!("a tree's own cleanup never waits"),
+                Ok(Reclaimed::Done) => return,
+                Ok(Reclaimed::Progress) => {}
+                other => panic!("unexpected tree cleanup: {other:?}"),
             }
             let next = driver
                 .remaining()
@@ -207,8 +192,14 @@ fn a_tree_declares_no_less_cleanup_than_it_takes() {
                 "a tree of {count} entries declared {next} calls after a call, from {declared}"
             );
             declared = next;
-        }
-        assert_eq!(a.live_bytes(), 0, "a tree of {count} entries left storage");
+        })?;
+                Ok(())
+            })?;
+            run.with_policy(policy, |m| {
+                assert_eq!(m.live_bytes(), 0, "a tree of {count} entries left storage")
+            });
+            Ok(())
+        });
     }
 }
 
@@ -1410,13 +1401,13 @@ fn retired<T: Transferable<Limits> + 'static>(
                         )
                     })
                 })???;
-                owner.with_policy(policy, |owner, m| {
-                    let mut previous = m.live_bytes();
-                    for at in 0..bound {
-                        if discipline == Discipline::RefusedFirst && owner.outstanding() != 0 {
-                            // The unit first refused, without release; a prepaid
-                            // release, which has no admission to refuse, is
-                            // progress that releases.
+                let mut previous = owner.with_policy(policy, |_, m| m.live_bytes());
+                for at in 0..bound {
+                    if discipline == Discipline::RefusedFirst && owner.value().outstanding() != 0 {
+                        // The unit first refused, without release; a prepaid
+                        // release, which has no admission to refuse, is
+                        // progress that releases.
+                        let done = owner.with_policy(policy, |owner, m| {
                             m.clear_refusal();
                             m.exhaust();
                             let held = m.live_bytes();
@@ -1425,29 +1416,32 @@ fn retired<T: Transferable<Limits> + 'static>(
                                 Ok(Reclaimed::Progress) => assert!(m.live_bytes() < held),
                                 Ok(Reclaimed::Done) => {
                                     assert_eq!(m.live_bytes(), 0);
-                                    return Ok((published, m.reached()));
+                                    return true;
                                 }
                                 other => panic!("unexpected cleanup: {other:?}"),
                             }
                             m.clear_refusal();
-                        }
-                        let result = support::scheduled_scope(m, owner, at, |owner, m| {
-                            owner.shutdown_step(m)
-                        })?
-                        .map_err(support::failed("the scope's shutdown"))?;
-                        let live = m.live_bytes();
-                        assert!(live <= previous, "reclamation acquired new storage");
-                        previous = live;
-                        if result == Reclaimed::Done {
-                            assert_eq!(m.live_bytes(), 0);
-                            return Ok((published, m.reached()));
+                            false
+                        });
+                        if done {
+                            return owner.with_policy(policy, |_, m| Ok((published, m.reached())));
                         }
                     }
-                    Err(Finding::Driver(format!(
-                        "the cleanup of {} exceeded its bound of {bound} turns",
-                        core::any::type_name::<T>()
-                    )))
-                })
+                    let result = owner
+                        .scope_step(policy, at, |owner, m| owner.shutdown_step(m))?
+                        .map_err(support::failed("the scope's shutdown"))?;
+                    let live = owner.with_policy(policy, |_, m| m.live_bytes());
+                    assert!(live <= previous, "reclamation acquired new storage");
+                    previous = live;
+                    if result == Reclaimed::Done {
+                        assert_eq!(live, 0);
+                        return owner.with_policy(policy, |_, m| Ok((published, m.reached())));
+                    }
+                }
+                Err(Finding::Driver(format!(
+                    "the cleanup of {} exceeded its bound of {bound} turns",
+                    core::any::type_name::<T>()
+                )))
             },
         )
     })

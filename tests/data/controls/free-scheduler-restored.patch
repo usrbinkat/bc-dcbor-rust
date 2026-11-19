@@ -1,0 +1,6 @@
+--- tests/support/lifecycle.rs
++++ tests/support/lifecycle.rs
+@@ -57,1 +57,3 @@
+ pub const TURNS: usize = 1 << 16;
++
++pub fn scheduled() {}

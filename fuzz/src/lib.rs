@@ -6,18 +6,13 @@ mod maps;
 mod schema;
 pub use schema::exercise_schema_schedule;
 
-/// The fuzzing policy: 2M values and 32M bytes of work, 4M live bytes, and a
-/// scheduled refusal of attempted call `refuse_at`.
-fn policy(refuse_at: Option<usize>) -> Limits {
-    Limits::new(2_000_000, 32_000_000, 4_000_000).refusing(refuse_at)
-}
-
-/// Panic unless one step, run under a cumulative allowance, admitted at most
-/// one quantum of work by itself.
-fn within_turn(before: WriteWork, after: WriteWork) {
-    assert!(after.values >= before.values && after.bytes >= before.bytes);
-    assert!(after.values - before.values <= TURN.values);
-    assert!(after.bytes - before.bytes <= TURN.bytes);
+/// Recorded 2M-value, 32M-byte work allowance, 4M live bytes, and one refusal.
+fn policy(run: &mut support::RecordedRun, refuse_at: Option<usize>) -> support::PolicyId {
+    let policy = run.budget(WriteWork::new(2_000_000, 32_000_000), 4_000_000);
+    run.with_policy(policy, |m| {
+        m.fail_call(refuse_at.map(|at| (at, LimitRefusal::Scheduled(at))));
+    });
+    policy
 }
 
 /// A refusal is either the scheduled one, at exactly the scheduled call, or a
@@ -47,74 +42,112 @@ pub fn exercise<T: Schema + ?Sized>(value: &T, expected: &[u8], refusal: Option<
     let write_refusal = refusal
         .filter(|index| index % 2 != 0)
         .map(|index| index / 2);
-    let mut allocator = policy(preparation_refusal);
-    let result = prepare(value, &mut allocator);
-    match result {
-        Err(error) => expected_failure(error, &allocator, preparation_refusal),
-        Ok(prepared) => {
-            assert_eq!(prepared.len(), expected.len());
-            let len = u64::try_from(prepared.len()).unwrap();
-            let write = prepared.write_work::<()>().unwrap();
-            let owned = encoding::owned_emit_bound::<Reservation, ()>(len).unwrap();
-            // The writing policy admits the output's release, grants its
-            // storage, exactly the encoding's length, then admits its write;
-            // the injected schedule may refuse any of them.
-            let mut budget = policy(write_refusal);
-            match prepared.encode_owned(&mut budget) {
-                Ok(encoded) => {
-                    assert_eq!(encoded.as_ref(), expected);
-                    assert!(owned.work().covers(&budget.used()));
-                    assert!(budget.requested_bytes() <= owned.allocated);
-                    assert_eq!(budget.live_bytes(), len);
-                    assert_eq!(
-                        dcbor::CBOR::try_from_data(encoded.as_ref())
-                            .unwrap()
-                            .to_cbor_data(),
-                        expected
-                    );
-                }
-                Err(error) => expected_failure(error, &budget, write_refusal),
-            }
-            assert_eq!(budget.live_bytes(), 0);
-            // Each write starts with a fresh writer, including after a
-            // refusal. Retry must be canonical and within the write bound.
-            let mut retry = policy(None);
-            let encoded = prepared.encode_owned(&mut retry).unwrap();
-            assert_eq!(encoded.as_ref(), expected);
-            assert!(owned.work().covers(&retry.used()));
-            assert_eq!(retry.requested_bytes(), len);
-            assert_eq!(owned.allocated, len);
-            drop(encoded);
-            assert_eq!(retry.live_bytes(), 0);
-            // The plan's own arena published in place as the encoding.
-            let mut publishing = policy(None);
-            let published = prepared.publish(&mut publishing).unwrap();
-            assert_eq!(published.as_ref(), expected);
-            assert!(write.covers(&publishing.used()));
-            assert!(allocator.live_bytes() >= len);
-            drop(published);
+    support::recorded_run(|run| {
+        let allocator = policy(run, preparation_refusal);
+        let writing = policy(run, write_refusal);
+        let retry = policy(run, None);
+        let publishing = policy(run, None);
+        let result = run.with_policy(allocator, |m| prepare(value, m));
+        match result {
+            Err(error) => run.with_policy(allocator, |m| {
+                expected_failure(error, m, preparation_refusal)
+            }),
+            Ok(prepared) => run.holding(
+                prepared,
+                support::Retirement::Released,
+                &support::pipeline::Unwitnessed,
+                |prepared| {
+                    assert_eq!(prepared.value().len(), expected.len());
+                    let len = u64::try_from(prepared.value().len()).unwrap();
+                    let write = prepared.value().write_work::<()>().unwrap();
+                    let owned = encoding::owned_emit_bound::<Reservation, ()>(len).unwrap();
+                    // The writing policy admits the output's release, grants its
+                    // storage, exactly the encoding's length, then admits its write;
+                    // the injected schedule may refuse any of them.
+                    let encoded =
+                        prepared.with_policy(writing, |prepared, m| prepared.encode_owned(m));
+                    match encoded {
+                        Ok(encoded) => {
+                            prepared.holding(encoded, support::Retirement::Released, |encoded| {
+                                encoded.with_policy(writing, |encoded, budget| {
+                                    assert_eq!(encoded.as_ref(), expected);
+                                    assert!(owned.work().covers(&budget.used()));
+                                    assert!(budget.requested_bytes() <= owned.allocated);
+                                    assert_eq!(budget.live_bytes(), len);
+                                    assert_eq!(
+                                        dcbor::CBOR::try_from_data(encoded.as_ref())
+                                            .unwrap()
+                                            .to_cbor_data(),
+                                        expected
+                                    );
+                                });
+                            })
+                        }
+                        Err(error) => prepared
+                            .with_policy(writing, |_, m| expected_failure(error, m, write_refusal)),
+                    }
+                    prepared.with_policy(writing, |_, m| assert_eq!(m.live_bytes(), 0));
+                    // Each write starts with a fresh writer, including after a
+                    // refusal. Retry must be canonical and within the write bound.
+                    let encoded = prepared
+                        .with_policy(retry, |prepared, m| prepared.encode_owned(m).unwrap());
+                    prepared.holding(encoded, support::Retirement::Released, |encoded| {
+                        encoded.with_policy(retry, |encoded, retry| {
+                            assert_eq!(encoded.as_ref(), expected);
+                            assert!(owned.work().covers(&retry.used()));
+                            assert_eq!(retry.requested_bytes(), len);
+                            assert_eq!(owned.allocated, len);
+                        })
+                    });
+                    prepared.with_policy(retry, |_, m| assert_eq!(m.live_bytes(), 0));
+                    // The plan's own arena published in place as the encoding.
+                    prepared.publish(publishing, |published| {
+                        published.with_policy(publishing, |published, publishing| {
+                            assert_eq!(published.as_ref(), expected);
+                            assert!(write.covers(&publishing.used()));
+                        });
+                        published.with_policy(allocator, |_, m| assert!(m.live_bytes() >= len));
+                    })?;
+                    Ok::<_, support::Finding>(())
+                },
+            )?,
         }
-    }
-    assert_eq!(allocator.live_bytes(), 0);
+        run.with_policy(allocator, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 pub fn exercise_decode(input: &[u8], refusal: Option<usize>) {
     use dcbor::bounded::decode::{DecodeError, decode};
-    let mut policy = policy(refusal);
-    match decode(input, 32, &mut policy) {
-        Ok(document) => {
-            assert_eq!(document.root().encoded(), input);
-            // Only successful bounded validation reaches the recursive oracle:
-            // its depth is now known and its text is canonical.
-            let symbolic = dcbor::CBOR::try_from_data(input).unwrap();
-            assert_eq!(symbolic.to_cbor_data(), input);
-            assert!(document.node_count() <= input.len());
+    support::recorded_run(|run| {
+        let policy = policy(run, refusal);
+        let decoded = run.with_policy(policy, |m| decode(input, 32, m));
+        match decoded {
+            Ok(document) => run.holding(
+                document,
+                support::Retirement::Released,
+                &support::pipeline::Unwitnessed,
+                |document| {
+                    let document = document.value();
+                    assert_eq!(document.root().encoded(), input);
+                    // Only successful bounded validation reaches the recursive oracle:
+                    // its depth is now known and its text is canonical.
+                    let symbolic = dcbor::CBOR::try_from_data(input).unwrap();
+                    assert_eq!(symbolic.to_cbor_data(), input);
+                    assert!(document.node_count() <= input.len());
+                },
+            ),
+            Err(DecodeError::Resource(error)) => {
+                run.with_policy(policy, |m| expected_failure(error, m, refusal))
+            }
+            Err(DecodeError::Invalid(_) | DecodeError::DepthLimit { .. }) => {}
+            Err(DecodeError::UnprovenText) => {
+                panic!("normalizing policy returned QuickOnly refusal")
+            }
         }
-        Err(DecodeError::Resource(error)) => expected_failure(error, &policy, refusal),
-        Err(DecodeError::Invalid(_) | DecodeError::DepthLimit { .. }) => {}
-        Err(DecodeError::UnprovenText) => panic!("normalizing policy returned QuickOnly refusal"),
-    }
-    assert_eq!(policy.live_bytes(), 0);
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 /// Arbitrary malformed inputs, every proper prefix of a bounded sample, and a

@@ -1,10 +1,9 @@
 use super::bindings::{decoder, text_encoder};
 use super::harness::*;
 use super::support::{
-    Finding, PolicyId, RecordedRun, Retirement, exhausted, label, panic_report,
-    pipeline::Unwitnessed, scheduled,
+    Finding, Holding, PolicyId, RecordedRun, Retirement, Stepped, Terminal, pipeline::Unwitnessed,
 };
-use dcbor::bounded::{Class, Custodial, Failure, Resumable, Step};
+use dcbor::bounded::{Class, Custodial, Failure, Resumable};
 use std::time::{Duration, Instant};
 
 // An acceptance ceiling for the measured call on the qualification host, not
@@ -20,54 +19,74 @@ const STEP_LATENCY: Duration = Duration::from_millis(10);
 /// hold in every run.
 const QUALIFICATION: &str = "DCBOR_LATENCY_QUALIFICATION";
 
-/// Drive `operation` through timed shared checked turns to its output
-/// ([`scheduled`]), the recording's integrity read inside each timed turn;
-/// or, for a lost recording, any other outcome than progress, a work
-/// refusal or publication, or for `steps` spent without one, the run's
-/// finding. The output is returned the moment it is published, with whether
-/// the schedule suspended before it, so its holder takes it before any
-/// check runs.
-fn measured_completion<O: Resumable<Limits>>(
-    m: &mut Limits,
-    operation: &mut O,
+/// Measure checked turns while shared holdings retain every publication
+/// across timing assertions, terminal probing, and output inspection.
+fn measured_completion<O>(
+    operation: &mut Holding<'_, '_, O, Unwitnessed>,
+    policy: PolicyId,
     steps: usize,
-) -> Result<(O::Output, bool), Finding>
+    check: impl FnOnce(&mut O::Output, &mut Limits),
+) -> Result<(), Finding>
 where
+    O: Resumable<Limits> + Custodial<Reservation> + Terminal,
+    O::Output: Custodial<Reservation>,
     O::Error: std::fmt::Debug,
     O::Position: std::fmt::Debug,
 {
     let qualifying = std::env::var_os(QUALIFICATION).is_some();
     let mut maximum = Duration::ZERO;
     let mut suspended = false;
+    let mut check = Some(check);
     for step in 0..steps {
-        let before = m.used();
+        let before = operation.with_policy(policy, |_, m| m.used());
         let started = Instant::now();
-        let outcome = scheduled(m, operation, step)?;
-        let elapsed = started.elapsed();
-        maximum = maximum.max(elapsed);
-        assert!(
-            !qualifying || elapsed <= STEP_LATENCY,
-            "step {step}: elapsed={elapsed:?}, maximum={maximum:?}, outcome={}",
-            label(&outcome)
-        );
-        let after = m.used();
-        match outcome {
-            Ok(Step::Complete(output)) => return Ok((output, suspended)),
-            Ok(Step::Progress) => suspended = true,
-            Err(error) if error.class() == Class::Refused(&LimitRefusal::Work) => {
-                assert_eq!(
-                    m.first_refusal().map(|(_, reason)| reason),
-                    Some(LimitRefusal::Work)
+        let outcome = operation.step(
+            policy,
+            step,
+            Retirement::Released,
+            |_, _| {
+                let elapsed = started.elapsed();
+                maximum = maximum.max(elapsed);
+                assert!(
+                    !qualifying || elapsed <= STEP_LATENCY,
+                    "step {step}: elapsed={elapsed:?}, maximum={maximum:?}"
                 );
-                assert_ne!(after, before, "fixed quantum cannot admit the next unit");
+            },
+            |output| {
+                assert!(
+                    suspended,
+                    "large fixture did not exercise multiple scheduler turns"
+                );
+                output.with_policy(policy, |output, m| {
+                    m.assert_units(TURN);
+                    check
+                        .take()
+                        .expect("one publication consumes its inspector")(
+                        output, m
+                    );
+                });
+            },
+        )?;
+        match outcome {
+            Stepped::Published(()) => return Ok(()),
+            Stepped::Progress => suspended = true,
+            Stepped::Failed(error) if error.class() == Class::Refused(&LimitRefusal::Work) => {
+                operation.with_policy(policy, |_, m| {
+                    assert_eq!(
+                        m.first_refusal().map(|(_, reason)| reason),
+                        Some(LimitRefusal::Work)
+                    );
+                    assert_ne!(m.used(), before, "fixed quantum cannot admit the next unit");
+                });
                 suspended = true;
             }
             other => {
-                return Err(Finding::Driver(format!(
-                    "step {step}: {}; maximum={maximum:?}; calls={:?}",
-                    label(&other),
-                    m.calls()
-                )));
+                return operation.with_policy(policy, |_, m| {
+                    Err(Finding::Driver(format!(
+                        "step {step}: {other:?}; maximum={maximum:?}; calls={:?}",
+                        m.calls()
+                    )))
+                });
             }
         }
     }
@@ -77,11 +96,8 @@ where
 }
 
 /// `operation`, held by `run`, through the timed schedule to its publication
-/// ([`measured_completion`]); then its terminal probe ([`exhausted`]) on the
-/// held operation, a probe failure the run's finding with the output still
-/// held; then the output handed over from its exhausted publisher
-/// ([`Holding::hand_over`]) and checked by `check` while it outlives the
-/// operation. Afterwards the run holds nothing.
+/// ([`measured_completion`]), inspected after shared terminal probing and
+/// publisher retirement.
 fn timed<O>(
     run: &mut RecordedRun,
     policy: PolicyId,
@@ -90,34 +106,13 @@ fn timed<O>(
     check: impl FnOnce(&mut O::Output, &mut Limits),
 ) -> Result<(), Finding>
 where
-    O: Resumable<Limits> + Custodial<Reservation>,
+    O: Resumable<Limits> + Custodial<Reservation> + Terminal,
     O::Output: Custodial<Reservation>,
     O::Error: std::fmt::Debug,
     O::Position: std::fmt::Debug,
 {
     run.holding(operation, Retirement::Released, &Unwitnessed, |operation| {
-        let (output, suspended) =
-            operation.with_policy(policy, |operation, m| measured_completion(m, operation, steps))?;
-        let probed = operation.with_policy(policy, |operation, m| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                exhausted(m, operation);
-                m.assert_units(TURN);
-            }))
-        });
-        operation.hand_over(Retirement::Exhausted, output, Retirement::Released, |output| {
-            if let Err(payload) = probed {
-                return Err(Finding::Defect(format!(
-                    "the published operation's terminal probe failed: {}",
-                    panic_report(payload.as_ref())
-                )));
-            }
-            assert!(
-                suspended,
-                "large fixture did not exercise multiple scheduler turns"
-            );
-            output.with_policy(policy, |output, m| check(output, m));
-            Ok(())
-        })
+        measured_completion(operation, policy, steps, check)
     })?;
     run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
     Ok(())

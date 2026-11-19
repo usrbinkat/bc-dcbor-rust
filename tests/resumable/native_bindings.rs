@@ -46,17 +46,16 @@ fn shared_driver_resumes_a_real_header_cursor_with_production_offsets() {
                 cursor.with_policy(policy, |cursor, m| {
                     refuse(m, Refusal::For(0, LimitRefusal::Work));
                     assert_eq!(cursor.acquired(), 0);
-                    let index = super::support::suspend_within(
-                        m,
-                        cursor,
-                        LimitRefusal::Work,
-                        decode_turns(wire.len()),
-                        super::support::TurnSchedule::Retained,
-                    )?;
-                    assert_eq!(index, 0);
-                    m.fail_call(None);
-                    Ok::<_, Finding>(())
-                })?;
+                });
+                let index = cursor.suspend(
+                    policy,
+                    LimitRefusal::Work,
+                    decode_turns(wire.len()),
+                    super::support::TurnSchedule::Retained,
+                    Retirement::Exhausted,
+                )?;
+                assert_eq!(index, 0);
+                cursor.with_policy(policy, |_, m| m.fail_call(None));
                 let mut acquired = 0;
                 cursor.drive_observed(
                     policy,
@@ -99,18 +98,17 @@ fn shared_driver_resumes_comparison_without_reexamining_its_prefix() {
                     assert_eq!(KeyComparison::position(comparison), 64);
                     refuse(m, Refusal::For(1, LimitRefusal::Work));
                     // The remaining pairs complete in one turn per 64 pairs, no more.
-                    let remaining = left.len() - KeyComparison::position(comparison);
-                    let index = super::support::suspend_within(
-                        m,
-                        comparison,
-                        LimitRefusal::Work,
-                        remaining.div_ceil(64),
-                        super::support::TurnSchedule::Retained,
-                    )?;
-                    assert_eq!(index, 1);
-                    m.fail_call(None);
-                    Ok::<_, Finding>(remaining)
-                })?;
+                    left.len() - KeyComparison::position(comparison)
+                });
+                let index = comparison.suspend(
+                    policy,
+                    LimitRefusal::Work,
+                    remaining.div_ceil(64),
+                    super::support::TurnSchedule::Retained,
+                    Retirement::Exhausted,
+                )?;
+                assert_eq!(index, 1);
+                comparison.with_policy(policy, |_, m| m.fail_call(None));
                 let mut position = 0;
                 comparison.drive_observed(
                     policy,

@@ -1,5 +1,5 @@
 --- tests/support/reclamation.rs
 +++ tests/support/reclamation.rs
-@@ -47,1 +47,1 @@
+@@ -82,1 +82,1 @@
 -                    held.reclaim_standalone(cleanup, turns, |_, _, _| {})
 +                    Ok(())

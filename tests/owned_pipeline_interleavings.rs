@@ -279,16 +279,13 @@ fn interleaved<H: Custodial<Reservation>>(
         // admits after the cut the retirement's cleanup.
         holding.holding(Lent::new(scope), Retirement::Exhausted, |view| {
             let before = view.boundary();
-            view.with_policy(policy, |view, m| {
-                let stepped =
-                    support::scheduled_scope(m, view, turn, |view, m| view.scope().step(m))?;
-                match stepped {
-                    Ok(Reclaimed::Progress | Reclaimed::Waiting | Reclaimed::Done) => Ok(()),
-                    Err(error) if support::ordinary_exhaustion(m, &error) => Ok(()),
-                    Err(error) => Err(Finding::Driver(format!(
-                        "interleaved cleanup failed: {error:?}"
-                    ))),
-                }
+            let stepped = view.scope_step(policy, turn, |view, m| view.scope().step(m))?;
+            view.with_policy(policy, |_, m| match stepped {
+                Ok(Reclaimed::Progress | Reclaimed::Waiting | Reclaimed::Done) => Ok(()),
+                Err(error) if support::ordinary_exhaustion(m, &error) => Ok(()),
+                Err(error) => Err(Finding::Driver(format!(
+                    "interleaved cleanup failed: {error:?}"
+                ))),
             })?;
             if retired {
                 intervals.push(before..view.boundary());
@@ -534,11 +531,8 @@ fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
                                     )
                                 })???;
                             }
-                            let shutdown = owner.with_policy(policy, |owner, m| {
-                                support::scheduled_scope(m, owner, 0, |owner, m| {
-                                    owner.shutdown_step(m)
-                                })
-                            })?;
+                            let shutdown =
+                                owner.scope_step(policy, 0, |owner, m| owner.shutdown_step(m))?;
                             assert_ne!(
                                 shutdown.ok(),
                                 Some(Reclaimed::Done),

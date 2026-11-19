@@ -117,7 +117,10 @@ fn enumerate(
                     );
                 }
                 (before, snapshot(enumeration), (result, None))
-            })?;
+            })
+            // A bucket step borrows the enumeration and owns no custody: the
+            // stop is rendered by reference, nothing published to retire.
+            .map_err(|stop| Finding::from(&stop))?;
             if progress.is_some() {
                 return Err(Finding::Driver(
                     "bucket enumeration made release progress without an admission".to_owned(),

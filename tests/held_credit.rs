@@ -15,14 +15,14 @@
 #[global_allocator]
 static HEAP: dcbor_test_support::heap::Heap = dcbor_test_support::heap::Heap;
 
+use dcbor::bounded::decode::DecodeError;
 use dcbor::bounded::decode::construction::Standalone;
 use dcbor::bounded::decode::construction::in_place::{Built, InPlace, StableOption};
+#[cfg(feature = "hashbrown")]
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
-use dcbor::bounded::decode::{DecodeError, decode};
 use dcbor::bounded::{
     BoundedError, Custodial, Identity, Limits, PermitsObserved, WriteWork, bound_of,
 };
-use std::mem::MaybeUninit;
 
 /// The ledgers of `m` with `held`, the state's held credit: `A = C + F + H`,
 /// no update refused.
@@ -36,111 +36,75 @@ fn conserved(m: &Limits, held: Option<WriteWork>, what: &str) {
     );
 }
 
-/// What one run did: the attempts of its policy when it ended.
-struct Run {
-    attempts: usize,
-}
-
-/// One run of `T` from `wire`: refusing attempted call `refuse` once, if
-/// any; at that refusal, cancelled when `cancel` and it falls in
-/// construction, otherwise retried; built to `Done`, the value `built`
-/// accepts, unless cancelled, then cleaned up to `Done`. Conservation is
-/// checked after every step, refused ones included, and cleanup's `Done`
-/// holds nothing.
+/// One run of `T` from `wire` under `fault`: its refusals applied to the
+/// construction, which is cancelled at its refusal when the fault cancels and
+/// otherwise retried; built to `Done`, the value `built` accepts, unless
+/// cancelled, then cleaned up to `Done` under the same policy, whose
+/// remaining refusals (every admission once, under `Refusal::Each`) cleanup
+/// retries. Conservation is checked after every step, refused ones included,
+/// and cleanup's `Done` holds nothing. Returns the construction's run as read
+/// where construction ended, before cleanup admits anything: a cancelled
+/// run's trace ends at its refused call, as the refusal matrix requires.
 fn run<T: InPlace<Limits>>(
     name: &str,
     wire: &[u8],
     built: &dyn Fn(&T) -> bool,
-    refuse: Option<usize>,
-    cancel: bool,
-) -> Run {
-    let what = format!("{name}, refusing {refuse:?}, cancelled {cancel}");
-    let mut parser = Limits::unlimited();
-    let document = decode(wire, 8, &mut parser).expect("the fixture decodes");
-    let mut m = Limits::unlimited().refusing(refuse);
-    let mut value = MaybeUninit::<T>::uninit();
-    let mut driver = Standalone::<T, Limits>::new(&document, &mut value);
-    conserved(&m, driver.held_credit(), &format!("{what}: initial"));
-    let mut cancelled = false;
-    for step in 0..4096 {
-        match driver.build_step(&mut m) {
-            Ok(Built::Done) => {
-                conserved(&m, driver.held_credit(), &format!("{what}: built"));
-                break;
-            }
-            Ok(Built::Progress) => {}
-            Err(DecodeError::Resource(BoundedError::Refused(_))) if cancel => {
-                conserved(&m, driver.held_credit(), &format!("{what}: refused"));
-                cancelled = true;
-                break;
-            }
-            Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Err(other) => panic!("{what}: step {step}: {other:?}"),
-        }
-        conserved(
-            &m,
-            driver.held_credit(),
-            &format!("{what}: build step {step}"),
-        );
-    }
-    assert!(
-        cancelled || driver.value().is_some_and(built),
-        "{what}: construction did not complete to the expected value"
-    );
-    // A refused cleanup unit changes nothing and is not counted: it is
-    // retried, as a refused build step is.
-    let declared = driver
-        .remaining()
-        .expect("a fixture's cleanup count fits in u64");
-    let mut taken = 0u64;
-    loop {
-        assert!(
-            taken < declared,
-            "{what}: cleanup beyond its declared {declared} calls"
-        );
-        match driver.reclaim_step(&mut m) {
-            Ok(reclaimed) => {
-                conserved(
-                    &m,
-                    driver.held_credit(),
-                    &format!("{what}: cleanup step {taken}"),
-                );
-                taken += 1;
-                if reclaimed == Reclaimed::Done {
-                    break;
+    fault: dcbor_test_support::Fault,
+) -> dcbor_test_support::RefusalRun {
+    let what = format!("{name}, {fault:?}");
+    use dcbor_test_support::{self as support, pipeline::Unwitnessed};
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let turns = support::turns(support::root_bound::<T>(wire));
+        let accounting = run.standalone::<T, _, _>(policy, wire, &Unwitnessed, |driver| {
+            driver.with_policy(policy, |driver, m| {
+                conserved(m, driver.held_credit(), &what)
+            });
+            let completed =
+                driver.build_standalone_faulted(policy, turns, fault, |driver, m, _| {
+                    conserved(m, driver.held_credit(), &what)
+                })?;
+            assert!(
+                completed.is_none() || driver.value().value().is_some_and(built),
+                "{what}: construction did not complete to the expected value"
+            );
+            let accounting = driver.with_policy(policy, |_, m| support::RefusalRun::of(m));
+            let declared = driver
+                .value()
+                .remaining()
+                .expect("cleanup count fits in u64");
+            let mut taken = 0;
+            driver.reclaim_standalone(policy, turns, |driver, m, result| {
+                conserved(m, driver.held_credit(), &what);
+                if result.is_ok() {
+                    taken += 1;
+                    assert!(
+                        taken <= declared,
+                        "{what}: cleanup exceeded {declared} calls"
+                    );
                 }
-            }
-            Err(BoundedError::Refused(_)) => {
-                conserved(
-                    &m,
-                    driver.held_credit(),
-                    &format!("{what}: refused cleanup"),
-                );
-            }
-            Err(other) => panic!("{what}: cleanup step {taken}: {other:?}"),
-        }
-    }
-    assert_eq!(
-        driver.held_credit(),
-        Some(WriteWork::default()),
-        "{what}: cleanup ended holding credit"
-    );
-    assert_eq!(m.live_bytes(), 0, "{what}: storage kept");
-    Run {
-        attempts: m.attempts(),
-    }
+            })?;
+            assert_eq!(
+                driver.value().held_credit(),
+                Some(WriteWork::default()),
+                "{what}: cleanup ended holding credit"
+            );
+            Ok(accounting)
+        })?;
+        run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0, "{what}: storage kept")
+        });
+        Ok(accounting)
+    })
 }
 
 /// The refusal matrix of `T` from `wire`, built to the value `built`
 /// accepts: the unrefused run, then every attempted call it made refused
 /// once, retried and cancelled.
 fn matrix<T: InPlace<Limits>>(name: &str, wire: &[u8], built: impl Fn(&T) -> bool) {
-    let attempts = run::<T>(name, wire, &built, None, false).attempts;
-    assert!(attempts > 0, "{name}: no admission");
-    for at in 0..attempts {
-        run::<T>(name, wire, &built, Some(at), false);
-        run::<T>(name, wire, &built, Some(at), true);
-    }
+    dcbor_test_support::refusal_matrix(name, dcbor_test_support::rigor::rigor(), |fault| {
+        run::<T>(name, wire, &built, fault)
+    });
 }
 
 /// A CBOR array of the integers `0..count`.
@@ -296,50 +260,57 @@ fn bound<T: InPlace<Limits>>(driver: &mut Standalone<'_, '_, '_, T, Limits>) -> 
 #[test]
 fn an_unallocated_states_pending_acquisition_holds_its_admitted_write() {
     use dcbor::bounded::decode::construction::in_place::{BufferObservation, SessionObservation};
-    let mut parser = Limits::unlimited();
-    let document = decode(&[0x61, b'a'], 1, &mut parser).unwrap();
     // The bind unit admitted; the metadata's write admitted, its release
     // refused: one obligation held.
-    let mut m = Limits::unlimited().refusing(Some(2));
-    let mut value = MaybeUninit::<String>::uninit();
-    let mut driver = Standalone::<String, Limits>::new(&document, &mut value);
-    assert_eq!(driver.build_step(&mut m).unwrap(), Built::Progress);
-    assert!(matches!(
-        driver.build_step(&mut m),
-        Err(DecodeError::Resource(BoundedError::Refused(_)))
-    ));
-    let SessionObservation {
-        inner: BufferObservation::Unallocated,
-        ..
-    } = driver.observe()
-    else {
-        panic!("the metadata was acquired through a refused release");
-    };
-    assert_eq!(
-        bound(&mut driver).len(),
-        1,
-        "the metadata's acquisition is not reported bound by the custody"
-    );
-    let held = driver.held_credit().unwrap();
-    assert_ne!(held, WriteWork::default(), "the admitted write is held");
-    conserved(&m, Some(held), "a refused release");
-    // The retry admits the release and is granted, ending the acquisition:
-    // nothing bound, nothing held.
-    assert_eq!(driver.build_step(&mut m).unwrap(), Built::Progress);
-    assert_eq!(
-        bound(&mut driver),
-        Vec::new(),
-        "the granted acquisition is still reported bound"
-    );
-    assert_eq!(driver.held_credit(), Some(WriteWork::default()));
-    conserved(&m, driver.held_credit(), "the granted metadata");
-    for _ in 0..8 {
-        if driver.reclaim_step(&mut m).unwrap() == Reclaimed::Done {
-            break;
-        }
-    }
-    conserved(&m, driver.held_credit(), "cleaned up");
-    assert_eq!(m.live_bytes(), 0);
+    use dcbor_test_support::{self as support, pipeline::Unwitnessed};
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.with_policy(policy, |m| {
+            m.fail_call(Some((2, dcbor::bounded::LimitRefusal::Scheduled(2))))
+        });
+        run.standalone::<String, _, _>(policy, &[0x61, b'a'], &Unwitnessed, |held| {
+            held.with_policy(policy, |driver, m| {
+                assert_eq!(driver.build_step(m).unwrap(), Built::Progress);
+                assert!(matches!(
+                    driver.build_step(m),
+                    Err(DecodeError::Resource(BoundedError::Refused(_)))
+                ));
+                let SessionObservation {
+                    inner: BufferObservation::Unallocated,
+                    ..
+                } = driver.observe()
+                else {
+                    panic!("the metadata was acquired through a refused release");
+                };
+                assert_eq!(
+                    bound(driver).len(),
+                    1,
+                    "the metadata's acquisition is not reported bound by the custody"
+                );
+                let held = driver.held_credit().unwrap();
+                assert_ne!(held, WriteWork::default(), "the admitted write is held");
+                conserved(m, Some(held), "a refused release");
+                // The retry admits the release and is granted, ending the acquisition:
+                // nothing bound, nothing held. The recorded policy is strict: the
+                // refusal is cleared before the retry, as a new turn clears it.
+                m.clear_refusal();
+                assert_eq!(driver.build_step(m).unwrap(), Built::Progress);
+                assert_eq!(
+                    bound(driver),
+                    Vec::new(),
+                    "the granted acquisition is still reported bound"
+                );
+                assert_eq!(driver.held_credit(), Some(WriteWork::default()));
+                conserved(m, driver.held_credit(), "the granted metadata");
+            });
+            held.checkpoint();
+            held.reclaim_standalone(policy, 8, |driver, m, _| {
+                conserved(m, driver.held_credit(), "cleaned up");
+            })
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 /// Preparation keeps a credit-free window binding across repeated refusals,
@@ -348,10 +319,8 @@ fn an_unallocated_states_pending_acquisition_holds_its_admitted_write() {
 #[cfg(feature = "hashbrown")]
 fn preparation_window_lifecycle(refusals: usize, cancel: bool) {
     use dcbor::bounded::encoding::Preparation;
-    use dcbor::bounded::{
-        Budget, Credit, Event, Family, Forfeit, Obligation, Origin, Reservation, Step,
-    };
-    use dcbor_test_support::{collect, recorded_run};
+    use dcbor::bounded::{Budget, Credit, Event, Family, Forfeit, Obligation, Origin, Reservation};
+    use dcbor_test_support::{Retirement, Stepped, collect, pipeline::Unwitnessed, recorded_run};
 
     // Identity hashes put adjacent entries in adjacent buckets, leaving
     // credit after the first entry instead of exhausting its window.
@@ -364,130 +333,143 @@ fn preparation_window_lifecycle(refusals: usize, cancel: bool) {
         let mint = run.policy(u64::MAX);
         let admit = run.policy(u64::MAX);
         let settle = run.policy(u64::MAX);
-        let mut preparation = Preparation::<Reservation, Family>::new(&table);
         let bound = dcbor_test_support::prepare_turns(dcbor_test_support::shape(&table));
-        let mut target = None;
-        for _ in 0..bound {
-            let before = preparation.position();
-            let result = run.with_policy(mint, |policy| {
-                policy.clear_refusal();
-                policy.refuse_next();
-                preparation.step(policy)
-            });
-            run.checkpoint(|sink| preparation.observe_custody(sink));
-            let custody = collect(|sink| preparation.observe_custody(sink)).unwrap();
-            // The stored preparation owner names windows alone; nested
-            // arena owners may also have credit-free acquisitions.
-            let candidate = custody.iter().find(|owner| {
-                Some(owner.owner) == preparation.owner_id()
-                    && owner.bound.len() == 1
-                    && owner.held.is_empty()
-                    && owner.permits.is_empty()
-            });
-            if let Some(owner) = candidate {
-                assert!(matches!(result, Err(BoundedError::Refused(_))));
-                assert_eq!(preparation.position(), before);
-                target = Some((owner.owner, owner.bound[0]));
-                break;
-            }
-            match result {
-                Err(BoundedError::Refused(_)) => {
-                    run.with_policy(setup, |policy| {
-                        assert!(matches!(preparation.step(policy), Ok(Step::Progress)));
+        let (
+            owner,
+            acquisition,
+            admitting_family,
+            admitting_by,
+            hold,
+            admitted_through,
+            performing_by,
+            closed,
+        ) = run.holding(
+            Preparation::<Reservation, Family>::new(&table),
+            Retirement::Released,
+            &Unwitnessed,
+            |preparation| {
+                let mut target = None;
+                for at in 0..bound {
+                    let before = preparation.value().position();
+                    preparation.with_policy(mint, |_, policy| {
+                        policy.clear_refusal();
+                        policy.refuse_next();
                     });
-                    run.checkpoint(|sink| preparation.observe_custody(sink));
-                }
-                Ok(Step::Progress) => {}
-                Err(error) => panic!("window acquisition not reached: {error:?}"),
-                Ok(_) => panic!("preparation ended before the window acquisition"),
-            }
-        }
-        let (owner, acquisition) = target.expect("a credit-free window refusal was reached");
-        let position = preparation.position();
-        let custody = collect(|sink| preparation.observe_custody(sink)).unwrap();
-        let baseline = run.with_policy(mint, |policy| (policy.attempts(), policy.credits()));
-        for _ in 1..refusals {
-            run.with_policy(mint, |policy| {
-                policy.clear_refusal();
-                policy.refuse_next();
-                assert!(matches!(
-                    preparation.step(policy),
-                    Err(BoundedError::Refused(_))
-                ));
-            });
-            assert_eq!(preparation.position(), position, "refusal moved execution");
-            assert_eq!(
-                collect(|sink| preparation.observe_custody(sink)).unwrap(),
-                custody,
-                "refusal replaced the credit-free acquisition"
-            );
-            run.checkpoint(|sink| preparation.observe_custody(sink));
-        }
-        run.with_policy(mint, |policy| {
-            assert_eq!(policy.attempts(), baseline.0 + refusals - 1);
-            assert_eq!(policy.credits(), baseline.1, "refusal admitted credit");
-        });
-        let (admitting_family, admitting_by) = run.with_policy(admit, |policy| {
-            (policy.origin().family(), policy.performer())
-        });
-        run.with_policy(admit, |policy| {
-            assert!(matches!(preparation.step(policy), Ok(Step::Progress)));
-        });
-        run.checkpoint(|sink| preparation.observe_custody(sink));
-        let held = collect(|sink| preparation.observe_custody(sink)).unwrap();
-        let hold = *held
-            .iter()
-            .find(|group| group.owner == owner)
-            .and_then(|group| group.held.first())
-            .expect("the retried window retains its unused controls");
-        assert_eq!(hold.obligation, Obligation::BucketWindow);
-        assert_eq!(
-            hold.acquisition, acquisition,
-            "retry reminted the acquisition"
-        );
-        assert_eq!(hold.id.family(), admitting_family);
-        assert_ne!(hold.work, WriteWork::default());
-        let admitted_through = run.boundary();
-        let performing_by = run.with_policy(settle, |policy| policy.performer());
-        if !cancel {
-            let mut completed = false;
-            for _ in 0..bound {
-                let result = run.with_policy(settle, |policy| preparation.step(policy));
-                match result {
-                    Ok(Step::Progress) => {}
-                    Ok(Step::Complete(mut plan)) => {
-                        run.checkpoint(|sink| {
-                            dcbor::bounded::observed_all([
-                                preparation.observe_custody(sink),
-                                plan.observe_custody(sink),
-                            ])
-                        });
-                        drop(plan);
-                        completed = true;
+                    let result =
+                        preparation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
+                    assert!(
+                        !matches!(result, Stepped::Published(_) | Stepped::Finished),
+                        "preparation ended before the window acquisition"
+                    );
+                    let custody =
+                        collect(|sink| preparation.value().observe_custody(sink)).unwrap();
+                    // The stored preparation owner names windows alone; nested
+                    // arena owners may also have credit-free acquisitions.
+                    let candidate = custody.iter().find(|owner| {
+                        Some(owner.owner) == preparation.value().owner_id()
+                            && owner.bound.len() == 1
+                            && owner.held.is_empty()
+                            && owner.permits.is_empty()
+                    });
+                    if let Some(owner) = candidate {
+                        assert!(matches!(result, Stepped::Failed(BoundedError::Refused(_))));
+                        assert_eq!(preparation.value().position(), before);
+                        target = Some((owner.owner, owner.bound[0]));
+                        break;
                     }
-                    Err(error) => panic!("cross-family continuation failed: {error:?}"),
-                    Ok(Step::Finished) => panic!("continuation finished without publishing"),
+                    match result {
+                        Stepped::Failed(BoundedError::Refused(_)) => {
+                            advanced(preparation, setup, "the setup retry")?;
+                        }
+                        Stepped::Progress => {}
+                        other => panic!("window acquisition not reached: {other:?}"),
+                    }
                 }
-                run.checkpoint(|sink| preparation.observe_custody(sink));
-                if completed {
-                    break;
+                let (owner, acquisition) =
+                    target.expect("a credit-free window refusal was reached");
+                let position = preparation.value().position();
+                let custody = collect(|sink| preparation.value().observe_custody(sink)).unwrap();
+                let baseline = preparation
+                    .with_policy(mint, |_, policy| (policy.attempts(), policy.credits()));
+                for at in 1..refusals {
+                    preparation.with_policy(mint, |_, policy| {
+                        policy.clear_refusal();
+                        policy.refuse_next();
+                    });
+                    assert!(matches!(
+                        preparation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?,
+                        Stepped::Failed(BoundedError::Refused(_))
+                    ));
+                    assert_eq!(
+                        preparation.value().position(),
+                        position,
+                        "refusal moved execution"
+                    );
+                    assert_eq!(
+                        collect(|sink| preparation.value().observe_custody(sink)).unwrap(),
+                        custody,
+                        "refusal replaced the credit-free acquisition"
+                    );
                 }
-            }
-            assert!(completed, "cross-family continuation exceeded its bound");
-        }
-        let mut released = false;
-        for _ in 0..bound {
-            let result = run.with_policy(settle, |policy| preparation.reclaim_step(policy));
-            run.checkpoint(|sink| preparation.observe_custody(sink));
-            if result.unwrap() == Reclaimed::Done {
-                released = true;
-                break;
-            }
-        }
-        assert!(released, "explicit cleanup exceeded its bound");
-        let closed = run.boundary();
-        drop(preparation);
-        run.checkpoint(|_| PermitsObserved::Complete);
+                preparation.with_policy(mint, |_, policy| {
+                    assert_eq!(policy.attempts(), baseline.0 + refusals - 1);
+                    assert_eq!(policy.credits(), baseline.1, "refusal admitted credit");
+                });
+                let (admitting_family, admitting_by) = preparation
+                    .with_policy(admit, |_, policy| {
+                        (policy.origin().family(), policy.performer())
+                    });
+                advanced(preparation, admit, "the cross-family window retry")?;
+                let held = collect(|sink| preparation.value().observe_custody(sink)).unwrap();
+                let hold = *held
+                    .iter()
+                    .find(|group| group.owner == owner)
+                    .and_then(|group| group.held.first())
+                    .expect("the retried window retains its unused controls");
+                assert_eq!(hold.obligation, Obligation::BucketWindow);
+                assert_eq!(
+                    hold.acquisition, acquisition,
+                    "retry reminted the acquisition"
+                );
+                assert_eq!(hold.id.family(), admitting_family);
+                assert_ne!(hold.work, WriteWork::default());
+                let admitted_through = preparation.boundary();
+                let performing_by = preparation.with_policy(settle, |_, policy| policy.performer());
+                if !cancel {
+                    preparation.drive(settle, bound, Retirement::Released, |_| ())?;
+                } else {
+                    preparation.transfer(
+                        |preparation| {
+                            dcbor_test_support::reclamation::Reclaiming::new(
+                                preparation,
+                                |slot, m| {
+                                    let result = slot
+                                        .as_mut()
+                                        .expect("preparation held until cleanup")
+                                        .reclaim_step(m);
+                                    if matches!(result, Ok(Reclaimed::Done)) {
+                                        slot.take();
+                                    }
+                                    result
+                                },
+                            )
+                        },
+                        Retirement::Released,
+                        |cleanup| cleanup.reclaim(settle, bound, |_| {}),
+                    )?;
+                }
+                Ok::<_, dcbor_test_support::Finding>((
+                    owner,
+                    acquisition,
+                    admitting_family,
+                    admitting_by,
+                    hold,
+                    admitted_through,
+                    performing_by,
+                    preparation.boundary(),
+                ))
+            },
+        )?;
         run.inspect_evidence(move |events, checkpoints| {
             assert!(
                 checkpoints
@@ -613,107 +595,107 @@ fn preparation_explicit_close_then_drop_settles_and_ends_once() {
 /// fresh turn per unit.
 const RETRY_TURNS: usize = 3;
 
+/// The held operation's resumed retry under `policy`, one fresh turn at a
+/// time within [`RETRY_TURNS`] ([`dcbor_test_support::Holding::step`]):
+/// every turn short of progress refused only as ordinary exhaustion of that
+/// turn's quantum, its admissions retained
+/// ([`dcbor_test_support::ordinary_exhaustion`]). Any other outcome, or the
+/// turns spent without progress, is the run's finding, naming `what`.
+fn advanced<O>(
+    operation: &mut dcbor_test_support::Holding<'_, '_, O, dcbor_test_support::pipeline::Unwitnessed>,
+    policy: dcbor_test_support::PolicyId,
+    what: &str,
+) -> Result<(), dcbor_test_support::Finding>
+where
+    O: dcbor::bounded::Resumable<Limits>
+        + Custodial<dcbor::bounded::Reservation>
+        + dcbor_test_support::Terminal,
+    O::Output: Custodial<dcbor::bounded::Reservation>,
+    O::Error: std::fmt::Debug + dcbor::bounded::Failure<Refusal = dcbor::bounded::LimitRefusal>,
+{
+    use dcbor_test_support::{Finding, Retirement, Stepped, ordinary_exhaustion};
+    for at in 0..RETRY_TURNS {
+        match operation.step(policy, at, Retirement::Released, |_, _| {}, |_| ())? {
+            Stepped::Progress => return Ok(()),
+            Stepped::Failed(error)
+                if operation.with_policy(policy, |_, m| ordinary_exhaustion(m, &error)) => {}
+            other => {
+                return Err(Finding::Driver(format!(
+                    "{what} was refused other than by its turn's quantum: {other:?}"
+                )));
+            }
+        }
+    }
+    Err(Finding::Driver(format!(
+        "{what} did not advance within {RETRY_TURNS} fresh turns"
+    )))
+}
+
 /// Reach a real holder's credit-free acquisition, refuse it repeatedly,
 /// resume under another family, then destroy the holder. The resumed
 /// retry takes fresh turns until the holder advances, each turn short of
 /// it refused only as ordinary exhaustion of that turn's quantum, its
 /// admissions retained ([`dcbor_test_support::ordinary_exhaustion`]). Every
 /// boundary is refined, including the empty custody after destruction.
-fn retained_holder_lifecycle<O>(
-    mut operation: O,
-    turns: usize,
-    mut observe: impl FnMut(
-        &mut O,
-        &mut dyn dcbor::bounded::CustodySink<dcbor::bounded::Reservation>,
-    ) -> PermitsObserved,
-) where
-    O: dcbor::bounded::Resumable<Limits>,
+fn retained_holder_lifecycle<O>(operation: O, turns: usize)
+where
+    O: dcbor::bounded::Resumable<Limits>
+        + Custodial<dcbor::bounded::Reservation>
+        + dcbor_test_support::Terminal,
+    O::Output: Custodial<dcbor::bounded::Reservation>,
     O::Error: std::fmt::Debug + dcbor::bounded::Failure<Refusal = dcbor::bounded::LimitRefusal>,
 {
-    use dcbor::bounded::{Credit, Event, Performer, Step};
-    use dcbor_test_support::{collect, recorded_run};
+    use dcbor::bounded::{Credit, Event, Performer};
+    use dcbor_test_support::{Retirement, Stepped, collect, pipeline::Unwitnessed, recorded_run};
 
     recorded_run(|run| {
         let mint = run.policy(u64::MAX);
         let resume = run.policy(u64::MAX);
+        let (acquisition, before_drop) = run.holding(
+            operation, Retirement::Released, &Unwitnessed, |operation| {
         let mut target = None;
         for at in 0..turns {
-            let result = run.with_policy(mint, |m| {
+            operation.with_policy(mint, |_, m| {
                 m.clear_refusal();
                 m.refuse_next();
-                dcbor_test_support::scheduled(m, &mut operation, at)
-            })?;
-            run.checkpoint(|sink| observe(&mut operation, sink));
-            let custody = collect(|sink| observe(&mut operation, sink)).unwrap();
+            });
+            let result = operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
+            let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
             if let Some(group) = custody
                 .iter()
                 .find(|group| group.bound.len() == 1 && group.held.is_empty())
             {
                 assert!(
-                    result.is_err(),
+                    matches!(result, Stepped::Failed(_)),
                     "a refused acquisition unexpectedly advanced"
                 );
                 target = Some(group.bound[0]);
                 break;
             }
-            drop(result);
-            let resumed = run.with_policy(resume, |m| {
-                dcbor_test_support::scheduled(m, &mut operation, at)
-            })?;
-            assert!(
-                matches!(resumed, Ok(Step::Progress)),
-                "holder ended before acquiring"
-            );
-            run.checkpoint(|sink| observe(&mut operation, sink));
+            assert!(!matches!(result, Stepped::Published(_) | Stepped::Finished),
+                "holder ended before acquiring");
+            advanced(operation, resume, "the holder's retry before its acquisition")?;
         }
         let acquisition = target.expect("the holder reached a credit-free acquisition");
-        let custody = collect(|sink| observe(&mut operation, sink)).unwrap();
-        let position = operation.position();
+        let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
+        let position = operation.value().position();
         for at in 0..3 {
-            let refused = run.with_policy(mint, |m| {
+            operation.with_policy(mint, |_, m| {
                 m.clear_refusal();
                 m.refuse_next();
-                dcbor_test_support::scheduled(m, &mut operation, at)
-            })?;
-            assert!(refused.is_err(), "the repeated refusal was swallowed");
-            assert_eq!(operation.position(), position, "refusal moved execution");
+            });
+            let refused = operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
+            assert!(matches!(refused, Stepped::Failed(_)), "the repeated refusal was swallowed");
+            assert_eq!(operation.value().position(), position, "refusal moved execution");
             assert_eq!(
-                collect(|sink| observe(&mut operation, sink)).unwrap(),
+                collect(|sink| operation.value().observe_custody(sink)).unwrap(),
                 custody,
                 "refusal replaced acquisition custody"
             );
-            run.checkpoint(|sink| observe(&mut operation, sink));
         }
-        let mut advanced = false;
-        for at in 0..RETRY_TURNS {
-            let resumed = run.with_policy(resume, |m| {
-                let resumed = dcbor_test_support::scheduled(m, &mut operation, at)?;
-                let exhausted = matches!(
-                    &resumed,
-                    Err(error) if dcbor_test_support::ordinary_exhaustion(m, error)
-                );
-                Ok::<_, dcbor_test_support::Finding>((resumed, exhausted))
-            })?;
-            run.checkpoint(|sink| observe(&mut operation, sink));
-            match resumed {
-                (Ok(Step::Progress), _) => {
-                    advanced = true;
-                    break;
-                }
-                (_, true) => {}
-                (other, false) => panic!(
-                    "the acquisition retry was refused other than by its turn's quantum: {}",
-                    dcbor_test_support::label(&other)
-                ),
-            }
-        }
-        assert!(
-            advanced,
-            "the acquisition retry did not advance within {RETRY_TURNS} fresh turns"
-        );
-        let before_drop = run.boundary();
-        drop(operation);
-        run.checkpoint(|_| PermitsObserved::Complete);
+        advanced(operation, resume, "the acquisition retry")?;
+        Ok::<_, dcbor_test_support::Finding>((acquisition, operation.boundary()))
+        })?;
         run.inspect_evidence(move |events, _| {
             let binds = events
                 .iter()
@@ -775,7 +757,6 @@ fn string_continuation_retains_its_acquisition_across_refusal_and_destruction() 
     retained_holder_lifecycle(
         StringDecoder::new(&wire, Options::normalizing(16)),
         dcbor_test_support::string_turns(wire.len()),
-        |operation, sink| operation.observe_custody(sink),
     );
 }
 
@@ -786,40 +767,44 @@ fn text_continuation_retains_its_acquisition_across_refusal_and_destruction() {
     retained_holder_lifecycle(
         TextEncoder::new(source),
         dcbor_test_support::normalize_turns(source),
-        |operation, sink| operation.observe_custody(sink),
     );
 }
 
 #[test]
 fn synchronous_writer_ends_each_call_after_settlement_on_refusal_and_success() {
     use dcbor::bounded::{Budget, Credit, Event, Forfeit, LimitRefusal, prepare};
-    use dcbor_test_support::recorded_run;
+    use dcbor_test_support::{Retirement, pipeline::Unwitnessed, recorded_run};
 
-    let mut preparation_policy = Limits::unlimited();
-    let plan = prepare(&24u64, &mut preparation_policy).expect("the literal plan");
     // Release admission, allocation request, initialization, and success.
     for refusal in [Some(0), Some(1), Some(2), None] {
         recorded_run(|run| {
+            let preparation_policy = run.policy(u64::MAX);
+            let plan = run.with_policy(preparation_policy, |m| {
+                prepare(&24u64, m).expect("the literal plan")
+            });
             let policy = run.policy(u64::MAX);
             let by = run.with_policy(policy, |m| {
                 m.fail_call(refusal.map(|at| (at, LimitRefusal::Scheduled(at))));
                 m.performer()
             });
-            let result = run.with_policy(policy, |m| plan.encode_owned(m));
-            match result {
-                Ok(mut encoded) => {
-                    assert_eq!(refusal, None, "the scheduled refusal was swallowed");
-                    assert_eq!(encoded.as_ref(), [0x18, 0x18]);
-                    run.checkpoint(|sink| encoded.observe_custody(sink));
-                    drop(encoded);
+            let start = run.boundary();
+            run.holding(plan, Retirement::Released, &Unwitnessed, |plan| {
+                let result = plan.with_policy(policy, |plan, m| plan.encode_owned(m));
+                match result {
+                    Ok(encoded) => plan.holding(encoded, Retirement::Released, |encoded| {
+                        assert_eq!(refusal, None, "the scheduled refusal was swallowed");
+                        assert_eq!(encoded.value().as_ref(), [0x18, 0x18]);
+                        encoded.checkpoint();
+                    }),
+                    Err(BoundedError::Refused(_)) => {
+                        assert!(refusal.is_some(), "the unlimited writer refused");
+                    }
+                    Err(error) => panic!("the synchronous writer failed: {error:?}"),
                 }
-                Err(BoundedError::Refused(_)) => {
-                    assert!(refusal.is_some(), "the unlimited writer refused");
-                }
-                Err(error) => panic!("the synchronous writer failed: {error:?}"),
-            }
-            run.checkpoint(|_| PermitsObserved::Complete);
+            });
+            let end = run.boundary();
             run.inspect_evidence(move |events, _| {
+                let events = &events[start..end];
                 let bindings: Vec<_> = events
                     .iter()
                     .filter_map(|event| match event.event {
@@ -882,8 +867,6 @@ fn synchronous_writer_ends_each_call_after_settlement_on_refusal_and_success() {
             Ok(())
         });
     }
-    drop(plan);
-    assert_eq!(preparation_policy.live_bytes(), 0);
 }
 
 #[test]

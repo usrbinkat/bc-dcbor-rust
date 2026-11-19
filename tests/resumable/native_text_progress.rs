@@ -1,11 +1,12 @@
 use super::bindings::text_encoder;
 use super::harness::*;
 use super::support::{
-    Fault, Finding, Retirement, allowed, contracted, expect_progress, label,
+    Fault, Finding, Retirement, Stepped, allowed, contracted, expect_progress,
     pipeline::{Refusal, Unwitnessed},
-    refusal_matrix, refuse, rigor::rigor, scheduled,
+    refusal_matrix, refuse,
+    rigor::rigor,
 };
-use dcbor::bounded::{BoundedError, Failure, Step};
+use dcbor::bounded::{BoundedError, Failure};
 
 #[test]
 fn actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_point() {
@@ -20,12 +21,21 @@ fn actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_poin
             Retirement::Released,
             &Unwitnessed,
             |reference| {
-                let (states, output) = reference.with_policy(policy, |reference, baseline| {
-                    let mut states = Vec::new();
-                    for _ in 0..normalize_turns(source) {
-                        let before = reference.position();
-                        match contracted(baseline, reference) {
-                            Ok(Step::Progress) => {
+                let mut states = Vec::new();
+                for at in 0..normalize_turns(source) {
+                    let before = reference.value().position();
+                    match reference.step(
+                        policy,
+                        at,
+                        Retirement::Released,
+                        |_, _| {},
+                        |output| {
+                            assert_eq!(output.value().as_ref(), expected);
+                            output.with_policy(policy, |_, baseline| baseline.assert_units(TURN));
+                        },
+                    )? {
+                        Stepped::Progress => {
+                            reference.with_policy(policy, |reference, baseline| {
                                 assert_ne!(
                                     reference.position(),
                                     before,
@@ -33,24 +43,17 @@ fn actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_poin
                                 );
                                 assert!(expected.starts_with(reference.emitted_prefix()));
                                 states.push((reference.position(), baseline.live_bytes()));
-                            }
-                            Ok(Step::Complete(encoded)) => return Ok((states, encoded)),
-                            other => {
-                                return Err(Finding::Driver(format!(
-                                    "unexpected normalization outcome {}",
-                                    label(&other)
-                                )));
-                            }
+                            });
+                        }
+                        Stepped::Published(()) => return Ok(states),
+                        other => {
+                            return Err(Finding::Driver(format!(
+                                "unexpected normalization outcome {other:?}"
+                            )));
                         }
                     }
-                    Err(Finding::Driver("normalization did not complete".to_owned()))
-                })?;
-                reference.retirement(Retirement::Exhausted);
-                reference.holding(output, Retirement::Released, |output| {
-                    assert_eq!(output.value().as_ref(), expected);
-                    output.with_policy(policy, |_, baseline| baseline.assert_units(TURN));
-                });
-                Ok(states)
+                }
+                Err(Finding::Driver("normalization did not complete".to_owned()))
             },
         )
     });
@@ -71,49 +74,61 @@ fn actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_poin
                     Retirement::Released,
                     &Unwitnessed,
                     |operation| {
-                        let output = operation.with_policy(policy, |operation, m| {
+                        let turns = operation.with_policy(policy, |_, m| {
                             refuse(m, fault.refusal);
-                            let mut steps = 0;
-                            for at in 0..allowed(m, normalize_turns(source)) {
-                                match scheduled(m, operation, at)? {
-                                    Ok(Step::Progress) => {
+                            allowed(m, normalize_turns(source))
+                        });
+                        let mut steps = 0;
+                        for at in 0..turns {
+                            match operation.step(
+                                policy,
+                                at,
+                                Retirement::Released,
+                                |_, _| {},
+                                |output| {
+                                    assert_eq!(
+                                        steps,
+                                        states.len(),
+                                        "completion came at another step"
+                                    );
+                                    assert_eq!(output.value().as_ref(), expected);
+                                },
+                            )? {
+                                Stepped::Progress => {
+                                    operation.with_policy(policy, |operation, m| {
                                         assert_eq!(
                                             (operation.position(), m.live_bytes()),
                                             states[steps],
                                             "progress step {steps} reached another state"
                                         );
                                         assert!(expected.starts_with(operation.emitted_prefix()));
-                                        steps += 1;
-                                    }
-                                    Ok(Step::Complete(encoded)) => {
-                                        return Ok(Some((encoded, steps)));
-                                    }
-                                    Err(error) if error.refused() => {
-                                        if fault.cancel && m.injected_refusals() > 0 {
-                                            assert!(
-                                                expected.starts_with(operation.emitted_prefix())
-                                            );
-                                            return Ok(None);
-                                        }
-                                    }
-                                    other => {
-                                        return Err(Finding::Driver(format!(
-                                            "unexpected normalization outcome {}",
-                                            label(&other)
-                                        )));
+                                    });
+                                    steps += 1;
+                                }
+                                Stepped::Published(()) => return Ok(()),
+                                Stepped::Failed(error) if error.refused() => {
+                                    if fault.cancel
+                                        && operation
+                                            .with_policy(policy, |_, m| m.injected_refusals())
+                                            > 0
+                                    {
+                                        assert!(
+                                            expected
+                                                .starts_with(operation.value().emitted_prefix())
+                                        );
+                                        return Ok(());
                                     }
                                 }
+                                other => {
+                                    return Err(Finding::Driver(format!(
+                                        "unexpected normalization outcome {other:?}"
+                                    )));
+                                }
                             }
-                            Err(Finding::Driver("the encoding exceeded its bound".to_owned()))
-                        })?;
-                        if let Some((output, steps)) = output {
-                            operation.retirement(Retirement::Exhausted);
-                            operation.holding(output, Retirement::Released, |output| {
-                                assert_eq!(steps, states.len(), "completion came at another step");
-                                assert_eq!(output.value().as_ref(), expected);
-                            });
                         }
-                        Ok::<_, Finding>(())
+                        Err(Finding::Driver(
+                            "the encoding exceeded its bound".to_owned(),
+                        ))
                     },
                 )?;
                 Ok(run.with_policy(policy, |m| {

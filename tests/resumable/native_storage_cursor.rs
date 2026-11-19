@@ -175,10 +175,10 @@ fn relocation_retains_actual_values_until_cancellation_not_just_their_permits()
         let dropped = Arc::new(AtomicUsize::new(0));
         arena_case(|storage, m| {
             for _ in 0..4 {
-                push(storage,Tracked(dropped.clone()), m)?;
+                push(storage, Tracked(dropped.clone()), m)?;
             }
             for _ in 0..3 + stop {
-                assert!(ungranted(storage,m)?);
+                assert!(ungranted(storage, m)?);
             }
             let call = m.attempts();
             refuse(m, Refusal::For(call, LimitRefusal::Work));
@@ -221,7 +221,7 @@ fn production_storage_retains_values_offsets_and_both_permits_during_growth()
                         // The block is staged beside the arena, then the grown
                         // allocation requested into it, then the relocation published:
                         // old, grown and block held at once.
-                        begin_relocation(storage,m)?;
+                        begin_relocation(storage, m)?;
                         assert_eq!(
                             m.live_bytes(),
                             16 + 32 + BLOCK,
@@ -253,7 +253,7 @@ fn production_storage_retains_values_offsets_and_both_permits_during_growth()
                                 m.fail_call(None);
                                 m.clear_refusal();
                             }
-                            assert!(ungranted(storage,m)?);
+                            assert!(ungranted(storage, m)?);
                         }
                         let after = m.used();
                         assert_eq!(
@@ -274,16 +274,16 @@ fn production_storage_retains_values_offsets_and_both_permits_during_growth()
                         assert_eq!(storage.last(), Some(&40), "the newest element, relocated");
                         // The relocated arena settles in place, then its vacated block
                         // is freed: a release its staging paid for.
-                        assert!(ungranted(storage,m)?);
+                        assert!(ungranted(storage, m)?);
                         assert_eq!(
                             storage.settled().map(|arena| arena.as_slice()),
                             Some([10, 20, 30, 40].as_slice())
                         );
                         let calls = m.attempts();
-                        assert!(ungranted(storage,m)?);
+                        assert!(ungranted(storage, m)?);
                         assert_eq!(m.attempts(), calls, "a prepaid release admits nothing");
                         assert_eq!(m.live_bytes(), 32);
-                        push(storage,50, m)?;
+                        push(storage, 50, m)?;
                         assert_eq!(storage.last(), Some(&50), "the newest element, settled");
                         // The settled vector taken out of the arena: it holds the
                         // allocation and its permit beyond the arena and its policy.
@@ -321,9 +321,9 @@ fn production_storage_cancels_at_every_partial_relocation() -> Result<(), Vec<Fi
     every_fixture(4, |stop| {
         arena_case(|storage, m| {
             fill(storage, m)?;
-            begin_relocation(storage,m)?;
+            begin_relocation(storage, m)?;
             for _ in 0..stop {
-                assert!(ungranted(storage,m)?);
+                assert!(ungranted(storage, m)?);
             }
             let call = m.attempts();
             refuse(m, Refusal::For(call, LimitRefusal::Work));
@@ -349,9 +349,9 @@ fn draining_interrupted_relocation_keeps_every_allocation_charged() -> Result<()
         let (moved, stop) = (pair / 4, pair % 4);
         arena_case(|storage, m| {
             fill(storage, m)?;
-            begin_relocation(storage,m)?;
+            begin_relocation(storage, m)?;
             for _ in 0..moved {
-                assert!(ungranted(storage,m)?);
+                assert!(ungranted(storage, m)?);
             }
             let before = m.used();
             for index in 0..4 {
@@ -369,7 +369,7 @@ fn draining_interrupted_relocation_keeps_every_allocation_charged() -> Result<()
                 }
                 m.fresh();
                 let held = m.live_bytes();
-                assert!(!reclaimed(storage,m)?);
+                assert!(!reclaimed(storage, m)?);
                 assert_eq!(storage.len(), 3 - index);
                 // Relocating or relocated, emptiness counts both
                 // allocations' elements.
@@ -392,7 +392,7 @@ fn draining_interrupted_relocation_keeps_every_allocation_charged() -> Result<()
             let mut done = false;
             for _ in 0..cleanup_units(storage.len()) {
                 m.fresh();
-                if reclaimed(storage,m)? {
+                if reclaimed(storage, m)? {
                     done = true;
                     break;
                 }
@@ -507,7 +507,7 @@ fn every_growth_and_cleanup_step_lowers_the_termination_measure() {
         let mut done = false;
         for _ in 0..cleanup_units(storage.len()) {
             let (attempts, live) = (m.attempts(), m.live_bytes());
-            done = reclaimed(storage,m)?;
+            done = reclaimed(storage, m)?;
             lowered(m, attempts, live, &format!("cleanup step {steps}"));
             steps += 1;
             if done {
@@ -561,7 +561,7 @@ fn a_refused_acquisition_keeps_and_forfeits_one_write_and_one_release() {
             m.clear_refusal();
             let kept = m.admitted_calls().len();
             if resumed {
-                assert!(ungranted(storage,m)?);
+                assert!(ungranted(storage, m)?);
                 assert_eq!(
                     &m.admitted_calls()[kept..],
                     [Call::Allocate(BLOCK)],
@@ -625,7 +625,7 @@ fn a_refused_acquisition_keeps_and_forfeits_one_write_and_one_release() {
                 let mut done = false;
                 for _ in 0..cleanup_units(storage.len()) {
                     m.fresh();
-                    done = reclaimed(storage,m)?;
+                    done = reclaimed(storage, m)?;
                     if done {
                         break;
                     }
@@ -653,7 +653,7 @@ fn a_refused_acquisition_keeps_and_forfeits_one_write_and_one_release() {
 fn cleanup_refusals_keep_the_storage_and_prepaid_releases_admit_nothing() {
     arena_case(|storage, m| {
         fill(storage, m)?;
-        begin_relocation(storage,m)?;
+        begin_relocation(storage, m)?;
         assert_eq!(m.live_bytes(), 16 + 32 + BLOCK);
         let mut done = false;
         // Each unit is refused once before it runs, both within one
@@ -673,7 +673,7 @@ fn cleanup_refusals_keep_the_storage_and_prepaid_releases_admit_nothing() {
                     m.fail_call(None);
                     m.clear_refusal();
                     m.fresh();
-                    done = reclaimed(storage,m)?;
+                    done = reclaimed(storage, m)?;
                 }
                 // A step that released what an acquisition paid for admits
                 // nothing, so the scheduled refusal stays unreached.
@@ -692,7 +692,7 @@ fn cleanup_refusals_keep_the_storage_and_prepaid_releases_admit_nothing() {
         assert_eq!(m.live_bytes(), 0);
         let calls = m.calls().len();
         m.fresh();
-        assert!(reclaimed(storage,m)?);
+        assert!(reclaimed(storage, m)?);
         assert_eq!(
             m.calls().len(),
             calls + 1,

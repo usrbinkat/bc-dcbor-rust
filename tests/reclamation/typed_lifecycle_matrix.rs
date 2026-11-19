@@ -247,17 +247,18 @@ fn unwinding<T: Transferable<Limits> + 'static>(
             &Unwitnessed,
             |owner| {
                 owner.initialize(policy)?;
-                owner.lending(Retirement::Exhausted, Lent::new, |view| {
-                    let scope = view.value().get();
-                    view.decoded::<T, _>(policy, wire, Options::normalizing(62), |value| {
-                        assert_eq!(value.value().bytes(), wire);
-                        assert_eq!(STARTS.get(), 1);
-                        assert!(scope.outstanding() > 0, "the value holds no record");
-                        value.with_policy(policy, |_, m| m.exhaust());
-                        panic!("maximum-depth terminal cleanup");
-                    })
-                })?
-                .map_err(support::failed("the deep decode"))
+                owner
+                    .lending(Retirement::Exhausted, Lent::new, |view| {
+                        let scope = view.value().get();
+                        view.decoded::<T, _>(policy, wire, Options::normalizing(62), |value| {
+                            assert_eq!(value.value().bytes(), wire);
+                            assert_eq!(STARTS.get(), 1);
+                            assert!(scope.outstanding() > 0, "the value holds no record");
+                            value.with_policy(policy, |_, m| m.exhaust());
+                            panic!("maximum-depth terminal cleanup");
+                        })
+                    })?
+                    .map_err(support::failed("the deep decode"))
             },
         )
     }));

@@ -1,10 +1,10 @@
 use super::harness::*;
 use super::support::{
-    Fault, Finding, Retirement, exhausted, pipeline::Unwitnessed, recorded_run, refusal_matrix,
-    refuse, rigor::rigor, scheduled,
+    Fault, Finding, Retirement, Stepped, pipeline::Unwitnessed, recorded_run, refusal_matrix,
+    refuse, rigor::rigor,
 };
 use dcbor::bounded::decode::{DecodeError, header::HeaderCursor};
-use dcbor::bounded::{Failure, Step, WriteWork};
+use dcbor::bounded::{Failure, WriteWork};
 
 /// What stepping a header cursor reached: a head's argument and encoded
 /// length, its rejection, or a cancellation.
@@ -28,63 +28,76 @@ fn read_header(wire: &[u8], fault: Fault) -> (Read, super::support::RefusalRun) 
             Retirement::Released,
             &Unwitnessed,
             |held| {
-                held.with_policy(policy, |cursor, m| {
-                    refuse(m, fault.refusal);
-                    // Each byte and the validation, each possibly refused once.
-                    for at in 0..2 * (wire.len() + 1) + 1 {
-                        let acquired = cursor.acquired();
-                        let bound = cursor.next_work();
-                        if let Some(bound) = bound {
-                            assert!(TURN.covers(&bound));
-                        }
-                        match scheduled(m, cursor, at)? {
-                            Ok(Step::Progress) => assert_eq!(cursor.acquired(), acquired + 1),
-                            Ok(Step::Complete(header)) => {
-                                assert_eq!(cursor.next_work(), None);
-                                exhausted(m, cursor);
+                held.with_policy(policy, |_, m| refuse(m, fault.refusal));
+                // Each byte and the validation, each possibly refused once.
+                for at in 0..2 * (wire.len() + 1) + 1 {
+                    let acquired = held.value().acquired();
+                    let bound = held.value().next_work();
+                    if let Some(bound) = bound {
+                        assert!(TURN.covers(&bound));
+                    }
+                    let mut next = None;
+                    match held.step(
+                        policy,
+                        at,
+                        Retirement::Released,
+                        |_, cursor| {
+                            next = cursor.next_work();
+                        },
+                        |header| {
+                            header.with_policy(policy, |header, m| {
                                 assert_eq!(m.live_bytes(), 0);
-                                let read = Read::Header {
-                                    argument: header.argument,
-                                    length: header.length,
-                                };
-                                return Ok((read, super::support::RefusalRun::of(m)));
+                                (
+                                    header.argument,
+                                    header.length,
+                                    super::support::RefusalRun::of(m),
+                                )
+                            })
+                        },
+                    )? {
+                        Stepped::Progress => assert_eq!(held.value().acquired(), acquired + 1),
+                        Stepped::Published((argument, length, calls)) => {
+                            assert_eq!(next, None);
+                            return Ok((Read::Header { argument, length }, calls));
+                        }
+                        Stepped::Failed(error) if error.refused() => {
+                            assert_eq!(
+                                held.value().acquired(),
+                                acquired,
+                                "a refused step acquired a byte"
+                            );
+                            assert_eq!(
+                                held.value().next_work(),
+                                bound,
+                                "a refused step moved the cursor"
+                            );
+                            if fault.cancel
+                                && held.with_policy(policy, |_, m| m.injected_refusals()) > 0
+                            {
+                                return held.with_policy(policy, |_, m| {
+                                    Ok((Read::Cancelled, super::support::RefusalRun::of(m)))
+                                });
                             }
-                            Err(error) if error.refused() => {
-                                assert_eq!(
-                                    cursor.acquired(),
-                                    acquired,
-                                    "a refused step acquired a byte"
-                                );
-                                assert_eq!(
-                                    cursor.next_work(),
-                                    bound,
-                                    "a refused step moved the cursor"
-                                );
-                                if fault.cancel && m.injected_refusals() > 0 {
-                                    return Ok((
-                                        Read::Cancelled,
-                                        super::support::RefusalRun::of(m),
-                                    ));
-                                }
-                            }
-                            Err(DecodeError::Invalid(_)) => {
-                                assert_eq!(cursor.acquired(), wire.len());
-                                exhausted(m, cursor);
+                        }
+                        Stepped::Failed(DecodeError::Invalid(_)) => {
+                            assert_eq!(held.value().acquired(), wire.len());
+                            held.finish(policy, wire.len() + 1, Retirement::Released)?;
+                            return held.with_policy(policy, |_, m| {
                                 m.assert_units(TURN);
                                 assert_eq!(m.live_bytes(), 0);
-                                return Ok((Read::Invalid, super::support::RefusalRun::of(m)));
-                            }
-                            other => {
-                                return Err(Finding::Driver(format!(
-                                    "unexpected header outcome {other:?}"
-                                )));
-                            }
+                                Ok((Read::Invalid, super::support::RefusalRun::of(m)))
+                            });
+                        }
+                        other => {
+                            return Err(Finding::Driver(format!(
+                                "unexpected header outcome {other:?}"
+                            )));
                         }
                     }
-                    Err(Finding::Driver(format!(
-                        "the header cursor exceeded its bound over {wire:02x?}"
-                    )))
-                })
+                }
+                Err(Finding::Driver(format!(
+                    "the header cursor exceeded its bound over {wire:02x?}"
+                )))
             },
         )
     })
@@ -118,18 +131,27 @@ fn production_header_cursor_retains_each_byte_before_and_after_refusal() {
             Retirement::Released,
             &Unwitnessed,
             |held| {
-                held.with_policy(policy, |cursor, m| {
-                    for at in 0..baseline.calls().len() {
-                        if let Err(error) = scheduled(m, cursor, at)? {
-                            return Err(Finding::Driver(format!(
-                                "a canonical head was not read: {error:?}"
-                            )));
-                        }
+                let mut next = None;
+                let mut used = WriteWork::new(0, 0);
+                for at in 0..baseline.calls().len() {
+                    if let Stepped::Failed(error) = held.step(
+                        policy,
+                        at,
+                        Retirement::Released,
+                        |m, cursor| {
+                            next = cursor.next_work();
+                            used = m.used();
+                        },
+                        |_| (),
+                    )? {
+                        return Err(Finding::Driver(format!(
+                            "a canonical head was not read: {error:?}"
+                        )));
                     }
-                    assert_eq!(m.used(), WriteWork::new(10, 18));
-                    assert_eq!(cursor.next_work(), None);
-                    Ok(())
-                })
+                }
+                assert_eq!(used, WriteWork::new(10, 18));
+                assert_eq!(next, None);
+                Ok(())
             },
         )
     });

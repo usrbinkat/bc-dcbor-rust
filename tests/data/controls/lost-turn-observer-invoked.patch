@@ -1,0 +1,11 @@
+--- tests/support/lifecycle.rs
++++ tests/support/lifecycle.rs
+@@ -5040,7 +5040,7 @@
+         if self.lost.is_none() {
+             self.lost = lost(m, at);
+         }
+-        if self.lost.is_none() {
++        if true {
+             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                 observe(&mut self.outcome)
+             })) {
