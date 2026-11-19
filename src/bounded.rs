@@ -3442,6 +3442,11 @@ pub(crate) mod places {
     // The one form of every recorded oracle: its configuration line and
     // atomic publication.
     use dcbor_record as record;
+    use record::capabilities::{Capabilities, Requirement};
+
+    /// This build's capabilities: which feature-gated cases it compiles, so
+    /// which recorded rows it must measure ([`Requirement`]).
+    const CAPABILITIES: Capabilities = record::capabilities!();
 
     /// This build's variant: [`VARIANT`], the suffix of each record's name,
     /// and [`RECORDS`], every suite's record of that variant compiled in. The
@@ -3615,6 +3620,7 @@ pub(crate) mod places {
     /// ceiling it is held to.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Ratio {
+        requirement: Requirement,
         outcome: Outcome,
         bound: u64,
         used: u64,
@@ -3660,6 +3666,7 @@ pub(crate) mod places {
     pub(crate) struct Tightness {
         suite: &'static str,
         ratios: Vec<(String, Ratio)>,
+        requirements: std::collections::BTreeMap<String, Requirement>,
         texts: Vec<String>,
         /// Each dimension some jointly checked total charges, by its index
         /// in [`EVERY`].
@@ -3673,10 +3680,31 @@ pub(crate) mod places {
             Self {
                 suite,
                 ratios: Vec::new(),
+                requirements: std::collections::BTreeMap::new(),
                 texts: Vec::new(),
                 charged: [false; 5],
                 covered: [false; 5],
             }
+        }
+
+        /// Declare a fixture's eligibility before any of its measurements.
+        /// The exact case identity is shared by place, total and joint rows.
+        pub(crate) fn requires(&mut self, case: &str, requirement: Requirement) {
+            assert!(
+                self.ratios.is_empty(),
+                "declare eligibility before measurement"
+            );
+            assert!(
+                self.requirements.insert(case.into(), requirement).is_none(),
+                "{case}: eligibility declared twice"
+            );
+        }
+
+        fn requirement(&self, case: &str) -> Requirement {
+            self.requirements
+                .get(case)
+                .copied()
+                .unwrap_or(Requirement::Always)
         }
 
         /// `bound` against `used`, as `what`, in `dimensions`: each the
@@ -3686,13 +3714,19 @@ pub(crate) mod places {
         /// charge is recorded as it is.
         fn measure(
             &mut self,
-            what: &str,
+            what: (&str, Requirement),
             outcome: Outcome,
             bound: ResourceBound,
             used: ResourceBound,
             ceiling: Ceiling,
             dimensions: &[Dimension],
         ) {
+            let (what, requirement) = what;
+            assert!(
+                requirement.eligible(CAPABILITIES),
+                "{what}: measured without required capability {}",
+                requirement.name()
+            );
             outcome.admissible(what);
             for &dimension in dimensions {
                 let (bound, used) = (dimension.of(bound), dimension.of(used));
@@ -3717,6 +3751,7 @@ pub(crate) mod places {
                 self.ratios.push((
                     format!("{what} {dimension}"),
                     Ratio {
+                        requirement,
                         outcome,
                         bound,
                         used,
@@ -3744,7 +3779,10 @@ pub(crate) mod places {
                 let measured = run.policy.ledger().measured(place);
                 match factor(place) {
                     Factor::Within(allowed) => self.measure(
-                        &format!("{}: {place:?}", run.name),
+                        (
+                            &format!("{}: {place:?}", run.name),
+                            self.requirement(&run.name),
+                        ),
                         run.outcome,
                         run.terms.term(place),
                         measured,
@@ -3752,7 +3790,10 @@ pub(crate) mod places {
                         EVERY,
                     ),
                     Factor::Measured => self.measure(
-                        &format!("{}: {place:?}", run.name),
+                        (
+                            &format!("{}: {place:?}", run.name),
+                            self.requirement(&run.name),
+                        ),
                         run.outcome,
                         run.terms.term(place),
                         measured,
@@ -3836,7 +3877,10 @@ pub(crate) mod places {
                 self.covered[index] |= dimensions.contains(&dimension);
             }
             self.measure(
-                &format!("{}: {what}", run.name),
+                (
+                    &format!("{}: {what}", run.name),
+                    self.requirement(&run.name),
+                ),
                 run.outcome,
                 bound,
                 measured,
@@ -3868,7 +3912,7 @@ pub(crate) mod places {
                     .push(format!("{what}: attained {attained:?} beyond {bound:?}"));
             }
             self.measure(
-                what,
+                (what, self.requirement(what)),
                 Outcome::Exact,
                 bound,
                 attained,
@@ -3892,7 +3936,7 @@ pub(crate) mod places {
                 let bound = run.terms.bound::<()>().expect("the bound fits in u64");
                 let measured = run.policy.ledger().total();
                 self.measure(
-                    &format!("{}: run", run.name),
+                    (&format!("{}: run", run.name), self.requirement(&run.name)),
                     run.outcome,
                     bound,
                     measured,
@@ -3929,6 +3973,7 @@ pub(crate) mod places {
             assert!(self.texts.is_empty(), "{:#?}", self.texts);
             let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tightness");
             let mode = if std::env::var_os(RECORD_FACTORS).is_some() {
+                CAPABILITIES.require_complete();
                 Ratchet::Record(record::recording_configuration())
             } else {
                 Ratchet::Check(record(self.suite))
@@ -3949,8 +3994,22 @@ pub(crate) mod places {
     /// taken under. A record names its configuration on its first line
     /// ([`record`]).
     fn ratchet(path: &str, measured: &[(String, Ratio)], mode: Ratchet<'_>) {
+        ratchet_under(path, measured, mode, CAPABILITIES);
+    }
+
+    fn ratchet_under(
+        path: &str,
+        measured: &[(String, Ratio)],
+        mode: Ratchet<'_>,
+        available: Capabilities,
+    ) {
         for (case, ratio) in measured {
             ratio.outcome.admissible(case);
+            assert!(
+                ratio.requirement.eligible(available),
+                "{case}: measured without required capability {}",
+                ratio.requirement.name()
+            );
         }
         let data = match mode {
             Ratchet::Record(configuration) => {
@@ -3961,12 +4020,13 @@ pub(crate) mod places {
                     .iter()
                     .map(|(key, ratio)| {
                         format!(
-                            "{}\t{}\t{}\t{}\t{}\t{key}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{key}",
                             ratio.bound,
                             ratio.used,
                             ratio.ceiling,
                             ratio.ceiling.evidence(),
-                            ratio.outcome.name()
+                            ratio.outcome.name(),
+                            ratio.requirement.name()
                         )
                     })
                     .collect();
@@ -3985,21 +4045,34 @@ pub(crate) mod places {
         let mut recorded = std::collections::BTreeMap::new();
         for (number, line) in read.rows {
             let at = || format!("{path}:{number}");
-            let mut fields = line.splitn(6, '\t');
-            let (Some(bound), Some(used), Some(ceiling), Some(class), Some(outcome), Some(key)) = (
+            let mut fields = line.splitn(7, '\t');
+            let (
+                Some(bound),
+                Some(used),
+                Some(ceiling),
+                Some(class),
+                Some(outcome),
+                Some(requirement),
+                Some(key),
+            ) = (
                 fields.next(),
                 fields.next(),
                 fields.next(),
                 fields.next(),
                 fields.next(),
                 fields.next(),
-            ) else {
+                fields.next(),
+            )
+            else {
                 panic!(
-                    "{}: not a bound, a use, a ceiling, an evidence class, an outcome and a key",
+                    "{}: not a bound, a use, a ceiling, an evidence class, an outcome, a requirement and a key",
                     at()
                 );
             };
             let ratio = Ratio {
+                requirement: Requirement::parse(requirement).unwrap_or_else(|| {
+                    panic!("{}: {key}: unknown requirement {requirement:?}", at())
+                }),
                 outcome: Outcome::parse(outcome)
                     .unwrap_or_else(|| panic!("{}: {key}: unknown outcome {outcome:?}", at())),
                 bound: bound
@@ -4035,17 +4108,20 @@ pub(crate) mod places {
                 )),
                 Some(record) if record != *ratio => texts.push(format!(
                     "{key}: changed from {record} to {ratio}; record it with \
-                     {RECORD_FACTORS}=1 and state why; outcome {} -> {}",
+                     {RECORD_FACTORS}=1 and state why; outcome {} -> {}; requirement {} -> {}",
                     record.outcome.name(),
-                    ratio.outcome.name()
+                    ratio.outcome.name(),
+                    record.requirement.name(),
+                    ratio.requirement.name()
                 )),
                 Some(_) => {}
             }
         }
         texts.extend(
             recorded
-                .into_keys()
-                .map(|key| format!("{key}: recorded in {path} but no longer measured")),
+                .into_iter()
+                .filter(|(_, ratio)| ratio.requirement.eligible(available))
+                .map(|(key, _)| format!("{key}: recorded in {path} but no longer measured")),
         );
         assert!(
             texts.is_empty(),
@@ -4069,6 +4145,7 @@ pub(crate) mod places {
         let path = directory.join("planted.txt");
         let path = path.to_str().expect("a UTF-8 temporary path");
         let ratio = |bound, used| Ratio {
+            requirement: Requirement::Always,
             outcome: Outcome::Published,
             bound,
             used,
@@ -4085,8 +4162,8 @@ pub(crate) mod places {
             record::render(
                 "toolchain=t std=s",
                 [
-                    "4\t2\tmeasured\tobserved\tpublished\ta values",
-                    "9\t9\tmeasured\tobserved\tpublished\tb bytes"
+                    "4\t2\tmeasured\tobserved\tpublished\t-\ta values",
+                    "9\t9\tmeasured\tobserved\tpublished\t-\tb bytes"
                 ]
             )
         );
@@ -4143,6 +4220,7 @@ pub(crate) mod places {
         let exact = vec![(
             "a values".to_string(),
             Ratio {
+                requirement: Requirement::Always,
                 outcome: Outcome::Exact,
                 bound: 4,
                 used: 2,
@@ -4151,7 +4229,7 @@ pub(crate) mod places {
         )];
         ratchet(path, &exact, Ratchet::Record("toolchain=t std=s".into()));
         assert!(
-            recorded().contains("4\t2\texact\tderived\texact\ta values"),
+            recorded().contains("4\t2\texact\tderived\texact\t-\ta values"),
             "{}",
             recorded()
         );
@@ -4179,6 +4257,7 @@ pub(crate) mod places {
     fn tightness_and_ratchet_refuse_planted_defects_before_publication() {
         let case = "planted preparation defect";
         let defect = Ratio {
+            requirement: Requirement::Always,
             outcome: Outcome::Defect,
             bound: 1,
             used: 1,
@@ -4212,6 +4291,113 @@ pub(crate) mod places {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous evidence");
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Each recorded row is held to its case's eligibility ([`Requirement`]),
+    /// whatever build checks it: a build lacking a row's capability neither
+    /// measures nor requires it; a build having it must measure it, and a row
+    /// of every build must be measured by every build; a changed requirement
+    /// is a change; measuring a case its build cannot execute, and a record
+    /// naming no known requirement, are refused.
+    #[test]
+    fn the_ratchet_holds_each_row_to_its_cases_eligibility() {
+        use record::capabilities::Capability;
+        let path =
+            std::env::temp_dir().join(format!("dcbor-eligibility-{}.txt", std::process::id()));
+        let path = path.to_str().expect("a UTF-8 temporary path").to_string();
+        let full = Capabilities {
+            derive: true,
+            hashbrown: true,
+        };
+        let minimal = Capabilities {
+            derive: false,
+            hashbrown: false,
+        };
+        let ratio = |requirement| Ratio {
+            requirement,
+            outcome: Outcome::Published,
+            bound: 3,
+            used: 1,
+            ceiling: Ceiling::Measured,
+        };
+        let always = ("a values".to_string(), ratio(Requirement::Always));
+        let gated = (
+            "h values".to_string(),
+            ratio(Requirement::Capability(Capability::Hashbrown)),
+        );
+        ratchet_under(
+            &path,
+            &[always.clone(), gated.clone()],
+            Ratchet::Record("toolchain=t std=s".into()),
+            full,
+        );
+        let data = std::fs::read_to_string(&path).expect("the record");
+        assert!(
+            data.contains("3\t1\tmeasured\tobserved\tpublished\thashbrown\th values"),
+            "{data}"
+        );
+        let refused = |measured: Vec<(String, Ratio)>, available: Capabilities| {
+            let (path, data) = (path.clone(), data.clone());
+            std::panic::catch_unwind(move || {
+                ratchet_under(&path, &measured, Ratchet::Check(&data), available)
+            })
+            .expect_err("an eligibility defect passed the ratchet")
+            .downcast::<String>()
+            .map(|text| *text)
+            .unwrap_or_default()
+        };
+        // Both builds pass with exactly their eligible rows.
+        ratchet_under(
+            &path,
+            &[always.clone(), gated.clone()],
+            Ratchet::Check(&data),
+            full,
+        );
+        ratchet_under(
+            &path,
+            std::slice::from_ref(&always),
+            Ratchet::Check(&data),
+            minimal,
+        );
+        let missing = refused(vec![always.clone()], full);
+        assert!(missing.contains("h values: recorded in"), "{missing}");
+        let unmeasured = refused(Vec::new(), minimal);
+        assert!(unmeasured.contains("a values: recorded in"), "{unmeasured}");
+        assert!(!unmeasured.contains("h values"), "{unmeasured}");
+        let regated = refused(
+            vec![
+                always.clone(),
+                ("h values".to_string(), ratio(Requirement::Always)),
+            ],
+            full,
+        );
+        assert!(
+            regated.contains("h values: changed") && regated.contains("requirement hashbrown -> -"),
+            "{regated}"
+        );
+        let ineligible = refused(vec![always.clone(), gated.clone()], minimal);
+        assert!(
+            ineligible.contains("h values: measured without required capability hashbrown"),
+            "{ineligible}"
+        );
+        std::fs::write(&path, data.replacen("\thashbrown\t", "\tnightly\t", 1))
+            .expect("a record of an unknown requirement");
+        let unknown = {
+            let path = path.clone();
+            std::panic::catch_unwind(move || {
+                let data = std::fs::read_to_string(&path).expect("the record");
+                ratchet_under(&path, &[always, gated], Ratchet::Check(&data), full)
+            })
+            .expect_err("an unknown requirement passed the ratchet")
+            .downcast::<String>()
+            .map(|text| *text)
+            .unwrap_or_default()
+        };
+        assert!(
+            unknown.contains("h values: unknown requirement \"nightly\""),
+            "{unknown}"
+        );
+        std::fs::remove_file(&path).expect("the temporary record removed");
     }
 
     /// `bound` never decreases in any dimension as its size grows over

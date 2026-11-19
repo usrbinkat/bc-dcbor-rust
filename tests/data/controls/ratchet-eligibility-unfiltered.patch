@@ -1,0 +1,7 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -4121,4 +4121,3 @@
+             recorded
+                 .into_iter()
+-                .filter(|(_, ratio)| ratio.requirement.eligible(available))
+                 .map(|(key, _)| format!("{key}: recorded in {path} but no longer measured")),

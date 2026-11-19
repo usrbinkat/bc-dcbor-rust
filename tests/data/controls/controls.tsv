@@ -563,3 +563,11 @@ observer-invalidation-unchecked	tests/data/controls/observer-invalidation-unchec
 free-scheduler-restored	tests/data/controls/free-scheduler-restored.patch	native	nightly	dcbor	all	lifecycle_authority	execution_cleanup_and_worker_startup_have_one_authority	-	failed	free custody execution
 cleanup-observer-unwind-propagated	tests/data/controls/cleanup-observer-unwind-propagated.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::drained_cleanup_preserves_observer_unwind_and_finishes	-	failed	planted cleanup observer unwind
 worker-join-failures-discarded	tests/data/controls/worker-join-failures-discarded.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::joined_batch_collects_every_worker_panic	-	failed	a join discarded a worker panic
+# Cleanup must preserve the first loss snapshot through later turns, including
+# when an observer defect preceded the loss. These controls retain physical
+# cleanup while corrupting only the returned failure evidence.
+cleanup-loss-snapshot-replaced	tests/data/controls/cleanup-loss-snapshot-replaced.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::drained_cleanup_keeps_the_loss_turn_when_its_bound_is_exceeded	-	failed	cleanup replaced the failure-time snapshot
+cleanup-later-loss-discarded	tests/data/controls/cleanup-later-loss-discarded.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::drained_cleanup_retains_loss_after_an_earlier_observer_unwind	-	failed	cleanup failed to retain both failures
+# A tightness row recorded for a capability the checking build lacks, held
+# to that build anyway: a build without hashbrown refuses its own record.
+ratchet-eligibility-unfiltered	tests/data/controls/ratchet-eligibility-unfiltered.patch	native	nightly	dcbor	all	lib	bounded::places::the_ratchet_holds_each_row_to_its_cases_eligibility	-	failed	h values: recorded in

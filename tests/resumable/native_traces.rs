@@ -74,6 +74,7 @@ use dcbor_record as record;
 use dcbor_refinement::{
     self as refinement, Cause, Checkpoint, End, Observed, Outcome, Publication, Row, Run,
 };
+use record::capabilities::{Capabilities, Capability};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -124,17 +125,19 @@ const RECORDED: &str = concat!(
 /// Rewrites [`RECORDED`] from the current build when set.
 const RECORD: &str = "DCBOR_RECORD_TRACES";
 
-/// Every feature a case may be gated on, and whether this build enables it.
-const FEATURES: &[(&str, bool)] = &[
-    ("derive", cfg!(feature = "derive")),
-    ("hashbrown", cfg!(feature = "hashbrown")),
-];
+/// This build's capabilities: which gated cases it compiles
+/// ([`record::capabilities`], the one definition of every gating feature).
+const CAPABILITIES: Capabilities = record::capabilities!();
 
-/// Whether this build enables `feature`, one of [`FEATURES`].
+/// Whether this build enables `feature`, a recorded row's gate: one of
+/// [`Capability::ALL`], any other name refused.
 fn enabled(feature: &str) -> bool {
-    match FEATURES.iter().find(|(name, _)| *name == feature) {
-        Some(&(_, enabled)) => enabled,
-        None => panic!("{feature} is not a gating feature; the features are {FEATURES:?}"),
+    match Capability::parse(feature) {
+        Some(capability) => CAPABILITIES.enables(capability),
+        None => panic!(
+            "{feature} is not a gating feature; the features are {:?}",
+            Capability::ALL.map(Capability::name)
+        ),
     }
 }
 
@@ -342,10 +345,14 @@ impl Cases {
         self.push(name, outcome, reached, run, Some(trace));
     }
 
-    /// The cases `add` adds, compiled only under `feature`.
+    /// The cases `add` adds, compiled only under `capability`.
     #[cfg(any(feature = "derive", feature = "hashbrown"))]
-    fn gated(&mut self, feature: &'static str, add: impl FnOnce(&mut Self)) {
-        assert!(enabled(feature), "{feature} cases run only under {feature}");
+    fn gated(&mut self, capability: Capability, add: impl FnOnce(&mut Self)) {
+        let feature = capability.name();
+        assert!(
+            CAPABILITIES.enables(capability),
+            "{feature} cases run only under {feature}"
+        );
         assert!(self.feature.is_none(), "cases are gated on one feature");
         self.feature = Some(feature);
         add(self);
@@ -959,7 +966,7 @@ fn preparation(cases: &mut Cases) {
         prepared_and_emitted(cases, name, source.as_ref());
     }
     #[cfg(feature = "hashbrown")]
-    cases.gated("hashbrown", |cases| {
+    cases.gated(Capability::Hashbrown, |cases| {
         let mut table = hashbrown::HashTable::new();
         for (hash, key, value) in [
             (0, "z", 1u64),
@@ -982,7 +989,7 @@ fn preparation(cases: &mut Cases) {
         );
     });
     #[cfg(feature = "derive")]
-    cases.gated("derive", |cases| {
+    cases.gated(Capability::Derive, |cases| {
         use super::schema_encoding::Record;
         let record = Record {
             omitted: None,
@@ -1128,9 +1135,9 @@ fn cases<W: Physical>() -> Cases {
     preparation(&mut cases);
     synchronous_encoding(&mut cases);
     #[cfg(feature = "derive")]
-    cases.gated("derive", derived);
+    cases.gated(Capability::Derive, derived);
     #[cfg(feature = "hashbrown")]
-    cases.gated("hashbrown", buckets);
+    cases.gated(Capability::Hashbrown, buckets);
     cases
 }
 
@@ -1183,7 +1190,7 @@ fn recorded() -> (String, BTreeMap<String, Recorded>) {
 /// The configuration the record `data` at `path` was recorded under, and
 /// every recorded case by name, each row read and checked by the refinement
 /// machine ([`refinement::parse_record`]) and each feature one of
-/// [`FEATURES`]: a row the machine refuses, or claiming another class than
+/// [`Capability::ALL`]: a row the machine refuses, or claiming another class than
 /// it supports, is refused, naming the line.
 fn parse(path: &str, data: &str) -> (String, BTreeMap<String, Recorded>) {
     if record::try_read(data).is_none() {
@@ -1325,15 +1332,7 @@ fn baselines<W: Physical>() {
          {inadmissible:#?}"
     );
     if std::env::var_os(RECORD).is_some() {
-        let disabled: Vec<&str> = FEATURES
-            .iter()
-            .filter(|(_, enabled)| !enabled)
-            .map(|(name, _)| *name)
-            .collect();
-        assert!(
-            disabled.is_empty(),
-            "recording requires every gating feature; disabled: {disabled:?}"
-        );
+        CAPABILITIES.require_complete();
         record::publish(
             RECORDED,
             &render(&cases, &record::recording_configuration()),

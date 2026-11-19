@@ -1,6 +1,6 @@
 --- tests/support/reclamation.rs
 +++ tests/support/reclamation.rs
-@@ -135,1 +135,2 @@
+@@ -136,1 +136,2 @@
 -            turned.observed(m, at, |result| observe(custody, m, result))
 +            observe(custody, m, &result);
 +            turned

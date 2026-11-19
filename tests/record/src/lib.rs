@@ -21,6 +21,8 @@ use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod capabilities;
+
 /// The variable naming the verification layer a run carries.
 pub const RIGOR: &str = "DCBOR_RIGOR";
 

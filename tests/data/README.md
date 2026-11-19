@@ -93,8 +93,14 @@ claiming another is refused, until every correspondence obligation of the refine
 each rule's planted divergence are verified. Every recorded test's whole stream, trace or not, is
 checked by the same transitions (`dcbor_refinement::settled`, through `tests/support/lifecycle.rs`
 `recorded_run`). Tightness rows contain bound, measured use, ceiling, evidence class, checked
-outcome, and case/dimension name. The class is the ceiling's (`exact` derived, every other ceiling
-observed; `dcbor_record::Evidence`), and a row claiming another is refused. Outcomes distinguish
+outcome, requirement, and case/dimension name. The class is the ceiling's (`exact` derived, every
+other ceiling observed; `dcbor_record::Evidence`), and a row claiming another is refused. The
+requirement is the case's eligibility, separate from the representation projection the file suffix
+names: `-` for a case every build executes, or the one capability the case needs
+(`dcbor_record::capabilities`, the one definition of `derive` and `hashbrown`, shared with the
+admission-trace feature column). A build checks every row whose requirement it satisfies and
+ignores the rest; a missing eligible row, a changed requirement, an unknown one, and a measurement
+taken without its capability are refused; recording requires every capability. Outcomes distinguish
 publication, invalid input, and cancellation; analytical tightness calculations use `exact`. A
 defect cannot be recorded or accepted by the ratchet, even when its numeric result matches an
 existing record. Diagnostics name cases rather than their indices.
@@ -403,6 +409,16 @@ interrupt a defined drain; the cleanup witness requires all remaining units exec
 original observer failure returned. `worker-join-failures-discarded.patch` discards the shared
 worker batch's join failures; its witness requires every worker panic collected after every join.
 Automated red/restored-green qualification of these controls is pending.
+
+`cleanup-loss-snapshot-replaced.patch` makes the drained cleanup schedule (`reclaim_by`) overwrite
+its first recording-loss snapshot with each later turn's;
+`drained_cleanup_keeps_the_loss_turn_when_its_bound_is_exceeded` requires the snapshot of the turn
+the loss occurred at. `cleanup-later-loss-discarded.patch` drops a recording loss found after an
+earlier observer failure; `drained_cleanup_retains_loss_after_an_earlier_observer_unwind` requires
+both returned together. `ratchet-eligibility-unfiltered.patch` holds every recorded tightness row
+to every build, its requirement ignored; `the_ratchet_holds_each_row_to_its_cases_eligibility`
+requires a build without `hashbrown` to pass its own record. Automated red/restored-green
+qualification of these controls is pending.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both

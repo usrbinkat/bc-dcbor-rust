@@ -1,0 +1,7 @@
+--- tests/support/reclamation.rs
++++ tests/support/reclamation.rs
+@@ -140,3 +140,3 @@
+-        if first_loss.is_none() {
++        if turned.lost.is_some() {
+             first_loss = turned.lost.clone();
+         }

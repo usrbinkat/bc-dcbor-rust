@@ -1,7 +1,7 @@
 use super::bindings::text_encoder;
 use super::harness::*;
 use super::support::{
-    Fault, Finding, Retirement, Stepped, allowed, contracted, expect_progress,
+    Fault, Finding, Retirement, Stepped, allowed, contracted, expect_progress, ordinary_exhaustion,
     pipeline::{Refusal, Unwitnessed},
     refusal_matrix, refuse,
     rigor::rigor,
@@ -46,6 +46,9 @@ fn actual_normalizer_progress_and_emitted_prefix_survive_every_cancellation_poin
                             });
                         }
                         Stepped::Published(()) => return Ok(states),
+                        Stepped::Failed(error)
+                            if reference
+                                .with_policy(policy, |_, m| ordinary_exhaustion(m, &error)) => {}
                         other => {
                             return Err(Finding::Driver(format!(
                                 "unexpected normalization outcome {other:?}"

@@ -602,7 +602,12 @@ const RETRY_TURNS: usize = 3;
 /// ([`dcbor_test_support::ordinary_exhaustion`]). Any other outcome, or the
 /// turns spent without progress, is the run's finding, naming `what`.
 fn advanced<O>(
-    operation: &mut dcbor_test_support::Holding<'_, '_, O, dcbor_test_support::pipeline::Unwitnessed>,
+    operation: &mut dcbor_test_support::Holding<
+        '_,
+        '_,
+        O,
+        dcbor_test_support::pipeline::Unwitnessed,
+    >,
     policy: dcbor_test_support::PolicyId,
     what: &str,
 ) -> Result<(), dcbor_test_support::Finding>
@@ -651,51 +656,66 @@ where
     recorded_run(|run| {
         let mint = run.policy(u64::MAX);
         let resume = run.policy(u64::MAX);
-        let (acquisition, before_drop) = run.holding(
-            operation, Retirement::Released, &Unwitnessed, |operation| {
-        let mut target = None;
-        for at in 0..turns {
-            operation.with_policy(mint, |_, m| {
-                m.clear_refusal();
-                m.refuse_next();
-            });
-            let result = operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
-            let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
-            if let Some(group) = custody
-                .iter()
-                .find(|group| group.bound.len() == 1 && group.held.is_empty())
-            {
-                assert!(
-                    matches!(result, Stepped::Failed(_)),
-                    "a refused acquisition unexpectedly advanced"
-                );
-                target = Some(group.bound[0]);
-                break;
-            }
-            assert!(!matches!(result, Stepped::Published(_) | Stepped::Finished),
-                "holder ended before acquiring");
-            advanced(operation, resume, "the holder's retry before its acquisition")?;
-        }
-        let acquisition = target.expect("the holder reached a credit-free acquisition");
-        let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
-        let position = operation.value().position();
-        for at in 0..3 {
-            operation.with_policy(mint, |_, m| {
-                m.clear_refusal();
-                m.refuse_next();
-            });
-            let refused = operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
-            assert!(matches!(refused, Stepped::Failed(_)), "the repeated refusal was swallowed");
-            assert_eq!(operation.value().position(), position, "refusal moved execution");
-            assert_eq!(
-                collect(|sink| operation.value().observe_custody(sink)).unwrap(),
-                custody,
-                "refusal replaced acquisition custody"
-            );
-        }
-        advanced(operation, resume, "the acquisition retry")?;
-        Ok::<_, dcbor_test_support::Finding>((acquisition, operation.boundary()))
-        })?;
+        let (acquisition, before_drop) =
+            run.holding(operation, Retirement::Released, &Unwitnessed, |operation| {
+                let mut target = None;
+                for at in 0..turns {
+                    operation.with_policy(mint, |_, m| {
+                        m.clear_refusal();
+                        m.refuse_next();
+                    });
+                    let result =
+                        operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
+                    let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
+                    if let Some(group) = custody
+                        .iter()
+                        .find(|group| group.bound.len() == 1 && group.held.is_empty())
+                    {
+                        assert!(
+                            matches!(result, Stepped::Failed(_)),
+                            "a refused acquisition unexpectedly advanced"
+                        );
+                        target = Some(group.bound[0]);
+                        break;
+                    }
+                    assert!(
+                        !matches!(result, Stepped::Published(_) | Stepped::Finished),
+                        "holder ended before acquiring"
+                    );
+                    advanced(
+                        operation,
+                        resume,
+                        "the holder's retry before its acquisition",
+                    )?;
+                }
+                let acquisition = target.expect("the holder reached a credit-free acquisition");
+                let custody = collect(|sink| operation.value().observe_custody(sink)).unwrap();
+                let position = operation.value().position();
+                for at in 0..3 {
+                    operation.with_policy(mint, |_, m| {
+                        m.clear_refusal();
+                        m.refuse_next();
+                    });
+                    let refused =
+                        operation.step(mint, at, Retirement::Released, |_, _| {}, |_| ())?;
+                    assert!(
+                        matches!(refused, Stepped::Failed(_)),
+                        "the repeated refusal was swallowed"
+                    );
+                    assert_eq!(
+                        operation.value().position(),
+                        position,
+                        "refusal moved execution"
+                    );
+                    assert_eq!(
+                        collect(|sink| operation.value().observe_custody(sink)).unwrap(),
+                        custody,
+                        "refusal replaced acquisition custody"
+                    );
+                }
+                advanced(operation, resume, "the acquisition retry")?;
+                Ok::<_, dcbor_test_support::Finding>((acquisition, operation.boundary()))
+            })?;
         run.inspect_evidence(move |events, _| {
             let binds = events
                 .iter()

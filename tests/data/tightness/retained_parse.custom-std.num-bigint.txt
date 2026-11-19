@@ -1,41 +1,41 @@
 #	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
-1212	1204	measured	observed	published	ascii text (Utf8): Utf8 bytes
-303	301	measured	observed	published	ascii text (Utf8): Utf8 values
-29600	1088	measured	observed	cancelled	cancelled text (Cleanup): Cleanup bytes
-1843	266	measured	observed	cancelled	cancelled text (Cleanup): Cleanup values
-49472	49472	measured	observed	published	flat array (Arena): Arena allocated
-27456	26752	measured	observed	published	flat array (Arena): Arena bytes
-36928	36928	measured	observed	published	flat array (Arena): Arena peak
-24576	24576	measured	observed	published	flat array (Arena): Arena retained
-859	856	measured	observed	published	flat array (Arena): Arena values
-105379	49728	joint	observed	published	flat array (Arena): total allocated
-37120	37120	joint	observed	published	flat array (Arena): total peak
-24576	24576	joint	observed	published	flat array (Arena): total retained
-303	301	measured	observed	published	flat array (Completion): Completion values
-606	606	measured	observed	published	flat array (Heads): Heads bytes
-607	604	measured	observed	published	flat array (Heads): Heads values
-2727	2709	measured	observed	published	flat array (Interpretation): Interpretation bytes
-303	301	measured	observed	published	flat array (Interpretation): Interpretation values
-2	2	measured	observed	published	flat array (Publication): Publication values
-1549635	787264	joint	observed	published	large flat array: total allocated
-590080	590080	joint	observed	published	large flat array: total peak
-393216	393216	joint	observed	published	large flat array: total retained
-5343658	243851	joint	observed	published	long undecided run: total bytes
-339036	58350	joint	observed	published	long undecided run: total values
-3723	2717	measured	observed	published	many keys (Keys): Keys bytes
-1920	999	measured	observed	published	many keys (Keys): Keys values
-24	23	measured	observed	published	nested arrays (Attach): Attach values
-3136	3136	measured	observed	published	nested arrays (Stack): Stack allocated
-2880	2496	measured	observed	published	nested arrays (Stack): Stack bytes
-2368	2368	measured	observed	published	nested arrays (Stack): Stack peak
-76	74	measured	observed	published	nested arrays (Stack): Stack values
-79414	5364	measured	observed	published	undecided run (Normalization): Normalization allocated
-382314	27363	measured	observed	published	undecided run (Normalization): Normalization bytes
-10304	2624	measured	observed	published	undecided run (Normalization): Normalization peak
-24344	5813	measured	observed	published	undecided run (Normalization): Normalization values
-553226	29691	joint	observed	published	undecided run (Normalization): total bytes
-34806	6074	joint	observed	published	undecided run (Normalization): total values
-262472	258300	measured	observed	published	undecided texts (NormalizerInit): NormalizerInit bytes
-11438	11400	measured	observed	published	undecided texts (NormalizerInit): NormalizerInit values
-903	900	measured	observed	published	undecided texts (TextCheck): TextCheck bytes
-316	300	measured	observed	published	undecided texts (TextCheck): TextCheck values
+1212	1204	measured	observed	published	-	ascii text (Utf8): Utf8 bytes
+303	301	measured	observed	published	-	ascii text (Utf8): Utf8 values
+29600	1088	measured	observed	cancelled	-	cancelled text (Cleanup): Cleanup bytes
+1843	266	measured	observed	cancelled	-	cancelled text (Cleanup): Cleanup values
+49472	49472	measured	observed	published	-	flat array (Arena): Arena allocated
+27456	26752	measured	observed	published	-	flat array (Arena): Arena bytes
+36928	36928	measured	observed	published	-	flat array (Arena): Arena peak
+24576	24576	measured	observed	published	-	flat array (Arena): Arena retained
+859	856	measured	observed	published	-	flat array (Arena): Arena values
+105379	49728	joint	observed	published	-	flat array (Arena): total allocated
+37120	37120	joint	observed	published	-	flat array (Arena): total peak
+24576	24576	joint	observed	published	-	flat array (Arena): total retained
+303	301	measured	observed	published	-	flat array (Completion): Completion values
+606	606	measured	observed	published	-	flat array (Heads): Heads bytes
+607	604	measured	observed	published	-	flat array (Heads): Heads values
+2727	2709	measured	observed	published	-	flat array (Interpretation): Interpretation bytes
+303	301	measured	observed	published	-	flat array (Interpretation): Interpretation values
+2	2	measured	observed	published	-	flat array (Publication): Publication values
+1549635	787264	joint	observed	published	-	large flat array: total allocated
+590080	590080	joint	observed	published	-	large flat array: total peak
+393216	393216	joint	observed	published	-	large flat array: total retained
+5343658	243851	joint	observed	published	-	long undecided run: total bytes
+339036	58350	joint	observed	published	-	long undecided run: total values
+3723	2717	measured	observed	published	-	many keys (Keys): Keys bytes
+1920	999	measured	observed	published	-	many keys (Keys): Keys values
+24	23	measured	observed	published	-	nested arrays (Attach): Attach values
+3136	3136	measured	observed	published	-	nested arrays (Stack): Stack allocated
+2880	2496	measured	observed	published	-	nested arrays (Stack): Stack bytes
+2368	2368	measured	observed	published	-	nested arrays (Stack): Stack peak
+76	74	measured	observed	published	-	nested arrays (Stack): Stack values
+79414	5364	measured	observed	published	-	undecided run (Normalization): Normalization allocated
+382314	27363	measured	observed	published	-	undecided run (Normalization): Normalization bytes
+10304	2624	measured	observed	published	-	undecided run (Normalization): Normalization peak
+24344	5813	measured	observed	published	-	undecided run (Normalization): Normalization values
+553226	29691	joint	observed	published	-	undecided run (Normalization): total bytes
+34806	6074	joint	observed	published	-	undecided run (Normalization): total values
+262472	258300	measured	observed	published	-	undecided texts (NormalizerInit): NormalizerInit bytes
+11438	11400	measured	observed	published	-	undecided texts (NormalizerInit): NormalizerInit values
+903	900	measured	observed	published	-	undecided texts (TextCheck): TextCheck bytes
+316	300	measured	observed	published	-	undecided texts (TextCheck): TextCheck values

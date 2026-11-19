@@ -5,7 +5,7 @@ use dcbor::bounded::{BoundedResult, Custodial, CustodySink, Failure, Limits, Per
 
 use crate::{
     Finding, Holding, Permit, PolicyId, Retirement, Scope, Scoped, Stopped, TURNS, allowed,
-    capture, lost, pipeline, require_evidence, retryable, scope_checked,
+    capture, pipeline, require_evidence, retryable, scope_checked,
 };
 
 pub(crate) enum Goal {
@@ -121,6 +121,7 @@ pub(crate) fn reclaim_by<C>(
     mut step: impl FnMut(&mut C, &mut Limits) -> BoundedResult<Reclaimed, Limits>,
 ) -> Result<(), Scoped<BoundedResult<Reclaimed, Limits>>> {
     let mut failure = None;
+    let mut first_loss = None;
     for at in 0..turns {
         if let Err(error) = require_evidence(m, at) {
             if matches!(goal, Goal::Quiescent) {
@@ -136,11 +137,23 @@ pub(crate) fn reclaim_by<C>(
         } else {
             turned
         };
+        if first_loss.is_none() {
+            first_loss = turned.lost.clone();
+        }
         if let Err(error) = turned.checked() {
             if matches!(goal, Goal::Quiescent) {
                 return Err(error);
             }
             failure.get_or_insert(error);
+        }
+        // An observer can fail before the recorder does. Cleanup still runs,
+        // so retain the loss where it first occurs beside that earlier defect.
+        if let Some(Stopped::Violated { lost, report, .. }) = &mut failure
+            && lost.is_none()
+            && let Some(loss) = &first_loss
+        {
+            report.push_str(&format!("; cleanup subsequently lost recording: {loss:?}"));
+            *lost = Some(loss.clone());
         }
         match result {
             Ok(Reclaimed::Done) => return failure.map_or(Ok(()), Err),
@@ -153,7 +166,7 @@ pub(crate) fn reclaim_by<C>(
                     Some(first) => Stopped::Violated {
                         output: None,
                         outcome: Some(Err(error)),
-                        lost: lost(m, at),
+                        lost: first_loss,
                         report: format!("cleanup failed after {first:?}"),
                     },
                 });
@@ -165,7 +178,7 @@ pub(crate) fn reclaim_by<C>(
         Some(first) => Stopped::Violated {
             output: None,
             outcome: None,
-            lost: lost(m, turns),
+            lost: first_loss,
             report: format!("cleanup exceeded {turns} turns after {first:?}"),
         },
     })
@@ -492,6 +505,139 @@ mod tests {
             });
             Ok(())
         });
+    }
+
+    #[test]
+    fn drained_cleanup_keeps_the_loss_turn_when_its_bound_is_exceeded() {
+        let checked = Cell::new(false);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            recorded_run(|run| {
+                let policy = run.policy(u64::MAX);
+                run.with_policy(policy, |m| {
+                    let mut steps = 0;
+                    let mut snapshot = None;
+                    let result = reclaim_by(
+                        &mut steps,
+                        m,
+                        3,
+                        Goal::Drained,
+                        |_, _, _| panic!("lost history reached the observer"),
+                        |steps, m| {
+                            if *steps == 0 {
+                                assert_eq!(
+                                    m.validate_owner(&Owner::unobserved()),
+                                    Err(LimitRefusal::Unrecorded)
+                                );
+                                snapshot = crate::lost(m, 0);
+                            }
+                            *steps += 1;
+                            Ok(Reclaimed::Progress)
+                        },
+                    );
+                    assert_eq!(steps, 3, "loss interrupted defined cleanup");
+                    match result {
+                        Err(Stopped::Violated {
+                            lost: Some(loss),
+                            report,
+                            ..
+                        }) => {
+                            assert_eq!(loss.turn, 0, "cleanup replaced the failure-time snapshot");
+                            assert_eq!(
+                                Some(loss),
+                                snapshot,
+                                "cleanup changed the failure-time recorder state"
+                            );
+                            assert!(report.contains("cleanup exceeded 3 turns"), "{report}");
+                        }
+                        other => panic!("cleanup discarded its recording loss: {other:?}"),
+                    }
+                    checked.set(true);
+                });
+                Ok(())
+            });
+        }))
+        .expect_err("a lost recording must fail finalization");
+        assert!(
+            checked.get(),
+            "the loss snapshot assertions did not complete"
+        );
+        assert!(
+            crate::panic_report(failure.as_ref()).contains("ForeignOwner"),
+            "finalization omitted the recording failure"
+        );
+    }
+
+    #[test]
+    fn drained_cleanup_retains_loss_after_an_earlier_observer_unwind() {
+        let checked = Cell::new(false);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            recorded_run(|run| {
+                let policy = run.policy(u64::MAX);
+                run.with_policy(policy, |m| {
+                    let mut steps = 0;
+                    let mut observations = 0;
+                    let mut snapshot = None;
+                    let result = reclaim_by(
+                        &mut steps,
+                        m,
+                        3,
+                        Goal::Drained,
+                        |_, _, _| {
+                            observations += 1;
+                            panic!("planted observer failure before recording loss");
+                        },
+                        |steps, m| {
+                            if *steps == 1 {
+                                assert_eq!(
+                                    m.validate_owner(&Owner::unobserved()),
+                                    Err(LimitRefusal::Unrecorded)
+                                );
+                                snapshot = crate::lost(m, 1);
+                            }
+                            *steps += 1;
+                            Ok(if *steps == 3 {
+                                Reclaimed::Done
+                            } else {
+                                Reclaimed::Progress
+                            })
+                        },
+                    );
+                    assert_eq!(steps, 3, "cleanup did not physically complete");
+                    assert_eq!(observations, 1, "the failed observer was invoked again");
+                    match result {
+                        Err(Stopped::Violated {
+                            outcome: Some(Ok(Reclaimed::Progress)),
+                            lost: Some(loss),
+                            report,
+                            ..
+                        }) => {
+                            assert_eq!(loss.turn, 1, "cleanup replaced the failure-time snapshot");
+                            assert_eq!(
+                                Some(loss),
+                                snapshot,
+                                "cleanup changed the failure-time recorder state"
+                            );
+                            assert!(
+                                report.contains("planted observer failure before recording loss"),
+                                "{report}"
+                            );
+                        }
+                        other => panic!("cleanup failed to retain both failures: {other:?}"),
+                    }
+                    checked.set(true);
+                });
+                Ok(())
+            });
+        }))
+        .expect_err("a lost recording must fail finalization");
+        assert!(
+            checked.get(),
+            "the combined failure assertions did not complete"
+        );
+        assert!(
+            crate::panic_report(failure.as_ref()).contains("ForeignOwner"),
+            "finalization omitted the recording failure"
+        );
     }
 
     #[test]

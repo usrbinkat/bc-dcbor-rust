@@ -4219,6 +4219,9 @@ mod bound_tests {
     use super::*;
     use crate::bounded::{Call, Capacity, Family, Limits, Reservation, Session, within};
     use core::ops::ControlFlow;
+    #[cfg(feature = "hashbrown")]
+    use dcbor_record::capabilities::Capability;
+    use dcbor_record::capabilities::Requirement;
 
     #[test]
     fn window_pair_rejects_missing_reversed_and_overflowing_parts() {
@@ -5658,7 +5661,8 @@ mod bound_tests {
 
         /// A witness: its name, its source, and where it is cancelled into
         /// its cleanup, if it is.
-        type Witness = (&'static str, Box<dyn Schema>, Option<Cancel>);
+        type WitnessInput = (&'static str, Box<dyn Schema>, Option<Cancel>);
+        type Witness = (Requirement, WitnessInput);
 
         /// The hashbrown table of the bucket witnesses ([`buckets`]): 200
         /// pairs and the key 255 in 256 buckets, each key hashed to itself,
@@ -5680,7 +5684,10 @@ mod bound_tests {
                     "key {key} is not in its home bucket"
                 );
             }
-            Some(("hash table", Box::new(table), None))
+            Some((
+                Requirement::Capability(Capability::Hashbrown),
+                ("hash table", Box::new(table), None),
+            ))
         }
 
         /// No hashbrown table where hashbrown is not built.
@@ -5705,7 +5712,7 @@ mod bound_tests {
                     "key {key} is not in its home bucket"
                 );
             }
-            Some(("std hash map", Box::new(map), None))
+            Some((Requirement::Always, ("std hash map", Box::new(map), None)))
         }
 
         /// No forked standard library map where the forked collections are
@@ -5733,7 +5740,7 @@ mod bound_tests {
         /// has one per sealed table the build compiles ([`buckets`]); none
         /// only for a place this build never charges.
         fn witness(place: PreparationPlace) -> Vec<Witness> {
-            let single: Witness = match place {
+            let single: WitnessInput = match place {
                 PreparationPlace::Instructions
                 | PreparationPlace::Pushes
                 | PreparationPlace::Frames
@@ -5809,7 +5816,7 @@ mod bound_tests {
                 #[cfg(not(feature = "num-bigint"))]
                 PreparationPlace::Digits => return Vec::new(),
             };
-            vec![single]
+            vec![(Requirement::Always, single)]
         }
 
         /// A generated source nested at most `depth` deep: integers, texts,
@@ -5950,6 +5957,7 @@ mod bound_tests {
         /// where it is cancelled into its cleanup if it is.
         struct Source {
             name: String,
+            requirement: Requirement,
             witnesses: Option<PreparationPlace>,
             schema: Box<dyn Schema>,
             cancel_after: Option<Cancel>,
@@ -5975,14 +5983,15 @@ mod bound_tests {
             let mut sources: Vec<Source> = PreparationPlace::ALL
                 .iter()
                 .flat_map(|&place| {
-                    witness(place)
-                        .into_iter()
-                        .map(move |(name, schema, cancel_after)| Source {
+                    witness(place).into_iter().map(
+                        move |(requirement, (name, schema, cancel_after))| Source {
                             name: format!("{name} ({place:?})"),
+                            requirement,
                             witnesses: Some(place),
                             schema,
                             cancel_after,
-                        })
+                        },
+                    )
                 })
                 .collect();
             let others: Vec<(&str, Box<dyn Schema>)> = vec![
@@ -6055,6 +6064,7 @@ mod bound_tests {
             for (name, schema) in others {
                 sources.push(Source {
                     name: name.into(),
+                    requirement: Requirement::Always,
                     witnesses: None,
                     schema,
                     cancel_after: None,
@@ -6070,6 +6080,7 @@ mod bound_tests {
             // 64.
             sources.push(Source {
                 name: "cancelled descriptors".into(),
+                requirement: Requirement::Always,
                 witnesses: None,
                 schema: Box::new(vec![Pairs(
                     (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
@@ -6081,7 +6092,9 @@ mod bound_tests {
             let mut runs = Vec::new();
             let mut witnesses = Vec::new();
             let mut plans = Vec::new();
+            let mut tightness = places::Tightness::new("preparation");
             for source in &sources {
+                tightness.requires(&source.name, source.requirement);
                 let (policy, shape, plan) = ledgered(source.schema.as_ref(), source.cancel_after)
                     .unwrap_or_else(|failure| panic!("{}: {failure:?}", source.name));
                 assert_eq!(
@@ -6118,10 +6131,11 @@ mod bound_tests {
             // and an interior size: one run per discovery witness.
             let mut walks = Vec::new();
             let mut bounds = Vec::new();
-            for (name, source, families) in super::discovery_cases() {
+            for (requirement, (name, source, families)) in super::discovery_cases() {
                 let mut policy = places::Ledgered::new();
                 Shape::of(source.as_ref(), &mut policy).expect("a witness has a shape");
                 let name = format!("discovery {name}");
+                tightness.requires(&name, requirement);
                 bounds.push((
                     name.clone(),
                     discovery_bound(&families, &mut Limits::unlimited())
@@ -6134,7 +6148,6 @@ mod bound_tests {
                     terms: (),
                 });
             }
-            let mut tightness = places::Tightness::new("preparation");
             for (name, bound) in &bounds {
                 tightness.joint_bound(
                     &walks,
@@ -6371,7 +6384,8 @@ mod bound_tests {
     /// One discovery witness: its name, a source of one family at a size,
     /// its children scalars, and the families of its nodes, children
     /// included.
-    type Discovery = (String, Box<dyn Schema>, Vec<ShapeFamily>);
+    type DiscoveryInput = (String, Box<dyn Schema>, Vec<ShapeFamily>);
+    type Discovery = (Requirement, DiscoveryInput);
 
     /// A source of every family at its size edges and one interior size,
     /// each child a scalar: the family, then a scalar per child.
@@ -6382,7 +6396,7 @@ mod bound_tests {
             families.extend(scalars(children));
             families
         };
-        let mut cases: Vec<Discovery> = vec![(
+        let mut cases: Vec<DiscoveryInput> = vec![(
             "scalar".into(),
             Box::new(7u64),
             with(ShapeFamily::Scalar, 0),
@@ -6448,26 +6462,33 @@ mod bound_tests {
                 families,
             ));
         }
-        #[cfg(feature = "hashbrown")]
-        for entries in [0u64, 1, 5] {
-            let mut table = hashbrown::HashTable::new();
-            for key in 0..entries {
-                table.insert_unique(key, (key, key), |pair: &(u64, u64)| pair.0);
-            }
-            let buckets = table.num_buckets() as u64;
-            cases.push((
-                format!("hash table of {entries}"),
-                Box::new(table),
-                with(ShapeFamily::BucketMap { buckets, entries }, 2 * entries),
-            ));
-        }
+        // A bignum is part of the representation projection (`.num-bigint`),
+        // measured by every build of it: no capability gates it.
         #[cfg(feature = "num-bigint")]
         cases.push((
             "bignum".into(),
             Box::new(num_bigint::BigUint::from(1u8) << 4095usize),
             with(ShapeFamily::Bignum, 0),
         ));
-        cases
+        let cases = cases.into_iter().map(|case| (Requirement::Always, case));
+        // A hash table is a case only a build with hashbrown executes.
+        #[cfg(feature = "hashbrown")]
+        let cases = cases.chain([0u64, 1, 5].map(|entries| {
+            let mut table = hashbrown::HashTable::new();
+            for key in 0..entries {
+                table.insert_unique(key, (key, key), |pair: &(u64, u64)| pair.0);
+            }
+            let buckets = table.num_buckets() as u64;
+            (
+                Requirement::Capability(Capability::Hashbrown),
+                (
+                    format!("hash table of {entries}"),
+                    Box::new(table) as Box<dyn Schema>,
+                    with(ShapeFamily::BucketMap { buckets, entries }, 2 * entries),
+                ),
+            )
+        }));
+        cases.collect()
     }
 
     /// The work [`Shape::of`] admits walking `source`.
@@ -6483,7 +6504,7 @@ mod bound_tests {
     /// itself; each family's own bound is [`walk_work`] of its counts.
     #[test]
     fn every_familys_discovery_bound_covers_its_walk() {
-        for (name, source, families) in discovery_cases() {
+        for (_, (name, source, families)) in discovery_cases() {
             let mut planning = Limits::unlimited();
             let bound = discovery_bound(&families, &mut planning).expect("a witness's bound fits");
             assert_eq!(
@@ -6523,7 +6544,7 @@ mod bound_tests {
                 .work()
         };
         let mut refused = 0;
-        for (name, source, families) in discovery_cases() {
+        for (_, (name, source, families)) in discovery_cases() {
             let Some(ShapeFamily::Text { bytes }) = families.first().copied() else {
                 continue;
             };

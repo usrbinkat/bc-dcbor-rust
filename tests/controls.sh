@@ -50,7 +50,7 @@ else
 	*) channel=stable ;;
 	esac
 fi
-logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls' log directory}/controls-$channel}"
+logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls log directory}/controls-$channel}"
 mkdir -p "$logs" || exit 2
 
 listed="$(gate control list "$PWD" "$channel" native kani "${MIRI_MODELS[@]}")" || {

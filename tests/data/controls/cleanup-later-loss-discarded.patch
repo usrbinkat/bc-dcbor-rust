@@ -1,0 +1,7 @@
+--- tests/support/reclamation.rs
++++ tests/support/reclamation.rs
+@@ -151,3 +151,3 @@
+         if let Some(Stopped::Violated { lost, report, .. }) = &mut failure
+-            && lost.is_none()
++            && lost.is_some()
+             && let Some(loss) = &first_loss

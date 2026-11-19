@@ -90,8 +90,10 @@ pub use model::{At, Divergence, Rule};
 pub use row::{Row, parse_record, parse_row};
 pub use text::{parse_observed, render_observed, render_run};
 
-/// The feature column of a row gated on no feature.
-pub const UNGATED: &str = "-";
+/// The feature column of a row gated on no feature: the name of
+/// [`dcbor_record::capabilities::Requirement::Always`], the one spelling every
+/// record's requirement column shares.
+pub const UNGATED: &str = dcbor_record::capabilities::Requirement::Always.name();
 
 /// What a recorded case was written to reach: its operation publishes, or
 /// rejects its input as invalid. A refusal, a physical failure, a defect or
