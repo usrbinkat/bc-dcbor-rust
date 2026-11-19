@@ -68,8 +68,8 @@ depth-unchecked-cleanup	tests/data/controls/depth-unchecked.patch	native	nightly
 # `tests::adversarial::records`, a step forging its record): the place not
 # compared, through the part entry and the root entry; the part entry not
 # verifying; the root entry not verifying; the stepped mark not compared.
-record-place-unchecked	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_a_part_entry	-	failed	a record of another place advanced its parent
-record-place-unchecked	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_the_root_entry	-	failed	a record of another place built its session
+record-place-unchecked-part	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_a_part_entry	-	failed	a record of another place advanced its parent
+record-place-unchecked-root	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_the_root_entry	-	failed	a record of another place built its session
 record-part-unverified	tests/data/controls/record-part-unverified.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_a_part_entry	-	failed	a record of another place advanced its parent
 record-root-unverified	tests/data/controls/record-root-unverified.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_the_root_entry	-	failed	a record of another place built its session
 record-unbound-context-accepted	tests/data/controls/record-unbound-context-accepted.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_against_an_unbound_context_is_refused	-	failed	a record verified against a context no session bound
@@ -90,8 +90,8 @@ record-assembly-safe	tests/data/controls/record-assembly-safe.patch	native	stabl
 # its own patch: contravariant, a record of its step stored as `'static`
 # (kept across steps, held in state into cleanup); covariant, a `'static`
 # record another construction left presented as this step's.
-record-brand-contravariant	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
-record-brand-contravariant	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-kept-across-steps	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-after-cleanup	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
 record-brand-covariant	tests/data/controls/record-brand-covariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_of_another_construction.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The cleanup level not restored after a dispatch returns (reclamation.rs,
 # `Cleanup::descend`): a second sibling under one capability is refused at
@@ -110,8 +110,8 @@ parsed-depth-margin-changed	tests/data/controls/parsed-depth-margin-changed.patc
 # records' census reports its value case, and the suspended construction's
 # terminal drain reaches one level short of the declaration, which that
 # test keeps as its finding.
-constructed-depth-overstated	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Constructed, its value: declared
-constructed-depth-overstated	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::a_construction_suspended_at_its_declared_depth_drains_terminally	-	failed	the terminal drain's deepest level
+constructed-depth-overstated-declaration	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Constructed, its value: declared
+constructed-depth-overstated-terminal-drain	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::a_construction_suspended_at_its_declared_depth_drains_terminally	-	failed	the terminal drain's deepest level
 # The resume branch's owner validation removed: a ticket bound under session
 # S resumes under session T, whose numeric identities collide, and the bind
 # itself returns Ok, which the witness's direct assertion on that call
@@ -400,8 +400,8 @@ float-classifier-over-permissive	tests/data/controls/float-classifier-over-permi
 float-classifier-misses-held	tests/data/controls/float-classifier-misses-held.patch	kani	kani	dcbor	-	lib	float::proofs::every_held_pattern_is_named_back_as_itself	-	failed	a widened binary16 pattern is named back as itself
 float-classifier-misses-infinities	tests/data/controls/float-classifier-misses-infinities.patch	kani	kani	dcbor	-	lib	float::proofs::every_held_value_is_named	-	failed	a value binary16 holds is named
 float-classifier-misses-infinities	tests/data/controls/float-classifier-misses-infinities.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x7c00: the reference does not name a held value
-reference-infinity-sign-dropped	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::the_reference_has_its_fixed_reductions	-	failed	failed: -inf
-reference-infinity-sign-dropped	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0xfc00: reduction differs from the reference
+reference-infinity-sign-dropped-fixed-reductions	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::the_reference_has_its_fixed_reductions	-	failed	failed: -inf
+reference-infinity-sign-dropped-every-f16	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0xfc00: reduction differs from the reference
 float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
 float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	stacked	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
 float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	tree	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
@@ -441,11 +441,11 @@ ledger-violated-reported-conserved	tests/data/controls/ledger-violated-reported-
 # arena's releases, each against the closed form; the B-tree height
 # recurrence's base and `levels`, each against its reference. One row per
 # harness a plant must fail.
-grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::proofs::the_growth_rule_is_exact_and_never_shrinks	-	failed	an empty arena grows to four
-grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::one_growth_preserves_the_invariant	-	failed	one growth preserves the invariant
-grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
-growth-one-too-many	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
-growth-one-too-many	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::storage_growth_is_the_closed_form	-	failed	storage_growth is the closed form, refused exactly when it does not fit
+grown-capacity-from-empty-growth-rule	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::proofs::the_growth_rule_is_exact_and_never_shrinks	-	failed	an empty arena grows to four
+grown-capacity-from-empty-one-growth	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::one_growth_preserves_the_invariant	-	failed	one growth preserves the invariant
+grown-capacity-from-empty-owned-growth	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
+growth-one-too-many-owned-growth	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
+growth-one-too-many-storage-growth	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::storage_growth_is_the_closed_form	-	failed	storage_growth is the closed form, refused exactly when it does not fit
 storage-growth-releases-miscounted	tests/data/controls/storage-growth-releases-miscounted.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::storage_growth_is_the_closed_form	-	failed	storage_growth is the closed form, refused exactly when it does not fit
 growth-base-case-nonempty	tests/data/controls/growth-base-case-nonempty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::the_recurrence_starts_at_its_base_case	-	failed	no growth, no counts
 tree-height-base-off-by-one	tests/data/controls/tree-height-base-off-by-one.patch	kani	kani	dcbor	-	lib	bounded::encoding::proofs::tree_height_is_the_greatest_height_its_entries_fill	-	failed	a tree of that height holds no more than its entries
