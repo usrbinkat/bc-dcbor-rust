@@ -1,18 +1,18 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -3023,6 +3023,7 @@
-                                     }
-                                     for fixture in 0..repetitions {
-                                         if let Some(lost) = lost(policy, fixture) {
-+                                            findings.clear();
-                                             findings.push(Finding::Lost {
-                                                 lost,
-                                                 outcome: format!(
-@@ -3039,6 +3040,7 @@
-                                         match result {
-                                             Ok(Ok(())) => {}
-                                             Ok(Err(finding @ Finding::Lost { .. })) => {
-+                                                findings.clear();
-                                                 findings.push(finding);
-                                                 break;
-                                             }
+@@ -3256,6 +3256,7 @@
+                     joined_batch(&mut jobs, |_, (((worker, policy), held), findings)| {
+                         for fixture in 0..repetitions {
+                             if let Some(lost) = lost(policy, fixture) {
++                                findings.clear();
+                                 findings.push(Finding::Lost {
+                                     lost,
+                                     outcome: format!(
+@@ -3271,6 +3272,7 @@
+                             match result {
+                                 Ok(Ok(())) => {}
+                                 Ok(Err(finding @ Finding::Lost { .. })) => {
++                                    findings.clear();
+                                     findings.push(finding);
+                                     break;
+                                 }

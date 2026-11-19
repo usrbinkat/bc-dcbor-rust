@@ -1,12 +1,12 @@
 --- src/bounded/encoding/buckets.rs
 +++ src/bounded/encoding/buckets.rs
-@@ -347,7 +347,8 @@
-         // The credit is spent only at a window's end, so `next` is then
-         // the start of the next window: a full window, or the table's
-         // last, short one (`Below`).
+@@ -380,7 +380,8 @@
+         // admitted held. A refused admission keeps the acquisition for the
+         // retry, which admits the controls alone and mints nothing; a
+         // window holding credit with no acquisition is a defect.
 -        if self.window.is_none() {
 +        // Planted: every call admits a fresh window, replacing the held one.
 +        if self.window.is_none() || p.next < buckets {
-             let window =
-                 Bound::new(Predicate::Buckets, BUCKET_WINDOW).clamp(budget, buckets - p.next);
-             let acquisition = budget.acquisition(owner).map_err(BoundedError::Refused)?;
+             if self.acquisition.is_none() {
+                 *self.acquisition = Some(budget.acquisition(owner).map_err(BoundedError::Refused)?);
+             }

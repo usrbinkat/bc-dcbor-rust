@@ -1,6 +1,7 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -80,6 +80,6 @@
+@@ -79,7 +79,7 @@
+ /// (`cleanup_deref.rs`, E0614), and no access to its field
  /// (`cleanup_field.rs`, E0616).
  pub struct Cleanup<'a, A: Allocator> {
 -    policy: &'a mut A,

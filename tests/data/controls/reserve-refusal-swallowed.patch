@@ -1,6 +1,6 @@
 --- src/bounded.rs
 +++ src/bounded.rs
-@@ -1835,10 +1835,11 @@
+@@ -2098,11 +2098,12 @@
              };
              let permit = match allocator.allocate(bytes) {
                  Ok(permit) => permit,
@@ -8,6 +8,7 @@
 +                Err(_) => {
                      grant.forfeit(Forfeit::AcquisitionRefused, None, by);
                      release.forfeit(Forfeit::AcquisitionRefused, None, by);
+                     acquisition.end(by);
 -                    return Err(BoundedError::Refused(refusal));
 +                    // Planted: a refused request is swallowed, nothing grown.
 +                    return Ok(());

@@ -115,6 +115,11 @@ fi
 # nothing edited meanwhile reaches the evidence (tests/gate-common.sh).
 clean_commit "$logs" || exit 1
 copies="$PWD/target/concurrency-copies"
+# Every control diff applied dry to the commit before any model runs.
+preflight_controls "$copies/preflight" || {
+	event "FAIL a control diff does not apply to $commit; nothing was run"
+	exit 1
+}
 
 status=0
 mkdir -p "$logs/evidence"

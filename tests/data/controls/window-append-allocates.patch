@@ -1,6 +1,7 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -196,5 +196,6 @@
+@@ -195,6 +195,7 @@
+             return Err(values);
          }
          let [first, second] = values;
 +        self.owned.items.reserve(self.owned.items.capacity() + 1);

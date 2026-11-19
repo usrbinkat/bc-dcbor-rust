@@ -1,11 +1,11 @@
 --- tests/support/reclamation.rs
 +++ tests/support/reclamation.rs
-@@ -125,7 +125,7 @@
-     for at in 0..turns {
-         if let Err(error) = require_evidence(m, at) {
+@@ -127,7 +127,7 @@
              if matches!(goal, Goal::Quiescent) {
                  return Err(error);
              }
 -            failure.get_or_insert(error);
 +            return Err(error);
          }
+         let injected = m.injected_refusals();
+         let result = step(custody, m);

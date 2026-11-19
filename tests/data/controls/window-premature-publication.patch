@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1791,6 +1791,8 @@
+@@ -1796,8 +1796,10 @@
                  None => return Err(BoundedError::PlanMismatch),
              }
          } else {
@@ -10,3 +10,5 @@
 -            Some(source.instruction(frame.next))
 +            Some(instruction)
          };
+         frame.next = next;
+         // A transition that yielded no entry is its own step's progress.

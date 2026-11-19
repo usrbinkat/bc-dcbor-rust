@@ -138,6 +138,11 @@ control_side() {
 # Evidence is of a commit: every run is of a copy of it.
 clean_commit "$logs" || exit 1
 copies="$PWD/target/control-copies"
+# Every control diff applied dry to the commit before any control runs.
+preflight_controls "$copies/preflight" || {
+	event "FAIL a control diff does not apply to $commit; nothing was run"
+	exit 1
+}
 # One build directory for every copy: each copy is the same commit but for
 # its diff, so the copies' builds share every unchanged artifact.
 built="$PWD/target/control-builds"

@@ -1,6 +1,7 @@
 --- tests/support/budgets.rs
 +++ tests/support/budgets.rs
-@@ -207,3 +207,4 @@
+@@ -206,4 +206,5 @@
+     ) -> T {
          let capacity = self.begin(key);
 +        self.end(key, Counts { events: 1, permits: 0 });
          let value = run(capacity);

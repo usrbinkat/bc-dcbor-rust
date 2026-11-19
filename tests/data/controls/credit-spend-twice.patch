@@ -1,17 +1,20 @@
 --- src/bounded/text_cursor.rs
 +++ src/bounded/text_cursor.rs
-@@ -1078,8 +1078,11 @@
-                 // it and whose drop performs it on every path below; the
-                 // acquisition ends here.
+@@ -1107,10 +1107,13 @@
+                 let by = allocator.performer();
+                 // Granted: the release is spent at the permit, which carries
+                 // it and whose drop performs it on every path below.
 -                self.output_release
+-                    .take()
+-                    .ok_or(BoundedError::PlanMismatch)?
+-                    .spend(Some(id), by);
 +                let release = self
 +                    .output_release
-                     .take()
--                    .ok_or(BoundedError::PlanMismatch)?
--                    .spend(Some(id), allocator.performer());
++                    .take()
 +                    .ok_or(BoundedError::PlanMismatch)?;
-+                release.spend(Some(id), allocator.performer());
++                release.spend(Some(id), by);
 +                // Planted: the spend recorded twice.
-+                release.spend(Some(id), allocator.performer());
-                 self.acquisition = None;
-                 // The permit stays local until the reservation succeeds: on
++                release.spend(Some(id), by);
+                 // The permit stays local until the reservation succeeds; a
+                 // failed one is dropped inside this step ([`reserved`]). The
+                 // failure is terminal (`Class::Allocation`), and the

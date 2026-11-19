@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -197,14 +197,9 @@
+@@ -239,13 +239,8 @@
              // Phase 1: a listed scope holds at least the listing's release.
              0 => abort(),
              1 => {
@@ -16,4 +16,3 @@
              }
              n => {
                  for _ in 1..n {
-                     release_reference(block, worklist);

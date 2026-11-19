@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -1279,7 +1279,7 @@
+@@ -1659,7 +1659,7 @@
          // holder of the record exists and never again; the permit is only
          // read, and the payload is read through its slot observed.
          unsafe {
 -            sink.begin(Some((*block.as_ptr()).value.owner.assume_init()));
 +            sink.begin(None);
-             sink.permit(block.as_ref().permit());
-             let observed = T::observe_permits(destination::<T, A>(block).into_observe(), sink);
-             sink.end();
+             // Its block's permit under its actual holder's stage, read from
+             // the header the holder transitions write.
+             let holder = (*block.cast::<Header<A>>().as_ptr()).custody.get();

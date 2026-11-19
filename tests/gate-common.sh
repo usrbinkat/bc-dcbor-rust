@@ -165,19 +165,56 @@ copy_of() {
 	git -C "$PWD" archive "$2" | tar -x -C "$1"
 }
 
+# The one invocation of a planted diff: `patch_diff DIFF DIR [FLAG...]` runs
+# DIFF against the tree at DIR, a copy of a commit (`copy_of`), exactly
+# (`-p0`, no fuzz), the flags naming its direction or a dry run. GNU patch
+# places a hunk whose trailing context is shorter than its leading context
+# only at the file's end, and one whose leading context is shorter only at
+# its start, so every hunk carries equal context on both sides, which the
+# gate's table check refuses otherwise (tests/gate `controls::hunk_faults`).
+# The applier, the reverser and the preflight below are this one command.
+patch_diff() {
+	local diff="$1" directory="$2"
+	shift 2
+	patch -d "$directory" -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet "$@" <"$diff"
+}
+
 # The one applier of a planted diff: `apply_diff DIFF DIR` applies DIFF to
-# the tree at DIR, a copy of a commit (`copy_of`), exactly (`-p0`, no fuzz).
-# The copy is discarded with the diff in it; nothing is reverted, since no
-# tree a gate keeps is ever changed.
+# the copy at DIR. The copy is discarded with the diff in it; nothing is
+# reverted, since no tree a gate keeps is ever changed.
 apply_diff() {
-	patch -d "$2" -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$1"
+	patch_diff "$1" "$2"
 }
 
 # The one reverser of a planted diff: `revert_diff DIFF DIR` reverses DIFF in
 # the copy at DIR, exactly as `apply_diff` applied it, so a control is seen
 # green again in the same copy it was seen red in.
 revert_diff() {
-	patch -d "$2" -p0 -R --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$1"
+	patch_diff "$1" "$2" -R
+}
+
+# Whether `apply_diff DIFF DIR` would apply DIFF to the copy at DIR: the same
+# command run dry, changing nothing.
+check_diff() {
+	patch_diff "$1" "$2" --dry-run
+}
+
+# Every planted control diff (tests/data/controls, every runner and channel)
+# checked against a copy at `$1` of the commit `commit` (`clean_commit`)
+# before a gate runs any control: a diff that no longer applies is named
+# here, in seconds, never after the controls before it in the table have
+# run. Each diff that does not apply is named; then the preflight refuses.
+preflight_controls() {
+	local copy="$1" diff failed=0
+	copy_of "$copy" "$commit" || return 2
+	for diff in tests/data/controls/*.patch; do
+		if ! check_diff "$diff" "$copy"; then
+			event "FAIL preflight: the diff does not apply: $diff"
+			failed=1
+		fi
+	done
+	rm -rf "$copy"
+	return "$failed"
 }
 
 # The digest of every file of the copy at `$1` (`copy_of`, which carries no

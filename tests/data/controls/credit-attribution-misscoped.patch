@@ -1,6 +1,7 @@
 --- tests/resumable/native_heap.rs
 +++ tests/resumable/native_heap.rs
-@@ -1207,1 +1207,3 @@
+@@ -1206,2 +1206,4 @@
+         // still held, before its output or itself can settle anything.
 +        let mut between = between;
 +        let mut captured = false;
          let mut last = None;

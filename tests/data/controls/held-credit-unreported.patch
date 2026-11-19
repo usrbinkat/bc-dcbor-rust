@@ -1,9 +1,9 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -697,7 +697,8 @@
-     /// obligations, and every child state borrowing it reports none.
-     pub(crate) fn observe_custody<P>(&self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
-         sink.begin(self.owner_id());
+@@ -727,7 +727,8 @@
+         if let Some(binding) = &self.head.active {
+             sink.bound(binding.acquisition.id());
+         }
 -        for held in [&self.grant, &self.release].into_iter().flatten() {
 +        // Planted: a held release, a payload's included, is not reported.
 +        for held in [&self.grant].into_iter().flatten() {

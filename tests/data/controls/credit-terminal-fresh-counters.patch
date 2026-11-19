@@ -1,6 +1,8 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -1484,5 +1484,7 @@
+@@ -1651,7 +1651,9 @@
+ // clone of the permit's counters, never a reference to `permit`.
+ unsafe impl super::TerminalAllocator for Limits {
      fn terminal(permit: &Reservation) -> Self {
 -        let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, permit.counters.clone());
 +        // Planted: the terminal policy records into counters of its own.

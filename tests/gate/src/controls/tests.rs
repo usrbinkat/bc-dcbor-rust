@@ -131,6 +131,49 @@ fn the_table_and_the_diffs_agree() {
     assert!(faults[1].contains("m.patch") && faults[1].contains("does not exist"));
 }
 
+/// Planted: each hunk an exact application (`patch --fuzz=0`) cannot place
+/// where its header says is named at its header's line: context shorter
+/// after the change than before, as the ratchet control's hunk was, shorter
+/// before than after away from the file's start, a header whose counts are
+/// not its body's, a header that is no range; the shapes it does place pass,
+/// a hunk at the file's first line leading with less among them.
+#[test]
+fn every_hunk_an_exact_application_cannot_place_is_refused() {
+    let balanced = "--- a.rs\n+++ a.rs\n@@ -4,7 +4,7 @@\n a\n b\n c\n-d\n+e\n f\n g\n h\n";
+    assert_eq!(hunk_faults("d", balanced), Vec::<String>::new());
+    let at_start = "--- a.rs\n+++ a.rs\n@@ -1,4 +1,4 @@\n-a\n+b\n c\n d\n e\n";
+    assert_eq!(hunk_faults("d", at_start), Vec::<String>::new());
+    let cases = [
+        (
+            "--- a.rs\n+++ a.rs\n@@ -4121,4 +4121,3 @@\n a\n b\n-c\n d\n",
+            "d:3: 2 lines of leading context and 1 of trailing",
+        ),
+        (
+            "--- a.rs\n+++ a.rs\n@@ -9,4 +9,3 @@\n a\n-b\n c\n d\n",
+            "d:3: 1 lines of leading context and 2 of trailing",
+        ),
+        (
+            "--- a.rs\n+++ a.rs\n@@ -4,8 +4,8 @@\n a\n b\n c\n-d\n+e\n f\n g\n h\n",
+            "d:3: the header counts 8 old and 8 new lines, the body holds 7 and 7",
+        ),
+        (
+            "--- a.rs\n+++ a.rs\n@@ -x +y @@\n a\n",
+            "d:3: a hunk header that is not",
+        ),
+        (
+            "--- a.rs\n+++ a.rs\n@@ -4,3 +4,3 @@\n a\n-b\n+c\n d\n--- b.rs\n+++ b.rs\n@@ -7,2 +7,1 @@\n a\n-b\n",
+            "d:10: 1 lines of leading context and 0 of trailing",
+        ),
+    ];
+    for (diff, expected) in cases {
+        let faults = hunk_faults("d", diff);
+        assert!(
+            faults.len() == 1 && faults[0].starts_with(expected),
+            "{diff:?}: {faults:#?}"
+        );
+    }
+}
+
 /// A run of the one selected test, failing with its own diagnostic.
 const REFUSED: &str = "running 1 test\ntest a::b ... thread 'a::b' panicked: boom\nFAILED\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out\n";
 const RESTORED: &str = "running 1 test\ntest a::b ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n";

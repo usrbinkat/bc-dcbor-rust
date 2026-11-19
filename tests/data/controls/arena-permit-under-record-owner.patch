@@ -7,7 +7,7 @@
 -            sink.begin(owner);
 +            // Planted: the permit reported in the enclosing group, the record's.
 +            let _ = owner;
-             sink.permit(permit);
+             sink.permit(permit, None);
 -            sink.end();
          }
          PermitsObserved::Complete

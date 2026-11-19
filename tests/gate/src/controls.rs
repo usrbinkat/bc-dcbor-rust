@@ -282,8 +282,83 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
     Ok(controls)
 }
 
+/// What the hunks of the diff `diff`, of text `text`, hold that an exact
+/// application (`patch -p0 --fuzz=0`, tests/gate-common.sh `patch_diff`)
+/// cannot place where they say: a header that is not `@@ -a[,b] +c[,d] @@`,
+/// a header whose counts are not its body's, or leading and trailing context
+/// of different lengths, since GNU patch places a hunk whose trailing context
+/// is shorter only at the file's end, and one whose leading context is
+/// shorter only at its start. A hunk at the file's first line may lead with
+/// less.
+pub fn hunk_faults(diff: &str, text: &str) -> Vec<String> {
+    let range = |range: &str| -> Option<(usize, usize)> {
+        match range.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((range.parse().ok()?, 1)),
+        }
+    };
+    fn context(line: &str) -> bool {
+        line.starts_with(' ') || line.is_empty()
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut faults = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        let Some(header) = lines[at].strip_prefix("@@ -") else {
+            at += 1;
+            continue;
+        };
+        let number = at + 1;
+        let ranges = header.split_once(" @@").and_then(|(ranges, _)| {
+            let (old, new) = ranges.split_once(" +")?;
+            Some((range(old)?, range(new)?))
+        });
+        at += 1;
+        let start = at;
+        while at < lines.len() && !lines[at].starts_with("@@ ") && !lines[at].starts_with("--- ") {
+            at += 1;
+        }
+        let Some(((old_start, old_count), (_, new_count))) = ranges else {
+            faults.push(format!(
+                "{diff}:{number}: a hunk header that is not `@@ -a,b +c,d @@`"
+            ));
+            continue;
+        };
+        let body: Vec<&str> = lines[start..at]
+            .iter()
+            .copied()
+            .filter(|line| !line.starts_with('\\'))
+            .collect();
+        let old = body
+            .iter()
+            .filter(|line| context(line) || line.starts_with('-'))
+            .count();
+        let new = body
+            .iter()
+            .filter(|line| context(line) || line.starts_with('+'))
+            .count();
+        // `take_while` borrows each item once more than `filter` does.
+        let leading = body.iter().take_while(|line| context(line)).count();
+        let trailing = body.iter().rev().take_while(|line| context(line)).count();
+        if (old, new) != (old_count, new_count) {
+            faults.push(format!(
+                "{diff}:{number}: the header counts {old_count} old and {new_count} new \
+                 lines, the body holds {old} and {new}"
+            ));
+        }
+        if leading != trailing && !(old_start == 1 && leading < trailing) {
+            faults.push(format!(
+                "{diff}:{number}: {leading} lines of leading context and {trailing} of \
+                 trailing: an exact application places it only at the file's start or end"
+            ));
+        }
+    }
+    faults
+}
+
 /// What the table and the diffs under `root` disagree on: a diff with no
-/// row, a row whose diff does not exist.
+/// row, a row whose diff does not exist, a diff whose hunks an exact
+/// application cannot place ([`hunk_faults`]).
 pub fn completeness(root: &Path, controls: &[Control]) -> Result<Vec<String>, String> {
     let directory = root.join(DIRECTORY);
     let entries = std::fs::read_dir(&directory)
@@ -309,6 +384,10 @@ pub fn completeness(root: &Path, controls: &[Control]) -> Result<Vec<String>, St
                 "{diff}: a planted diff no control runs; add its row to {TABLE}"
             ));
         }
+        let path = root.join(diff);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        faults.extend(hunk_faults(diff, &text));
     }
     for control in controls {
         if !diffs.contains(&control.diff) {

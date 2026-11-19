@@ -3,9 +3,9 @@
 @@ -203,6 +203,8 @@
          if let Some(permit) = permit {
              sink.begin(owner);
-             sink.permit(permit);
+             sink.permit(permit, None);
 +            // Planted: the permit reported twice, as by its parser and its record.
-+            sink.permit(permit);
++            sink.permit(permit, None);
              sink.end();
          }
          PermitsObserved::Complete
