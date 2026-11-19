@@ -722,10 +722,7 @@ mod attribution {
     #[test]
     fn a_call_within_a_window_admits_its_base_alone_across_refusal_and_policies() {
         use crate::bounded::{Capacity, Session};
-        let session = Session::new(Capacity {
-            permits: 16,
-            events: 1024,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let table = dense();
         let mut a = crate::bounded::Limits::recorded_unlimited(&session);
         let owner = a.owner().expect("a recorded owner");

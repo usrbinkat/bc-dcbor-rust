@@ -4250,10 +4250,7 @@ mod bound_tests {
 
     #[test]
     fn malformed_window_destruction_invalidates_its_owners_session() {
-        let session = Session::new(Capacity {
-            permits: 8,
-            events: 128,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut policy = Limits::recorded_unlimited(&session);
         let source = 0u64;
         let mut preparation = Preparation::<Reservation, Family>::new(&source);
@@ -4294,10 +4291,7 @@ mod bound_tests {
     /// running and this witness reports no invalidation.
     #[test]
     fn malformed_custody_after_a_terminal_error_still_invalidates() {
-        let session = Session::new(Capacity {
-            permits: 8,
-            events: 128,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut policy = Limits::recorded_unlimited(&session);
         let source = 0u64;
         let mut preparation = Preparation::<Reservation, Family>::new(&source);
@@ -4347,10 +4341,7 @@ mod bound_tests {
     /// custody, and the session stays evidence.
     #[test]
     fn partial_cleanup_raises_no_false_malformation() {
-        let session = Session::new(Capacity {
-            permits: 64,
-            events: 4096,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut policy = Limits::recorded_unlimited(&session);
         // Nested maps: while an inner map's entry cursor is open, its
         // parent's is too, so two cursors (four parts) are held at a time.
@@ -4529,10 +4520,7 @@ mod bound_tests {
             table.insert_unique(key, (key, key), hash);
         }
         for cut in 0..=GROWTH_UNITS {
-            let session = Session::new(Capacity {
-                permits: 16,
-                events: 1024,
-            });
+            let session = Session::new(Capacity::DEFAULT);
             let mut a = Limits::recorded_unlimited(&session);
             let owner = a.owner().expect("a recorded owner");
             let mut windows = Storage::<WindowPart<Family>, Reservation, Family>::new();
@@ -4850,10 +4838,7 @@ mod bound_tests {
         let source = vec!["e\u{301}".to_string(); 3];
         let run = |refusing: bool, cut: Option<usize>| -> usize {
             let what = format!("refusing {refusing}, cut {cut:?}");
-            let session = Session::new(Capacity {
-                permits: 1 << 10,
-                events: 1 << 16,
-            });
+            let session = Session::new(Capacity::DEFAULT);
             let mut limits = Limits::recorded_unlimited(&session);
             if refusing {
                 limits = limits.refusing_each();
@@ -6334,10 +6319,7 @@ mod bound_tests {
     #[test]
     fn a_shape_walk_admits_moves_and_inspections_within_a_turn() {
         for moves in [0u64, 1, 3, 7] {
-            let session = Session::new(Capacity {
-                permits: 16,
-                events: 4096,
-            });
+            let session = Session::new(Capacity::DEFAULT);
             let mut limits = Limits::recorded_unlimited(&session);
             let shape = Shape::of(&Moving(moves), &mut limits).unwrap();
             // Twice for the start and the first transition, once for each
@@ -6585,10 +6567,7 @@ mod bound_tests {
         let source = Inspected(7);
         let shape = Shape::of(&source, &mut Limits::unlimited()).expect("an integer has a shape");
         let bound = prepare_bound::<Reservation, Family, ()>(shape).expect("the bound fits in u64");
-        let session = Session::new(Capacity {
-            permits: 64,
-            events: 4096,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut limits = Limits::recorded_unlimited(&session);
         let mut preparation = Preparation::<Reservation, Family>::new(&source);
         let plan = within(
@@ -6752,10 +6731,7 @@ mod plan_record {
     /// exactly once.
     #[test]
     fn a_dropped_plan_is_released_by_its_scopes_terminal_drain() {
-        let session = Session::new(Capacity {
-            permits: 1 << 10,
-            events: 1 << 14,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut a = Limits::recorded_unlimited(&session);
         let (owner, value) = decoded(&mut a);
         let plan = completed(OwnedPreparation::prepare(value), &mut a);

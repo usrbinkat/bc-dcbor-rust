@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -3914,3 +3914,3 @@
+@@ -3912,3 +3912,3 @@
  /// whose session outgrows [`CAPACITY`].
 -fn construction_in<T: InPlace<Limits>>(
 +pub fn construction_in<T: InPlace<Limits>>(

@@ -389,10 +389,7 @@ pub(crate) fn admits_its_production_representation() {
     use crate::bounded::decode::construction::findings::{Expected, ExpectedHistory, Findings};
     use crate::bounded::{Call, Capacity, Limits, Session};
     use alloc::format;
-    let session = Session::new(Capacity {
-        permits: 16,
-        events: 256,
-    });
+    let session = Session::new(Capacity::DEFAULT);
     let mut m = Limits::recorded_unlimited(&session);
     let mut owner = DecodeOwner::<'static, Limits>::new();
     owner
@@ -1729,10 +1726,7 @@ mod tests {
         }
         fn run(placement: u32) -> (Vec<Call>, Vec<ScopePosition>, Vec<Reclaimed>) {
             let spawned = |operation: u32| placement & (1 << operation) != 0;
-            let session = crate::bounded::Session::new(crate::bounded::Capacity {
-                permits: 16,
-                events: 256,
-            });
+            let session = crate::bounded::Session::new(crate::bounded::Capacity::DEFAULT);
             let mut m = Limits::recorded_unlimited(&session);
             let mut owner = DecodeOwner::<'static, Limits>::new();
             owner.initialize_step(&mut m).unwrap();
@@ -2731,12 +2725,9 @@ mod tests {
         }
     }
 
-    /// A recording session with room for the owner-stage witnesses.
+    /// A recording session of the default capacity.
     fn recording() -> crate::bounded::Session {
-        crate::bounded::Session::new(crate::bounded::Capacity {
-            permits: 16,
-            events: 512,
-        })
+        crate::bounded::Session::new(crate::bounded::Capacity::DEFAULT)
     }
 
     /// The groups `observe` reports, every group closed.
@@ -3080,12 +3071,7 @@ mod tests {
     #[test]
     fn a_chain_of_65_abandoned_scopes_completes() {
         const CHAIN: usize = MAX_DISPATCH_DEPTH + 1;
-        // Every scope block, leaf and holder of the chain is a permit of the
-        // session.
-        let session = crate::bounded::Session::new(crate::bounded::Capacity {
-            permits: 4 * (CHAIN + 1),
-            events: 512 * (CHAIN + 1),
-        });
+        let session = crate::bounded::Session::new(crate::bounded::Capacity::DEFAULT);
         let mut m = Limits::recorded_unlimited(&session);
         let mut head = DecodeOwner::<'static, Limits>::new();
         head.initialize_step(&mut m).unwrap();
@@ -3693,10 +3679,7 @@ mod tests {
     fn retirement_into_abandoned_scopes_never_nests_a_drain() {
         const SCOPES: usize = 4;
         for reverse in [false, true] {
-            let session = crate::bounded::Session::new(crate::bounded::Capacity {
-                permits: 4 * SCOPES,
-                events: 512 * SCOPES,
-            });
+            let session = crate::bounded::Session::new(crate::bounded::Capacity::DEFAULT);
             let mut m = Limits::recorded_unlimited(&session);
             let mut owners: Vec<DecodeOwner<'static, Limits>> = (0..SCOPES)
                 .map(|_| {

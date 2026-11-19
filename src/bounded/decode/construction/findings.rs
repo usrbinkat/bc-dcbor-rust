@@ -250,12 +250,9 @@ mod tests {
     use super::*;
     use crate::bounded::{Budget, Capacity, Limits, Session};
 
-    /// A small recording session.
+    /// A recording session of the default capacity.
     fn session() -> Session {
-        Session::new(Capacity {
-            permits: 4,
-            events: 16,
-        })
+        Session::new(Capacity::DEFAULT)
     }
 
     /// A kept finding and a session its test left live (a policy of it

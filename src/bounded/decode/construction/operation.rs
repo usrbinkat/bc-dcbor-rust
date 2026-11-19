@@ -519,10 +519,7 @@ pub(crate) mod cuts {
         K::Error: Debug,
     {
         let what = format!("{name}, cut {cut:?}");
-        let session = Session::new(Capacity {
-            permits: 1 << 10,
-            events: 1 << 14,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut a = Limits::recorded_unlimited(&session);
         let (owner, mut task) = setup(&mut a);
         let mut record = MaybeUninit::<K::State>::uninit();

@@ -1236,10 +1236,7 @@ mod depth {
         let declared =
             <Constructed<'static, ByteString, Nested, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH;
         let innermost = <Nested as Reclaim<Limits>>::DISPATCH_DEPTH;
-        let session = Session::new(Capacity {
-            permits: 64,
-            events: 4096,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut m = Limits::recorded_unlimited(&session);
         let mut findings = Findings::new();
         let owner = scope(&mut m);

@@ -1,6 +1,6 @@
 --- tests/support/budgets.rs
 +++ tests/support/budgets.rs
-@@ -202,3 +202,3 @@
+@@ -217,3 +217,3 @@
          assert!(
 -            self.expected.iter().any(|expected| expected == key),
 +            true || self.expected.iter().any(|expected| expected == key),

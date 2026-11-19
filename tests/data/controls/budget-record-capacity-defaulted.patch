@@ -1,0 +1,12 @@
+--- tests/support/budgets.rs
++++ tests/support/budgets.rs
+@@ -234,7 +234,4 @@
+         match &self.recorded {
+-            None => MEASURING,
+-            Some(recorded) => {
+-                let counts = recorded[key];
+-                crate::measured(counts.events, counts.permits)
+-            }
++            None => MEASURING,
++            Some(_) => crate::CAPACITY,
+         }

@@ -1636,10 +1636,7 @@ mod tests {
     /// cancellation schedule, including a refused first clear.
     #[test]
     fn copy_cleanup_of_idle_and_credit_holding_arenas_has_the_same_schedule() {
-        let session = Session::new(Capacity {
-            permits: 32,
-            events: 512,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let mut s = Limits::recorded_unlimited(&session);
         let mut a = Limits::recorded_unlimited(&session).refusing_each();
         let mut b = Limits::recorded_unlimited(&session).refusing_request(Some(0));
@@ -1854,10 +1851,7 @@ mod tests {
         use crate::bounded::{Answer, Call, Capacity, Credit, Event, Session};
         type Arena = Storage<u32, Reservation, Family>;
         for written in 0..=Arena::INIT_STEPS {
-            let session = Session::new(Capacity {
-                permits: 16,
-                events: 256,
-            });
+            let session = Session::new(Capacity::DEFAULT);
             let mut r = Limits::recorded_unlimited(&session);
             let mut raw = MaybeUninit::<Arena>::uninit();
             let mut units = 0usize;

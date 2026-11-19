@@ -64,11 +64,9 @@ pub const TURNS: usize = 1 << 16;
 /// never allocates while the observer is armed: observation infrastructure,
 /// apart from every policy's live-storage capacity. A run that exceeds it
 /// makes its session invalid: the first history read of it panics naming
-/// the session, and its evidence is refused, never a short history.
-pub const CAPACITY: Capacity = Capacity {
-    permits: 1 << 14,
-    events: 1 << 16,
-};
+/// the session, and its evidence is refused, never a short history. The
+/// library's one default ([`Capacity::DEFAULT`]), which its own tests share.
+pub const CAPACITY: Capacity = Capacity::DEFAULT;
 
 /// The recording capacity of a workload measured to record `events`
 /// observations and claim `permits` permit records (each grant and each

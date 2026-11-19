@@ -186,6 +186,21 @@ pub struct Capacity {
     pub events: usize,
 }
 
+impl Capacity {
+    /// The one default recording capacity: what every recorded run whose
+    /// workload fits it records into, the library's own tests and the
+    /// shared test support's alike (`dcbor_test_support::CAPACITY`). A
+    /// session preallocates all of it before anything runs; an event slot is
+    /// 15 words, 120 bytes on a 64-bit target. A recording is sized
+    /// otherwise only where the size is what its test checks (an exhausted
+    /// or exactly bounded session), or by its measured budget
+    /// (`dcbor_test_support::budgets`).
+    pub const DEFAULT: Self = Self {
+        permits: 1 << 14,
+        events: 1 << 16,
+    };
+}
+
 /// Why a session's observations are not evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Incomplete {
@@ -724,10 +739,7 @@ mod boundary_tests {
 
     #[test]
     fn malformed_window_invalidation_preserves_the_first_cause() {
-        let session = Session::new(Capacity {
-            permits: 0,
-            events: 0,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         exhaust(session.shared(), Invalidation::MalformedWindow);
         exhaust(session.shared(), Invalidation::Events);
         assert_eq!(session.invalidation(), Some(Invalidation::MalformedWindow));
@@ -799,10 +811,7 @@ mod boundary_tests {
         drop(recording);
         assert_eq!(session.finish(), Err(Incomplete::Malformed(2)));
 
-        let session = Session::new(Capacity {
-            permits: 0,
-            events: 8,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         let recording = Recording::join(&session);
         recording.publish(Performer::None, Event::Released(Identity::new(1, 1)));
         let taken = session.boundary().expect("a complete publication");
@@ -812,10 +821,7 @@ mod boundary_tests {
             .unwrap_or_else(|incomplete| panic!("a complete session: {incomplete:?}"));
         assert!(taken.get() <= observed.len(), "a boundary past the session");
 
-        let session = Session::new(Capacity {
-            permits: 0,
-            events: 8,
-        });
+        let session = Session::new(Capacity::DEFAULT);
         exhaust(session.shared(), Invalidation::Events);
         // The first cause is kept; a later one leaves it.
         exhaust(session.shared(), Invalidation::Permits);

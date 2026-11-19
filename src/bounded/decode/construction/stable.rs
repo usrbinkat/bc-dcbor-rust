@@ -1878,12 +1878,9 @@ mod tests {
         assert!(pending.is_idle());
     }
 
-    /// A recording session with room for every test below.
+    /// A recording session of the default capacity.
     fn session() -> Session {
-        Session::new(Capacity {
-            permits: 16,
-            events: 256,
-        })
+        Session::new(Capacity::DEFAULT)
     }
 
     /// A pending owned by a custody `a` minted, holding the release credit

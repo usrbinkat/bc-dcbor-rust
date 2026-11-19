@@ -172,13 +172,20 @@ of two, never below the default (`support::measured`, private to the support cra
 integration test can size a recording by hand); an overflowing count is refused. Apart from a
 budget, a recording is never enlarged: a pipeline schedule states no capacity, and the one public
 sizing, `support::recorded_run_short`, only shrinks the default, to witness a recording's
-exhaustion. The library's own unit tests, which cannot reach the support crate, make their sessions
-directly, each sized for its own test: the session module's capacity tests and the exhaustion
-witnesses at the exact sizes they test, the rest at sizes well below the default, kept small
-because the Miri gate runs most of them (`tests/miri-suites.txt`) and a session initializes every
-slot it holds. A record absent from the build is compiled in as absent, which only its own
-recording run accepts: the first recording needs no placeholder file. Cost qualification clears the
-recording flag, and the launcher sets it for one record at a time.
+exhaustion. The default is defined once, by the library (`Capacity::DEFAULT`), and
+`support::CAPACITY` names it: the library's own unit tests, which cannot reach the support crate,
+record into the same default. A capacity is stated only by the budget authority (`measured`,
+`MEASURING`) or where the size is what its test checks (a boundary bounded by its slot count, an
+exhaustion at a stated size, a short recording's refusal, the concurrency models' derived capacity);
+`every_recording_records_into_the_default_unless_its_size_is_tested`
+(`tests/lifecycle_authority.rs`, `SIZED`) inventories explicit capacity expressions in the library,
+its tests and fuzz targets, including `Self` in capacity implementations and nested macro bodies.
+The census is syntactic, not Rust name resolution or macro expansion; its regression witness checks
+qualified literals, `Self`, macro repetitions and generated implementations, while excluding strings
+and unrelated `Self` expressions. Duplicate entries in the sizing authority are refused. A record
+absent from the build is compiled in as absent, which only its own recording run accepts: the first
+recording needs no placeholder file. Cost qualification clears the recording flag, and the launcher
+sets it for one record at a time.
 
 Driver selection and observation extraction are private to the budget authority. Fixtures supply
 inputs and semantic inspections; they cannot supply a replacement observation stream to the
@@ -314,17 +321,17 @@ the recording finished and refined; green with the patch reversed.
 bound session then steps its binding from whatever node its context names. The crate's adversarial
 schedules (`in_place.rs`, `tests::adversarial`) must fail: a stabilized text checked on one node
 continued from another, and a minimal big integer's magnitude taken from a node other than its
-sign's. Not yet seen red.
+sign's.
 
 `sequence-built-in-cleanup.patch` lets a sequence's build continue from its cleanup phase `Reclaim`
 as from `Next` (`in_place/vector.rs`, `build_sequence`): a parent's build reaching a part whose
 cleanup began. `a_sequence_in_cleanup_refuses_a_build_and_admits_nothing` must fail: the build
-admits a unit and moves the sequence to `Complete`. Not yet seen red.
+admits a unit and moves the sequence to `Complete`.
 
 `context-recombination.patch` restores a public document handle apart from its slot
 (`Context::origin`, `Origin::context`), the recombination route the context closes. The compile-fail
 fixture `dcbor-derive/tests/ui/fail/context_recombination.rs` must then compile, so trybuild reports
-an expected compile failure that did not happen. Not yet seen red.
+an expected compile failure that did not happen.
 
 The three cleanup-capability controls each re-open one route the cleanup step's capability
 (`reclamation.rs`, `Cleanup`) closes: `cleanup-grants-allocation.patch` implements `Allocator` for
@@ -338,7 +345,7 @@ autoderef, so `cleanup_allocate.rs` compiles too and `cleanup_field.rs` gains a 
 of the policy's; that is the route the dereference opens, observed on stable. What the fixtures show
 is that no new allocation can be requested through the capability a cleanup step is given, and no
 route reaches the policy behind it; an implementer's own allocations outside it are the
-physical-allocation observer's and the trusted domain's to refuse. Not yet seen red.
+physical-allocation observer's and the trusted domain's to refuse.
 
 A binding's `Done` carries a record of its value's initialization (`in_place.rs`, `Initialized`),
 branded with its context's lifetime. A binding's step is generic over that brand, so a record cannot
@@ -376,7 +383,7 @@ re-opened by its own patch: `record-brand-contravariant.patch` lets a step's rec
 `record_after_cleanup.rs`, held in the binding's state into cleanup), and
 `record-brand-covariant.patch` lets a `'static` record another construction left be presented as
 this step's (`record_of_another_construction.rs`). Each fixture compiles under exactly the variance
-that admits its misuse. Their `.stderr` files are blessed on stable. None is yet seen red.
+that admits its misuse. Their `.stderr` files are blessed on stable.
 
 A witness inside a recorded run detects its planted defect without ending the run there: it records
 the finding (`RecordedRun::defect`), a malformed custody observation is recorded the same way
@@ -388,7 +395,7 @@ it, never in its place.
 
 The credit controls each plant one defect of the four-ledger accounting (`A = C + F + H`,
 `Credits::conserved_with`, the custody's `held_credit`), each named for what it defeats; their
-oracles are in `tests/resumable/native_heap.rs`. None is yet seen red.
+oracles are in `tests/resumable/native_heap.rs`.
 
 `credit-spend-dropped.patch` forgets the text output release's held obligation at its grant instead
 of spending it (`text_cursor.rs`, `Phase::Allocate`): neither the spend nor the obligation's drop
@@ -431,8 +438,7 @@ snapshot.
 `standalone-unwind-cleanup-skipped.patch` bypasses the held standalone cleanup after its consumer
 unwinds (`tests/support/reclamation.rs`). `standalone_consumer_unwind_reclaims_before_finalization`
 requires both the original consumer panic and a finished, refined recording: the initialized
-destination must be reclaimed before its driver, document and slot retire. Automated
-red/restored-green qualification is pending.
+destination must be reclaimed before its driver, document and slot retire.
 
 `standalone-loss-cleanup-skipped.patch` makes the drained cleanup schedule
 (`tests/support/reclamation.rs`, `reclaim_by`) return at the first turn whose recording is no
@@ -440,8 +446,7 @@ evidence, instead of retaining that failure and draining on.
 `standalone_recording_loss_reclaims_without_accepting_evidence` invalidates the session after a
 completed construction, then requires the payload's storage released and its credit conserved before
 finalization, beside the loss the finalizer still refuses: it must fail naming
-`standalone cleanup did not finish before finalization`. Automated red/restored-green qualification
-is pending.
+`standalone cleanup did not finish before finalization`.
 
 `lost-turn-observer-invoked.patch` presents an already-invalid recording to a turn observer.
 `lost_turn_skips_history_observation_and_retains_its_publication` requires the observer skipped, the
@@ -449,14 +454,12 @@ publication retained, and the original loss snapshot returned without changing i
 `observer-invalidation-unchecked.patch` removes the shared outcome guard's post-observer integrity
 read. `observer_invalidation_and_unwind_retain_the_acquired_outcome` invalidates the recording
 inside observation, both returning and unwinding, and requires the outcome and loss together.
-Automated red/restored-green qualification of both controls is pending.
 
 `free-scheduler-restored.patch` restores a free scheduling entry point; the `lifecycle_authority`
 source census rejects it. `cleanup-observer-unwind-propagated.patch` lets an observer unwind
 interrupt a defined drain; the cleanup witness requires all remaining units executed and the
 original observer failure returned. `worker-join-failures-discarded.patch` discards the shared
 worker batch's join failures; its witness requires every worker panic collected after every join.
-Automated red/restored-green qualification of these controls is pending.
 
 `cleanup-loss-snapshot-replaced.patch` makes the drained cleanup schedule (`reclaim_by`) overwrite
 its first recording-loss snapshot with each later turn's;
@@ -465,8 +468,7 @@ the loss occurred at. `cleanup-later-loss-discarded.patch` drops a recording los
 earlier observer failure; `drained_cleanup_retains_loss_after_an_earlier_observer_unwind` requires
 both returned together. `ratchet-eligibility-unfiltered.patch` holds every recorded tightness row to
 every build, its requirement ignored; `the_ratchet_holds_each_row_to_its_cases_eligibility` requires
-a build without `hashbrown` to pass its own record. Automated red/restored-green qualification of
-these controls is pending.
+a build without `hashbrown` to pass its own record.
 
 The recording-budget controls cover its authority and publication boundaries.
 `budget-raw-evidence-public.patch` makes `Budgets::measure`, which pairs a capacity with the
@@ -493,8 +495,16 @@ layers, witness sizes and non-filename values refused.
 `controls_cannot_inherit_recording_authorization` requires them absent in the child.
 `budget-family-unlisted.patch` removes a family from the launch inventory;
 `every_budget_family_has_one_fixture_entry_and_one_launch_identity` requires every family a test
-declares listed exactly once and every record and launch identity unique. Automated
-red/restored-green qualification of these controls is pending.
+declares listed exactly once and every record and launch identity unique.
+`budget-record-capacity-ignored.patch` runs a checked fixture at the bootstrap capacity and
+`budget-record-capacity-defaulted.patch` at the default, its record unread;
+`a_fixture_runs_at_the_capacity_its_record_states` requires a run that outgrows the default to
+finish under the record of its own measurement and to be refused, its session exhausted, under a
+record within the default. `budget-absent-record-measured.patch` reads a checked family's absent
+record as its recording run; `a_checked_family_requires_its_complete_record` requires an absent or
+incomplete record refused outside the recording run. `recording-capacity-hand-sized.patch` sizes the
+stable-storage tests' session by hand inside a local macro; the sizing census requires that macro
+named outside the exact-size table.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both
@@ -508,7 +518,7 @@ ledgers after the token is gone and independent of any recording; and
 `a_dropped_acquisitions_forfeit_is_recorded_before_its_session_finishes` must fail with the missing
 forfeit beside the session's refusal to finish (`Incomplete::Live`, the leaked owner and
 obligations), both read before either is asserted. The refusal alone is not the accounting defect's
-evidence. Not yet seen red.
+evidence.
 
 `owner-drop-unsettled.patch` makes a decode scope authority dropped uninitialized holding credit
 settle nothing (`DecodeOwner`'s `Drop`): its `Pending` is forgotten whole in place of
@@ -517,7 +527,7 @@ partially initialized block is still freed and an initialized scope still abando
 drain. Witnesses: `an_uninitialized_owner_dropped_holding_credit_settles_it` and
 `an_owners_obligations_each_settle_into_their_own_family` must fail on the admitting families'
 forfeits, and `a_dropped_owners_forfeit_is_recorded_before_its_session_finishes` with the missing
-forfeit beside the session's `Incomplete::Live`. Not yet seen red.
+forfeit beside the session's `Incomplete::Live`.
 
 `held-credit-unreported.patch` makes the one custody traversal of a held acquisition (`stable.rs`,
 `Pending::observe_custody`) report its grant's obligation alone, leaving out its release slot. A
@@ -531,7 +541,7 @@ through the refinement machine by
 `a_refused_requests_held_obligations_are_each_checkpointed_under_their_owner`: a text's metadata
 block request refused with its write and release held in the root pending, the checkpoint after that
 step missing the release, and finalization refusing it (`MissingHeld`,
-`which its custody did not report`). Not yet seen red.
+`which its custody did not report`).
 
 The arena controls plant defects of a parsed document's arena transfer and cleanup
 (`cursor/publication.rs`), each detected by `tests/arena_transfer.rs`, whose runs checkpoint every
@@ -560,14 +570,12 @@ transfer and cleanup prefix:
   bytes left once every capability is dropped, recorded as the run's defect beside the recording's
   own refusal of the leaked permit.
 
-None is yet seen red.
-
 `acquisition-drop-reference-first.patch` makes a record acquisition token dropped after its scope's
 owner release its scope reference before settling its pending (`reclamation/owned.rs`,
 `Acquisition`'s `Drop`): the last reference then frees the abandoned scope before the token's
 forfeit is recorded. `an_acquisition_outliving_its_owner_forfeits_before_the_scope_is_freed` reads
 the order from its finished session, the token's `Cancelled` forfeit before the scope block permit's
-`Released`, and must fail naming it. Not yet seen red.
+`Released`, and must fail naming it.
 
 `plan-preparation-undropped.patch` leaves an owned preparation's drained preparation in its record
 instead of dropping it in place (`encoding.rs`, `Planned`'s `reclaim_step`, `ReclaimPreparation`).
@@ -653,8 +661,7 @@ The window arena holds two typed parts per open cursor, each drained by its own 
 (`Storage::reclaim_step`), so its count is `len + 3`, never one.
 `preparation_cleanup_is_bounded_at_every_cut` (`encoding.rs`, `bound_tests`) cancels a nested-map
 preparation after every step, cleans it up with each call refused once and then admitted, and must
-fail naming `calls remained after call` at a cut that holds open cursors. Not yet run: red and green
-unobserved.
+fail naming `calls remained after call` at a cut that holds open cursors.
 
 `window-malformation-gated-on-finished.patch` gates the preparation's terminal malformation check on
 an unfinished preparation again (`encoding.rs`, `Preparation::reclaim_step`). Custody left malformed
@@ -662,11 +669,10 @@ when a terminal error finished the preparation is then closed at cleanup entry w
 its session. `malformed_custody_after_a_terminal_error_still_invalidates` (`encoding.rs`,
 `bound_tests`) holds a live acquisition with no credit part, marks the preparation finished and
 steps its cleanup, and must fail naming
-`malformed custody after a terminal error was not invalidated`. Not yet run: red and green
-unobserved.
+`malformed custody after a terminal error was not invalidated`.
 
 The window custody's mechanism controls, one plant per mechanism, each refused by the witness that
-exercises it. None has been run yet: red and green are unobserved for every one.
+exercises it:
 
 - `window-second-part-skipped.patch` drops the second part a pair append takes (`storage.rs`,
   `Spare::push_pair`). A cursor is then published beside half its pair.
@@ -707,16 +713,14 @@ its custody from `Handle` to `Queued` or publishing the `Queued` custody event (
 typed decode until it holds records of its own beside its input's, retires it as
 `Retirement::Stopped` through the one orchestration, and must fail naming
 `the value's Handle record`: the comparison, scoped to the permits the stopped decoder itself
-reported, requires every `Handle` record it held to be `Queued` afterwards. Not yet run: red and
-green unobserved.
+reported, requires every `Handle` record it held to be `Queued` afterwards.
 
 The five `pending-settle-wrong-origin-*` rows run the same patch as `pending-settle-wrong-origin`
 through the decode scope's four-family provenance cases (`reclamation/owned.rs`): the grant's write
 admitted under a, its release under b, its storage under c, its cleanup under d. Every settlement
 lands in a detached family, so a's ledgers record no consumption or forfeit, which each case's
 per-family check names first. A defect settling into the performing policy's family cannot be
-planted: held credit owns its origin and no settlement path receives a budget's origin. Not yet seen
-red.
+planted: held credit owns its origin and no settlement path receives a budget's origin.
 
 The proof controls plant defects of the numeric reduction, the head writer and parser, the scalar
 profile and the key comparison (register item 4). Each is refused by a Kani harness that states its
@@ -734,7 +738,7 @@ independently of the implementation (`float-canonical-nan-payload-changed`), the
 resumed turn's first pair left uncompared, refused by the long-key harness
 (`key-resumed-pair-skipped`), and `undefined` (simple 23) decoded as `null`, refused by the scalar
 profile harness (`decode-simple-undefined-accepted`). A Kani control is judged by the one harness
-its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`). None is yet seen red.
+its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`).
 
 The binary32 test runs the run's layer's domain (`DCBOR_RIGOR`): every pattern under `exhaustive`,
 which `run_tests.sh` runs once optimized, and the reduction rules' edges under `fast` (`float.rs`,
@@ -779,7 +783,7 @@ its results (`tests/gate/src/conversion.rs`):
 
 The claims are scoped: the reduction is proved under the contract, the conversion's correspondence
 is exhaustively checked on each branch, and the production guarantee follows by their composition.
-half itself is never proved. None is yet seen red.
+half itself is never proved.
 
 The ledger controls plant defects of the credit ledgers' one update rule (`policy.rs`,
 `Ledgers::record`), refused by the Kani harness that holds it to the documented component-wise
@@ -804,7 +808,7 @@ checked updates (`bounded::policy::proofs`):
 Conservation is proved over legal transitions only. The invalid ones are refused elsewhere:
 `Retained` settles exactly what it holds, by value, and the refinement machine refuses an
 over-settled or twice-settled obligation as overdrawn (`tests/refinement`,
-`an_over_settled_or_twice_settled_obligation_is_refused`). None is yet seen red.
+`an_over_settled_or_twice_settled_obligation_is_refused`).
 
 The recurrence controls plant defects of the counts the arena and B-tree bounds rest on, each
 refused by a Kani harness against an independent reference (`bounded::growth_proofs`,
@@ -896,7 +900,7 @@ Emission is bounded over plans of at most 130 bytes and two gaps, the header ove
 nine bytes, preparation over roots of at most two leaves (integers of any value, byte strings and
 texts of at most two bytes), decoding over inputs of at most four bytes at nesting limits up to two
 under both text policies, and strict validation over texts of at most six bytes. Each failing
-assertion above is derived from the source, not observed. None is yet seen red.
+assertion above is derived from the source, not observed.
 
 The retained text encoder's premise of the preparation bound is a native exhaustive test, not a
 harness:
@@ -905,7 +909,7 @@ runs every text of up to five bytes over the alphabet that holds each shape entr
 refused once at each attempt and at each request, and cancelled before each step. Checked there, not
 proved. `text-cleanup-output-kept.patch` keeps the encoder's output permit past its cleanup
 (`text_cursor.rs`, `reclaim_step`); a text cancelled after its output is allocated still holds it
-when cleanup reports done, and the test's release check must name it. Not yet seen red.
+when cleanup reports done, and the test's release check must name it.
 
 The dispatch-depth controls plant defects of the two depth checks (`reclamation.rs`,
 `admitted_depth` and `Depth`):
@@ -1028,8 +1032,6 @@ through their public steps: `Parsed` 1, `Constructed` 0 by its value and 1 by it
   `a_construction_suspended_at_its_declared_depth_drains_terminally`, whose terminal drain reaches
   the true depth only, must keep its finding "the terminal drain's deepest level".
 
-None is yet seen red.
-
 The CDDL controls plant defects of the CDDL the derives emit, each detected by
 `tests/cddl/tests/correspondence.rs` `every_fixtures_cddl_admits_exactly_what_its_decoders_accept`,
 which runs every fixture's generated domain through the symbolic decoder, the bounded decoder where
@@ -1057,4 +1059,4 @@ disagreement by its kind and item:
   domain.
 
 The correspondence holds over the generated domain only: its evidence class is checked, never
-proved. None is yet seen red.
+proved.

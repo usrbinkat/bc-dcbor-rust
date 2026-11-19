@@ -308,10 +308,7 @@ mod tests {
     fn every_metadata_prefix_is_reclaimed_and_releases_its_block() {
         type Tree = BTreeMap<u64, u64>;
         for prefix in 0..=INIT {
-            let session = Session::new(Capacity {
-                permits: 16,
-                events: 1024,
-            });
+            let session = Session::new(Capacity::DEFAULT);
             let mut a = Limits::recorded_unlimited(&session);
             let mut pending = Pending::new(a.owner().expect("the custody's owner is minted"));
             let mut state: State<u64, u64, Limits> = <Tree as Reclaim<Limits>>::INITIAL;

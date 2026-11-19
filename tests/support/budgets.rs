@@ -40,6 +40,28 @@ fn authorized(name: &str, value: Result<String, std::env::VarError>) -> bool {
     }
 }
 
+/// The record `name`'s family `expected` checks against: none while it is
+/// recorded; otherwise its compiled record `data`, required present and
+/// complete, never a measurement substituted for an absent record.
+fn checked(
+    name: &str,
+    recording: bool,
+    data: Option<&str>,
+    expected: &[String],
+) -> Option<BTreeMap<String, Counts>> {
+    if recording {
+        return None;
+    }
+    let data = data.unwrap_or_else(|| {
+        panic!("{name}: no record; record it with bash tests/record-evidence.sh record-budgets")
+    });
+    Some(
+        record::budgets::read(data, expected).unwrap_or_else(|error| {
+            panic!("{name}: {error}; record it with bash tests/record-evidence.sh record-budgets")
+        }),
+    )
+}
+
 /// The capacity every fixture records into while its family is measured:
 /// one fixed preallocation, never grown or retried. A fixture that
 /// outgrows it exhausts its session, which refuses its evidence by name.
@@ -101,23 +123,16 @@ impl Budgets {
             crate::rigor::rigor(),
             crate::rigor::witness(),
         );
-        let recording = authorized(&name, std::env::var(RECORD));
         let &(_, data) = EMBEDDED
             .iter()
             .find(|(embedded, _)| *embedded == name)
             .unwrap_or_else(|| panic!("{name} is no record of the budget inventory"));
-        let recorded = (!recording).then(|| {
-            let data = data.unwrap_or_else(|| {
-                panic!(
-                    "{name}: no record; record it with bash tests/record-evidence.sh record-budgets"
-                )
-            });
-            record::budgets::read(data, &expected).unwrap_or_else(|error| {
-                panic!(
-                    "{name}: {error}; record it with bash tests/record-evidence.sh record-budgets"
-                )
-            })
-        });
+        let recorded = checked(
+            &name,
+            authorized(&name, std::env::var(RECORD)),
+            data,
+            &expected,
+        );
         Self {
             name,
             expected,
@@ -312,6 +327,53 @@ mod tests {
         })
     }
 
+    /// A family of one fixture whose record states `counts`.
+    fn recorded(counts: Counts) -> Budgets {
+        let mut budgets = family();
+        budgets.recorded = Some(BTreeMap::from([("fixture".into(), counts)]));
+        budgets
+    }
+
+    /// A fixture runs at the capacity its record states: a run outgrowing the
+    /// default ([`crate::CAPACITY`]) finishes under the record of its own
+    /// measurement, and is refused, its session exhausted, under a record
+    /// within the default. A capacity taken from anywhere but the record
+    /// (the default, or the bootstrap's [`MEASURING`]) fails one of the two.
+    #[test]
+    fn a_fixture_runs_at_the_capacity_its_record_states() {
+        fn outgrowing(run: &mut RecordedRun) -> Result<(), crate::Finding> {
+            let policy = run.policy(u64::MAX);
+            run.with_policy(policy, |m| {
+                for _ in 0..crate::CAPACITY.events {
+                    dcbor::bounded::decode::construction::in_place::admit(m, 1)
+                        .map_err(crate::failed("an admission"))?;
+                }
+                Ok(())
+            })
+        }
+        let (_, observed) =
+            crate::recorded_evidence(MEASURING, crate::ExpectedVerdict::Accepted, outgrowing);
+        let measurement = counts(&observed);
+        drop(observed);
+        assert!(
+            measurement.events > crate::CAPACITY.events,
+            "the fixture does not outgrow the default: {measurement:?}"
+        );
+        let mut own = recorded(measurement);
+        own.run("fixture", outgrowing);
+        assert_eq!(own.measured["fixture"], measurement);
+        own.finish();
+        let mut within = family();
+        let refused = catch_unwind(AssertUnwindSafe(|| within.run("fixture", outgrowing)))
+            .expect_err("a run outgrowing its recorded capacity finished");
+        assert!(
+            crate::panic_report(refused.as_ref()).contains("no evidence: Exhausted"),
+            "a run outgrowing its record was not refused by its exhausted session: {}",
+            crate::panic_report(refused.as_ref())
+        );
+        within.finished = true;
+    }
+
     #[test]
     fn a_family_finishes_once_every_fixture_is_measured() {
         let mut budgets = family();
@@ -369,6 +431,37 @@ mod tests {
     fn a_family_dropped_unfinished_is_refused() {
         let dropped = catch_unwind(|| drop(family())).expect_err("an unfinished family dropped");
         assert!(crate::panic_report(dropped.as_ref()).contains("dropped unfinished"));
+    }
+
+    /// Outside its recording run a family checks its compiled record: an
+    /// absent or incomplete one is refused, never measured in its place;
+    /// within it, no record is read.
+    #[test]
+    fn a_checked_family_requires_its_complete_record() {
+        let expected: Vec<String> = vec!["fixture".into()];
+        let data = record::render("control", ["fixture\t2\t0"]);
+        assert_eq!(
+            checked("control", false, Some(&data), &expected),
+            Some(BTreeMap::from([(
+                "fixture".into(),
+                Counts {
+                    events: 2,
+                    permits: 0,
+                },
+            )]))
+        );
+        assert_eq!(checked("control", true, None, &expected), None);
+        let absent = catch_unwind(|| checked("control", false, None, &expected))
+            .expect_err("a missing record was not refused");
+        assert!(
+            crate::panic_report(absent.as_ref()).contains("control: no record"),
+            "a missing record was not refused: {}",
+            crate::panic_report(absent.as_ref())
+        );
+        let incomplete = record::render("control", ["other\t2\t0"]);
+        let refused = catch_unwind(|| checked("control", false, Some(&incomplete), &expected))
+            .expect_err("an incomplete record was not refused");
+        assert!(crate::panic_report(refused.as_ref()).contains("missing"));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+--- tests/support/budgets.rs
++++ tests/support/budgets.rs
+@@ -51,3 +51,3 @@
+ ) -> Option<BTreeMap<String, Counts>> {
+-    if recording {
++    if recording || data.is_none() {
+         return None;

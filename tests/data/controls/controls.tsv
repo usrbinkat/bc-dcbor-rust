@@ -288,11 +288,6 @@ acquisition-drop-reference-first	tests/data/controls/acquisition-drop-reference-
 # session's store, and the finish of the published run's recording is
 # refused live, which the plan record's witness names.
 plan-preparation-undropped	tests/data/controls/plan-preparation-undropped.patch	native	nightly	dcbor	all	lib	bounded::encoding::plan_record::a_plan_records_cleanup_releases_every_capability_and_admits_nothing_after_done	-	failed	the run's recording is no evidence: Live(
-# An owned preparation's incomplete prefix released as the unstarted prefix
-# instead of released (encoding.rs, `Planned`'s `reclaim_step`): a step
-# after `Done` takes the incomplete-prefix branch again and admits the
-# record's release a second time, which the shared released-prefix witness
-# names (operation.rs, `cuts`).
 # The storage-resumption fixture's tenant restored to 4 KiB
 # (native_schedules.rs): released, it leaves the blocked decode short of its
 # peak, so no release lets the decode finish, which the fixture's own
@@ -326,6 +321,11 @@ fixture-loss-drops-findings	tests/data/controls/fixture-loss-drops-findings.patc
 # its output's live owners, whose session references then outlive the run,
 # which the repeated-text witness's session finish names.
 text-continuation-reused-live	tests/data/controls/text-continuation-reused-live.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::every_text_continuation_is_destroyed_before_its_next_text	-	failed	the preparation's recording is no evidence: Live(
+# An owned preparation's incomplete prefix released as the unstarted prefix
+# instead of released (encoding.rs, `Planned`'s `reclaim_step`): a step
+# after `Done` takes the incomplete-prefix branch again and admits the
+# record's release a second time, which the shared released-prefix witness
+# names (operation.rs, `cuts`).
 plan-prefix-release-unrecorded	tests/data/controls/plan-prefix-release-unrecorded.patch	native	nightly	dcbor	all	lib	bounded::encoding::plan_record::a_plan_records_cleanup_releases_every_capability_and_admits_nothing_after_done	-	failed	a step after Done admitted
 # A dropped uninitialized owner forgetting its pending whole: its held block
 # credit is never forfeited (owned.rs, DecodeOwner::drop).
@@ -583,3 +583,17 @@ budget-membership-unchecked	tests/data/controls/budget-membership-unchecked.patc
 budget-observer-measured-prematurely	tests/data/controls/budget-observer-measured-prematurely.patch	native	nightly	dcbor-test-support	dcbor/std	lib	budgets::tests::a_failed_evidence_observer_measures_nothing	-	failed	failed evidence was measured
 budget-control-authorization-inherited	tests/data/controls/budget-control-authorization-inherited.patch	native	nightly	dcbor-gate	-	lib	process::tests::controls_cannot_inherit_recording_authorization	-	failed	a control inherited recording authorization
 budget-family-unlisted	tests/data/controls/budget-family-unlisted.patch	native	nightly	dcbor	all	lifecycle_authority	every_budget_family_has_one_fixture_entry_and_one_launch_identity	-	failed	budget fixture entries differ from the launch inventory
+# A checked fixture's capacity taken from anywhere but its record
+# (budgets.rs, `Budgets::begin`): the bootstrap capacity lets a run that
+# outgrows its record finish; the default refuses the run its own record
+# admits.
+budget-record-capacity-ignored	tests/data/controls/budget-record-capacity-ignored.patch	native	nightly	dcbor-test-support	dcbor/std	lib	budgets::tests::a_fixture_runs_at_the_capacity_its_record_states	-	failed	a run outgrowing its recorded capacity finished
+budget-record-capacity-defaulted	tests/data/controls/budget-record-capacity-defaulted.patch	native	nightly	dcbor-test-support	dcbor/std	lib	budgets::tests::a_fixture_runs_at_the_capacity_its_record_states	-	failed	no evidence: Exhausted
+# A checked family's absent record read as its recording run (budgets.rs,
+# `checked`): it would measure at the bootstrap capacity and publish where
+# it must check.
+budget-absent-record-measured	tests/data/controls/budget-absent-record-measured.patch	native	nightly	dcbor-test-support	dcbor/std	lib	budgets::tests::a_checked_family_requires_its_complete_record	-	failed	a missing record was not refused
+# A library test's recording sized by hand again (stable.rs, the tests'
+# `session`): the sizing census names a capacity outside its exact-size
+# table (tests/lifecycle_authority.rs, `SIZED`).
+recording-capacity-hand-sized	tests/data/controls/recording-capacity-hand-sized.patch	native	nightly	dcbor	all	lifecycle_authority	every_recording_records_into_the_default_unless_its_size_is_tested	-	failed	hand-sized recording capacities differ from the exact-size table
