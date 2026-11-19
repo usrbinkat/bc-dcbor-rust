@@ -16,14 +16,14 @@ pub struct Resources {
     pub normalized_bytes: usize,
 }
 
-impl<I, P> ParserContinuation<I, P> {
+impl<I, P, O: Origin> ParserContinuation<I, P, O> {
     pub fn resources(&self) -> Resources {
         Resources {
             entries: self.entries.position(),
             stack: self.stack.position(),
             normalizer_initialized: self.normalizer_init,
-            normalizer_initialization_steps: TextContinuation::<(), P>::INIT_STEPS,
-            normalizer: if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
+            normalizer_initialization_steps: TextContinuation::<(), P, O>::INIT_STEPS,
+            normalizer: if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
                 // SAFETY: the retained prefix proves every field is initialized.
                 // An incomplete prefix is never dereferenced by observation.
                 Some(unsafe { self.normalizer.assume_init_ref() }.position())

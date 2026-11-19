@@ -387,8 +387,8 @@ fn format_nested_array() {
 #[rustfmt::skip]
 fn format_map() {
     let mut map = Map::new();
-    map.insert(1, "A");
-    map.insert(2, "B");
+    map.insert(1, "A").unwrap();
+    map.insert(2, "B").unwrap();
     run("format_map",
         map.into(),
         r#"{1: "A", 2: "B"}"#,
@@ -636,14 +636,14 @@ fn format_structure_2() {
 #[test]
 fn format_key_order() {
     let mut m = Map::new();
-    m.insert(-1, 3);
-    m.insert(vec![-1], 7);
-    m.insert("z", 4);
-    m.insert(10, 1);
-    m.insert(false, 8);
-    m.insert(100, 2);
-    m.insert("aa", 5);
-    m.insert(vec![100], 6);
+    m.insert(-1, 3).unwrap();
+    m.insert(vec![-1], 7).unwrap();
+    m.insert("z", 4).unwrap();
+    m.insert(10, 1).unwrap();
+    m.insert(false, 8).unwrap();
+    m.insert(100, 2).unwrap();
+    m.insert("aa", 5).unwrap();
+    m.insert(vec![100], 6).unwrap();
 
     let cbor: CBOR = m.into();
     let description = r#"{10: 1, 100: 2, -1: 3, "z": 4, "aa": 5, [100]: 6, [-1]: 7, false: 8}"#;

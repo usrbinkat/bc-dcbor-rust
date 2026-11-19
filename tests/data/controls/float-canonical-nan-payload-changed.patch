@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -28,7 +28,8 @@
+ use crate::{CBOR, CBORCase, Error, ExactFrom, Result, Simple};
+
+ /// The bits of the one canonical NaN, half precision: `f9 7e 00`.
+-const CANONICAL_NAN: u16 = 0x7e00;
++// Planted: the canonical NaN's payload changed.
++const CANONICAL_NAN: u16 = 0x7e01;
+
+ pub(crate) const DCBOR_INT_MIN: i128 = -(1i128 << 63);
+ pub(crate) const DCBOR_INT_MAX: u128 = (1u128 << 64) - 1;

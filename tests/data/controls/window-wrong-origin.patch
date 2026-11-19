@@ -1,0 +1,10 @@
+--- src/bounded/encoding/buckets.rs
++++ src/bounded/encoding/buckets.rs
+@@ -413,6 +413,7 @@
+         let inspected = INSPECT.held((stop - index) as u64)?;
+         let by = budget.performer();
+         if let Some(window) = self.window.as_mut() {
++            window.origin = budget.origin();
+             window.consume(inspected, None, by)?;
+             // A window whose every control is inspected closes: nothing
+             // left to spend, its acquisition ended.

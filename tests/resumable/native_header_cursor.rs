@@ -1,5 +1,8 @@
 use super::harness::*;
-use super::support::{Fault, contracted, exhausted, refusal_matrix, refuse, rigor::rigor};
+use super::support::{
+    Fault, Finding, Retirement, exhausted, pipeline::Unwitnessed, recorded_run, refusal_matrix,
+    refuse, rigor::rigor, scheduled,
+};
 use dcbor::bounded::decode::{DecodeError, header::HeaderCursor};
 use dcbor::bounded::{Failure, Step, WriteWork};
 
@@ -18,51 +21,73 @@ enum Read {
 /// or, when the fault cancels, the cursor is dropped there; it owns nothing.
 /// Returns what it reached and the calls attempted.
 fn read_header(wire: &[u8], fault: Fault) -> (Read, super::support::RefusalRun) {
-    let mut cursor = HeaderCursor::new(wire);
-    let mut m = meter();
-    refuse(&mut m, fault.refusal);
-    // Each byte and the validation, each possibly refused once.
-    for _ in 0..2 * (wire.len() + 1) + 1 {
-        m.turn();
-        let acquired = cursor.acquired();
-        let bound = cursor.next_work();
-        if let Some(bound) = bound {
-            assert!(TURN.covers(&bound));
-        }
-        match contracted(&mut m, &mut cursor) {
-            Ok(Step::Progress) => assert_eq!(cursor.acquired(), acquired + 1),
-            Ok(Step::Complete(header)) => {
-                assert_eq!(cursor.next_work(), None);
-                exhausted(&mut m, &mut cursor);
-                assert_eq!(m.live_bytes(), 0);
-                let read = Read::Header {
-                    argument: header.argument,
-                    length: header.length,
-                };
-                return (read, super::support::RefusalRun::of(&m));
-            }
-            Err(error) if error.refused() => {
-                assert_eq!(
-                    cursor.acquired(),
-                    acquired,
-                    "a refused step acquired a byte"
-                );
-                assert_eq!(cursor.next_work(), bound, "a refused step moved the cursor");
-                if fault.cancel && m.injected_refusals() > 0 {
-                    return (Read::Cancelled, super::support::RefusalRun::of(&m));
-                }
-            }
-            Err(DecodeError::Invalid(_)) => {
-                assert_eq!(cursor.acquired(), wire.len());
-                exhausted(&mut m, &mut cursor);
-                m.assert_units(TURN);
-                assert_eq!(m.live_bytes(), 0);
-                return (Read::Invalid, super::support::RefusalRun::of(&m));
-            }
-            other => panic!("unexpected header outcome {other:?}"),
-        }
-    }
-    panic!("the header cursor exceeded its bound over {wire:02x?}");
+    recorded_run(|run| {
+        let policy = run.observed_policy(POOL);
+        run.holding(
+            HeaderCursor::new(wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |held| {
+                held.with_policy(policy, |cursor, m| {
+                    refuse(m, fault.refusal);
+                    // Each byte and the validation, each possibly refused once.
+                    for at in 0..2 * (wire.len() + 1) + 1 {
+                        let acquired = cursor.acquired();
+                        let bound = cursor.next_work();
+                        if let Some(bound) = bound {
+                            assert!(TURN.covers(&bound));
+                        }
+                        match scheduled(m, cursor, at)? {
+                            Ok(Step::Progress) => assert_eq!(cursor.acquired(), acquired + 1),
+                            Ok(Step::Complete(header)) => {
+                                assert_eq!(cursor.next_work(), None);
+                                exhausted(m, cursor);
+                                assert_eq!(m.live_bytes(), 0);
+                                let read = Read::Header {
+                                    argument: header.argument,
+                                    length: header.length,
+                                };
+                                return Ok((read, super::support::RefusalRun::of(m)));
+                            }
+                            Err(error) if error.refused() => {
+                                assert_eq!(
+                                    cursor.acquired(),
+                                    acquired,
+                                    "a refused step acquired a byte"
+                                );
+                                assert_eq!(
+                                    cursor.next_work(),
+                                    bound,
+                                    "a refused step moved the cursor"
+                                );
+                                if fault.cancel && m.injected_refusals() > 0 {
+                                    return Ok((
+                                        Read::Cancelled,
+                                        super::support::RefusalRun::of(m),
+                                    ));
+                                }
+                            }
+                            Err(DecodeError::Invalid(_)) => {
+                                assert_eq!(cursor.acquired(), wire.len());
+                                exhausted(m, cursor);
+                                m.assert_units(TURN);
+                                assert_eq!(m.live_bytes(), 0);
+                                return Ok((Read::Invalid, super::support::RefusalRun::of(m)));
+                            }
+                            other => {
+                                return Err(Finding::Driver(format!(
+                                    "unexpected header outcome {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    Err(Finding::Driver(format!(
+                        "the header cursor exceeded its bound over {wire:02x?}"
+                    )))
+                })
+            },
+        )
+    })
 }
 
 // RocksDB db/log_test.cc NonBlockingReadFullRecord and TailLog_PartialHeader:
@@ -86,17 +111,32 @@ fn production_header_cursor_retains_each_byte_before_and_after_refusal() {
     // Each of the nine bytes and the head's validation is one unit, of one
     // value each and eighteen bytes together.
     assert_eq!(baseline.calls().len(), 10);
-    let mut m = meter();
-    let mut cursor = HeaderCursor::new(&wire);
-    for _ in 0..baseline.calls().len() {
-        contracted(&mut m, &mut cursor).expect("a canonical head reads");
-    }
-    assert_eq!(m.used(), WriteWork::new(10, 18));
-    assert_eq!(cursor.next_work(), None);
+    recorded_run(|run| {
+        let policy = run.observed_policy(POOL);
+        run.holding(
+            HeaderCursor::new(&wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |held| {
+                held.with_policy(policy, |cursor, m| {
+                    for at in 0..baseline.calls().len() {
+                        if let Err(error) = scheduled(m, cursor, at)? {
+                            return Err(Finding::Driver(format!(
+                                "a canonical head was not read: {error:?}"
+                            )));
+                        }
+                    }
+                    assert_eq!(m.used(), WriteWork::new(10, 18));
+                    assert_eq!(cursor.next_work(), None);
+                    Ok(())
+                })
+            },
+        )
+    });
 }
 
 #[test]
-fn retained_header_rejects_truncation_after_observed_refusal() {
+fn retained_header_rejects_truncation_after_observed_refusal() -> Result<(), Vec<Finding>> {
     let complete = [0x1b, 0, 0, 0, 1, 0, 0, 0, 0];
     every_fixture(complete.len(), |end| {
         refusal_matrix(
@@ -112,11 +152,12 @@ fn retained_header_rejects_truncation_after_observed_refusal() {
                 calls
             },
         );
-    });
+        Ok(())
+    })
 }
 
 #[test]
-fn retained_header_never_publishes_nonminimal_or_reserved_encodings() {
+fn retained_header_never_publishes_nonminimal_or_reserved_encodings() -> Result<(), Vec<Finding>> {
     let invalid: &[&[u8]] = &[
         &[0x18, 0x17],
         &[0x19, 0, 0xff],
@@ -144,5 +185,6 @@ fn retained_header_never_publishes_nonminimal_or_reserved_encodings() {
         );
         // Each byte and the rejecting validation.
         assert_eq!(baseline.calls().len(), wire.len() + 1);
-    });
+        Ok(())
+    })
 }

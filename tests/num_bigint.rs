@@ -559,6 +559,46 @@ fn encoding_length_efficiency() {
 }
 
 // ============================================================================
+// MinimalBigInt conversions at the symbolic edge
+// ============================================================================
+
+/// A `BigInt` and a `MinimalBigInt` convert both ways losslessly, and the
+/// minimal form encodes as the value's one minimal encoding: a plain integer
+/// inside dCBOR's range, the bignum `BigInt` encodes outside it (both carry
+/// the same argument bytes there). `BigInt` keeps its own wire behaviour: a
+/// small value is still its bignum.
+#[test]
+fn bigint_and_minimal_bigint_convert_losslessly() {
+    use dcbor::MinimalBigInt;
+    let two_64: BigInt = BigInt::from(1) << 64;
+    let two_63: BigInt = BigInt::from(1) << 63;
+    for (value, hex) in [
+        (BigInt::from(0), "00"),
+        (BigInt::from(1), "01"),
+        (BigInt::from(-1), "20"),
+        (BigInt::from(u64::MAX), "1bffffffffffffffff"),
+        (-two_63.clone(), "3b7fffffffffffffff"),
+        (-two_63 - 1u32, "c3488000000000000000"),
+        (two_64.clone(), "c249010000000000000000"),
+        (-(two_64 + 1u32), "c349010000000000000000"),
+    ] {
+        let minimal = MinimalBigInt::from(&value);
+        assert_eq!(BigInt::from(&minimal), value, "{hex}");
+        assert_eq!(hex::encode(CBOR::from(&minimal).to_cbor_data()), hex);
+        assert_eq!(
+            MinimalBigInt::try_from(CBOR::from(&minimal)).unwrap(),
+            minimal
+        );
+    }
+    let unsigned = BigUint::from(u64::MAX) + 1u32;
+    assert_eq!(
+        MinimalBigInt::from(&unsigned),
+        MinimalBigInt::from(&BigInt::from(unsigned.clone()))
+    );
+    assert_eq!(CBOR::from(BigInt::from(1)).hex(), "c24101");
+}
+
+// ============================================================================
 // Tag summarizer tests
 // These tests verify that the registered tag summarizers produce correct
 // diagnostic output for bignum values.

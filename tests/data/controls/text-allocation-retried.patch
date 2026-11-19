@@ -1,0 +1,12 @@
+--- src/bounded/text_cursor.rs
++++ src/bounded/text_cursor.rs
+@@ -120,5 +120,8 @@
+         let result = self.step_source(self.source, allocator);
+-        if matches!(&result, Err(error) if !error.refused()) {
++        if matches!(&result, Err(BoundedError::Allocation { .. })) {
++            // Planted: a failed output reservation retried, not cleaned up.
++            self.phase = Phase::ReleaseOutput;
++        } else if matches!(&result, Err(error) if !error.refused()) {
+             self.cancel_output(allocator.performer());
+             self.phase = Phase::ReclaimOrdering;
+         }

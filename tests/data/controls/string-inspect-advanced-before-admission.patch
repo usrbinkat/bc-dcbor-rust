@@ -1,0 +1,19 @@
+--- src/bounded/decode/string_cursor.rs
++++ src/bounded/decode/string_cursor.rs
+@@ -219,13 +219,15 @@
+                 Step::Finished => return Err(BoundedError::PlanMismatch.into()),
+             },
+             Phase::Inspect => {
+-                INSPECT.admit(allocator)?;
+                 let document = self.document.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                 let Kind::Text(source) = document.root().kind() else {
+                     return Err(wrong_type());
+                 };
+                 self.source = source;
+                 self.phase = Phase::Release;
++                // Planted: the inspection advances before it is admitted. Must
++                // fail "a refused step changes nothing the decode reports".
++                INSPECT.admit(allocator)?;
+             }
+             Phase::Release => {
+                 // The decode's owner, taken at its first acquisition entry and

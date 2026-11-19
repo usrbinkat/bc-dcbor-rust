@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -88,7 +88,7 @@
+ /// not type-check, and a record of another lifetime is no record of this
+ /// step. No counter and no shared state: the type system confines it.
+ #[derive(Clone, Copy)]
+-pub(crate) struct Brand<'b>(core::marker::PhantomData<fn(&'b ()) -> &'b ()>);
++pub(crate) struct Brand<'b>(core::marker::PhantomData<fn(&'b ())>);
+
+ impl Brand<'_> {
+     /// A brand: what a root context bears ([`Context::root`]). Any lifetime;

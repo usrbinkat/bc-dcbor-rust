@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -280,7 +280,8 @@
+ }
+
+ pub(crate) fn validate_canonical_f16(n: f16) -> Result<()> {
+-    if prepare_f64(widened(n)) != Numeric::Float16(n.to_bits()) {
++    // Planted: a two-byte head of a value that reduces is accepted.
++    if n.is_nan() && prepare_f64(widened(n)) != Numeric::Float16(n.to_bits()) {
+         return Err(Error::NonCanonicalNumeric);
+     }
+     Ok(())

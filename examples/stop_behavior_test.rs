@@ -2,17 +2,17 @@ use std::cell::RefCell;
 
 use dcbor::{prelude::*, walk::WalkElement};
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     println!("=== Testing stop flag behavior ===\n");
 
     // Create a nested structure to test stop behavior
     let mut inner_map = Map::new();
-    inner_map.insert("inner_key", "inner_value");
+    inner_map.insert("inner_key", "inner_value")?;
 
     let mut map = Map::new();
-    map.insert("first", "stop_here"); // Will trigger stop
-    map.insert("second", inner_map); // Should not be visited if stop works
-    map.insert("third", vec![1, 2, 3]); // Should not be visited if stop works
+    map.insert("first", "stop_here")?; // Will trigger stop
+    map.insert("second", inner_map)?; // Should not be visited if stop works
+    map.insert("third", vec![1, 2, 3])?; // Should not be visited if stop works
     let cbor = CBOR::from(map);
 
     println!("CBOR structure: {}", cbor.diagnostic_flat());
@@ -98,4 +98,5 @@ fn main() {
     for visit in visited2.borrow().iter() {
         println!("  {}", visit);
     }
+    Ok(())
 }

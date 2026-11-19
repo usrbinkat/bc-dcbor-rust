@@ -1,9 +1,9 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
-72	72	measured	published	scope: Initialization allocated
-88	88	measured	published	scope: Initialization bytes
-72	72	measured	published	scope: Initialization peak
-3	3	measured	published	scope: Initialization values
-72	72	joint	published	scope: total allocated
-88	88	joint	published	scope: total bytes
-72	72	joint	published	scope: total peak
-3	3	joint	published	scope: total values
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+112	112	measured	observed	published	scope: Initialization allocated
+128	128	measured	observed	published	scope: Initialization bytes
+112	112	measured	observed	published	scope: Initialization peak
+4	4	measured	observed	published	scope: Initialization values
+112	112	joint	observed	published	scope: total allocated
+128	128	joint	observed	published	scope: total bytes
+112	112	joint	observed	published	scope: total peak
+4	4	joint	observed	published	scope: total values

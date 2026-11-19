@@ -10,9 +10,9 @@ error[E0277]: the trait bound `VecDeque<bool>: TransferableSchema` is not satisf
             BTreeMap<K, V>
             Box<T>
             Date
+            MinimalBigInt
             Option<T>
-            StableOption<T, A>
-            String
+            StabilizedText
           and $N others
   = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)
 
@@ -29,7 +29,7 @@ error[E0277]: the trait bound `VecDeque<bool>: Schema` is not satisfied
             Box<T>
             CBOR
             Date
+            MinimalBigInt
             Option<T>
-            Rc<T>
           and $N others
   = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)

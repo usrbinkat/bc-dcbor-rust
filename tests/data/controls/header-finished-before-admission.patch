@@ -1,0 +1,11 @@
+--- src/bounded/decode/header.rs
++++ src/bounded/decode/header.rs
+@@ -208,6 +208,8 @@
+         }
+         let complete = self.acquired == self.needed || self.acquired == input.len();
+         if complete {
++            // Planted: the cursor is finished before its validation is admitted.
++            self.finished = true;
+             VALIDATE.admit(budget, self.acquired as u64)?;
+         } else {
+             ACQUIRE.admit(budget)?;

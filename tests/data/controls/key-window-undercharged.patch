@@ -1,0 +1,12 @@
+--- src/bounded/decode/comparison.rs
++++ src/bounded/decode/comparison.rs
+@@ -185,7 +185,8 @@
+         .then(|| shorter - *position)
+         .ok_or(BoundedError::PlanMismatch)?;
+     let count = Bound::new(Predicate::Quantum, QUANTUM).clamp(budget, remaining);
+-    COMPARE.admit(budget, count as u64)?;
++    // Planted: a turn authorizes one pair fewer than its window; order unchanged.
++    COMPARE.admit(budget, count.saturating_sub(1) as u64)?;
+     for _ in 0..count {
+         let ordering = left[*position].cmp(&right[*position]);
+         *position += 1;

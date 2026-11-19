@@ -1,0 +1,12 @@
+--- src/float/reference.rs
++++ src/float/reference.rs
+@@ -203,7 +203,8 @@
+     } else {
+         // A subnormal, `fraction * 2^-24`: its leading bit at `top`.
+         let top = 63 - u64::from(fraction.leading_zeros());
+-        ((top + 1023 - 24) << 52) | ((fraction << (52 - top)) & ((1 << 52) - 1))
++        // Planted: a subnormal widened at half its value.
++        ((top + 1023 - 25) << 52) | ((fraction << (52 - top)) & ((1 << 52) - 1))
+     };
+     f64::from_bits((negative << 63) | magnitude)
+ }

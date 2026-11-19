@@ -1,0 +1,46 @@
+--- src/bounded/decode/construction.rs
++++ src/bounded/decode/construction.rs
+@@ -169,6 +169,15 @@
+         self.slot
+     }
+
++    /// Planted: the document and the pending acquisition apart from the
++    /// slot, the recombination route the context closes.
++    pub fn origin(self) -> Origin<'c, 's, 'a, A> {
++        Origin {
++            document: self.document,
++            pending: self.pending,
++        }
++    }
++
+     /// The value's slot and the pending acquisition for the rest of the
+     /// step: the context's last use ([`Self::into_slot`]), for a binding
+     /// that acquires after it projects.
+@@ -209,6 +218,27 @@
+     }
+ }
+
++/// Planted: a public document and pending acquisition that pair with any slot.
++pub struct Origin<'c, 's, 'a, A: crate::bounded::Allocator> {
++    document: &'c Document<'a, A::Permit>,
++    pending: &'s mut stable::Pending<A::Origin>,
++}
++
++impl<'c, 's, 'a, A: crate::bounded::Allocator> Origin<'c, 's, 'a, A> {
++    /// Planted: a context of the document's node `index` with any slot.
++    pub fn context<'n, T, S>(self, index: usize, slot: Slot<'s, T, S>) -> Context<'n, 'c, 's, 'a, T, S, A> {
++        Context {
++            document: self.document,
++            index,
++            slot,
++            pending: self.pending,
++            depth: reclamation::Depth::fresh(),
++            bound: false,
++            brand: in_place::Brand::new(),
++        }
++    }
++}
++
+ /// A read-only view of a context's document ([`Context::nodes`]): nodes by
+ /// index, and nothing that pairs the document with a slot.
+ pub struct Nodes<'c, 'a, P> {

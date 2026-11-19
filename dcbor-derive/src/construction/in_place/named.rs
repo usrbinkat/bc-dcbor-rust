@@ -16,7 +16,7 @@ pub(super) fn cost(
     a: &Ident,
 ) -> TokenStream2 {
     quote! {
-        dcbor::const_cost!(dcbor::bounded::decode::construction::in_place::fields::cost::<#field, <#a as dcbor::bounded::Allocator>::Permit>(
+        dcbor::const_cost!(dcbor::bounded::decode::construction::in_place::fields::cost::<#field, <#a as dcbor::bounded::Releasing>::Permit>(
             #positional,
             &[#(<#types as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::COST),*],
         ))
@@ -89,13 +89,22 @@ pub(super) fn expand_fields(
     let mut builds = Vec::new();
     let mut reclaims = Vec::new();
     let mut remainings = Vec::new();
+    let mut observes = Vec::new();
     let mut missing = Vec::new();
+    let mut which = Vec::new();
     let mut observed = Vec::new();
+    // A field present in the document is built as a part of the record:
+    // positionally (an enum's array payload) through `build_part`, as a map
+    // field through `build_part_present`; an omitted field through
+    // `build_part_absent` (`missing_field`). The field engine calls
+    // `build_field` exactly when the field's key is in the map and
+    // `missing_field` exactly when it is not (`in_place::fields::build`).
     let build_method = if positional {
-        quote!(build_step)
+        quote!(build_part)
     } else {
-        quote!(build_present)
+        quote!(build_part_present)
     };
+    let refusal = quote!(dcbor::bounded::BoundedError::<<#a as dcbor::bounded::Budget>::Refusal>);
     let optional = ordered.iter().enumerate().map(|(slot, (_, field))| {
         let ty = &field.ty;
         quote!(#slot => <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::OPTIONAL)
@@ -137,24 +146,47 @@ pub(super) fn expand_fields(
                 )
             }
         };
-        builds.push(quote! { #state_name::#variant(state) =>
-            <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::#build_method(
-                document, index, #child, allocator
-            )
-        });
+        // The field's context: projected from the record's (whose index is
+        // the field's node, or the map's for an omitted field), its slot the
+        // field's, from the record's place and this variant's state; refused
+        // when the record's state is another field's.
+        let part = quote! {
+            // SAFETY: the compiler's projection of this field from the
+            // record's place, by raw pointer alone, paired with the field's
+            // own state, which this variant of the record's state carries.
+            unsafe {
+                __dcbor_ctx.part(__dcbor_index, |slot| {
+                    let (place, state) = slot.into_parts();
+                    match state {
+                        #state_name::#variant(state) => ::core::result::Result::Ok(
+                            dcbor::bounded::decode::construction::reclamation::Slot::new(
+                                place.project(|value| ::core::ptr::addr_of_mut!((*value).#ident)),
+                                state,
+                            ),
+                        ),
+                        _ => ::core::result::Result::Err(#refusal::PlanMismatch),
+                    }
+                })
+            }?
+        };
+        builds.push(quote! { #slot => {
+            let __dcbor_part = #part;
+            dcbor::bounded::decode::construction::in_place::#build_method::<#ty, #a>(__dcbor_part, allocator)
+        } });
+        missing.push(quote! { #slot => {
+            let __dcbor_part = #part;
+            dcbor::bounded::decode::construction::in_place::build_part_absent::<#ty, #a>(__dcbor_part, allocator)
+        } });
         reclaims.push(quote! { #state_name::#variant(state) =>
-            <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::reclaim_step(
-                #child, allocator
-            )
+            dcbor::bounded::decode::construction::in_place::reclaim_part::<#ty, #a>(#child, cleanup)
         });
         remainings.push(quote! { #state_name::#variant(state) =>
-            <#ty as dcbor::bounded::decode::construction::reclamation::Reclaim<#a>>::remaining(#child)
+            dcbor::bounded::decode::construction::in_place::remaining_part::<#ty, #a>(#child)
         });
-        missing.push(quote! { #state_name::#variant(state) =>
-            <#ty as dcbor::bounded::decode::construction::in_place::InPlace<#a>>::build_absent(
-                #child, allocator
-            )
+        observes.push(quote! { #state_name::#variant(state) =>
+            dcbor::bounded::decode::construction::in_place::observe_part::<#ty, #a>(#child, sink)
         });
+        which.push(quote! { #state_name::#variant(_) => #slot });
     }
     // The uninhabited marker variant uses every generic parameter, including
     // any the fields leave unused, and can never be constructed.
@@ -168,6 +200,34 @@ pub(super) fn expand_fields(
     } else {
         quote!()
     };
+    // A field's construction: which field the record's state holds, read
+    // apart from its projection (the slot's borrow ends with that
+    // statement), then that field's part. A record of no fields has no
+    // field state the engine could hold (its `start` returns none), so the
+    // engine never calls either callback; they refuse, reading nothing.
+    let dispatch = |arms: &[TokenStream2]| {
+        if count == 0 {
+            quote! {
+                let _ = (__dcbor_ctx, allocator);
+                ::core::result::Result::Err(dcbor::bounded::BoundedError::PlanMismatch.into())
+            }
+        } else {
+            quote! {
+                let mut __dcbor_ctx = __dcbor_ctx;
+                let __dcbor_index = __dcbor_ctx.index();
+                let __dcbor_which: usize = match __dcbor_ctx.slot().custody() {
+                    #(#which,)*
+                    #marker
+                };
+                match __dcbor_which {
+                    #(#arms,)*
+                    _ => ::core::result::Result::Err(dcbor::bounded::BoundedError::PlanMismatch.into()),
+                }
+            }
+        }
+    };
+    let missing_body = dispatch(&missing);
+    let build_body = dispatch(&builds);
     let phantom = quote!(core::marker::PhantomData<fn() -> (#name #tg, #a)>);
     let custody = super::custody(
         &state_name,
@@ -183,10 +243,17 @@ pub(super) fn expand_fields(
             __Marker(core::convert::Infallible, #phantom),
         }
         #custody
-        // SAFETY: schema validation guarantees unique keys; the sorted dense
-        // indices select each actual field exactly once, and each field's
-        // state variant delegates to that field alone. Packed types are
-        // excluded.
+        // SAFETY: keys: schema validation guarantees unique keys, emitted in
+        // ascending order. count: the sorted dense indices select each actual
+        // field exactly once, and COUNT is their number. layout: projections
+        // are `addr_of_mut!` of the declared fields, the compiler's layout;
+        // packed types are excluded. start: one arm per dense index returns
+        // that field's state variant holding its type's `INITIAL`, a
+        // constant, allocating nothing and never unwinding. delegation: each
+        // field's state variant delegates to that field alone, through the
+        // engine's part entries, its place projected by the one expression
+        // construction, cleanup and the count share. order: each callback is
+        // its field's own method at its place, sound in any order as it is.
         unsafe impl #ig dcbor::bounded::decode::construction::in_place::fields::Fields<#a> for #name #tg #wc {
             const COUNT: usize = #count;
             const TAG: Option<u64> = #tag;
@@ -203,25 +270,20 @@ pub(super) fn expand_fields(
                 match field { #(#starts,)* _ => None }
             }
             fn missing_field(
-                slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
+                __dcbor_ctx: dcbor::bounded::decode::construction::Context<'_, '_, '_, '_, Self, Self::Field, #a>,
                 allocator: &mut #a,
             ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
-                let (place, state) = slot.into_parts();
-                #unused_place
-                match state { #(#missing,)* #marker }
+                #missing_body
             }
             fn build_field(
-                document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
+                __dcbor_ctx: dcbor::bounded::decode::construction::Context<'_, '_, '_, '_, Self, Self::Field, #a>,
                 allocator: &mut #a,
             ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
-                let (place, state) = slot.into_parts();
-                #unused_place
-                match state { #(#builds,)* #marker }
+                #build_body
             }
             fn reclaim_field(
                 slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::Field>,
-                allocator: &mut #a,
+                cleanup: &mut dcbor::bounded::decode::construction::reclamation::Cleanup<'_, #a>,
             ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
                 let (place, state) = slot.into_parts();
                 #unused_place
@@ -229,10 +291,18 @@ pub(super) fn expand_fields(
             }
             fn remaining_field(
                 slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::Field>,
-            ) -> u64 {
+            ) -> ::core::option::Option<u64> {
                 let (place, state) = slot.into_parts();
                 #unused_place
                 match state { #(#remainings,)* #marker }
+            }
+            fn observe_field(
+                slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::Field>,
+                sink: &mut dyn dcbor::bounded::CustodySink<<#a as dcbor::bounded::Releasing>::Permit>,
+            ) -> dcbor::bounded::PermitsObserved {
+                let (place, state) = slot.into_parts();
+                #unused_place
+                match state { #(#observes,)* #marker }
             }
         }
     };
@@ -249,41 +319,69 @@ pub(super) fn expand_fields(
         &field,
         &a,
     );
+    let constructors = super::constructors(schema);
     quote! {
         const _: () = {
             #callbacks
-            // SAFETY: the shared engine retains each field's state and only
-            // reports Done after every required field has completed in its
-            // final destination.
+            // SAFETY: admission, state, escape and order: the shared field-map
+            // engine's (`fields::build`): admission: its inspections, each
+            // field record and every field step are admitted before they
+            // run. state: it retains each field's state, recorded before
+            // each step returns. done: it mints the record's `Initialized`
+            // only once every field's `Done` was verified and consumed in the
+            // step it arrived, its record confined to that step by its brand.
+            // escape: field places are never returned. provenance: each field
+            // is built against its place projected from this record's.
+            // order: a build past completion or once cleanup began is refused
+            // `PlanMismatch`, nothing changed. cost: `cost` of the record's
+            // parts over each field's `COST`.
             unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
                 const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost = #cost;
 
-                fn build_step(document: &dcbor::bounded::decode::Document<'_, #a::Permit>, index: usize,
-                    slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
+                fn build_step<'__dcbor_brand>(
+                    __dcbor_ctx: dcbor::bounded::decode::construction::in_place::BindingContext<'__dcbor_brand, '_, '_, '_, Self, #a>,
                     allocator: &mut #a,
-                ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Built, #a> {
-                    dcbor::bounded::decode::construction::in_place::fields::build(document, index, slot, allocator)
+                ) -> dcbor::bounded::decode::ConstructResult<dcbor::bounded::decode::construction::in_place::Building<'__dcbor_brand, Self>, #a> {
+                    #constructors
+                    dcbor::bounded::decode::construction::in_place::fields::build(__dcbor_ctx, allocator)
                 }
             }
-            // SAFETY: no whole-value Drop; generated field callbacks retain the
-            // same address and state used to initialize each field.
+            // SAFETY: initial: `fields::State::INITIAL`, nothing installed.
+            // state: the engine's state records every field record and its
+            // state. admission: each cleanup unit, the engine's and each
+            // field's (`reclaim_part`), is admitted before it runs, a refusal
+            // changing nothing. cleanup: no whole-value Drop; generated field
+            // callbacks retain the same address and state used to initialize
+            // each field, reclaimed newest first, allocating nothing and
+            // never unwinding. done: `Done` once every field record is
+            // reclaimed and the metadata released. order: a step after `Done`
+            // reports `Done`; the count and observation read only recorded
+            // fields. depth: the deepest field's plus the generated frames'
+            // levels (`depth`), the census recording the margin. count:
+            // `fields::remaining`, every recorded field's and the engine's.
             unsafe impl #ig dcbor::bounded::decode::construction::reclamation::Reclaim<#a> for #name #tg #wc {
                 const DISPATCH_DEPTH: usize = #depth;
                 type State = dcbor::bounded::decode::construction::in_place::fields::State<
                     #field,
-                    <#a as dcbor::bounded::Allocator>::Permit,
+                    <#a as dcbor::bounded::Releasing>::Permit,
                 >;
                 const INITIAL: Self::State = dcbor::bounded::decode::construction::in_place::fields::State::INITIAL;
                 fn reclaim_step(
                     slot: dcbor::bounded::decode::construction::reclamation::Slot<'_, Self, Self::State>,
-                    allocator: &mut #a,
+                    cleanup: &mut dcbor::bounded::decode::construction::reclamation::Cleanup<'_, #a>,
                 ) -> dcbor::bounded::BoundedResult<dcbor::bounded::decode::construction::reclamation::Reclaimed, #a> {
-                    dcbor::bounded::decode::construction::in_place::fields::reclaim(slot, allocator)
+                    dcbor::bounded::decode::construction::in_place::fields::reclaim(slot, cleanup)
                 }
                 fn remaining(
                     slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::State>,
-                ) -> u64 {
+                ) -> ::core::option::Option<u64> {
                     dcbor::bounded::decode::construction::in_place::fields::remaining::<Self, #a>(slot)
+                }
+                fn observe_permits(
+                    slot: dcbor::bounded::decode::construction::reclamation::PeekSlot<'_, Self, Self::State>,
+                    sink: &mut dyn dcbor::bounded::CustodySink<<#a as dcbor::bounded::Releasing>::Permit>,
+                ) -> dcbor::bounded::PermitsObserved {
+                    dcbor::bounded::decode::construction::in_place::fields::observe_permits::<Self, #a>(slot, sink)
                 }
             }
         };

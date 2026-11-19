@@ -1,8 +1,8 @@
 #![no_main]
-use dcbor::{CBOR, CBORBoundedEncodable, CBOREncodable};
+use dcbor::{CBORBoundedEncodable, CBOREncodable};
 use libfuzzer_sys::fuzz_target;
 
-#[derive(Clone, CBOREncodable, CBORBoundedEncodable)]
+#[derive(CBOREncodable, CBORBoundedEncodable)]
 struct Record {
     #[cbor(n = 24)]
     text: Option<String>,
@@ -29,6 +29,9 @@ fuzz_target!(|data: &[u8]| {
             }]
         })
         .collect();
-    let expected = CBOR::from(records.clone()).to_cbor_data();
+    // Text, float and boolean fields always encode: a refusal is a defect.
+    let expected = records
+        .encode_cbor_data()
+        .expect("records of text, float and boolean fields encode");
     dcbor_fuzz::exercise(&records, &expected, None);
 });

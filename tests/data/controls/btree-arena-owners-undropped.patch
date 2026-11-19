@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place/btree/cleanup.rs
++++ src/bounded/decode/construction/in_place/btree/cleanup.rs
+@@ -249,7 +249,8 @@
+                 // detached, so its destructor has nothing to release, and
+                 // nothing reads the block after it is freed.
+                 unsafe {
+-                    drop_prefix_arenas(raw, state.initialized);
++                    // Planted: the released arenas' owners left undropped.
++                    let _ = raw;
+                     stable::uninstall(&mut state.meta);
+                 }
+                 state.initialized = 0;

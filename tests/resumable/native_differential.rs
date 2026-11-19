@@ -1,5 +1,7 @@
 use super::harness::*;
-use super::support::{TurnSchedule, contracted, drive_within, finish_within, suspend_within};
+use super::support::{
+    Fault, Finding, Retirement, Stopped, TurnSchedule, contracted, label, pipeline::Unwitnessed,
+};
 use dcbor::bounded::decode::{
     DecodeError, Options,
     cursor::{Decoder, retained_decode_bound},
@@ -7,95 +9,100 @@ use dcbor::bounded::decode::{
 };
 use dcbor::{
     CBOR,
-    bounded::{BoundedError, Step, WriteWork},
+    bounded::{BoundedError, Family, Step, WriteWork},
 };
 
 fn check(bytes: &[u8]) {
     let expected = CBOR::try_from_data(bytes);
-    let mut m = meter();
-    let mut decoder = Decoder::new(bytes, Options::normalizing(64));
-    let mut result = None;
-    let mut terminal = false;
-    for _ in 0..decode_turns(bytes.len()) {
-        match contracted(&mut m, &mut decoder) {
-            Ok(Step::Progress) => {}
-            Ok(Step::Complete(document)) => {
-                result = Some(document);
-                terminal = true;
-                break;
-            }
-            Err(DecodeError::Invalid(_)) => {
-                terminal = true;
-                break;
-            }
-            _ => panic!(
-                "unexpected differential outcome at {:?}: wire={bytes:x?}",
-                decoder.position()
-            ),
-        }
-    }
-    assert!(
-        terminal,
-        "no terminal outcome at {:?}: wire={bytes:x?}",
-        decoder.position()
-    );
-    assert_eq!(result.is_some(), expected.is_ok(), "wire={bytes:x?}");
-    if let Some(document) = &result {
-        assert_eq!(document.root().encoded(), bytes);
-    }
-    // The retained parser's own bound, not the synchronous decoder's.
-    let bound = retained_decode_bound::<Reservation, LimitRefusal>(
-        bytes.len() as u64,
-        Options::normalizing(64),
-    )
-    .unwrap();
-    let used = m.used();
-    assert!(used.values <= bound.values && used.bytes <= bound.bytes);
-    let allocated: u64 = m
-        .calls()
-        .iter()
-        .filter_map(|call| match call {
-            Call::Allocate(bytes) => Some(*bytes),
-            _ => None,
-        })
-        .sum();
-    assert!(allocated <= bound.allocated);
-    assert_eq!(allocated, m.requested_bytes());
-    assert!(m.peak_bytes() <= bound.peak);
-    // A terminal parse error retains custody for admitted cleanup, which the
-    // decoder's own steps perform. The retained bound describes the published
-    // document, not a suspended cleanup.
-    if result.is_none() {
-        let mut cleanup = m.share();
-        finish_within(&mut cleanup, &mut decoder, decode_turns(bytes.len()));
-        cleanup.assert_units(TURN);
-        assert_eq!(
-            cleanup.live_bytes(),
-            0,
-            "terminal error retained storage after cleanup"
-        );
-    }
-    assert!(
-        m.live_bytes() <= bound.retained,
-        "retained capacity exceeded: wire={bytes:02x?}, accepted={}, parser={:?}, live={}, peak={}, bound={bound:?}, admissions={:?}\n{:?}",
-        result.is_some(),
-        decoder.position(),
-        m.live_bytes(),
-        m.peak_bytes(),
-        m.calls(),
-        m.trace()
-    );
-    m.assert_units(TURN);
-    drop(decoder);
-    drop(result);
-    assert_eq!(m.live_bytes(), 0);
+    suite(|run, policy| {
+        let cleanup = run.shared_policy(policy);
+        let mut position = None;
+        let retained = run.holding(
+            Decoder::new(bytes, Options::normalizing(64)),
+            Retirement::Released,
+            &Unwitnessed,
+            |decoder| {
+                let retained = match decoder.drive_observed(
+                    policy,
+                    decode_turns(bytes.len()),
+                    Retirement::Released,
+                    |_, decoder| position = Some(decoder.position()),
+                    |document| {
+                        assert!(expected.is_ok(), "wire={bytes:x?}");
+                        assert_eq!(document.value().root().encoded(), bytes);
+                        document.with_policy(policy, |_, m| m.live_bytes())
+                    },
+                ) {
+                    Ok(retained) => Some(retained),
+                    Err(Stopped::Operation(DecodeError::Invalid(_))) => {
+                        assert!(expected.is_err(), "wire={bytes:x?}");
+                        None
+                    }
+                    Err(Stopped::Operation(error)) => {
+                        return Err(Finding::Driver(format!(
+                            "unexpected differential outcome {error:?} at {position:?}: wire={bytes:x?}",
+                        )));
+                    }
+                    Err(stop) => return Err(Finding::from(stop)),
+                };
+                // Terminal errors retain custody for the parser's admitted cleanup.
+                if retained.is_none() {
+                    decoder.finish(cleanup, decode_turns(bytes.len()), Retirement::Released)?;
+                }
+                Ok::<_, Finding>(retained)
+            },
+        )?;
+        // The retained parser's own bound, not the synchronous decoder's.
+        let bound = retained_decode_bound::<Reservation, Family, LimitRefusal>(
+            bytes.len() as u64,
+            Options::normalizing(64),
+        )
+        .unwrap();
+        run.with_policy(cleanup, |cleanup| {
+            cleanup.assert_units(TURN);
+            assert_eq!(
+                cleanup.live_bytes(),
+                0,
+                "terminal error retained storage after cleanup"
+            );
+        });
+        run.with_policy(policy, |m| {
+            let used = m.used();
+            assert!(used.values <= bound.values && used.bytes <= bound.bytes);
+            let allocated: u64 = m
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Allocate(bytes) => Some(*bytes),
+                    _ => None,
+                })
+                .sum();
+            assert!(allocated <= bound.allocated);
+            assert_eq!(allocated, m.requested_bytes());
+            assert!(m.peak_bytes() <= bound.peak);
+            let live = retained.unwrap_or_else(|| m.live_bytes());
+            assert!(
+                live <= bound.retained,
+                "retained capacity exceeded: wire={bytes:02x?}, accepted={}, parser={position:?}, live={}, peak={}, bound={bound:?}, admissions={:?}\n{:?}",
+                retained.is_some(),
+                live,
+                m.peak_bytes(),
+                m.calls(),
+                m.trace()
+            );
+            m.assert_units(TURN);
+            assert_eq!(m.live_bytes(), 0);
+        });
+        Ok(())
+    });
 }
 
 /// Every single byte, and every truncation and single-bit mutation of each
 /// literal, agrees with the symbolic decoder: each wire a fixture of its
 /// own, all run and every failure reported ([`every_fixture`]).
 #[test]
-fn every_single_byte_and_mutated_literal_agrees_with_independent_symbolic_decoder() {
+fn every_single_byte_and_mutated_literal_agrees_with_independent_symbolic_decoder()
+-> Result<(), Vec<Finding>> {
     let literals: &[&[u8]] = &[
         &[0xa2, 0x00, 0x82, 0x01, 0x02, 0x01, 0x62, 0xc3, 0xa9],
         &[0x82, 0xf5, 0xf6],
@@ -116,22 +123,35 @@ fn every_single_byte_and_mutated_literal_agrees_with_independent_symbolic_decode
             }
         }
     }
-    every_fixture(wires.len(), |index| check(&wires[index]));
+    every_fixture(wires.len(), |index| {
+        check(&wires[index]);
+        Ok(())
+    })
 }
 
-/// 2048 generated nested byte strings, each also with one corrupted byte,
-/// agree with the symbolic decoder within the retained parse's bounds: each
-/// wire a fixture of its own, all run and every failure reported
-/// ([`every_fixture`]).
+/// Generated nested byte strings, each also with one corrupted byte, agree
+/// with the symbolic decoder within the retained parse's bounds: each wire a
+/// fixture of its own, all run and every failure reported
+/// ([`every_fixture`]). A wire's nesting depth, 0 through 31, is its one
+/// structural variable: the exhaustive layer runs all 2048 generated, the
+/// fast layer the first generated at each depth, each beside its corruption
+/// ([`super::support::rigor`]).
 #[test]
-fn deterministic_generated_nested_inputs_keep_semantics_and_resource_bounds() {
+fn deterministic_generated_nested_inputs_keep_semantics_and_resource_bounds()
+-> Result<(), Vec<Finding>> {
+    use super::support::rigor::{Rigor, rigor};
+    let exhaustive = rigor() == Rigor::Exhaustive;
     let mut state = 0x7a31_ef02_45cd_918bu64;
     let mut wires = Vec::with_capacity(2 * 2048);
+    let mut depths = [false; 32];
     for _ in 0..2048 {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let depth = (state % 32) as usize;
+        if !exhaustive && core::mem::replace(&mut depths[depth], true) {
+            continue;
+        }
         let mut wire = vec![0x81; depth];
         wire.extend_from_slice(&[
             0x44,
@@ -146,7 +166,14 @@ fn deterministic_generated_nested_inputs_keep_semantics_and_resource_bounds() {
         wires.push(wire);
         wires.push(corrupted);
     }
-    every_fixture(wires.len(), |index| check(&wires[index]));
+    assert!(
+        exhaustive || depths.iter().all(|&reached| reached),
+        "the generator reached every depth"
+    );
+    every_fixture(wires.len(), |index| {
+        check(&wires[index]);
+        Ok(())
+    })
 }
 
 #[test]
@@ -157,7 +184,10 @@ fn overflowing_decode_bounds_are_typed_errors_not_saturated_allowances() {
             Err(BoundedError::Overflow)
         ));
         assert!(matches!(
-            retained_decode_bound::<Reservation, LimitRefusal>(length, Options::normalizing(64)),
+            retained_decode_bound::<Reservation, Family, LimitRefusal>(
+                length,
+                Options::normalizing(64),
+            ),
             Err(BoundedError::Overflow)
         ));
     }
@@ -168,93 +198,139 @@ fn overflowing_decode_bounds_are_typed_errors_not_saturated_allowances() {
 /// refused part way keeps what it admitted and resumes there, so every
 /// schedule admits exactly the unobstructed decode's calls, in order.
 #[test]
-fn randomized_turn_allowances_never_change_canonical_results_or_replay_work() {
+fn randomized_turn_allowances_never_change_canonical_results_or_replay_work()
+-> Result<(), Vec<Finding>> {
     let wire = [0x83, 0x18, 0x18, 0x62, 0xc3, 0xa9, 0x42, 0x00, 0xff];
     let turns = decode_turns(wire.len());
-    let baseline = {
-        let mut m = meter();
-        let mut decoder = Decoder::new(&wire, Options::normalizing(64));
-        let document = drive_within(&mut m, &mut decoder, turns).expect("baseline failed");
-        assert_eq!(document.root().encoded(), wire);
-        drop(document);
-        m.admitted().to_vec()
-    };
+    let baseline = retained_case(
+        Decoder::new(&wire, Options::normalizing(64)),
+        turns,
+        Fault::NONE,
+        |document, _| assert_eq!(document.root().encoded(), wire),
+    )
+    .into_admitted();
     every_fixture(64, |seed| {
-        let mut m = meter();
-        let mut decoder = Decoder::new(&wire, Options::normalizing(64));
-        let mut random = seed as u64 + 1;
-        let mut document = None;
-        // Every third turn grants a whole quantum, so the schedule completes
-        // within three times the unobstructed bound.
-        for turn in 0..3 * turns {
-            random = random
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let allowance = match turn % 3 {
-                0 => WriteWork::new(0, 0),
-                1 => WriteWork::new(
-                    1 + (random >> 33) % TURN.values,
-                    1 + (random >> 17) % TURN.bytes,
-                ),
-                _ => TURN,
-            };
-            m.clear_refusal();
-            let used = m.used();
-            m.set_limit(WriteWork::new(
-                used.values + allowance.values,
-                used.bytes + allowance.bytes,
-            ));
-            match contracted(&mut m, &mut decoder) {
-                Ok(Step::Progress) => {}
-                Ok(Step::Complete(published)) => {
-                    document = Some(published);
-                    break;
-                }
-                Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Work))) => {}
-                _ => panic!(
-                    "seed {seed}, turn {turn}: unexpected outcome at {:?}",
-                    decoder.position()
-                ),
-            }
-        }
-        let document = document.expect("schedule exceeded its bound");
-        assert_eq!(document.root().encoded(), wire);
-        assert_eq!(
-            m.admitted(),
-            baseline,
-            "seed {seed}: an allowance schedule replayed admitted work"
-        );
-        m.assert_units(TURN);
-        drop(decoder);
-        drop(document);
-        assert_eq!(m.live_bytes(), 0);
-    });
+        suite(|run, policy| {
+            run.holding(
+                Decoder::new(&wire, Options::normalizing(64)),
+                Retirement::Released,
+                &Unwitnessed,
+                |decoder| {
+                    let mut random = seed as u64 + 1;
+                    // Every third turn grants a whole quantum, so the schedule completes
+                    // within three times the unobstructed bound.
+                    for turn in 0..3 * turns {
+                        random = random
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let allowance = match turn % 3 {
+                            0 => WriteWork::new(0, 0),
+                            1 => WriteWork::new(
+                                1 + (random >> 33) % TURN.values,
+                                1 + (random >> 17) % TURN.bytes,
+                            ),
+                            _ => TURN,
+                        };
+                        let outcome = decoder.with_policy(policy, |decoder, m| {
+                            m.clear_refusal();
+                            let used = m.used();
+                            m.set_limit(WriteWork::new(
+                                used.values + allowance.values,
+                                used.bytes + allowance.bytes,
+                            ));
+                            contracted(m, decoder)
+                        });
+                        match outcome {
+                            Ok(Step::Progress) => {
+                                decoder.with_policy(policy, |_, m| {
+                                    assert_eq!(m.evidence(), Ok(()), "seed {seed}, turn {turn}");
+                                });
+                                decoder.checkpoint();
+                            }
+                            Ok(Step::Complete(published)) => {
+                                decoder.holding(published, Retirement::Released, |document| {
+                                    document.checkpoint();
+                                    assert_eq!(document.value().root().encoded(), wire);
+                                    document.with_policy(policy, |_, m| {
+                                assert_eq!(m.evidence(), Ok(()), "seed {seed}, turn {turn}");
+                                assert_eq!(
+                                    m.admitted_calls(),
+                                    baseline,
+                                    "seed {seed}: an allowance schedule replayed admitted work"
+                                );
+                                m.assert_units(TURN);
+                            });
+                                });
+                                return Ok(());
+                            }
+                            Err(DecodeError::Resource(BoundedError::Refused(
+                                LimitRefusal::Work,
+                            ))) => {
+                                decoder.with_policy(policy, |_, m| {
+                                    assert_eq!(m.evidence(), Ok(()), "seed {seed}, turn {turn}");
+                                });
+                                decoder.checkpoint();
+                            }
+                            other => {
+                                return Err(Finding::Driver(format!(
+                                    "seed {seed}, turn {turn}: unexpected outcome {} at {:?}",
+                                    label(&other),
+                                    decoder.value().position()
+                                )));
+                            }
+                        }
+                    }
+                    Err(Finding::Driver(format!(
+                        "seed {seed}: the schedule exceeded its bound"
+                    )))
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
+        });
+        Ok(())
+    })
 }
 
 #[test]
-fn generated_valid_inputs_complete_after_small_budget_refusal_without_replay() {
+fn generated_valid_inputs_complete_after_small_budget_refusal_without_replay()
+-> Result<(), Vec<Finding>> {
     every_fixture(64, |seed| {
         let mut wire = vec![0x81; seed % 16];
         wire.extend_from_slice(&[0x43, seed as u8, 0, 255]);
-        let mut m = meter();
-        m.set_limit(WriteWork::new(3, 16));
-        let pool = m.share();
-        let mut decoder = Decoder::new(&wire, Options::normalizing(64));
-        // Within the retained parse's own bound, under the small allowance
-        // set above, kept across steps until it refuses.
-        suspend_within(
-            &mut m,
-            &mut decoder,
-            LimitRefusal::Work,
-            decode_turns(wire.len()),
-            TurnSchedule::Retained,
-        );
-        let document = drive_within(&mut m, &mut decoder, decode_turns(wire.len()))
-            .expect("valid input failed after refusal");
-        assert_eq!(document.root().encoded(), wire);
-        drop(decoder);
-        assert!(pool.live_bytes() > 0);
-        drop(document);
-        assert_eq!(pool.live_bytes(), 0);
-    });
+        suite(|run, policy| {
+            run.with_policy(policy, |m| m.set_limit(WriteWork::new(3, 16)));
+            run.holding(
+                Decoder::new(&wire, Options::normalizing(64)),
+                Retirement::Released,
+                &Unwitnessed,
+                |decoder| {
+                    // Within the retained parse's own bound, under the small
+                    // allowance set above, kept across steps until it refuses.
+                    decoder.suspend(
+                        policy,
+                        LimitRefusal::Work,
+                        decode_turns(wire.len()),
+                        TurnSchedule::Retained,
+                        Retirement::Released,
+                    )?;
+                    decoder.drive_faulted(
+                        policy,
+                        decode_turns(wire.len()),
+                        Retirement::Released,
+                        Fault::NONE,
+                        |_, _| {},
+                        |document| {
+                            assert_eq!(document.value().root().encoded(), wire);
+                            document.with_policy(policy, |_, m| assert!(m.live_bytes() > 0));
+                        },
+                    )?;
+                    Ok::<_, Finding>(())
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
+        });
+        Ok(())
+    })
 }

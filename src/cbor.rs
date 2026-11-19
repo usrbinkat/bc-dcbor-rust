@@ -285,15 +285,15 @@ impl CBOR {
     /// // Decode a CBOR array [1, 2, 3] from hex
     /// let cbor = CBOR::try_from_hex("83010203").unwrap();
     /// assert_eq!(cbor.diagnostic(), "[1, 2, 3]");
+    ///
+    /// // Malformed hex is refused, never a panic.
+    /// assert!(matches!(
+    ///     CBOR::try_from_hex("830"),
+    ///     Err(dcbor::Error::InvalidHex(_))
+    /// ));
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if the hex string is not well-formed hexadecimal
-    /// (contains non-hex characters or an odd number of digits).
     pub fn try_from_hex(hex: &str) -> Result<CBOR> {
-        let data = hex::decode(hex).unwrap();
-        Self::try_from_data(data)
+        Self::try_from_data(crate::conveniences::decode_hex(hex)?)
     }
 
     /// Encodes this CBOR value to binary data following dCBOR encoding rules.
@@ -315,7 +315,7 @@ impl CBOR {
     ///
     /// // Create a CBOR map
     /// let mut map = Map::new();
-    /// map.insert(CBOR::from("key"), CBOR::from(123));
+    /// map.insert(CBOR::from("key"), CBOR::from(123)).unwrap();
     /// let cbor = CBOR::from(map);
     ///
     /// // Encode to binary

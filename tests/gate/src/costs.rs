@@ -47,13 +47,15 @@ impl Action {
 pub const LAYERS: [&str; 2] = ["fast", "exhaustive"];
 
 /// The variables a leg never inherits: a cost run must not rewrite the
-/// independent trace and tightness baselines, nor run at minimal witness
-/// sizes, which record another selection under the same identity.
-pub const UNINHERITED: [&str; 4] = [
+/// independent trace and tightness baselines, measure recordings instead of
+/// running their stated budgets, nor run at minimal witness sizes, which
+/// record another selection under the same identity.
+pub const UNINHERITED: [&str; 5] = [
     "DCBOR_RECORD_FACTORS",
     "DCBOR_RECORD_TRACES",
     "DCBOR_CLASS_COVERAGE",
     "DCBOR_WITNESS",
+    "DCBOR_MEASURE_RECORDING",
 ];
 
 /// The marker each checked or recorded cost record's digest follows in a

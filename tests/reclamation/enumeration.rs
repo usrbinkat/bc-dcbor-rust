@@ -52,74 +52,16 @@ representation_matrix!(primitive_layout, u8);
 representation_matrix!(c_layout, C);
 representation_matrix!(c_primitive_layout, C, u8);
 
-/// Construct `T` from `wire`, retiring the construction after `stop` turns:
-/// retirement releases nothing synchronously, and the scope's queued cleanup
-/// takes every unit refused once, releasing nothing, before it is admitted,
-/// then recovers everything. Both are within the decode's own bound. The
-/// turns construction took to publish, when it published within `stop`, and
-/// the boundary valuations the run reached.
-fn retired<T: Transferable<Limits> + 'static>(
-    wire: &[u8],
-    stop: usize,
-) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
-    let bound = support::typed_turns::<T>(wire.len());
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-    let mut operation = Construction::<_, T, Limits>::construct(document);
-    let mut output = None;
-    let mut published = None;
-    for turn in 0..stop.min(bound) {
-        match support::checked(&mut m, |m| support::contracted(m, &mut operation)) {
-            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Ok(Step::Complete(value)) => {
-                support::exhausted(&mut m, &mut operation);
-                output = Some(value);
-                published = Some(turn + 1);
-                break;
-            }
-            _ => panic!("publication omitted"),
-        }
-    }
-    let held = m.live_bytes();
-    drop(operation);
-    drop(output);
-    assert_eq!(m.live_bytes(), held, "retirement released storage");
-    // Every queued cleanup unit is first refused without release.
-    let mut drained = false;
-    for _ in 0..bound {
-        m.clear_refusal();
-        m.exhaust();
-        let held = m.live_bytes();
-        if owner.outstanding() != 0 {
-            match owner.shutdown_step(&mut m) {
-                Err(BoundedError::Refused(_)) => assert_eq!(m.live_bytes(), held),
-                Ok(Reclaimed::Progress) => assert!(m.live_bytes() < held),
-                Ok(Reclaimed::Done) => {
-                    drained = true;
-                    break;
-                }
-                other => panic!("unexpected cleanup: {other:?}"),
-            }
-        }
-        if support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).unwrap()
-            == Reclaimed::Done
-        {
-            drained = true;
-            break;
-        }
-    }
-    assert!(drained, "cleanup exceeded its bound of {bound} turns");
-    assert_eq!(owner.outstanding(), 0);
-    assert_eq!(m.live_bytes(), 0);
-    (published, m.reached())
-}
-
 /// The enumeration constructed from `wire` retired after every number of
-/// turns through its publication ([`support::stop_matrix`]): publication is
-/// reached within the decode's bound, and exactly the stops at or past it
-/// publish.
+/// turns through its publication ([`support::stop_matrix`]), its queued
+/// cleanup's every unit first refused without release
+/// ([`super::super::retired`]): publication is reached within the decode's
+/// bound, and exactly the stops at or past it publish.
 fn cancellation<T: Transferable<Limits> + 'static>(wire: &[u8]) {
-    let boundaries = retired::<T>(wire, usize::MAX)
+    let retired = |stop| {
+        super::super::retired::<T>(wire, stop, super::super::Discipline::RefusedFirst, |_| {})
+    };
+    let boundaries = retired(usize::MAX)
         .0
         .expect("enumeration never reached publication within its bound");
     support::stop_matrix(
@@ -129,7 +71,7 @@ fn cancellation<T: Transferable<Limits> + 'static>(wire: &[u8]) {
         ),
         boundaries,
         |stop| {
-            let (published, reached) = retired::<T>(wire, stop);
+            let (published, reached) = retired(stop);
             assert_eq!(
                 published.is_some(),
                 stop == boundaries,

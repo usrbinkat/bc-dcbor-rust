@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -155,7 +155,7 @@
+     pub(crate) fn descend<R>(&mut self) -> Result<(), BoundedError<R>> {
+         let at = self.at.checked_add(1).ok_or(BoundedError::Overflow)?;
+         match self.declared {
+-            Some(declared) if at <= declared => {
++            Some(_) => {
+                 self.at = at;
+                 #[cfg(all(test, feature = "std"))]
+                 DEEPEST.with(|deepest| deepest.set(deepest.get().max(at)));

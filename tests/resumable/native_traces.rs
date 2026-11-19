@@ -3,9 +3,27 @@
 //! build: it proves nothing is replayed, and nothing about the baseline
 //! itself. Here the baselines are fixed in `tests/data/admission-traces.txt`,
 //! so a change to any operation's admissions (an amount, an order, a call
-//! added or removed) fails at that operation's first differing call. The
+//! added or removed) fails at that operation's first differing point. The
 //! resumed and cancelled traces the other checks derive from a baseline are
 //! fixed with it.
+//!
+//! A recorded baseline is its run's identity-keyed contract
+//! ([`refinement::Run`]): the recording session's whole stream, every
+//! observation in the session's one order, each with the family that
+//! published it and the policy that performed it; the custody its
+//! operation's owners held after every turn, owner by owner, from the one
+//! grouped production traversal (`observe_custody`, collected after every
+//! turn by the holding schedules, [`support::Holding::drive`]); where its
+//! driver began
+//! cleanup and why; what it published, by permit identity; and its end. Each
+//! case is one recorded run of its own ([`support::recorded_run`]): the
+//! runner refines the stream and every checkpoint before the row is built,
+//! the row's marks are checked again when it is rendered
+//! ([`refinement::check`]), and every recorded row again when it is read. The
+//! machine is a refusal check: a run it refuses is never recorded, and
+//! acceptance upgrades nothing, every row `observed`
+//! ([`refinement::evidence`]). The gate refuses every record holding a row
+//! the machine refuses (`gate refine`).
 //!
 //! A baseline is evidence only of an outcome its case was written to reach.
 //! Each case declares that outcome, published or rejected as invalid input,
@@ -16,7 +34,7 @@
 //! the decoding wires are themselves checked against the symbolic decoder,
 //! an oracle independent of the bounded engine.
 //!
-//! Each case is driven by the shared driver under the suite's policy, one
+//! Each case is driven by the shared driver under its witness's policy, one
 //! quantum per turn, so a recorded trace also fixes where each call falls
 //! against the quanta. A terminal error is followed by the operation's own
 //! cleanup, recorded with it. Setting `DCBOR_RECORD_TRACES` rewrites the data
@@ -37,21 +55,29 @@ use super::bindings::{string_decoder, text_encoder};
 use super::harness::*;
 use super::support::classes::Classes;
 use super::support::pipeline::{Physical, Under};
-use super::support::{self, drive_within, finish_within, heap, pipeline};
+use super::support::{
+    self, Finding, Holding, PolicyId, RecordedRun, Retirement, Stopped, heap, pipeline,
+};
+use dcbor::bounded::decode::construction::DecodeOwner;
 use dcbor::bounded::decode::construction::in_place::StableOption;
 use dcbor::bounded::decode::cursor::Decoder;
 use dcbor::bounded::decode::header::HeaderCursor;
 use dcbor::bounded::decode::{Options, decode_typed, decode_with};
-use dcbor::bounded::encoding::Schema;
+use dcbor::bounded::encoding::{Preparation, Schema};
 use dcbor::bounded::text_cursor::pipeline::TextPreparation;
 use dcbor::bounded::{
-    AdmissionTrace, BoundedError, BoundedResult, Class, Failure, Resumable, Step, Tagged, encode,
-    prepare,
+    Admission, AdmissionTrace, BoundedError, BoundedResult, Class, Custodial, CustodySink, Failure,
+    Family, Identity, PermitsObserved, Resumable, Step, Tagged, encode, permits_of, prepare,
 };
 use dcbor::{ByteString, CBOR, Map};
 use dcbor_record as record;
+use dcbor_refinement::{
+    self as refinement, Cause, Checkpoint, End, Observed, Outcome, Publication, Row, Run,
+};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::rc::Rc;
 
 /// The variant of the recorded baselines the standard library's collections
 /// select: ordered trees walked by their iterator, or by the forked library's
@@ -104,9 +130,6 @@ const FEATURES: &[(&str, bool)] = &[
     ("hashbrown", cfg!(feature = "hashbrown")),
 ];
 
-/// The recorded column of a case gated on no feature.
-const UNGATED: &str = "-";
-
 /// Whether this build enables `feature`, one of [`FEATURES`].
 fn enabled(feature: &str) -> bool {
     match FEATURES.iter().find(|(name, _)| *name == feature) {
@@ -115,41 +138,14 @@ fn enabled(feature: &str) -> bool {
     }
 }
 
-/// What a case is written to reach: its operation publishes, or rejects its
-/// input as invalid. The suite's policy admits all work and holds 32 MiB, so
-/// a refusal, a physical failure or a defect is never what a case is for,
-/// and none of them can be declared.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
-    Published,
-    Invalid,
-}
-
-impl Outcome {
-    const ALL: [Self; 2] = [Self::Published, Self::Invalid];
-
-    /// The recorded column of this outcome.
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Invalid => "invalid",
-        }
-    }
-
-    /// The outcome whose recorded column is `text`.
-    fn parse(text: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|outcome| outcome.name() == text)
-    }
-}
-
 /// What a case's operation reached: an outcome a case can declare, or a
 /// description of anything else.
-type Observed = Result<Outcome, String>;
+type Reached = Result<Outcome, String>;
 
 /// The outcome `result` reached, classified by the outcome taxonomy: an
 /// output published, an input rejected as invalid, or, described, an error
 /// of any other class.
-fn observed<T, E: Failure + Debug>(result: &Result<T, E>) -> Observed
+fn reached<T, E: Failure + Debug>(result: &Result<T, E>) -> Reached
 where
     E::Refusal: Debug,
 {
@@ -162,27 +158,115 @@ where
     }
 }
 
+/// The end a run that reached `reached` records: its outcome's, or, for a
+/// run that reached no outcome a case can declare, a defect's. Such a run is
+/// inadmissible ([`Cases::inadmissible`]) and never recorded, whatever its
+/// end.
+fn end(reached: &Reached) -> End {
+    match reached {
+        Ok(outcome) => outcome.end(),
+        Err(_) => End::Failed(Class::Defect),
+    }
+}
+
+/// The class of a terminal error, owned: the cause a driver's cleanup mark
+/// names ([`Cause::Error`]).
+fn owned_class(class: Class<&LimitRefusal>) -> Class<LimitRefusal> {
+    match class {
+        Class::Refused(refusal) => Class::Refused(*refusal),
+        Class::Allocation => Class::Allocation,
+        Class::Invalid => Class::Invalid,
+        Class::Defect => Class::Defect,
+    }
+}
+
+/// The permits `output` holds, by identity: the publication mark's.
+fn published_permits(output: &mut impl Custodial<Reservation>) -> Vec<Identity> {
+    let mut permits = Vec::new();
+    let observed = permits_of::<Limits>(|sink| output.observe_custody(sink), &mut |permit| {
+        permits.push(permit)
+    });
+    assert_eq!(
+        observed,
+        PermitsObserved::Complete,
+        "a published output's custody is no observation"
+    );
+    permits
+}
+
+/// The marks a case's driver places in its run ([`Run`]): where cleanup
+/// began and why, and what it published.
+#[derive(Default)]
+struct Marks {
+    cleaning: Option<(usize, Cause)>,
+    published: Option<Publication>,
+}
+
+/// The operation `holding` holds, driven under `policy` to publication, or
+/// failed and then driven through its own cleanup to `Finished`, within
+/// `bound` turns each ([`Holding::drive`], [`Holding::finish`]): the whole
+/// holding stack checkpointed after every turn of both, the operation, the
+/// output a completing turn publishes and every custody that surrounds them
+/// (a writer's lent plan), each permit once. Its publication is marked with
+/// the output's permits, read while the scope holds it, its cleanup where it
+/// began, with the error's class. The output is retired as released storage
+/// once marked; the operation, published or finished, as its type declares
+/// ([`support::Terminal`]); a stopped one as releasing its storage. What the
+/// operation reached is its own outcome, its error classified by the outcome
+/// taxonomy ([`reached`]); any other stop of the drive or of the cleanup is
+/// no outcome a case declares but the run's finding, every custody already
+/// retired by its holding.
+fn drive_retained<O, W: Physical>(
+    holding: &mut Holding<'_, '_, O, W>,
+    policy: PolicyId,
+    marks: &mut Marks,
+    bound: usize,
+) -> Result<Reached, Finding>
+where
+    O: Resumable<Limits> + Custodial<Reservation> + support::Terminal,
+    O::Output: Custodial<Reservation>,
+    O::Error: Failure<Refusal = LimitRefusal> + Debug,
+    O::Position: Debug,
+{
+    let published = holding.drive(policy, bound, Retirement::Released, |output| {
+        marks.published = Some(Publication {
+            boundary: output.boundary(),
+            permits: published_permits(output.value()),
+        });
+    });
+    match published {
+        Ok(()) => Ok(Ok(Outcome::Published)),
+        Err(Stopped::Operation(error)) => {
+            marks.cleaning = Some((holding.boundary(), Cause::Error(owned_class(error.class()))));
+            let outcome = reached::<(), _>(&Err(error));
+            holding.finish(policy, bound, Retirement::Released)?;
+            Ok(outcome)
+        }
+        Err(stop) => Err(stop.into()),
+    }
+}
+
 /// One operation's baseline: its name, the feature its case is compiled
-/// under, the outcome it declares and the one it reached, its calls, and the
-/// policy it ran under when it has one of its own, whose trace is the
+/// under, the outcome it declares and the one it reached, its run, and its
+/// policy's admission trace when it ran under a policy of its own, the
 /// diagnostic of a difference.
 struct Case {
     name: String,
     feature: Option<&'static str>,
     outcome: Outcome,
-    observed: Observed,
-    calls: Vec<Call>,
-    policy: Option<Limits>,
+    reached: Reached,
+    run: Run,
+    trace: Option<AdmissionTrace>,
 }
 
 /// Every case, each named once, the feature the cases being added are
-/// compiled under, and the policy each case runs under: its witness's
-/// ([`Physical::policy`]), the heap guard's natively, the admission oracle's
-/// alone inside a model.
+/// compiled under, and how each case's policy is made: its witness's
+/// ([`Physical::policy`], [`RecordedRun::witnessed_policy`]), the heap
+/// guard's natively, the admission oracle's alone inside a model.
 struct Cases {
     cases: Vec<Case>,
     feature: Option<&'static str>,
-    meter: fn() -> Limits,
+    policy: fn(&mut RecordedRun) -> PolicyId,
 }
 
 impl Cases {
@@ -191,17 +275,18 @@ impl Cases {
         Self {
             cases: Vec::new(),
             feature: None,
-            meter: W::policy,
+            policy: RecordedRun::witnessed_policy::<W>,
         }
     }
 
-    fn add(
+    /// A case and its run, named once.
+    fn push(
         &mut self,
         name: String,
         outcome: Outcome,
-        observed: Observed,
-        calls: Vec<Call>,
-        policy: Option<Limits>,
+        reached: Reached,
+        run: Run,
+        trace: Option<AdmissionTrace>,
     ) {
         assert!(
             !self.cases.iter().any(|case| case.name == name),
@@ -211,10 +296,50 @@ impl Cases {
             name,
             feature: self.feature,
             outcome,
-            observed,
-            calls,
-            policy,
+            reached,
+            run,
+            trace,
         });
+    }
+
+    /// A case recorded as one run of its own ([`support::recorded_run`]):
+    /// `body` runs the operation under the case's one policy and places its
+    /// marks; the runner finishes and refines the session and its
+    /// checkpoints; the case's row holds that finished stream, those
+    /// checkpoints, the marks, and the end of what `body` reached. A finding
+    /// `body` returns (a driver's stop that is no outcome a case declares)
+    /// is the run's, reported by its finalization: nothing is recorded.
+    fn record(
+        &mut self,
+        name: String,
+        outcome: Outcome,
+        body: impl FnOnce(&mut RecordedRun, PolicyId, &mut Marks) -> Result<Reached, Finding>,
+    ) {
+        type Evidence = Rc<RefCell<Option<(Vec<Observed>, Vec<Checkpoint>)>>>;
+        let evidence: Evidence = Rc::default();
+        let kept = Rc::clone(&evidence);
+        let policy = self.policy;
+        let (reached, marks, trace) = support::recorded_run(|run| {
+            let id = policy(run);
+            let mut marks = Marks::default();
+            let reached = body(run, id, &mut marks)?;
+            let trace = run.with_policy(id, |m| m.trace().clone());
+            run.inspect_evidence(move |observed, checkpoints| {
+                *kept.borrow_mut() = Some((observed.to_vec(), checkpoints.to_vec()));
+            });
+            Ok((reached, marks, trace))
+        });
+        let (observed, checkpoints) = evidence
+            .take()
+            .expect("the runner reads every run's evidence");
+        let run = Run {
+            observed,
+            checkpoints,
+            cleaning: marks.cleaning,
+            published: marks.published,
+            end: end(&reached),
+        };
+        self.push(name, outcome, reached, run, Some(trace));
     }
 
     /// The cases `add` adds, compiled only under `feature`.
@@ -227,45 +352,55 @@ impl Cases {
         self.feature = None;
     }
 
-    /// The calls `m` attempted, under `m`'s own trace.
-    fn policy(&mut self, name: String, outcome: Outcome, observed: Observed, m: Limits) {
-        let calls = m.calls().to_vec();
-        self.add(name, outcome, observed, calls, Some(m));
-    }
-
-    /// A retained operation driven to publication, or failed and then driven
-    /// through its own cleanup to `Finished`.
-    fn retained<O: Resumable<Limits>>(
-        &mut self,
-        name: String,
-        outcome: Outcome,
-        mut operation: O,
-        bound: usize,
-    ) where
-        O::Error: Debug,
+    /// A retained operation held by its run, driven to publication, or
+    /// failed and then driven through its own cleanup ([`drive_retained`]).
+    /// Stopped, it releases its own storage as it drops.
+    fn retained<O>(&mut self, name: String, outcome: Outcome, operation: O, bound: usize)
+    where
+        O: Resumable<Limits> + Custodial<Reservation> + support::Terminal,
+        O::Output: Custodial<Reservation>,
+        O::Error: Failure<Refusal = LimitRefusal> + Debug,
+        O::Position: Debug,
     {
-        let mut m = (self.meter)();
-        let result = drive_within(&mut m, &mut operation, bound);
-        let reached = observed(&result);
-        match result {
-            Ok(output) => drop(output),
-            Err(_) => finish_within(&mut m, &mut operation, bound),
-        }
-        drop(operation);
-        self.policy(name, outcome, reached, m);
+        self.record(name, outcome, |run, policy, marks| {
+            run.holding(
+                operation,
+                Retirement::Released,
+                &pipeline::Unwitnessed,
+                |held| drive_retained(held, policy, marks, bound),
+            )
+        });
     }
 
-    /// A synchronous operation: one call of `operation` under the suite's
-    /// policy, which returns what it reached.
+    /// A synchronous operation: one call of `operation` under the case's
+    /// policy, which returns what it reached. Its publication leaves no
+    /// surviving output for the run to hold, so its mark names the
+    /// completion's boundary alone, no permit; its rejection of an invalid
+    /// input is its cleaning cause, `reached` having classified the error's
+    /// class as [`Class::Invalid`].
     fn synchronous(
         &mut self,
         name: &str,
         outcome: Outcome,
-        operation: impl FnOnce(&mut Limits) -> Observed,
+        operation: impl FnOnce(&mut Limits) -> Reached,
     ) {
-        let mut m = (self.meter)();
-        let reached = operation(&mut m);
-        self.policy(name.into(), outcome, reached, m);
+        self.record(name.into(), outcome, |run, policy, marks| {
+            let reached = run.with_policy(policy, operation);
+            match reached {
+                Ok(Outcome::Published) => {
+                    marks.published = Some(Publication {
+                        boundary: run.boundary(),
+                        permits: Vec::new(),
+                    });
+                }
+                Ok(Outcome::Invalid) => {
+                    marks.cleaning =
+                        Some((run.boundary(), Cause::Error(owned_class(Class::Invalid))));
+                }
+                _ => {}
+            }
+            Ok(reached)
+        });
     }
 
     /// Every case that did not reach the outcome it declares, described:
@@ -273,9 +408,9 @@ impl Cases {
     fn inadmissible(&self) -> Vec<String> {
         self.cases
             .iter()
-            .filter(|case| case.observed != Ok(case.outcome))
+            .filter(|case| case.reached != Ok(case.outcome))
             .map(|case| {
-                let reached = match &case.observed {
+                let reached = match &case.reached {
                     Ok(outcome) => outcome.name().to_string(),
                     Err(description) => description.clone(),
                 };
@@ -433,12 +568,12 @@ fn decoding(cases: &mut Cases) {
             cases.synchronous(
                 &format!("decode_with {name} {policy}"),
                 wire.decoded(quick),
-                |m| observed(&decode_with(&wire.bytes, options, m)),
+                |m| reached(&decode_with(&wire.bytes, options, m)),
             );
             cases.retained(
                 format!("Decoder {name} {policy}"),
                 wire.decoded(quick),
-                Decoder::<Reservation>::new(&wire.bytes, options),
+                Decoder::<Reservation, Family>::new(&wire.bytes, options),
                 support::decode_turns(wire.bytes.len()),
             );
         }
@@ -459,10 +594,10 @@ fn decoding(cases: &mut Cases) {
         0x83, 0x63, b'a', b'b', b'c', 0x63, b'1', b'2', b'3', 0x61, b'x',
     ];
     cases.synchronous("decode_typed Vec<String>", Outcome::Published, |m| {
-        observed(&decode_typed::<Vec<String>, _>(&texts, 8, m))
+        reached(&decode_typed::<Vec<String>, _>(&texts, 8, m))
     });
     cases.synchronous("decode_typed String", Outcome::Published, |m| {
-        observed(&decode_typed::<String, _>(
+        reached(&decode_typed::<String, _>(
             &text_wire("\u{e9}t\u{e9}"),
             8,
             m,
@@ -470,31 +605,64 @@ fn decoding(cases: &mut Cases) {
     });
     cases.synchronous("decode_typed ByteString", Outcome::Published, |m| {
         let wire = CBOR::to_byte_string([7u8; 70]).to_cbor_data();
-        observed(&decode_typed::<ByteString, _>(&wire, 8, m))
+        reached(&decode_typed::<ByteString, _>(&wire, 8, m))
     });
     cases.synchronous("decode_typed wrong type", Outcome::Invalid, |m| {
-        observed(&decode_typed::<Vec<u64>, _>(&text_wire("x"), 8, m))
+        reached(&decode_typed::<Vec<u64>, _>(&text_wire("x"), 8, m))
     });
 }
 
-/// A typed decode in its own scope, from scope initialization through the
-/// borrowed input, the decode, the value's retirement and the drain.
+/// A typed decode in its own scope, held by its run from the scope's
+/// initialization through the borrowed input, the decode, the value's
+/// retirement into the scope's queue and the drain, to the scope's terminal
+/// destruction ([`Holding::decoded`]). The decode's publication is marked
+/// with the published value's permits, read while the scope holds it; its
+/// own error is its outcome and its cleaning cause, the stopped decoder
+/// retired, its records queued, before the drain; any other stop, the
+/// scope's and the drain's included, is the run's finding.
 fn owned_decode<T>(cases: &mut Cases, name: &str, outcome: Outcome, wire: &[u8])
 where
     T: dcbor::bounded::decode::construction::in_place::Transferable<Limits>,
 {
-    let mut m = (cases.meter)();
-    let (mut owner, input) = support::open(&mut m, wire);
-    let result = support::decode::<_, T>(&mut m, input, Options::normalizing(8));
-    let reached = observed(&result);
-    drop(result);
-    support::drain(&mut owner, &mut m);
-    cases.policy(format!("owned decode {name}"), outcome, reached, m);
+    cases.record(
+        format!("owned decode {name}"),
+        outcome,
+        |run, policy, marks| {
+            run.holding(
+                DecodeOwner::new(),
+                Retirement::Scope,
+                &pipeline::Unwitnessed,
+                |scope| {
+                    scope.initialize(policy)?;
+                    let outcome = match scope.decoded::<T, _>(
+                        policy,
+                        wire,
+                        Options::normalizing(8),
+                        |value| {
+                            marks.published = Some(Publication {
+                                boundary: value.boundary(),
+                                permits: published_permits(value.value()),
+                            });
+                        },
+                    )? {
+                        Ok(()) => Ok(Outcome::Published),
+                        Err(error) => {
+                            marks.cleaning =
+                                Some((scope.boundary(), Cause::Error(owned_class(error.class()))));
+                            reached::<(), _>(&Err(error))
+                        }
+                    };
+                    scope.drain(policy)?;
+                    Ok(outcome)
+                },
+            )
+        },
+    );
 }
 
 /// What an observed owned pipeline reached: its selected end with the
 /// input's exact bytes, the input rejected, or, described, anything else.
-fn reached(report: &pipeline::Report) -> Observed {
+fn pipeline_reached(report: &pipeline::Report) -> Reached {
     match (
         report.complete,
         report.invalid,
@@ -509,7 +677,10 @@ fn reached(report: &pipeline::Report) -> Observed {
     }
 }
 
-/// The owned cases, the pipeline's under witness `W` ([`Under`]).
+/// The owned cases, the pipeline's under witness `W` ([`Under`]). A pipeline
+/// run owns its recording session whole and refines it itself; its row is
+/// that finished stream and its end, with no marks: a mark adds checks, its
+/// absence relaxes none.
 fn owned<W: Physical>(cases: &mut Cases) {
     let texts = [
         0x83, 0x63, b'a', b'b', b'c', 0x63, b'1', b'2', b'3', 0x61, b'x',
@@ -599,12 +770,40 @@ fn owned<W: Physical>(cases: &mut Cases) {
             report.accounting.admitted().len() + report.refusals,
             "{name}"
         );
-        let reached = reached(&report);
-        cases.add(
+        let reached = pipeline_reached(&report);
+        // The pipeline's own row carries no per-phase mark site: its one
+        // mark stands at the stream's end, the quiescent boundary its drain
+        // reaches, the pipeline's publication named by no permit (each
+        // phase's output retired before it) and its rejection of an invalid
+        // input by its class, the outcome taxonomy's own
+        // (`pipeline_reached`).
+        let boundary = report.observed.len();
+        let (cleaning, published) = match &reached {
+            Ok(Outcome::Published) => (
+                None,
+                Some(Publication {
+                    boundary,
+                    permits: Vec::new(),
+                }),
+            ),
+            Ok(Outcome::Invalid) => (
+                Some((boundary, Cause::Error(owned_class(Class::Invalid)))),
+                None,
+            ),
+            _ => (None, None),
+        };
+        let run = Run {
+            observed: report.observed,
+            checkpoints: Vec::new(),
+            cleaning,
+            published,
+            end: end(&reached),
+        };
+        cases.push(
             format!("owned pipeline {name}"),
             outcome,
             reached,
-            report.accounting.into_admitted(),
+            run,
             None,
         );
     }
@@ -626,34 +825,54 @@ fn texts() -> Vec<(&'static str, String)> {
 
 fn text(cases: &mut Cases) {
     for (name, source) in texts() {
+        let turns = support::normalize_turns(&source);
         cases.retained(
             format!("text_encoder {name}"),
             Outcome::Published,
             text_encoder(&source),
-            support::normalize_turns(&source),
+            turns,
         );
-        let mut m = (cases.meter)();
-        let result = drive_within(
-            &mut m,
-            &mut TextPreparation::new(&source),
-            support::normalize_turns(&source),
-        );
-        let reached = observed(&result);
-        cases.policy(
+        cases.retained(
             format!("TextPreparation {name}"),
             Outcome::Published,
-            reached,
-            m,
+            TextPreparation::<Reservation, Family>::new(&source),
+            turns,
         );
-        let plan = result.expect("a text preparation publishes");
-        let mut bytes = vec![0; usize::try_from(plan.len()).expect("a text plan fits in memory")];
-        cases.retained(
+        // The writer's run prepares its plan first, under the same policy,
+        // held by the run, and lends the plan to the writer it holds while
+        // the write is driven: every custody the run makes is the run's.
+        cases.record(
             format!("TextWriter {name}"),
             Outcome::Published,
-            plan.writer(&mut bytes),
-            support::text_emit_turns(
-                usize::try_from(plan.len()).expect("a text plan fits in memory"),
-            ),
+            |run, policy, marks| {
+                run.holding(
+                    TextPreparation::<Reservation, Family>::new(&source),
+                    Retirement::Released,
+                    &pipeline::Unwitnessed,
+                    |preparing| {
+                        preparing
+                            .drive(policy, turns, Retirement::Released, |plan| {
+                                let len = usize::try_from(plan.value().len())
+                                    .expect("a text plan fits in memory");
+                                let mut bytes = vec![0; len];
+                                plan.lending(
+                                    Retirement::Released,
+                                    |plan| plan.writer(&mut bytes),
+                                    |writer| {
+                                        drive_retained(
+                                            writer,
+                                            policy,
+                                            marks,
+                                            support::text_emit_turns(len),
+                                        )
+                                    },
+                                )
+                            })
+                            .map_err(Finding::from)
+                            .and_then(|outcome| outcome)
+                    },
+                )
+            },
         );
     }
 }
@@ -687,23 +906,51 @@ fn sources() -> Vec<(&'static str, Box<dyn Schema>)> {
 }
 
 /// `source` prepared, then its plan emitted, each its own case, each
-/// published.
+/// published: the preparation driven with its custody checkpointed, and the
+/// writer's run preparing its plan first, under the same policy.
 fn prepared_and_emitted(cases: &mut Cases, name: &str, source: &dyn Schema) {
-    let (plan, m) = prepared_under(source, (cases.meter)());
-    let mut bytes = vec![0; plan.len()];
     cases.retained(
-        format!("Writer {name}"),
-        Outcome::Published,
-        plan.writer(&mut bytes),
-        support::emit_turns(plan.len()),
-    );
-    drop(plan);
-    // The preparation published its plan: `prepared` requires it.
-    cases.policy(
         format!("Preparation {name}"),
         Outcome::Published,
-        Ok(Outcome::Published),
-        m,
+        Preparation::<Reservation, Family>::new(source),
+        support::prepare_turns(support::shape(source)),
+    );
+    cases.record(
+        format!("Writer {name}"),
+        Outcome::Published,
+        |run, policy, marks| {
+            run.holding(
+                Preparation::<Reservation, Family>::new(source),
+                Retirement::Released,
+                &pipeline::Unwitnessed,
+                |preparing| {
+                    preparing
+                        .drive(
+                            policy,
+                            support::prepare_turns(support::shape(source)),
+                            Retirement::Released,
+                            |plan| {
+                                let len = plan.value().len();
+                                let mut bytes = vec![0; len];
+                                plan.lending(
+                                    Retirement::Released,
+                                    |plan| plan.writer(&mut bytes),
+                                    |writer| {
+                                        drive_retained(
+                                            writer,
+                                            policy,
+                                            marks,
+                                            support::emit_turns(len),
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                        .map_err(Finding::from)
+                        .and_then(|outcome| outcome)
+                },
+            )
+        },
     );
 }
 
@@ -730,7 +977,7 @@ fn preparation(cases: &mut Cases) {
         cases.retained(
             "Preparation duplicate keys".into(),
             Outcome::Invalid,
-            dcbor::bounded::encoding::Preparation::<Reservation>::new(&duplicate),
+            Preparation::<Reservation, Family>::new(&duplicate),
             support::prepare_turns(support::shape(&duplicate)),
         );
     });
@@ -749,38 +996,38 @@ fn preparation(cases: &mut Cases) {
 fn synchronous_encoding(cases: &mut Cases) {
     let tree: BTreeMap<String, u64> = (0..20u64).rev().map(|n| (format!("k{n:02}"), n)).collect();
     let mut symbolic = Map::new();
-    symbolic.insert("k", 1.5f64);
-    symbolic.insert(-1i64, true);
-    symbolic.insert(10u64, "a");
+    symbolic.insert("k", 1.5f64).unwrap();
+    symbolic.insert(-1i64, true).unwrap();
+    symbolic.insert(10u64, "a").unwrap();
     cases.synchronous("encode Vec<u64>", Outcome::Published, |m| {
-        observed(&encode(&(0..300u64).collect::<Vec<_>>(), m))
+        reached(&encode(&(0..300u64).collect::<Vec<_>>(), m))
     });
     cases.synchronous("encode text", Outcome::Published, |m| {
-        observed(&encode(&format!("q{}", "\u{301}\u{316}".repeat(16)), m))
+        reached(&encode(&format!("q{}", "\u{301}\u{316}".repeat(16)), m))
     });
     cases.synchronous("encode BTreeMap", Outcome::Published, |m| {
-        observed(&encode(&tree, m))
+        reached(&encode(&tree, m))
     });
     cases.synchronous("encode CBOR", Outcome::Published, |m| {
-        observed(&encode(&CBOR::from(symbolic.clone()), m))
+        reached(&encode(&CBOR::from(symbolic.clone()), m))
     });
     cases.synchronous("encode Tagged", Outcome::Published, |m| {
-        observed(&encode(&Tagged { tag: 2, value: "x" }, m))
+        reached(&encode(&Tagged { tag: 2, value: "x" }, m))
     });
     cases.synchronous("encode ByteString", Outcome::Published, |m| {
-        observed(&encode(&ByteString::from(vec![1u8; 100]), m))
+        reached(&encode(&ByteString::from(vec![1u8; 100]), m))
     });
     cases.synchronous("encode Option", Outcome::Published, |m| {
-        observed(&encode(&Some(vec![None, Some(1u64)]), m))
+        reached(&encode(&Some(vec![None, Some(1u64)]), m))
     });
     cases.synchronous("prepare encode_into", Outcome::Published, |m| {
         let value = vec!["a\u{301}".to_string(), "b".into()];
         let prepared = match prepare(&value, m) {
             Ok(prepared) => prepared,
-            Err(error) => return observed::<(), _>(&Err(error)),
+            Err(error) => return reached::<(), _>(&Err(error)),
         };
         let mut bytes = vec![0; prepared.len()];
-        observed(&prepared.encode_into(&mut bytes, m))
+        reached(&prepared.encode_into(&mut bytes, m))
     });
 }
 
@@ -792,26 +1039,29 @@ fn derived(cases: &mut Cases) {
     ];
     let choice = [0x82, 0x02, 0xa1, 0x00, 0x61, b'x'];
     cases.synchronous("decode_typed derived record", Outcome::Published, |m| {
-        observed(&decode_typed::<Record, _>(&record, 8, m))
+        reached(&decode_typed::<Record, _>(&record, 8, m))
     });
     cases.synchronous("decode_typed derived choice", Outcome::Published, |m| {
-        observed(&decode_typed::<Choice, _>(&choice, 8, m))
+        reached(&decode_typed::<Choice, _>(&choice, 8, m))
     });
     cases.synchronous("encode derived choice", Outcome::Published, |m| {
-        observed(&encode(&Choice::Text("x".into()), m))
+        reached(&encode(&Choice::Text("x".into()), m))
     });
     owned_decode::<Record>(cases, "derived record", Outcome::Published, &record);
     owned_decode::<Choice>(cases, "derived choice", Outcome::Published, &choice);
 }
 
 /// A hash table enumerated by the engine's one bucket traversal, each call
-/// in a fresh turn: its windows, the entries ending them early, and the
-/// completion forfeiting the last window's credit.
+/// in a fresh turn, the cursor's custody checkpointed after each: its
+/// window, reported in the group of the owner its windows are acquisitions
+/// of, which this driver holds ([`BucketCursor::observe_window`]); its
+/// windows, the entries ending them early, and the completion forfeiting
+/// the last window's credit.
 #[cfg(feature = "hashbrown")]
 fn buckets(cases: &mut Cases) {
     use dcbor::bounded::encoding::{
         BUCKET_WINDOW,
-        buckets::{BucketCursor, BucketStep, Buckets},
+        buckets::{BucketCursor, BucketPosition, BucketStep, Buckets},
     };
     let mut table = hashbrown::HashTable::with_capacity(64);
     for key in [0u64, 17, 40, 63] {
@@ -820,24 +1070,54 @@ fn buckets(cases: &mut Cases) {
     let source: &dyn Buckets = &table;
     // At most a call per window and per entry, then the completion.
     let calls = table.num_buckets().div_ceil(BUCKET_WINDOW) + table.len() + 1;
-    let mut m = (cases.meter)();
-    let mut cursor = BucketCursor::new();
-    let mut reached = Err(format!("incomplete after {calls} calls"));
-    for _ in 0..calls {
-        m.fresh();
-        match cursor.step(source, &mut m) {
-            Ok(BucketStep::Complete) => {
-                reached = Ok(Outcome::Published);
-                break;
+    cases.record(
+        "BucketCursor".into(),
+        Outcome::Published,
+        |run, policy, marks| {
+            let owner = run.with_policy(policy, |m| {
+                m.owner().expect("the run's policy makes an owner")
+            });
+            let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+            let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
+            let mut outcome = Err(format!("incomplete after {calls} calls"));
+            for _ in 0..calls {
+                let step = run.with_policy(policy, |m| {
+                    m.fresh();
+                    cursor
+                        .step(source, &owner, m)
+                        .map(|step| matches!(step, BucketStep::Complete))
+                });
+                run.checkpoint(|sink| {
+                    sink.begin(Some(owner.id()));
+                    cursor.observe_window(sink);
+                    sink.end();
+                    PermitsObserved::Complete
+                });
+                match step {
+                    Ok(true) => {
+                        // The enumeration's completion publishes: the
+                        // completion forfeited the last window's credit, so
+                        // its output holds no permit to name.
+                        marks.published = Some(Publication {
+                            boundary: run.boundary(),
+                            permits: Vec::new(),
+                        });
+                        outcome = Ok(Outcome::Published);
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        marks.cleaning =
+                            Some((run.boundary(), Cause::Error(owned_class(error.class()))));
+                        outcome = reached::<(), _>(&Err(error));
+                        break;
+                    }
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                reached = observed::<(), _>(&Err(error));
-                break;
-            }
-        }
-    }
-    cases.policy("BucketCursor".into(), Outcome::Published, reached, m);
+            drop(owner);
+            Ok(outcome)
+        },
+    );
 }
 
 fn cases<W: Physical>() -> Cases {
@@ -854,128 +1134,79 @@ fn cases<W: Physical>() -> Cases {
     cases
 }
 
-/// One call from its `Debug` rendering, the inverse of `{call:?}`.
-fn parse_call(text: &str) -> Result<Call, String> {
-    let number = |digits: &str| {
-        digits
-            .parse::<u64>()
-            .map_err(|error| format!("{text:?}: {error}"))
-    };
-    if let Some(bytes) = text
-        .strip_prefix("Allocate(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        return Ok(Call::Allocate(number(bytes)?));
-    }
-    let fields = text
-        .strip_prefix("Work { values: ")
-        .and_then(|rest| rest.strip_suffix(" }"))
-        .ok_or_else(|| format!("{text:?} is not a call"))?;
-    let (values, bytes) = fields
-        .split_once(", bytes: ")
-        .ok_or_else(|| format!("{text:?} is not a work call"))?;
-    Ok(Call::Work {
-        values: number(values)?,
-        bytes: number(bytes)?,
-    })
-}
-
 /// The recorded data, a record ([`record::render`]) under `configuration`:
-/// one case per row, sorted by name: its name, the feature it is gated on or
-/// [`UNGATED`], its outcome, and its calls in their `Debug` rendering
-/// separated by `; `, the four separated by tabs. Only admissible cases are
-/// rendered ([`Cases::inadmissible`]).
+/// one row per case ([`Row::render`]), sorted by name. Only admissible cases
+/// are rendered ([`Cases::inadmissible`]), and only runs the refinement
+/// machine accepts: a refused run names where and the rule.
 fn render(cases: &Cases, configuration: &str) -> String {
     let inadmissible = cases.inadmissible();
     assert!(
         inadmissible.is_empty(),
         "refusing trace evidence: {inadmissible:#?}"
     );
-    let sorted: BTreeMap<&str, (&str, Outcome, &[Call])> = cases
+    let sorted: BTreeMap<&str, &Case> = cases
         .cases
         .iter()
-        .map(|case| {
-            let feature = case.feature.unwrap_or(UNGATED);
-            (
-                case.name.as_str(),
-                (feature, case.outcome, case.calls.as_slice()),
-            )
-        })
+        .map(|case| (case.name.as_str(), case))
         .collect();
     let rows: Vec<String> = sorted
-        .into_iter()
-        .map(|(name, (feature, outcome, calls))| {
-            let calls: Vec<String> = calls.iter().map(|call| format!("{call:?}")).collect();
-            format!(
-                "{name}\t{feature}\t{}\t{}",
-                outcome.name(),
-                calls.join("; ")
-            )
+        .into_values()
+        .map(|case| {
+            Row {
+                name: case.name.clone(),
+                feature: case.feature.map(str::to_string),
+                outcome: case.outcome,
+                run: case.run.clone(),
+            }
+            .render()
+            .unwrap_or_else(|error| panic!("refusing trace evidence: {error}"))
         })
         .collect();
     record::render(configuration, rows.iter().map(String::as_str))
 }
 
-/// One recorded case: the feature it is gated on, its outcome, and its
-/// calls.
+/// One recorded case: the feature it is gated on, its outcome, and its run.
 struct Recorded {
     feature: Option<String>,
     outcome: Outcome,
-    calls: Vec<Call>,
+    run: Run,
 }
 
 /// The configuration a record was recorded under, and every recorded case
-/// by name. Each call renders back to its own text, each feature is one of
-/// [`FEATURES`], and each outcome is one a case can declare.
+/// by name ([`parse`]).
 fn recorded() -> (String, BTreeMap<String, Recorded>) {
     let data = std::fs::read_to_string(RECORDED)
         .unwrap_or_else(|error| panic!("{RECORDED}: {error}; record it with {RECORD}=1"));
-    let read = record::read(RECORDED, &data, &format!("{RECORD}=1"));
-    let configuration = read.configuration.to_string();
-    let mut recorded = BTreeMap::new();
-    for (at, line) in read.rows {
-        let mut columns = line.splitn(4, '\t');
-        let (Some(name), Some(feature), Some(outcome), Some(calls)) = (
-            columns.next(),
-            columns.next(),
-            columns.next(),
-            columns.next(),
-        ) else {
-            panic!("{RECORDED}:{at}: not four columns: {line:?}");
-        };
-        let feature = (feature != UNGATED).then(|| {
-            enabled(feature);
-            feature.to_string()
-        });
-        let outcome = Outcome::parse(outcome)
-            .unwrap_or_else(|| panic!("{RECORDED}:{at}: no outcome {outcome:?}"));
-        let calls: Vec<Call> = if calls.is_empty() {
-            Vec::new()
-        } else {
-            calls
-                .split("; ")
-                .map(|text| {
-                    let call =
-                        parse_call(text).unwrap_or_else(|error| panic!("{RECORDED}:{at}: {error}"));
-                    assert_eq!(format!("{call:?}"), text, "{RECORDED}:{at}");
-                    call
-                })
-                .collect()
-        };
-        assert!(
-            recorded
-                .insert(
-                    name.to_string(),
-                    Recorded {
-                        feature,
-                        outcome,
-                        calls
-                    }
-                )
-                .is_none(),
-            "{RECORDED}:{at}: {name} is recorded twice"
-        );
+    parse(RECORDED, &data)
+}
+
+/// The configuration the record `data` at `path` was recorded under, and
+/// every recorded case by name, each row read and checked by the refinement
+/// machine ([`refinement::parse_record`]) and each feature one of
+/// [`FEATURES`]: a row the machine refuses, or claiming another class than
+/// it supports, is refused, naming the line.
+fn parse(path: &str, data: &str) -> (String, BTreeMap<String, Recorded>) {
+    if record::try_read(data).is_none() {
+        record::read(path, data, &format!("{RECORD}=1"));
     }
+    let (configuration, rows) =
+        refinement::parse_record(path, data).unwrap_or_else(|error| panic!("{error}"));
+    let recorded = rows
+        .into_iter()
+        .map(|(_, row)| {
+            if let Some(feature) = &row.feature {
+                enabled(feature);
+            }
+            (
+                row.name,
+                Recorded {
+                    feature: row.feature,
+                    outcome: row.outcome,
+                    run: row.run,
+                },
+            )
+        })
+        .collect();
     (configuration, recorded)
 }
 
@@ -1019,11 +1250,12 @@ fn every_baseline_admits_exactly_its_recorded_calls() {
 
 /// The admission oracle alone ([`pipeline::Unwitnessed`]), run natively,
 /// renders the recorded baselines byte for byte: dropping the physical
-/// witness changes only what is observed, never a call admitted, so the
-/// models compare against the one record, not a second. The record holds
-/// every gated case; a build renders the ones it compiles, so the
-/// comparison is of the record's configuration line, its ungated cases and
-/// the cases of every feature this build enables, each line whole.
+/// witness changes only what is observed, never an observation a session
+/// records nor what a custody holds, so the models compare against the one
+/// record, not a second. The record holds every gated case; a build renders
+/// the ones it compiles, so the comparison is of the record's configuration
+/// line, its ungated cases and the cases of every feature this build
+/// enables, each line whole.
 #[test]
 fn the_admission_oracle_alone_reproduces_the_record() {
     let (recorded_under, _) = recorded();
@@ -1034,8 +1266,8 @@ fn the_admission_oracle_alone_reproduces_the_record() {
         .enumerate()
         .filter(|(at, line)| {
             *at == 0 || {
-                let feature = line.split('\t').nth(1).unwrap_or(UNGATED);
-                feature == UNGATED || enabled(feature)
+                let feature = line.split('\t').nth(1).unwrap_or(refinement::UNGATED);
+                feature == refinement::UNGATED || enabled(feature)
             }
         })
         .map(|(_, line)| line)
@@ -1047,8 +1279,43 @@ fn the_admission_oracle_alone_reproduces_the_record() {
     );
 }
 
+/// Panic at the first point `actual` and `expected` differ, naming `run`:
+/// their observations, each in its canonical text, compared one by one and a
+/// window of both shown around the first difference; then their marks and
+/// their end. Canonical text, since identities are numbered by first
+/// appearance ([`refinement::render_run`]).
+fn assert_run(actual: &Run, expected: &Run, run: &str) {
+    let (actual_observed, actual_marks, actual_end) = refinement::render_run(actual);
+    let (expected_observed, expected_marks, expected_end) = refinement::render_run(expected);
+    if actual_observed != expected_observed {
+        let actual: Vec<&str> = actual_observed.split("; ").collect();
+        let expected: Vec<&str> = expected_observed.split("; ").collect();
+        let at = actual
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(actual.len().min(expected.len()));
+        let start = at.saturating_sub(2);
+        let window = |observed: &[&str]| {
+            observed[start.min(observed.len())..observed.len().min(at + 4)].join("; ")
+        };
+        panic!(
+            "trace divergence: run={run}, first_difference={at}, actual_len={}, expected_len={}\n\
+             actual_window={}\nexpected_window={}",
+            actual.len(),
+            expected.len(),
+            window(&actual),
+            window(&expected)
+        );
+    }
+    assert_eq!(actual_marks, expected_marks, "{run}: its marks differ");
+    assert_eq!(actual_end, expected_end, "{run}: its end differs");
+}
+
 /// The baselines, compared with their record or, under `DCBOR_RECORD_TRACES`,
-/// recorded ([`every_baseline_admits_exactly_its_recorded_calls`]).
+/// recorded ([`every_baseline_admits_exactly_its_recorded_calls`]). Each
+/// case's calls are compared first, under its policy's trace, the
+/// diagnostic of an admission's difference; then its whole run.
 fn baselines<W: Physical>() {
     let cases = cases::<W>();
     let inadmissible = cases.inadmissible();
@@ -1086,7 +1353,10 @@ fn baselines<W: Physical>() {
         .collect();
     assert!(unrun.is_empty(), "recorded but no longer run: {unrun:#?}");
     let diagnostic = AdmissionTrace::new();
-    every_fixture(cases.cases.len(), |index| {
+    // Every case's run finalized when it was recorded: what remains is
+    // comparison, each case a fixture, every difference reported together
+    // at the test's boundary, where nothing is held.
+    let compared = every_fixture(cases.cases.len(), |index| {
         let case = &cases.cases[index];
         let expected = recorded
             .get(&case.name)
@@ -1102,16 +1372,26 @@ fn baselines<W: Physical>() {
             "{}: recorded with another outcome",
             case.name
         );
-        let trace = case.policy.as_ref().map_or(&diagnostic, Limits::trace);
-        trace.assert_calls(
-            &case.calls,
-            &expected.calls,
-            &format!(
-                "{} (recorded under {recorded_under}; running under {running_under})",
-                case.name
-            ),
+        let run = format!(
+            "{} (recorded under {recorded_under}; running under {running_under})",
+            case.name
         );
+        let trace = case.trace.as_ref().unwrap_or(&diagnostic);
+        trace.assert_calls(
+            &refinement::calls(&case.run.observed),
+            &refinement::calls(&expected.run.observed),
+            &run,
+        );
+        assert_run(&case.run, &expected.run, &run);
+        Ok(())
     });
+    if let Err(findings) = compared {
+        panic!(
+            "{} of {} baselines differ from {RECORDED}: {findings:#?}",
+            findings.len(),
+            cases.cases.len()
+        );
+    }
 }
 
 /// Each wire's declaration agrees with the symbolic decoder, an oracle
@@ -1164,6 +1444,16 @@ impl Resumable<Limits> for Defective {
     }
 }
 
+/// The planted defect admits nothing, so holds nothing.
+impl Custodial<Reservation> for Defective {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<Reservation>) -> PermitsObserved {
+        PermitsObserved::Complete
+    }
+}
+
+// Holding nothing at any step, it holds nothing once published.
+dcbor_test_support::terminal!(Exhausted: [] Defective);
+
 /// The recorder refuses a planted defect, and a planted outcome other than
 /// the one declared, naming each case and what it reached; an admissible
 /// case beside them is not refused.
@@ -1179,7 +1469,12 @@ fn a_planted_defect_or_undeclared_outcome_is_never_recorded() {
     cases.synchronous("planted outcome", Outcome::Published, |_| {
         Ok(Outcome::Invalid)
     });
-    cases.synchronous("admissible", Outcome::Invalid, |_| Ok(Outcome::Invalid));
+    cases.retained(
+        "admissible".into(),
+        Outcome::Invalid,
+        HeaderCursor::new(&[0x18, 0x17]),
+        support::decode_turns(2),
+    );
     let inadmissible = cases.inadmissible();
     assert_eq!(inadmissible.len(), 2, "{inadmissible:#?}");
     assert!(
@@ -1212,44 +1507,167 @@ fn a_planted_defect_or_undeclared_outcome_is_never_recorded() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// A trace record is a record ([`record::render`]) whose rows are its cases:
-/// name, feature gate, outcome and calls; its header and publication are the
-/// record module's, checked there.
+/// Planted control: an admissible case whose run the refinement machine
+/// refuses (a grant whose release was never paid, nothing preceding it) is
+/// never rendered, naming the case and the machine's refusal.
 #[test]
-fn a_trace_record_names_its_configuration_and_each_case() {
+fn a_run_the_machine_refuses_is_never_recorded() {
     let mut cases = Cases::under::<heap::Observation>();
-    cases.synchronous("one", Outcome::Invalid, |_| Ok(Outcome::Invalid));
-    assert_eq!(
-        render(&cases, "toolchain=t std=s"),
-        record::render(
-            "toolchain=t std=s",
-            [format!("one\t{UNGATED}\tinvalid\t").as_str()]
-        )
+    let observed = refinement::parse_observed("1 1 allocate 8 granted 1.1")
+        .expect("a planted observation in canonical text");
+    cases.push(
+        "planted allocation".into(),
+        Outcome::Published,
+        Ok(Outcome::Published),
+        Run {
+            observed: vec![observed],
+            checkpoints: Vec::new(),
+            cleaning: None,
+            published: None,
+            end: End::Published,
+        },
+        None,
+    );
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        render(&cases, "planted configuration")
+    }))
+    .expect_err("a refused run was rendered");
+    let message = failure
+        .downcast::<String>()
+        .expect("named refinement diagnostic");
+    assert!(
+        message.contains("planted allocation: the refinement machine refused its run at"),
+        "{message}"
     );
 }
 
+/// A trace record is a record ([`record::render`]) whose rows are its cases
+/// ([`Row::render`]); its header and publication are the record module's,
+/// its rows' grammar the refinement crate's, each checked there. A rendered
+/// record reads back to the same case: its outcome, its feature and its run,
+/// the end its outcome's, the row's class `observed`.
 #[test]
-fn a_call_renders_back_to_itself() {
-    for call in [
-        Call::Work {
-            values: 0,
-            bytes: 0,
-        },
-        Call::Work {
-            values: u64::MAX,
-            bytes: 64,
-        },
-        Call::Allocate(u64::MAX),
-    ] {
-        assert_eq!(parse_call(&format!("{call:?}")), Ok(call));
+fn a_trace_record_names_its_configuration_and_each_case() {
+    let mut cases = Cases::under::<heap::Observation>();
+    cases.retained(
+        "one".into(),
+        Outcome::Invalid,
+        HeaderCursor::new(&[0x18, 0x17]),
+        support::decode_turns(2),
+    );
+    let rendered = render(&cases, "toolchain=t std=s");
+    let (observed, marks, end) = refinement::render_run(&cases.cases[0].run);
+    assert_eq!(
+        rendered,
+        record::render(
+            "toolchain=t std=s",
+            [format!(
+                "one\t{}\tinvalid\tobserved\t{observed}\t{marks}\t{end}",
+                refinement::UNGATED
+            )
+            .as_str()]
+        )
+    );
+    assert_eq!(end, "invalid");
+    let (configuration, recorded) = parse("rendered", &rendered);
+    assert_eq!(configuration, "toolchain=t std=s");
+    assert_eq!(recorded["one"].outcome, Outcome::Invalid);
+    assert_eq!(recorded["one"].feature, None);
+    assert_eq!(recorded["one"].run.end, End::Failed(Class::Invalid));
+    assert_run(&recorded["one"].run, &cases.cases[0].run, "read back");
+}
+
+/// Planted controls: a row claiming a class its run does not support,
+/// `checked` and `derived` each, is refused naming the line and the class
+/// it claims.
+#[test]
+fn a_row_claiming_another_evidence_class_is_refused() {
+    let mut cases = Cases::under::<heap::Observation>();
+    cases.retained(
+        "one".into(),
+        Outcome::Invalid,
+        HeaderCursor::new(&[0x18, 0x17]),
+        support::decode_turns(2),
+    );
+    // Establish valid evidence before changing only its claimed class.
+    let valid = render(&cases, "toolchain=t std=s");
+    assert_eq!(parse("valid", &valid).1.len(), 1);
+    let (observed, marks, end) = refinement::render_run(&cases.cases[0].run);
+    for claimed in ["checked", "derived"] {
+        let data = record::render(
+            "toolchain=t std=s",
+            [format!(
+                "one\t{}\tinvalid\t{claimed}\t{observed}\t{marks}\t{end}",
+                refinement::UNGATED
+            )
+            .as_str()],
+        );
+        let failure = std::panic::catch_unwind(|| parse("planted", &data).1.len())
+            .expect_err("a misclassified row was read");
+        let message = failure
+            .downcast::<String>()
+            .expect("a named class diagnostic");
+        assert!(
+            message.contains(&format!(
+                "planted:2: one claims {claimed}, its row supports observed"
+            )),
+            "{message}"
+        );
     }
-    for text in [
-        "",
-        "Allocate()",
-        "Allocate(-1)",
-        "Work { values: 1 }",
-        "Work",
-    ] {
-        assert!(parse_call(text).is_err(), "{text:?} parsed");
+}
+
+/// A case's admission diagnostic is its own policy's trace, kept past the
+/// run: a case driven under a policy of its own carries the trace whose
+/// first admission is its first call.
+#[test]
+fn a_case_keeps_its_policys_admission_trace() {
+    let mut cases = Cases::under::<heap::Observation>();
+    cases.synchronous("one decode", Outcome::Published, |m| {
+        reached(&decode_with(&[0x01], Options::normalizing(1), m))
+    });
+    let trace = cases.cases[0]
+        .trace
+        .as_ref()
+        .expect("a recorded case keeps its policy's trace");
+    let first: Option<Admission> = trace.recent().next();
+    assert_eq!(
+        first.map(|admission| admission.call),
+        refinement::calls(&cases.cases[0].run.observed)
+            .first()
+            .copied(),
+        "the kept trace is not the case's policy's"
+    );
+}
+
+/// The permits a publication mark names are the output's own, by identity:
+/// a published decode's arena permit, granted under the run's policy.
+#[test]
+fn a_publication_names_the_outputs_permits() {
+    let mut cases = Cases::under::<heap::Observation>();
+    cases.retained(
+        "Decoder published".into(),
+        Outcome::Published,
+        Decoder::<Reservation, Family>::new(&[0x82, 0x01, 0x02], Options::normalizing(4)),
+        support::decode_turns(3),
+    );
+    let run = &cases.cases[0].run;
+    let publication = run.published.as_ref().expect("a published run is marked");
+    assert!(
+        !publication.permits.is_empty(),
+        "the document holds its arena"
+    );
+    let granted: Vec<Identity> = run
+        .observed
+        .iter()
+        .filter_map(|observation| match observation.event {
+            dcbor::bounded::Event::Call(_, dcbor::bounded::Answer::Granted(permit)) => Some(permit),
+            _ => None,
+        })
+        .collect();
+    for permit in &publication.permits {
+        assert!(
+            granted.contains(permit),
+            "published permit {permit:?} was never granted in the run"
+        );
     }
 }

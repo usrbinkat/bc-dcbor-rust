@@ -7,10 +7,8 @@
 extern crate alloc;
 use super::*;
 use crate::bounded::boundary::{Bound, Predicate, boundary};
-use crate::bounded::decode::construction::reclamation::{
-    Admitted, Custody, Peek, Place, Reduction, Uniform,
-};
-use crate::bounded::decode::construction::stable::{self, Installed, Stack};
+use crate::bounded::decode::construction::reclamation::{Custody, Peek, Place, Reduction, Uniform};
+use crate::bounded::decode::construction::stable::{self, Installed, Stack, Ticket};
 use crate::sync::{Atomics, Representation};
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
@@ -41,17 +39,14 @@ pub enum Phase {
     BufferFreed,
 }
 
-/// One element's custody record: its state, and whether it entered the
-/// initialized prefix.
-struct Element<E> {
-    state: E,
-    committed: bool,
-}
-
-/// What the metadata block's acquisition writes, whole: the element records
-/// and the length of the initialized prefix.
+/// What the metadata block's acquisition writes, whole: the element records,
+/// each holding its element's state, and the length of the initialized
+/// prefix. Records are pushed one per element in slot order, each once the
+/// one before it is committed, so record `i` holds an element of the prefix
+/// exactly when `i < committed`: only the newest can be outside it. The
+/// count is the one record of which elements are committed.
 struct Head<E, P> {
-    children: Stack<Element<E>, P>,
+    children: Stack<E, P>,
     /// Elements in the initialized prefix.
     committed: usize,
 }
@@ -81,12 +76,14 @@ const fn contract<E, P>() -> stable::Contract<Head<E, P>, Meta<E, P>, P> {
 }
 
 /// The construction state of a sequence whose elements' states are `E`, with
-/// permits of `P`: its metadata, once installed; what that installation has
-/// admitted; its phase; and the document index of the next element, once the
-/// array's header is read. Only the sequence engine reads or changes it.
+/// permits of `P`: its metadata, once installed; the ticket of its own
+/// acquisition pending, the metadata block's or the payload's ([`Ticket`]),
+/// whose credit is the operation's; its phase; and the document index of the
+/// next element, once the array's header is read. Only the sequence engine
+/// reads or changes it.
 pub struct State<E, P> {
     meta: Option<Installed<Meta<E, P>, P>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
     // Control belongs to the continuation, including before installation and
     // after release. It also tracks which metadata fields are initialized,
     // without reading the allocation to discover its initialization state.
@@ -98,7 +95,7 @@ impl<E, P> State<E, P> {
     /// Nothing installed, no header read.
     pub const INITIAL: Self = Self {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
         phase: Phase::Initializing,
         position: 0,
     };
@@ -110,28 +107,28 @@ impl<E, P> State<E, P> {
 // here so a nested sequence's proof is one obligation per level.
 unsafe impl<E: Send, P: Send> Send for State<E, P> {}
 
-/// What a sequence's construction holds: no metadata block, with the
-/// admissions held toward it; or the block, holding the element records.
+/// What a sequence's construction holds: no metadata block, or the block,
+/// holding the element records. Progress alone: an acquisition bound for
+/// the block, the payload or the next record is the root pending's custody,
+/// reported by its observation (`CustodySink::bound`), never by this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SequenceObservation<E> {
-    Unallocated(Admitted),
+    Unallocated,
     Held(SequenceCustody<E>),
 }
 
 /// A sequence's custody once its metadata is held, `E` an element's
 /// observation: the phase; the document index of the next element; the
-/// elements in the initialized prefix; the element records held and the
-/// admissions held toward the next; whether the payload's permit is held;
-/// and the newest record, the element under construction or cleanup
-/// whenever one is, whole. Every record before the newest holds a committed
-/// element.
+/// elements in the initialized prefix; the element records held; whether
+/// the payload's permit is held; and the newest record, the element under
+/// construction or cleanup whenever one is, whole. Every record before the
+/// newest holds a committed element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SequenceCustody<E> {
     pub phase: Phase,
     pub position: usize,
     pub committed: usize,
     pub records: usize,
-    pub admitted: Admitted,
     pub payload: bool,
     pub newest: Option<ElementObservation<E>>,
 }
@@ -149,22 +146,24 @@ impl<E: Custody, P> Custody for State<E, P> {
 
     fn observe(&mut self) -> Self::Observation {
         let Some(installed) = self.meta.as_mut() else {
-            return SequenceObservation::Unallocated(self.admitted);
+            return SequenceObservation::Unallocated;
         };
         let meta = installed.get();
+        let (committed, records) = (meta.head.committed, meta.head.children.len());
         SequenceObservation::Held(SequenceCustody {
             phase: self.phase,
             position: self.position,
-            committed: meta.head.committed,
-            records: meta.head.children.len(),
-            admitted: meta.head.children.admitted(),
+            committed,
+            records,
             // SAFETY: every phase after Initializing has written the slot;
             // short-circuiting keeps observation from reading it before then.
             payload: self.phase != Phase::Initializing
                 && unsafe { meta.payload.assume_init_ref() }.is_some(),
+            // The newest record is in the prefix exactly when every record
+            // is ([`Head`]).
             newest: meta.head.children.top().map(|child| ElementObservation {
-                committed: child.state.committed,
-                element: child.state.state.observe(),
+                committed: records == committed,
+                element: child.state.observe(),
             }),
         })
     }
@@ -202,28 +201,31 @@ pub enum SequenceClass<C> {
     Freed { payload: bool },
 }
 
-// Cleanup (`reclaim`) reads the metadata's presence and the phase, grouped as
-// above; in `Reclaim`, the newest record's element through its own cleanup,
-// then, once it is done, whether that record was committed (its slot leaves
-// the committed prefix) and the committed count (the container is released
-// only with none). Only the newest record can be uncommitted: a record is
-// pushed in `Next` once the one before it is committed. So every record below
-// the newest holds a committed element, complete, and of the elements' one
-// complete class ([`Uniform`]): the committed count and the newest record fix
-// every record. The element's own relation is a simulation of its cleanup,
-// and a record is popped exactly when its element's cleanup reports done,
-// after which the newest is the committed record below it, of the complete
-// class, or none. The payload's permit is released in `Freed` without
-// admission and never read before. The document position, the admissions
-// held toward the next record and the records' count (the committed count and
-// whether the newest is uncommitted) are never read by cleanup apart from
-// what the class keeps, so the relation is a simulation of cleanup.
+// Cleanup (`reclaim_sequence`) reads the metadata's presence and the phase,
+// grouped as above; in `Reclaim`, the newest record's element through its
+// own cleanup, then, once it is done, the committed count and the
+// records' count: the newest record is outside the prefix exactly when the
+// records exceed the count ([`Head`]), so its slot is the count's, and
+// otherwise the count's predecessor, leaving the prefix (the container is
+// released only with none). The class keeps the committed count and, for the
+// newest record, whether the records equal it, which is that same fact: a
+// record is pushed in `Next` once the one before it is committed, so the
+// records are the count or one more. So every record below the newest holds
+// a committed element, complete, of the elements' one complete class
+// ([`Uniform`]): the committed count and the newest record fix every
+// record. The element's own relation is a simulation of its cleanup, and a
+// record is popped exactly when its element's cleanup reports done, after
+// which the newest is the committed record below it, of the complete class,
+// or none. The payload's permit is released in `Freed` without admission
+// and never read before. The document position and a pending acquisition,
+// whose credit the operation settles at its cleanup entry, are never read
+// by cleanup, so the relation is a simulation of cleanup.
 impl<E: Uniform, P> Reduction for State<E, P> {
     type Class = SequenceClass<E::Class>;
 
     fn class(observation: &Self::Observation) -> Self::Class {
         let custody = match observation {
-            SequenceObservation::Unallocated(_) => return SequenceClass::Unallocated,
+            SequenceObservation::Unallocated => return SequenceClass::Unallocated,
             SequenceObservation::Held(custody) => custody,
         };
         let newest = custody
@@ -432,7 +434,7 @@ const fn sequence_cost<T, Q: Sequence<T>, E, P>(
     element: ConstructionCost,
 ) -> Option<ConstructionCost> {
     let meta = contract::<E, P>();
-    let child = Stack::<Element<E>, P>::RECORD;
+    let child = Stack::<E, P>::RECORD;
     let release = stable::release_cost::<P>();
     let storage = if Q::INLINE { 0 } else { size_of::<T>() };
     let payload = if Q::INLINE {
@@ -455,16 +457,41 @@ const fn sequence_cost<T, Q: Sequence<T>, E, P>(
     own.checked_add(cost!(element.checked_children()))
 }
 
-/// One admitted construction unit of sequence `Q` in `slot` from the array
-/// at `index`. Without metadata the state is `INITIAL` (every cleanup that
-/// releases the metadata restores it), so construction begins; any phase
-/// past construction is refused.
-fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
-    document: &Document<'_, A::Permit>,
-    index: usize,
-    mut slot: Slot<'_, Q, State<T::State, A::Permit>>,
+/// The construction state of a sequence of `T`, its elements' own states,
+/// parts of the sequence's, in its records.
+type SequenceState<T, A> =
+    State<<T as Reclaim<A>>::State, <A as crate::bounded::Releasing>::Permit>;
+
+/// The payload permit's slot in a sequence's metadata, for
+/// [`stable::allocate_payload`]: refused before `Initializing`'s unit wrote
+/// it, so it is never read unwritten.
+fn payload<E, P, R>(state: &mut State<E, P>) -> Result<&mut Option<P>, BoundedError<R>> {
+    if state.phase == Phase::Initializing {
+        return Err(BoundedError::PlanMismatch);
+    }
+    let meta = state.meta.as_mut().ok_or(BoundedError::PlanMismatch)?.get();
+    // SAFETY: every phase after Initializing has written the slot.
+    Ok(unsafe { meta.payload.assume_init_mut() })
+}
+
+/// One admitted construction unit of sequence `Q` in the context's slot,
+/// from the context's node, an array. Without metadata the state is
+/// `INITIAL`, so construction begins; any phase past construction is
+/// refused. Each element is built as a part ([`build_part`]), its context
+/// projected from this one's slot. The recorded `position` is the next
+/// element's node: this sequence's own progress through its children, the
+/// one record of which node its current element continues from.
+fn build_sequence<'b, T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
+    ctx: Context<'b, '_, '_, '_, Q, SequenceState<T, A>, A>,
     a: &mut A,
-) -> ConstructResult<Built, A> {
+) -> ConstructResult<Building<'b, Q>, A> {
+    let mut ctx = ctx;
+    let assembly = ctx.assembly();
+    let index = ctx.index();
+    let node = ctx.node();
+    let position = ctx.slot().custody().position;
+    let current = ctx.node_at(position);
+    let (mut slot, pending) = ctx.acquiring();
     let (place, state) = slot.parts();
     if state.meta.is_none() {
         if state.phase != Phase::Initializing {
@@ -477,7 +504,8 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
             stable::install::<Meta<T::State, A::Permit>, Head<T::State, A::Permit>, A>(
                 const { contract::<T::State, A::Permit>() },
                 &mut state.meta,
-                &mut state.admitted,
+                pending,
+                &mut state.ticket,
                 || Head {
                     children: Stack::new(),
                     committed: 0,
@@ -486,7 +514,7 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
                 a,
             )?
         };
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     }
     // Element 0's place and the storage's room, taken under the sequence's
     // custody before its metadata is borrowed: an element building needs
@@ -503,11 +531,11 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
         const { sized::<Option<A::Permit>>() }.admit(a)?;
         meta.payload.write(None);
         state.phase = Phase::Empty;
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     }
     if state.phase == Phase::Empty {
         Q::HEADER.admit(a)?;
-        let Some(Kind::Array(count)) = node_at(document, index).map(|n| n.kind()) else {
+        let Some(Kind::Array(count)) = node.map(|n| n.kind()) else {
             return Err(wrong_type());
         };
         if !Q::accepts(usize::try_from(count).map_err(|_| BoundedError::Overflow)?) {
@@ -521,9 +549,9 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
             Phase::Initialized
         };
         state.position = index.checked_add(1).ok_or(BoundedError::Overflow)?;
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     }
-    let Some(Kind::Array(count)) = node_at(document, index).map(|n| n.kind()) else {
+    let Some(Kind::Array(count)) = node.map(|n| n.kind()) else {
         return Err(wrong_type());
     };
     let count = usize::try_from(count).map_err(|_| BoundedError::Overflow)?;
@@ -533,67 +561,113 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
             state.phase = Phase::ReleasePayload;
         }
         Phase::ReleasePayload => {
-            stable::admit_release(a)?;
+            stable::admit_release(pending, &mut state.ticket, a)?;
             state.phase = Phase::AllocatePayload;
         }
         Phase::AllocatePayload => {
-            // SAFETY: every phase after Initializing has written the slot.
-            if unsafe { meta.payload.assume_init_ref() }.is_some() {
-                // A permit is already held: a step after a failed
-                // reservation, refused rather than leaking the permit.
-                return Err(BoundedError::PlanMismatch.into());
-            }
             let bytes = count
                 .checked_mul(size_of::<T>())
                 .ok_or(BoundedError::Overflow)?;
             let bytes = u64::try_from(bytes).map_err(|_| BoundedError::Overflow)?;
-            meta.payload
-                .write(Some(a.allocate(bytes).map_err(BoundedError::Refused)?));
-            // SAFETY: the container is initialized and empty.
-            if !unsafe { Q::reserve(place, state, count) } {
-                return Err(BoundedError::Allocation { bytes }.into());
-            }
+            // The ticket moves out of the state for the call, which borrows
+            // the state as the payload's custody, and back whatever the call
+            // returns.
+            let mut ticket = state.ticket.take();
+            let allocated = stable::allocate_payload(
+                state,
+                payload,
+                bytes,
+                // SAFETY: AllocatePayload follows the container's
+                // initialization, and no element is reserved yet: it is
+                // empty.
+                |state| unsafe { Q::reserve(place, state, count) },
+                pending,
+                &mut ticket,
+                a,
+            );
+            state.ticket = ticket;
+            allocated?;
             state.phase = Phase::Next;
         }
         Phase::Next => {
+            // The node holds exactly the elements its count claims: `position`,
+            // the next element's node, is inside the array's subtree exactly
+            // while an element remains. A child beyond the count is refused
+            // before it is built, and fewer children than the count before a
+            // record is pushed for one that does not exist; both are
+            // `PlanMismatch`, nothing changed, since a decoded document's
+            // array node always holds its count.
+            let end = super::super::next_index(node.ok_or_else(wrong_type)?);
+            let inside = boundary!(a, Predicate::ArenaLength, state.position, end).is_lt();
             if boundary!(a, Predicate::ArenaLength, meta.head.committed, count).is_eq() {
+                if inside {
+                    return Err(BoundedError::PlanMismatch.into());
+                }
                 STEP.admit(a)?;
                 state.phase = Phase::Complete;
-                return Ok(Built::Done);
+                // SAFETY: the container was initialized in `Empty` and, for a
+                // vector, its storage reserved for `count` elements; every
+                // element of the prefix entered it in `Commit`, which follows
+                // only a `Done` whose record, confined by its brand to the
+                // step that minted it, `build_part` verified against the
+                // place this sequence projected for that element; the prefix
+                // now holds `count` elements, recorded by `set_len`, and the
+                // slot is not reclaimed: its cleanup is refused while it
+                // builds.
+                return Ok(Building::Done(unsafe { assembly.assemble() }));
             }
-            meta.head.children.push(
-                Element {
-                    state: T::INITIAL,
-                    committed: false,
-                },
-                a,
-            )?;
+            if !inside {
+                return Err(BoundedError::PlanMismatch.into());
+            }
+            meta.head.children.push(T::INITIAL, pending, a)?;
             state.phase = Phase::Child;
         }
         Phase::Child => {
             let (elements, capacity) = elements.ok_or(BoundedError::PlanMismatch)?;
+            let committed = meta.head.committed;
             // The element's slot lies within the storage reserved: a count
             // read at a later step that would pass it is refused here, before
             // any place outside the storage exists.
-            if Bound::new(Predicate::ArenaLength, capacity).reached(a, meta.head.committed) {
+            if Bound::new(Predicate::ArenaLength, capacity).reached(a, committed) {
                 return Err(BoundedError::PlanMismatch.into());
             }
-            let child = meta.head.children.top().ok_or(BoundedError::PlanMismatch)?;
             // SAFETY: `committed` is below the storage's capacity; reserved
-            // storage cannot move during child construction, and the child's
-            // record holds the state of exactly this slot.
-            let destination =
-                unsafe { Slot::new(elements.add(meta.head.committed), &mut child.state.state) };
-            if T::build_step(document, state.position, destination, a)? == Built::Done {
-                state.phase = Phase::Commit;
+            // storage cannot move during child construction; the newest
+            // record, held in this sequence's metadata, holds the state of
+            // exactly this slot, the first past the committed prefix.
+            let element = unsafe {
+                ctx.part(position, |slot| {
+                    let meta = slot
+                        .into_parts()
+                        .1
+                        .meta
+                        .as_mut()
+                        .ok_or(BoundedError::PlanMismatch)?;
+                    let record = meta
+                        .get()
+                        .head
+                        .children
+                        .top()
+                        .ok_or(BoundedError::PlanMismatch)?;
+                    Ok::<_, BoundedError<A::Refusal>>(Slot::new(
+                        elements.add(committed),
+                        &mut record.state,
+                    ))
+                })
+            }?;
+            if build_part::<T, A>(element, a)? == Built::Done {
+                ctx.slot().custody().phase = Phase::Commit;
             }
         }
         Phase::Commit => {
+            // Only the newest record is past the committed prefix, and it is
+            // the element built: one record more than the prefix.
+            if meta.head.children.len() != meta.head.committed + 1 {
+                return Err(BoundedError::PlanMismatch.into());
+            }
             STEP.admit(a)?;
-            let node = node_at(document, state.position).ok_or_else(wrong_type)?;
+            let node = current.ok_or_else(wrong_type)?;
             state.position = super::super::next_index(node);
-            let child = meta.head.children.top().ok_or(BoundedError::PlanMismatch)?;
-            child.state.committed = true;
             meta.head.committed += 1;
             let committed = meta.head.committed;
             // SAFETY: the child returned Done at slot `committed - 1`.
@@ -602,22 +676,27 @@ fn build<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
         }
         _ => return Err(BoundedError::PlanMismatch.into()),
     }
-    Ok(Built::Progress)
+    Ok(Building::Progress)
 }
 
 /// One admitted cleanup unit of sequence `Q` in `slot`, following the
-/// retained child records in reverse order. Partial children never enter the
-/// committed prefix; committed elements leave it only after their own cleanup
-/// returns Done, and the container is released empty. Every path that
-/// releases the metadata leaves the state `INITIAL`, so a later step reports
-/// `Done` and a later build begins anew.
-fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
-    mut slot: Slot<'_, Q, State<T::State, A::Permit>>,
-    a: &mut A,
+/// retained child records in reverse order, each element as a part
+/// ([`reclaim_part`]). Partial children never enter the committed prefix;
+/// committed elements leave it only after their own cleanup returns Done,
+/// and the container is released empty. Every path that releases the
+/// metadata leaves the state `INITIAL`. No build follows: the root's session
+/// refuses every build once its cleanup began, and a parent holding this
+/// sequence as a part reclaims it only from its own cleanup phases.
+fn reclaim_sequence<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
+    mut slot: Slot<'_, Q, SequenceState<T, A>>,
+    a: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let (place, state) = slot.parts();
     if state.meta.is_none() {
         STEP.admit(a)?;
+        // The metadata's acquisition, if pending, had its credit settled at
+        // the operation's cleanup entry: the ticket is forgotten.
+        state.ticket = None;
         state.position = 0;
         return Ok(Reclaimed::Done);
     }
@@ -647,11 +726,17 @@ fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
         | Phase::Commit
         | Phase::Complete => {
             STEP.admit(a)?;
+            // A payload's or a record's acquisition pending had its credit
+            // settled at the operation's cleanup entry: the tickets are
+            // forgotten.
+            state.ticket = None;
+            meta.head.children.abandon();
             state.phase = Phase::Reclaim;
         }
         Phase::Reclaim => {
             let elements = elements.ok_or(BoundedError::PlanMismatch)?;
-            let Some(child) = meta.head.children.top() else {
+            let records = meta.head.children.len();
+            if records == 0 {
                 if meta.head.committed != 0 {
                     return Err(BoundedError::PlanMismatch);
                 }
@@ -661,8 +746,10 @@ fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
                 unsafe { Q::release(place, state) };
                 state.phase = Phase::BufferFreed;
                 return Ok(Reclaimed::Progress);
-            };
-            let committed = child.state.committed;
+            }
+            // The newest record is in the prefix exactly when every record
+            // is ([`Head`]).
+            let committed = records == meta.head.committed;
             let slot = if committed {
                 if boundary!(a, Predicate::ArenaLength, meta.head.committed, 0).is_eq() {
                     return Err(BoundedError::PlanMismatch);
@@ -671,11 +758,12 @@ fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
             } else {
                 meta.head.committed
             };
+            let child = meta.head.children.top().ok_or(BoundedError::PlanMismatch)?;
             // SAFETY: a partial slot was reserved before its record was pushed;
             // committed slots lie inside the prefix; the record holds the
             // state of exactly this slot.
-            let destination = unsafe { Slot::new(elements.add(slot), &mut child.state.state) };
-            if T::reclaim_step(destination, a)? == Reclaimed::Done {
+            let destination = unsafe { Slot::new(elements.add(slot), &mut child.state) };
+            if reclaim_part::<T, A>(destination, a)? == Reclaimed::Done {
                 // The element is reclaimed completely: its record is freed in
                 // the same step, a release its push paid for.
                 meta.head.children.pop();
@@ -703,32 +791,31 @@ fn reclaim<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
     Ok(Reclaimed::Progress)
 }
 
-/// The calls [`reclaim`] still takes from `slot`'s state: no metadata or only
-/// the block, one; nothing written, two; written, one to enter `Reclaim`,
-/// then every element record's own calls, the container's release and the
-/// metadata's; in `Reclaim`, the latter three; freed, one.
-fn remaining<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
-    mut slot: PeekSlot<'_, Q, State<T::State, A::Permit>>,
-) -> u64 {
+/// The calls [`reclaim_sequence`] still takes from `slot`'s state: no
+/// metadata or only the block, one; nothing written, two; written, one to
+/// enter `Reclaim`, then every element's own calls ([`remaining_part`]),
+/// the container's release and the metadata's; in
+/// `Reclaim`, the latter three; freed, one. `None` when the count does not
+/// fit in `u64`.
+fn remaining_sequence<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
+    mut slot: PeekSlot<'_, Q, SequenceState<T, A>>,
+) -> Option<u64> {
     let (place, state) = slot.parts();
     if state.meta.is_none() {
-        return 1;
+        return Some(1);
     }
     // Without an initialized container no element record exists.
     match state.phase {
-        Phase::Initializing | Phase::BufferFreed => return 1,
-        Phase::Empty => return 2,
+        Phase::Initializing | Phase::BufferFreed => return Some(1),
+        Phase::Empty => return Some(2),
         _ => {}
     }
     // Element 0's place, observed under the sequence's custody before its
     // metadata is borrowed.
     // SAFETY: every remaining phase follows the container's initialization.
     let elements = unsafe { Q::peek_elements(place, &*state) };
-    let Some(installed) = state.meta.as_mut() else {
-        return 1;
-    };
-    let meta = installed.get();
-    let mut drain = 0u64;
+    let meta = state.meta.as_mut()?.get();
+    let mut drain = Some(0u64);
     // The records are pushed one per element in slot order, so the record
     // `records - 1 - n`, visited `n`th newest first, holds slot
     // `records - 1 - n`.
@@ -738,77 +825,182 @@ fn remaining<T: Reclaim<A>, Q: Sequence<T>, A: Allocator>(
         // SAFETY: every recorded slot was reserved, in an initialized
         // container, before its record was pushed; the record's state
         // describes that slot.
-        let destination = unsafe { Slot::new(elements.add(slot), &mut child.state) };
-        drain = drain.saturating_add(T::remaining(destination));
+        let destination = unsafe { Slot::new(elements.add(slot), child) };
+        drain = drain.and_then(|drain| drain.checked_add(remaining_part::<T, A>(destination)?));
     });
     // Each record's own calls, then the container's release and the metadata's.
-    let reclaiming = drain.saturating_add(2);
+    let reclaiming = drain?.checked_add(2)?;
     if state.phase == Phase::Reclaim {
-        reclaiming
+        Some(reclaiming)
     } else {
-        reclaiming.saturating_add(1)
+        reclaiming.checked_add(1)
     }
 }
 
-// SAFETY: the shared engine initializes the header and each spare-capacity
-// child in final storage; a child record is pushed before its element acquires
-// anything and describes that element until reclamation, including partials.
+/// The permits sequence `Q` in `slot` owns ([`Reclaim::observe_permits`]),
+/// reported inside the caller's open group: its metadata block's; its
+/// payload's, once its slot is written and a permit granted; then, newest
+/// first, each element record's block and the element's own
+/// ([`observe_part`]), each record paired with its slot as the cleanup count
+/// pairs them. Without an initialized container no record exists; once it
+/// is released none remains.
+fn permits_sequence<T: InPlace<A>, Q: Sequence<T>, A: Allocator>(
+    mut slot: PeekSlot<'_, Q, SequenceState<T, A>>,
+    sink: &mut dyn CustodySink<A::Permit>,
+) -> PermitsObserved {
+    let (place, state) = slot.parts();
+    let Some(installed) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    sink.permit(installed.permit(), None);
+    if state.phase == Phase::Initializing {
+        return PermitsObserved::Complete;
+    }
+    // SAFETY: every phase after Initializing has written the payload slot.
+    if let Some(payload) = unsafe { installed.get().payload.assume_init_ref() } {
+        sink.permit(payload, None);
+    }
+    if matches!(state.phase, Phase::Empty | Phase::BufferFreed) {
+        return PermitsObserved::Complete;
+    }
+    // Element 0's place, observed under the sequence's custody before its
+    // metadata is borrowed.
+    // SAFETY: every remaining phase follows the container's initialization.
+    let elements = unsafe { Q::peek_elements(place, &*state) };
+    let Some(installed) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    let children = &mut installed.get().head.children;
+    let mut index = children.len();
+    let mut whole = PermitsObserved::Complete;
+    children.for_each_record(|permit, child| {
+        index -= 1;
+        sink.permit(permit, None);
+        // SAFETY: every recorded slot was reserved, in an initialized
+        // container, before its record was pushed; the record's state
+        // describes that slot.
+        let element = observe_part::<T, A>(unsafe { Slot::new(elements.add(index), child) }, sink);
+        whole = observed_all([whole, element]);
+    });
+    whole
+}
+
+// SAFETY: admission, state, done, escape, provenance and order: the shared
+// sequence engine's (`build_sequence`, the one engine of `Vec` and arrays):
+// admission: the metadata, the header, the payload reservation, each child
+// record and every element step (`build_part`) are admitted before they run.
+// state: a child record is pushed before its element acquires anything and
+// describes that element until reclamation, partials included. done: `Done`
+// once the declared count of elements is built and the length committed;
+// more or fewer children than declared are refused. escape: element places
+// lie in the reserved buffer the header owns and are never returned.
+// provenance: the engine initializes the header and each spare-capacity
+// child in final storage, through places derived from the slot's. order: a
+// build past completion or once cleanup began is refused `PlanMismatch`,
+// nothing changed. cost: `sequence_cost` of the sequence's parts over
+// `T::COST`.
 unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for Vec<T> {
+    /// The sequence's own parts (`sequence_cost`) over each element's cost.
     const COST: ConstructionCost =
         crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
 
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        build::<T, Self, A>(document, index, slot, a)
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        build_sequence::<T, Self, A>(ctx, a)
     }
 }
 
-// SAFETY: the shared engine reclaims every recorded child, then the buffer.
-unsafe impl<T: Reclaim<A>, A: Allocator> Reclaim<A> for Vec<T> {
+// SAFETY: initial: `State::INITIAL`, nothing installed, no child recorded.
+// state: the metadata, the header's phase, the payload's permit and each
+// child's record describe everything acquired. admission: each cleanup unit
+// of the shared engine (`reclaim_sequence`), and each child's own
+// (`reclaim_part`), is admitted before it runs, a refusal changing nothing.
+// cleanup: the engine reclaims every recorded child through its own binding,
+// newest first, then frees the buffer without dropping elements, allocating
+// nothing and never unwinding. done: `Done` once every child is reclaimed and
+// the buffer and metadata released. order: a step after `Done` reports
+// `Done`; the count and observation read only recorded children. depth: one
+// level above `T`'s, exact. count: `remaining_sequence` counts every child's
+// remaining and the engine's own units.
+unsafe impl<T: InPlace<A>, A: Allocator> Reclaim<A> for Vec<T> {
     const DISPATCH_DEPTH: usize = T::DISPATCH_DEPTH.saturating_add(1);
-    type State = State<T::State, A::Permit>;
+    type State = SequenceState<T, A>;
     const INITIAL: Self::State = State::INITIAL;
 
-    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        reclaim::<T, Self, A>(slot, a)
+    fn reclaim_step(
+        slot: Slot<'_, Self, Self::State>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        reclaim_sequence::<T, Self, A>(slot, cleanup)
     }
 
-    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64 {
-        remaining::<T, Self, A>(slot)
+    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
+        remaining_sequence::<T, Self, A>(slot)
+    }
+
+    fn observe_permits(
+        slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        permits_sequence::<T, Self, A>(slot, sink)
     }
 }
 
-// SAFETY: as for Vec, with each element built in the destination's own slot.
+// SAFETY: admission, state, done, escape, provenance and order: the shared
+// sequence engine's, as for Vec, with each element built in the destination's
+// own slot: admission: each child record and element step is admitted before
+// it runs. state: a child record is pushed before its element acquires
+// anything and describes it until reclamation. done: `Done` once exactly `N`
+// elements are built; another count is refused. escape: element places lie
+// within the array's own place and are never returned. provenance: each
+// element's place is projected from the slot's. order: a build past
+// completion or once cleanup began is refused `PlanMismatch`, nothing
+// changed. cost: `sequence_cost` over `T::COST`, with no storage of its own.
 unsafe impl<T: InPlace<A>, A: Allocator, const N: usize> InPlace<A> for [T; N] {
+    /// As for `Vec`, with no storage of its own.
     const COST: ConstructionCost =
         crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
 
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        build::<T, Self, A>(document, index, slot, a)
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        build_sequence::<T, Self, A>(ctx, a)
     }
 }
 
-// SAFETY: as for Vec; the array owns no storage of its own to release.
-unsafe impl<T: Reclaim<A>, A: Allocator, const N: usize> Reclaim<A> for [T; N] {
+// SAFETY: initial: `State::INITIAL`, no child recorded. state: each child's
+// record describes everything acquired. admission: each cleanup unit, the
+// engine's and each child's, is admitted before it runs, a refusal changing
+// nothing. cleanup: as for Vec, each recorded child reclaimed through its own
+// binding, newest first; the array owns no storage of its own to release;
+// nothing is allocated and nothing unwinds. done: `Done` once every child is
+// reclaimed. order: a step after `Done` reports `Done`; the count and
+// observation read only recorded children. depth: one level above `T`'s,
+// exact. count: `remaining_sequence`.
+unsafe impl<T: InPlace<A>, A: Allocator, const N: usize> Reclaim<A> for [T; N] {
     const DISPATCH_DEPTH: usize = T::DISPATCH_DEPTH.saturating_add(1);
-    type State = State<T::State, A::Permit>;
+    type State = SequenceState<T, A>;
     const INITIAL: Self::State = State::INITIAL;
 
-    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        reclaim::<T, Self, A>(slot, a)
+    fn reclaim_step(
+        slot: Slot<'_, Self, Self::State>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        reclaim_sequence::<T, Self, A>(slot, cleanup)
     }
 
-    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64 {
-        remaining::<T, Self, A>(slot)
+    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
+        remaining_sequence::<T, Self, A>(slot)
+    }
+
+    fn observe_permits(
+        slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        permits_sequence::<T, Self, A>(slot, sink)
     }
 }
 
@@ -825,10 +1017,14 @@ mod tests {
     // parent's child record containing this continuation. u128 exercises a
     // full-size permit without Reservation's pointer niche, including its
     // stronger alignment on targets that give it 16-byte alignment.
-    fn layouts<E, P>() {
-        let _ = const { contract::<E, P>() };
+    // A sequence whose elements' state is `S` records each element's state:
+    // the metadata and the record of `S`, and, nested, the record of a
+    // sequence of such sequences.
+    fn layouts<S, P>() {
+        let _ = const { contract::<S, P>() };
         let _ = const { sized::<Option<P>>() };
-        let _ = const { Stack::<Element<State<E, P>>, P>::RECORD };
+        let _ = const { Stack::<S, P>::RECORD };
+        let _ = const { Stack::<State<S, P>, P>::RECORD };
     }
 
     #[test]
@@ -887,86 +1083,231 @@ mod tests {
         assert!(reserved, "an array's storage is the destination itself");
     }
 
+    type Bytes = Session<<Vec<u8> as Reclaim<Limits>>::State>;
+
+    /// The pending credit of a construction under [`Limits`].
+    type Credit = stable::Pending<<Limits as crate::bounded::Budget>::Origin>;
+
+    /// A vector of bytes' destination and its session, initial, and the
+    /// pending credit of its construction, its owner made by its first
+    /// acquisition entry.
+    fn destination() -> (MaybeUninit<Vec<u8>>, Bytes, Credit) {
+        (
+            MaybeUninit::uninit(),
+            Session::new(<Vec<u8> as Reclaim<Limits>>::INITIAL),
+            stable::Pending::deferred(),
+        )
+    }
+
+    /// One engine unit of construction of the vector in `slot` from the root
+    /// of `document`, its acquisitions' credit held in `pending`.
+    fn step(
+        document: &crate::bounded::decode::Document<'_, Reservation>,
+        slot: &mut Slot<'_, Vec<u8>, Bytes>,
+        pending: &mut Credit,
+        policy: &mut Limits,
+    ) -> ConstructResult<Built, Limits> {
+        build::<Vec<u8>, Limits>(Context::root(document, slot.reborrow(), pending), policy)
+    }
+
     #[test]
     fn unwritten_payload_slot_is_observable_and_reclaimed_without_reading_it() {
         let mut parser = Limits::unlimited();
         let document = decode(&[0x80], 1, &mut parser).unwrap();
         let mut policy = Limits::turns();
-        let mut value = MaybeUninit::<Vec<u8>>::uninit();
-        let mut state = <Vec<u8> as Reclaim<Limits>>::INITIAL;
+        let (mut value, mut session, mut pending) = destination();
         // SAFETY: the test owns the destination and pairs it with its initial
-        // state; every access to either is through this slot for the test.
-        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+        // session; every access to either is through this slot for the test.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut session) };
         assert_eq!(
-            build::<u8, Vec<u8>, Limits>(&document, 0, slot.reborrow(), &mut policy).unwrap(),
+            step(&document, &mut slot, &mut pending, &mut policy).unwrap(),
+            Built::Progress,
+            "the session binds the root"
+        );
+        policy.turn();
+        assert_eq!(
+            step(&document, &mut slot, &mut pending, &mut policy).unwrap(),
             Built::Progress,
         );
         assert_eq!(
-            slot.custody().observe(),
+            slot.custody().inner.observe(),
             SequenceObservation::Held(SequenceCustody {
                 phase: Phase::Initializing,
                 position: 0,
                 committed: 0,
                 records: 0,
-                admitted: Admitted::Nothing,
                 payload: false,
                 newest: None,
             })
         );
+        assert!(pending.is_idle(), "the installed block's acquisition ended");
+        policy.turn();
+        assert_eq!(
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap(),
+            Reclaimed::Progress,
+            "cleanup begins in its own unit"
+        );
+        assert_eq!(slot.custody().stage(), Stage::Cleaning);
         let attempts = policy.attempts();
         policy.exhaust();
         assert_eq!(
-            reclaim::<u8, Vec<u8>, Limits>(slot.reborrow(), &mut policy).unwrap(),
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap(),
             Reclaimed::Done,
         );
         assert_eq!(policy.attempts(), attempts, "release was prepaid");
         assert_eq!(policy.live_bytes(), 0);
+        assert_eq!(slot.custody().stage(), Stage::Released);
         assert_eq!(
-            slot.custody().observe(),
-            SequenceObservation::Unallocated(Admitted::Nothing)
+            slot.custody().inner.observe(),
+            SequenceObservation::Unallocated
         );
     }
 
-    /// A sequence reclaimed to `Done` is `INITIAL` again: a further cleanup
-    /// step reports `Done` and touches nothing, and a further build begins
-    /// anew instead of reading metadata slots it never wrote.
+    /// A sequence reclaimed to `Done` is released: its state is `INITIAL`
+    /// again, a further cleanup reports `Done` admitting nothing, and a
+    /// further build is refused, nothing changed, instead of beginning anew.
     #[test]
-    fn a_reclaimed_sequence_is_initial_for_every_later_call() {
+    fn a_released_sequence_refuses_every_later_build_and_admits_nothing() {
         let mut parser = Limits::unlimited();
         let document = decode(&[0x80], 1, &mut parser).unwrap();
         let mut policy = Limits::unlimited();
-        let mut value = MaybeUninit::<Vec<u8>>::uninit();
-        let mut state = <Vec<u8> as Reclaim<Limits>>::INITIAL;
+        let (mut value, mut session, mut pending) = destination();
         // SAFETY: the test owns the destination and pairs it with its initial
-        // state; every access to either is through this slot for the test.
-        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
-        for _ in 0..2 {
-            crate::bounded::within_steps("an empty vector's construction", 16, || {
-                match build::<u8, Vec<u8>, Limits>(&document, 0, slot.reborrow(), &mut policy)
-                    .unwrap()
-                {
-                    Built::Done => core::ops::ControlFlow::Break(()),
-                    Built::Progress => core::ops::ControlFlow::Continue(()),
-                }
-            });
-            crate::bounded::within_steps("an empty vector's cleanup", 16, || {
-                match reclaim::<u8, Vec<u8>, Limits>(slot.reborrow(), &mut policy).unwrap() {
-                    Reclaimed::Done => core::ops::ControlFlow::Break(()),
-                    _ => core::ops::ControlFlow::Continue(()),
-                }
-            });
-            assert_eq!(slot.custody().phase, Phase::Initializing);
-            assert_eq!(
-                slot.custody().observe(),
-                SequenceObservation::Unallocated(Admitted::Nothing)
-            );
-            assert_eq!(
-                reclaim::<u8, Vec<u8>, Limits>(slot.reborrow(), &mut policy).unwrap(),
-                Reclaimed::Done,
-                "a step after Done"
-            );
-            assert_eq!(policy.live_bytes(), 0);
+        // session; every access to either is through this slot for the test.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut session) };
+        crate::bounded::within_steps("an empty vector's construction", 16, || {
+            match step(&document, &mut slot, &mut pending, &mut policy).unwrap() {
+                Built::Done => core::ops::ControlFlow::Break(()),
+                Built::Progress => core::ops::ControlFlow::Continue(()),
+            }
+        });
+        let declared = remaining::<Vec<u8>, Limits>(slot.observe())
+            .expect("an empty vector's cleanup count fits in u64");
+        crate::bounded::within_steps("an empty vector's cleanup", declared, || {
+            match reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy))
+                .unwrap()
+            {
+                Reclaimed::Done => core::ops::ControlFlow::Break(()),
+                _ => core::ops::ControlFlow::Continue(()),
+            }
+        });
+        assert_eq!(slot.custody().stage(), Stage::Released);
+        assert_eq!(slot.custody().inner.phase, Phase::Initializing);
+        assert_eq!(
+            slot.custody().inner.observe(),
+            SequenceObservation::Unallocated
+        );
+        let attempts = policy.attempts();
+        assert_eq!(
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap(),
+            Reclaimed::Done,
+            "a step after Done"
+        );
+        assert!(matches!(
+            step(&document, &mut slot, &mut pending, &mut policy),
+            Err(DecodeError::Resource(BoundedError::PlanMismatch))
+        ));
+        assert_eq!(
+            policy.attempts(),
+            attempts,
+            "nothing admitted after release"
+        );
+        assert_eq!(slot.custody().stage(), Stage::Released);
+        assert_eq!(policy.live_bytes(), 0);
+    }
+
+    /// A sequence whose cleanup began refuses every build, admitting
+    /// nothing and changing nothing: in `Reclaim`, and in `BufferFreed`
+    /// before its metadata is released. As a part no build reaches it then
+    /// (its parent steps it only from the parent's own build phases), and at
+    /// the root its session refuses first; this is the sequence's own guard,
+    /// reached here directly, as a parent's build would reach it.
+    #[test]
+    fn a_sequence_in_cleanup_refuses_a_build_and_admits_nothing() {
+        let mut parser = Limits::unlimited();
+        // [1]
+        let document = decode(&[0x81, 0x01], 1, &mut parser).unwrap();
+        let mut policy = Limits::unlimited();
+        let (mut value, mut session, mut pending) = destination();
+        // SAFETY: the test owns the destination; every access to it is
+        // through this place for the rest of the test.
+        let place = unsafe { Place::root(NonNull::from(&mut value)) };
+        {
+            // SAFETY: the test owns the destination and pairs it with its
+            // initial session; every access is through slots of this place.
+            let mut slot = unsafe { Slot::new(place, &mut session) };
+            while step(&document, &mut slot, &mut pending, &mut policy).unwrap() != Built::Done {}
+            // The session's begin unit, then the sequence's own entry into
+            // `Reclaim`.
+            for _ in 0..2 {
+                reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy))
+                    .unwrap();
+            }
         }
+        // The sequence's own build, as a parent reaches it, from `phase`.
+        fn refused_at(
+            document: &crate::bounded::decode::Document<'_, Reservation>,
+            place: Place<Vec<u8>>,
+            session: &mut Bytes,
+            pending: &mut Credit,
+            policy: &mut Limits,
+            phase: Phase,
+        ) {
+            assert_eq!(session.inner.phase, phase);
+            let before = session.inner.observe();
+            let attempts = policy.attempts();
+            // SAFETY: the same place, paired with its sequence's own state.
+            let slot = unsafe { Slot::new(place, &mut session.inner) };
+            let result = build_sequence::<u8, Vec<u8>, Limits>(
+                Context::root(document, slot, pending),
+                policy,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(DecodeError::Resource(BoundedError::PlanMismatch))
+                ),
+                "a build in {phase:?}: {result:?}"
+            );
+            assert_eq!(
+                policy.attempts(),
+                attempts,
+                "a build in {phase:?} admitted work"
+            );
+            assert_eq!(
+                session.inner.observe(),
+                before,
+                "a build in {phase:?} moved"
+            );
+        }
+        refused_at(
+            &document,
+            place,
+            &mut session,
+            &mut pending,
+            &mut policy,
+            Phase::Reclaim,
+        );
+        // SAFETY: as above.
+        let mut slot = unsafe { Slot::new(place, &mut session) };
+        while slot.custody().inner.phase != Phase::BufferFreed {
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap();
+        }
+        refused_at(
+            &document,
+            place,
+            &mut session,
+            &mut pending,
+            &mut policy,
+            Phase::BufferFreed,
+        );
+        // SAFETY: as above.
+        let mut slot = unsafe { Slot::new(place, &mut session) };
+        assert_eq!(
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap(),
+            Reclaimed::Done
+        );
+        assert_eq!(policy.live_bytes(), 0);
     }
 
     #[test]
@@ -974,13 +1315,18 @@ mod tests {
         let mut parser = Limits::unlimited();
         let document = decode(&[0x80], 1, &mut parser).unwrap();
         let mut policy = Limits::turns();
-        let mut value = MaybeUninit::<Vec<u8>>::uninit();
-        let mut state = <Vec<u8> as Reclaim<Limits>>::INITIAL;
+        let (mut value, mut session, mut pending) = destination();
         // SAFETY: the test owns the destination and pairs it with its initial
-        // state; every access to either is through this slot for the test.
-        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+        // session; every access to either is through this slot for the test.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut session) };
         assert_eq!(
-            build::<u8, Vec<u8>, Limits>(&document, 0, slot.reborrow(), &mut policy).unwrap(),
+            step(&document, &mut slot, &mut pending, &mut policy).unwrap(),
+            Built::Progress,
+            "the session binds the root"
+        );
+        policy.turn();
+        assert_eq!(
+            step(&document, &mut slot, &mut pending, &mut policy).unwrap(),
             Built::Progress,
         );
         let before = slot.custody().observe();
@@ -990,7 +1336,7 @@ mod tests {
         let refusals = policy.scheduled_refusals();
         policy.turn();
         policy.refuse_next();
-        let result = build::<u8, Vec<u8>, Limits>(&document, 0, slot.reborrow(), &mut policy);
+        let result = step(&document, &mut slot, &mut pending, &mut policy);
         assert!(
             matches!(
                 &result,
@@ -1007,26 +1353,31 @@ mod tests {
         assert_eq!(policy.live_bytes(), live);
         policy.turn();
         assert_eq!(
-            build::<u8, Vec<u8>, Limits>(&document, 0, slot.reborrow(), &mut policy).unwrap(),
+            step(&document, &mut slot, &mut pending, &mut policy).unwrap(),
             Built::Progress,
         );
-        assert_eq!(slot.custody().phase, Phase::Empty);
+        assert_eq!(slot.custody().inner.phase, Phase::Empty);
         assert_eq!(policy.attempts(), attempt + 2);
         assert_eq!(policy.scheduled_refusals(), refusals + 1);
         assert_eq!(
             policy.used(),
-            used.then::<()>(WriteWork::new(1, size_of::<Option<Reservation>>() as u64))
+            used.checked_then(WriteWork::new(1, size_of::<Option<Reservation>>() as u64))
                 .unwrap()
         );
         assert_eq!(policy.live_bytes(), live);
-        policy.turn();
-        assert_eq!(
-            reclaim::<u8, Vec<u8>, Limits>(slot.reborrow(), &mut policy).unwrap(),
-            Reclaimed::Progress,
-        );
+        // Cleanup begins in its own unit, then marks the empty container
+        // freed; the releases were prepaid.
+        for _ in 0..2 {
+            policy.turn();
+            assert_eq!(
+                reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy))
+                    .unwrap(),
+                Reclaimed::Progress,
+            );
+        }
         policy.exhaust();
         assert_eq!(
-            reclaim::<u8, Vec<u8>, Limits>(slot.reborrow(), &mut policy).unwrap(),
+            reclaim::<Vec<u8>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut policy)).unwrap(),
             Reclaimed::Done,
         );
         assert_eq!(policy.live_bytes(), 0);

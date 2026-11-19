@@ -18,7 +18,15 @@
 use std::path::Path;
 
 use crate::outcome::{self, Judgement, Outcome};
-use crate::rows::{Physical, Purpose, Row};
+use crate::rows::{Evidence, Physical, Purpose, Row};
+
+/// The aliasing models every Miri verdict is given under, as their runs'
+/// rows name them: Stacked and Tree Borrows. The one list of them: the
+/// scripts read it (`gate miri models`, `tests/gate-common.sh`
+/// `miri_models`) and pass it back to `gate miri results`, which refuses a
+/// model outside it, so a row's runner names a Miri model exactly when
+/// [`crate::rows::supported`] reads it as one.
+pub const MIRI_MODELS: [&str; 2] = ["stacked", "tree"];
 
 /// One selection line of the gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,7 +74,7 @@ pub fn lines(logs: &Path) -> Result<Vec<Line>, String> {
 
 /// The outcome the file at `path` records, or [`Outcome::NotRun`] when the
 /// run left none.
-fn outcome_at(path: &Path) -> Result<Outcome, String> {
+pub(crate) fn outcome_at(path: &Path) -> Result<Outcome, String> {
     match read(path)? {
         None => Ok(Outcome::NotRun),
         Some(text) => Outcome::parse(text.trim())
@@ -76,7 +84,7 @@ fn outcome_at(path: &Path) -> Result<Outcome, String> {
 
 /// The verdict file at `path` as an outcome: a pass, a failure, or a
 /// runner that never reached its verdict.
-fn verdict_at(path: &Path) -> Result<Outcome, String> {
+pub(crate) fn verdict_at(path: &Path) -> Result<Outcome, String> {
     match read(path)?.as_deref().map(str::trim) {
         None => Ok(Outcome::NotRun),
         Some("pass") => Ok(Outcome::Pass),
@@ -115,8 +123,10 @@ fn seed_of(text: &str, at: &Path) -> Result<Option<u64>, String> {
 }
 
 /// The runs `logs/<base>.runs` lists. Every listed line has its runs
-/// written before any runs, so a line without them is a broken gate.
-fn runs(logs: &Path, base: &str) -> Result<Vec<Run>, String> {
+/// written before any runs, so a line without them is a broken gate. The
+/// one reader of them: the results, the baseline and the conversion's
+/// branch obligations (`crate::conversion`) read runs through it.
+pub(crate) fn runs(logs: &Path, base: &str) -> Result<Vec<Run>, String> {
     let path = logs.join(format!("{base}.runs"));
     required(&path)?
         .lines()
@@ -131,46 +141,60 @@ fn runs(logs: &Path, base: &str) -> Result<Vec<Run>, String> {
 /// `models`: each line's verdict per runner, then each run under each
 /// model.
 pub fn results(logs: &Path, models: &[&str]) -> Result<Vec<Row>, String> {
+    if let Some(unknown) = models.iter().find(|model| !MIRI_MODELS.contains(model)) {
+        return Err(format!(
+            "no Miri model {unknown}; the models are {}",
+            MIRI_MODELS.join(", ")
+        ));
+    }
     let mut rows = Vec::new();
     for line in lines(logs)? {
         for runner in core::iter::once("native").chain(models.iter().copied()) {
-            rows.push(Row {
-                domain: line.domain.clone(),
-                line: line.base.clone(),
-                runner: runner.to_string(),
-                test: "(suite)".to_string(),
-                seed: None,
-                purpose: Purpose::Suite,
-                bound: None,
-                stack: None,
-                expected: Some(Outcome::Pass),
-                outcome: verdict_at(&logs.join(format!("{}-{runner}.verdict", line.base)))?,
-                seconds: None,
-                peak_kb: None,
-                physical: Physical::Witnessed,
-            });
+            rows.push(
+                Row {
+                    domain: line.domain.clone(),
+                    line: line.base.clone(),
+                    runner: runner.to_string(),
+                    test: "(suite)".to_string(),
+                    seed: None,
+                    purpose: Purpose::Suite,
+                    bound: None,
+                    stack: None,
+                    expected: Some(Outcome::Pass),
+                    outcome: verdict_at(&logs.join(format!("{}-{runner}.verdict", line.base)))?,
+                    seconds: None,
+                    peak_kb: None,
+                    physical: Physical::Witnessed,
+                    evidence: Evidence::Unverified,
+                }
+                .classified(),
+            );
         }
         for (index, (test, seed)) in runs(logs, &line.base)?.into_iter().enumerate() {
             for model in models {
                 let directory = logs.join(format!("{}-{model}", line.base));
                 let (seconds, peak_kb) = measured(&directory.join(format!("{index}.measure")))?;
-                rows.push(Row {
-                    domain: line.domain.clone(),
-                    line: line.base.clone(),
-                    runner: (*model).to_string(),
-                    test: test.clone(),
-                    seed,
-                    purpose: Purpose::Normal,
-                    bound: None,
-                    stack: None,
-                    // A run's kind is in its classification: an abort
-                    // scenario that aborted is a pass (`outcome::miri`).
-                    expected: Some(Outcome::Pass),
-                    outcome: outcome_at(&directory.join(format!("{index}.outcome")))?,
-                    seconds,
-                    peak_kb,
-                    physical: Physical::Witnessed,
-                });
+                rows.push(
+                    Row {
+                        domain: line.domain.clone(),
+                        line: line.base.clone(),
+                        runner: (*model).to_string(),
+                        test: test.clone(),
+                        seed,
+                        purpose: Purpose::Normal,
+                        bound: None,
+                        stack: None,
+                        // A run's kind is in its classification: an abort
+                        // scenario that aborted is a pass (`outcome::miri`).
+                        expected: Some(Outcome::Pass),
+                        outcome: outcome_at(&directory.join(format!("{index}.outcome")))?,
+                        seconds,
+                        peak_kb,
+                        physical: Physical::Witnessed,
+                        evidence: Evidence::Unverified,
+                    }
+                    .classified(),
+                );
             }
         }
     }

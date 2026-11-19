@@ -14,6 +14,7 @@
 //!   releasing a permit, leaving that step's state recording what it no
 //!   longer holds; the release aborts instead.
 
+use dcbor::bounded::decode::construction::{Acquisition, DecodeOwner};
 use dcbor::bounded::{Allocator, Limits};
 use dcbor_test_support as support;
 
@@ -24,18 +25,40 @@ const DEFECTIVE_RECORD: &str = "a_defective_record_left_to_the_terminal_drain";
 const PANICKING_OBSERVER: &str = "a_release_observer_that_panics";
 
 /// The defective scenario: a queued record declaring one cleanup call but
-/// taking three ([`support::Understated`]), its scope's authority
-/// dropped. The terminal drain removes the record, spends its one declared
+/// taking three ([`support::Understated`]), its scope retired by the run's
+/// holding. The terminal drain removes the record, spends its one declared
 /// call, and is refused the next as a defect, which aborts. Returning from
 /// this test is the failure the witness detects.
 #[test]
 #[ignore = "run only as the abort witness's child: it ends its own process"]
 fn a_defective_record_left_to_the_terminal_drain() {
-    let mut m = Limits::unlimited().logged().strict();
-    let owner = support::scope(&mut m);
-    let record = support::understated(&owner, &mut m, 2);
-    drop(record);
-    drop(owner);
+    // The record retires to the queue as a published handle; the scope's
+    // retirement is its authority's terminal destruction, whose drain meets
+    // the understated count and aborts before the run can finalize.
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.holding(
+            DecodeOwner::new(),
+            support::Retirement::Scope,
+            &support::pipeline::Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.lending(support::Retirement::Exhausted, support::Lent::new, |view| {
+                    let scope = view.value().get();
+                    view.holding(
+                        Acquisition::<support::Understated, Limits>::new(),
+                        support::Retirement::Stopped,
+                        |acquisition| {
+                            acquisition.acquire(policy, scope, |record| {
+                                support::understate(record.value(), 2)
+                            })
+                        },
+                    )
+                })?;
+                Ok::<_, support::Finding>(())
+            },
+        )
+    });
 }
 
 /// A release observer that breaks its contract by panicking.

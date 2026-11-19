@@ -1,0 +1,14 @@
+--- src/bounded/encoding/buckets.rs
++++ src/bounded/encoding/buckets.rs
+@@ -301,9 +301,8 @@
+     /// reached, [`Forfeit::Cancelled`] when an error or cleanup ends it.
+     /// Admits nothing; later calls return [`BucketStep::Finished`].
+     pub fn end(&mut self, by: Performer, rule: Forfeit) {
+-        if let Some(window) = self.window.take() {
+-            window.forfeit(rule, None, by);
+-        }
++        // Planted: the cursor ends still holding its window's obligation.
++        let _ = (by, rule);
+         self.position.finished = true;
+     }
+

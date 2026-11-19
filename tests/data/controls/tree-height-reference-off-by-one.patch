@@ -1,0 +1,13 @@
+--- src/bounded/encoding/proofs.rs
++++ src/bounded/encoding/proofs.rs
+@@ -40,7 +40,9 @@
+
+ /// The fewest entries a tree of `h` levels holds (the module's reference).
+ fn fewest(h: u32) -> u128 {
+-    if h <= 1 { 1 } else { 2 * 6u128.pow(h - 1) - 1 }
++    // Planted: the reference's least count one too many. Must fail
++    // the_height_recurrence_keeps_its_invariant, "the recurrence starts at m(2) = 11".
++    if h <= 1 { 1 } else { 2 * 6u128.pow(h - 1) }
+ }
+
+ /// The step of the recurrence, at any height whose least count fits a

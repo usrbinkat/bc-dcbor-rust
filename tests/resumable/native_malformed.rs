@@ -2,8 +2,9 @@ use super::bindings::decoder;
 use super::harness::*;
 use super::support::rigor::rigor;
 use super::support::{
-    Fault, allowed, drive_faulted, finish_within, pipeline::Refusal, reason_matrix, refusal_matrix,
-    refuse,
+    Fault, Finding, Retirement, Stopped,
+    pipeline::{Refusal, Unwitnessed},
+    reason_matrix, recorded_run, refusal_matrix,
 };
 use dcbor::bounded::decode::DecodeError;
 
@@ -34,23 +35,43 @@ const INVALID: &[&[u8]] = &[
 /// is released on every path.
 fn invalid_matrix(name: &str, wire: &[u8]) {
     let baseline = refusal_matrix(name, rigor(), |fault: Fault| {
-        let mut m = meter();
-        refuse(&mut m, fault.refusal);
-        let pool = m.share();
-        let mut operation = decoder(wire);
-        let turns = allowed(&m, decode_turns(wire.len()));
-        match drive_faulted(&mut m, &mut operation, turns, fault.cancel) {
-            Ok(Some(_)) => panic!("{name}: invalid input published"),
-            Ok(None) => assert!(fault.cancel),
-            Err(error) => {
-                assert!(matches!(error, DecodeError::Invalid(_)), "{error:?}");
-                m.assert_units(TURN);
-                finish_within(&mut m.share(), &mut operation, decode_turns(wire.len()));
-            }
-        }
-        drop(operation);
-        assert_eq!(pool.live_bytes(), 0);
-        super::support::RefusalRun::of(&m)
+        recorded_run(|run| {
+            let policy = run.observed_policy(POOL);
+            let cleanup = run.shared_policy(policy);
+            run.holding(
+                decoder(wire),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    match operation.drive_faulted(
+                        policy,
+                        decode_turns(wire.len()),
+                        Retirement::Released,
+                        fault,
+                        |_, _| {},
+                        |_| panic!("{name}: invalid input published"),
+                    ) {
+                        Ok(Some(())) => unreachable!("publication fails inside its holding"),
+                        Ok(None) => assert!(fault.cancel),
+                        Err(Stopped::Operation(error)) => {
+                            assert!(matches!(error, DecodeError::Invalid(_)), "{error:?}");
+                            operation.with_policy(policy, |_, m| m.assert_units(TURN));
+                            operation.finish(
+                                cleanup,
+                                decode_turns(wire.len()),
+                                Retirement::Released,
+                            )?;
+                        }
+                        Err(stop) => return Err(Finding::from(stop)),
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(run.with_policy(policy, |m| {
+                assert_eq!(m.live_bytes(), 0);
+                super::support::RefusalRun::of(m)
+            }))
+        })
     });
     reasons(name, wire, baseline.calls());
 }
@@ -64,19 +85,35 @@ fn invalid_matrix(name: &str, wire: &[u8]) {
 fn reasons(name: &str, wire: &[u8], baseline: &[Call]) {
     const REASONS: [LimitRefusal; 2] = [LimitRefusal::Storage, LimitRefusal::Deadline];
     reason_matrix(name, rigor(), baseline, &REASONS, |stop, reason| {
-        let mut m = meter();
-        refuse(&mut m, Refusal::For(stop, reason));
-        let pool = m.share();
-        let mut operation = decoder(wire);
-        let result = drive_faulted(&mut m, &mut operation, decode_turns(wire.len()), true)
-            .expect("selected refusal must precede invalid-input rejection");
-        assert!(result.is_none(), "invalid input published");
-        assert_eq!(m.first_refusal(), Some((stop, reason)));
-        assert_eq!(m.injected_refusals(), 1);
-        assert_eq!(m.calls(), &baseline[..=stop], "{reason:?} at call {stop}");
-        drop(operation);
-        assert_eq!(pool.live_bytes(), 0);
-        m.reached()
+        recorded_run(|run| {
+            let policy = run.observed_policy(POOL);
+            run.holding(
+                decoder(wire),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    operation.drive_faulted(
+                        policy,
+                        decode_turns(wire.len()),
+                        Retirement::Released,
+                        Fault {
+                            refusal: Refusal::For(stop, reason),
+                            cancel: true,
+                        },
+                        |_, _| {},
+                        |_| panic!("invalid input published"),
+                    )?;
+                    Ok::<_, Finding>(())
+                },
+            )?;
+            Ok(run.with_policy(policy, |m| {
+                assert_eq!(m.first_refusal(), Some((stop, reason)));
+                assert_eq!(m.injected_refusals(), 1);
+                assert_eq!(m.calls(), &baseline[..=stop], "{reason:?} at call {stop}");
+                assert_eq!(m.live_bytes(), 0);
+                m.reached()
+            }))
+        })
     });
 }
 
@@ -84,19 +121,22 @@ fn reasons(name: &str, wire: &[u8], baseline: &[Call]) {
 // read_incomplete_head_multi and read_incomplete_payload: suspension must not
 // turn an incomplete item into success or consume its terminal error.
 #[test]
-fn malformed_inputs_stay_invalid_and_cancel_cleanly_at_every_refusal() {
+fn malformed_inputs_stay_invalid_and_cancel_cleanly_at_every_refusal() -> Result<(), Vec<Finding>> {
     every_fixture(INVALID.len(), |fixture| {
         let wire = INVALID[fixture];
         invalid_matrix(&format!("malformed {wire:02x?}"), wire);
-    });
+        Ok(())
+    })
 }
 
 #[test]
-fn every_truncation_of_nested_literal_input_resumes_to_error_without_replay() {
+fn every_truncation_of_nested_literal_input_resumes_to_error_without_replay()
+-> Result<(), Vec<Finding>> {
     let complete = [
         0x82, 0x82, 0x01, 0x62, 0xc3, 0xa9, 0xa1, 0x00, 0x43, 1, 2, 3,
     ];
     every_fixture(complete.len(), |end| {
         invalid_matrix(&format!("truncated at {end}"), &complete[..end]);
-    });
+        Ok(())
+    })
 }

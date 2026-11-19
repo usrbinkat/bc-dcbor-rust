@@ -5,41 +5,66 @@
 #![cfg(feature = "std")]
 
 use dcbor::bounded::decode::construction::{Acquisition, DecodeOwner, Reclaimed};
-use dcbor::bounded::{Allocator, Budget, LimitRefusal, Limits, Reservation};
+use dcbor::bounded::{
+    Allocator, Budget, Effect, Hold, Identity, LimitRefusal, Limits, Owner, Performer, Releasing,
+    Reservation, TerminalAllocator, WriteWork, boundary,
+};
 use std::sync::{Arc, Barrier};
 
 /// Steps a shutdown may take before it is a defect: two records, each one
 /// removal, one cleanup unit and one release, then the scope's release.
 const SHUTDOWN_STEPS: usize = 16;
 
+/// A scope's authority dropped while a published value lives: the scope is
+/// abandoned, not freed ([`support::Retirement::Abandoned`]), and the value,
+/// whose handle now reports the scope block as shared custody, is read on a
+/// worker thread; its final handle is then moved to a retirement worker,
+/// where destruction drains the abandoned scope terminally
+/// ([`support::Retirement::LastReference`]). The joined retirement leaves
+/// nothing live.
 #[test]
 fn last_worker_handle_reclaims_an_abandoned_scope() {
-    let mut m = Limits::unlimited();
-    let owner = dcbor_test_support::scope(&mut m);
-    let input = dcbor_test_support::copy(&owner, &mut m, &[0x62, b'o', b'k']);
-    let value = dcbor_test_support::decode::<_, String>(
-        &mut m,
-        input,
-        dcbor::bounded::decode::Options::normalizing(8),
-    )
-    .unwrap();
-    let ready = Arc::new(Barrier::new(2));
-    let worker_ready = ready.clone();
-    let worker = std::thread::spawn(move || {
-        worker_ready.wait();
-        assert_eq!(value.value(), "ok");
-        drop(value);
+    use dcbor_test_support::{
+        self as support, CustodyBatch, DropOrder, Retirement, pipeline::Unwitnessed,
+    };
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.terminal::<String, _, _>(
+            policy,
+            &[0x62, b'o', b'k'],
+            dcbor::bounded::decode::Options::normalizing(8),
+            &Unwitnessed,
+            DropOrder::OwnerFirst,
+            |value| {
+                std::thread::scope(|threads| {
+                    let published = value.value();
+                    threads
+                        .spawn(|| assert_eq!(published.value(), "ok"))
+                        .join()
+                        .expect("the worker read the abandoned scope's value")
+                });
+                value.transfer(
+                    |value| {
+                        let mut batch = CustodyBatch::with_capacity(1);
+                        batch.retain(value);
+                        batch
+                    },
+                    Retirement::LastReference,
+                    |batch| batch.retire_concurrently(),
+                );
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
     });
-    drop(owner);
-    ready.wait();
-    worker.join().unwrap();
-    assert_eq!(m.live_bytes(), 0);
 }
 
 /// A policy that holds its first admission at a rendezvous: it signals
 /// `entered`, then waits for `released`. The first admission of a queue step
 /// is the removal of the front record, made while the step holds the
-/// queue's stepping flag, so the holder is parked inside `step`.
+/// queue's stepping flag, so the holder is parked inside `step`. Everything
+/// else, every observation, identity, credit origin and settlement, is its
+/// inner policy's, forwarded unchanged.
 struct Gate {
     inner: Limits,
     gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
@@ -59,18 +84,76 @@ impl Budget for Gate {
         }
         self.inner.traverse(values, bytes)
     }
-}
 
-impl Allocator for Gate {
-    type Permit = Reservation;
+    // Each forwarded through the trait by path: `Limits` has inherent
+    // readers whose names a method call would resolve to first.
+    fn boundary(&mut self, boundary: boundary::Boundary) {
+        Budget::boundary(&mut self.inner, boundary);
+    }
 
-    fn allocate(&mut self, bytes: u64) -> Result<Reservation, LimitRefusal> {
-        self.inner.allocate(bytes)
+    type Origin = <Limits as Budget>::Origin;
+
+    fn origin(&self) -> Self::Origin {
+        Budget::origin(&self.inner)
+    }
+
+    fn admitted(&mut self, work: WriteWork) {
+        Budget::admitted(&mut self.inner, work);
+    }
+
+    fn identify(&mut self) -> Result<Identity, LimitRefusal> {
+        Budget::identify(&mut self.inner)
+    }
+
+    fn held(&mut self, work: WriteWork, hold: Hold) {
+        Budget::held(&mut self.inner, work, hold);
+    }
+
+    fn effect(&mut self, effect: Effect) {
+        Budget::effect(&mut self.inner, effect);
+    }
+
+    fn owner(&mut self) -> Result<Owner, LimitRefusal> {
+        Budget::owner(&mut self.inner)
+    }
+
+    fn acquisition(
+        &mut self,
+        owner: &Owner,
+    ) -> Result<dcbor::bounded::Acquisition<Self::Origin>, LimitRefusal> {
+        Budget::acquisition(&mut self.inner, owner)
+    }
+
+    fn validate_owner(&mut self, owner: &Owner) -> Result<(), LimitRefusal> {
+        Budget::validate_owner(&mut self.inner, owner)
+    }
+
+    fn performer(&self) -> Performer {
+        Budget::performer(&self.inner)
     }
 }
 
-// SAFETY: terminal cleanup delegates to Limits and never enters a barrier.
-unsafe impl dcbor::bounded::TerminalAllocator for Gate {
+impl Releasing for Gate {
+    type Permit = Reservation;
+
+    fn permit_identity(permit: &Reservation) -> Identity {
+        <Limits as Releasing>::permit_identity(permit)
+    }
+
+    fn custody(permit: &Reservation, owner: Identity, stage: dcbor::bounded::RecordStage) {
+        <Limits as Releasing>::custody(permit, owner, stage)
+    }
+}
+
+impl Allocator for Gate {
+    fn allocate(&mut self, bytes: u64) -> Result<Reservation, LimitRefusal> {
+        Allocator::allocate(&mut self.inner, bytes)
+    }
+}
+
+// SAFETY: terminal cleanup delegates to Limits' terminal policy and never
+// enters a barrier: the terminal gate is empty.
+unsafe impl TerminalAllocator for Gate {
     fn terminal(permit: &Reservation) -> Self {
         Self {
             inner: Limits::terminal(permit),

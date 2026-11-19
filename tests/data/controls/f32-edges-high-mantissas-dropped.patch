@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -447,7 +447,8 @@
+         let mut mantissas = BTreeSet::from([0, MANTISSA]);
+         for s in 0..23 {
+             let bit = 1u32 << s;
+-            mantissas.extend([bit, bit - 1, bit + 1, MANTISSA & !(bit - 1)]);
++            // Planted: the high mantissas cleared below each bit are dropped.
++            mantissas.extend([bit, bit - 1, bit + 1]);
+         }
+         mantissas.retain(|mantissa| *mantissa <= MANTISSA);
+         let mut patterns = Vec::new();

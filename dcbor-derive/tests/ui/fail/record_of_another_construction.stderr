@@ -1,0 +1,8 @@
+error: lifetime may not live long enough
+  --> tests/ui/fail/record_of_another_construction.rs:49:57
+   |
+46 |     fn build_step<'b>(ctx: BindingContext<'b, '_, '_, '_, Self, A>, a: &mut A) -> ConstructResult<Building<'b, Self>, A> {
+   |                   -- lifetime `'b` defined here
+...
+49 |         let left = LEFT.lock().ok().and_then(|mut left| left.take());
+   |                                                         ^^^^^^^^^^^ returning this value requires that `'b` must outlive `'static`

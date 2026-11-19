@@ -23,6 +23,7 @@ for tool in cargo rustc cargo-mutants cargo-llvm-cov patch time systemd-run syst
 	fi
 done
 gate_prepare
+miri_models
 # A mutant can turn a bounded loop into unbounded allocation (one grew a
 # test binary past 110 GB). Each layer runs in its own memory-capped scope
 # of the user's systemd manager: the kernel kills the runaway test inside

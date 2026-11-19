@@ -1,0 +1,14 @@
+--- src/bounded/decode/cursor/publication.rs
++++ src/bounded/decode/cursor/publication.rs
+@@ -201,9 +201,9 @@
+                 .get(&*parts)
+         };
+         if let Some(permit) = permit {
+-            sink.begin(owner);
++            // Planted: the permit reported in the enclosing group, the record's.
++            let _ = owner;
+             sink.permit(permit);
+-            sink.end();
+         }
+         PermitsObserved::Complete
+     }

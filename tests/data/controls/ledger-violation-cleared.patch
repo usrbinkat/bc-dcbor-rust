@@ -1,0 +1,14 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -238,7 +238,10 @@
+         ];
+         if fitted.contains(&false) {
+             self.violate();
+-        }
++        } else {
++            // Planted: an event that fits clears an earlier violation.
++            self.violated.store(0, Ordering::Release);
++        }
+     }
+
+     /// `work` added to a ledger, its values and its bytes each by its own

@@ -1,0 +1,12 @@
+--- src/bounded/decode.rs
++++ src/bounded/decode.rs
+@@ -641,7 +641,8 @@
+ impl Terms {
+     fn of<R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
+         let depth = widen(options.max_depth)?.min(input);
+-        let arena = owned_growth(input, widen(core::mem::size_of::<Entry>())?)?;
++        // Planted: the arena is priced for half the input's nodes.
++        let arena = owned_growth(input / 2, widen(core::mem::size_of::<Entry>())?)?;
+         let stack = owned_growth(depth, widen(core::mem::size_of::<Frame>())?)?;
+         let (arena_released, stack_released) = (arena.released()?, stack.released()?);
+         // A growth reports its relocated bytes as one admission of no

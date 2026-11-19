@@ -1,0 +1,5 @@
+error[E0614]: type `dcbor::bounded::decode::construction::reclamation::Cleanup<'_, Limits>` cannot be dereferenced
+ --> tests/ui/fail/cleanup_deref.rs:8:10
+  |
+8 |     &mut **cleanup
+  |          ^^^^^^^^^ can't be dereferenced

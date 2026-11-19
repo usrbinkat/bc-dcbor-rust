@@ -1,31 +1,76 @@
 use super::harness::*;
 use super::support::{
-    self, Fault, Traced, allowed, drive_faulted, drive_within, refusal_matrix, refuse, rigor::rigor,
+    self, Fault, Finding, Retirement, Traced, pipeline::Unwitnessed, refusal_matrix, rigor::rigor,
 };
 use dcbor::bounded::decode::Options;
 use dcbor::bounded::decode::construction::{
     Borrowed, DecodeOwner, TypedDecoder, in_place::Transferable,
 };
-use dcbor::bounded::decode::{BoundedDecodable, decode_typed};
+use dcbor::bounded::decode::decode_typed;
 use dcbor::bounded::{Schema, encode};
 use dcbor::{ByteString, CBORBoundedDecodable, CBORBoundedEncodable};
 
-type Typed<'s, T> = Traced<TypedDecoder<'s, Borrowed<'s>, T, Limits>>;
-
-/// A scope over `wire` and a traced typed decode of it. Setup is not
-/// measured: the policy's counts, log and trace cover only the decode, with
-/// an unlimited allowance; a schedule's refusals are applied after.
-fn typed<'s, T: Transferable<Limits> + 's>(
+/// Scope setup precedes the measured traced decode. Publication outlives its
+/// decoder; the run holds every operation and handle through observed retirement.
+fn typed_case<'s, T: Transferable<Limits> + 's>(
     wire: &'s [u8],
-    m: &mut Limits,
-) -> (DecodeOwner<'s, Limits>, Typed<'s, T>) {
-    let (owner, input) = support::open(m, wire);
-    m.measure();
-    m.open();
-    (
-        owner,
-        Traced(TypedDecoder::new(input, Options::normalizing(8))),
-    )
+    fault: Fault,
+    check: impl FnOnce(&T, &Limits),
+) -> support::RefusalRun {
+    suite(|run, policy| {
+        let cleanup = run.shared_policy(policy);
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |scope| {
+                scope.initialize(policy)?;
+                let borrow = scope.value().borrow_input(wire);
+                scope.holding(borrow, Retirement::Stopped, |borrow| {
+                    borrow.drive_then(
+                        policy,
+                        support::turns(
+                            dcbor::bounded::decode::construction::borrow_bound::<Limits, ()>()
+                                .expect("borrow bound fits in u64"),
+                        ),
+                        Retirement::Published,
+                        |input| {
+                            Traced(TypedDecoder::<Borrowed<'s>, T, Limits>::new(
+                                input,
+                                Options::normalizing(8),
+                            ))
+                        },
+                        Retirement::Stopped,
+                        |operation| {
+                            operation.with_policy(policy, |_, m| {
+                                m.measure();
+                                m.open();
+                            });
+                            operation.drive_faulted(
+                                policy,
+                                typed_turns::<T>(wire.len()),
+                                Retirement::Published,
+                                fault,
+                                |_, _| {},
+                                |value| {
+                                    value.with_policy(policy, |value, m| {
+                                        check(value.value(), m);
+                                        m.assert_units(TURN);
+                                    })
+                                },
+                            )?;
+                            Ok::<_, Finding>(())
+                        },
+                    )?
+                })?;
+                scope.drain(cleanup)
+            },
+        )?;
+        Ok(run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            support::RefusalRun::of(m)
+        }))
+    })
 }
 
 #[derive(Debug, PartialEq, CBORBoundedDecodable, CBORBoundedEncodable)]
@@ -71,17 +116,31 @@ struct Collection<T> {
     values: Vec<T>,
 }
 
-fn literal<T: BoundedDecodable + Schema + std::fmt::Debug + PartialEq>(wire: &[u8], expected: &T) {
-    let mut m = meter();
-    let result = decode_typed::<T, _>(wire, 8, &mut m).unwrap();
-    assert_eq!(result.value(), expected);
-    let mut writing = meter();
-    let bytes = encode(expected, &mut writing).unwrap();
-    assert_eq!(bytes.as_ref(), wire);
-    drop(bytes);
-    assert_eq!(writing.live_bytes(), 0);
-    drop(result);
-    assert_eq!(m.live_bytes(), 0);
+fn literal<T: Transferable<Limits> + Schema + std::fmt::Debug + PartialEq + 'static>(
+    wire: &[u8],
+    expected: &T,
+) {
+    support::recorded_run(|run| {
+        // The decode and the encoding, each under a family of its own.
+        let decoding = run.policy(POOL);
+        let result = run.with_policy(decoding, |m| {
+            decode_typed::<T, _>(wire, 8, m).map_err(failed("the literal's decode"))
+        })?;
+        let writing = run.policy(POOL);
+        run.holding(result, Retirement::LastReference, &Unwitnessed, |result| {
+            assert_eq!(result.value().value(), expected);
+            let bytes = result
+                .with_policy(writing, |_, w| encode(expected, w))
+                .map_err(failed("the literal's encoding"))?;
+            result.holding(bytes, Retirement::Released, |bytes| {
+                assert_eq!(bytes.value().as_ref(), wire);
+            });
+            result.with_policy(writing, |_, w| assert_eq!(w.live_bytes(), 0));
+            Ok::<_, Finding>(())
+        })?;
+        run.with_policy(decoding, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
@@ -122,24 +181,35 @@ fn derived_newtypes_tags_and_enum_shapes_have_literal_wire_oracles() {
     );
     let wire = [0xd8, 0x2a, 0xa1, 0x00, 0x61, b'x'];
     let expected = Tagged { text: "x".into() };
-    let mut m = meter();
-    let value = decode_typed::<Tagged, _>(&wire, 8, &mut m).unwrap();
-    assert_eq!(value.value(), &expected);
-    // As in the symbolic API, the explicit wrapper emits the outer tag.
-    let mut writing = meter();
-    let output = encode(
-        &dcbor::bounded::Tagged {
-            tag: 42,
-            value: &expected,
-        },
-        &mut writing,
-    )
-    .unwrap();
-    assert_eq!(output.as_ref(), wire);
-    drop(output);
-    drop(value);
-    assert_eq!(m.live_bytes(), 0);
-    assert_eq!(writing.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let decoding = run.policy(POOL);
+        let value = run.with_policy(decoding, |m| {
+            decode_typed::<Tagged, _>(&wire, 8, m).map_err(failed("the tagged decode"))
+        })?;
+        // As in the symbolic API, the explicit wrapper emits the outer tag.
+        let writing = run.policy(POOL);
+        run.holding(value, Retirement::LastReference, &Unwitnessed, |value| {
+            assert_eq!(value.value().value(), &expected);
+            let output = value
+                .with_policy(writing, |_, w| {
+                    encode(
+                        &dcbor::bounded::Tagged {
+                            tag: 42,
+                            value: &expected,
+                        },
+                        w,
+                    )
+                })
+                .map_err(failed("the tagged encoding"))?;
+            value.holding(output, Retirement::Released, |output| {
+                assert_eq!(output.value().as_ref(), wire);
+            });
+            value.with_policy(writing, |_, w| assert_eq!(w.live_bytes(), 0));
+            Ok::<_, Finding>(())
+        })?;
+        run.with_policy(decoding, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 /// The fault matrix of a traced typed decode of `T` from `wire`
@@ -156,59 +226,56 @@ fn resumed_shape<T: Transferable<Limits> + std::fmt::Debug + PartialEq + 'static
         core::any::type_name::<T>()
     );
     refusal_matrix(&name, rigor(), |fault: Fault| {
-        let mut m = meter();
-        let (mut owner, mut operation) = typed::<T>(wire, &mut m);
-        refuse(&mut m, fault.refusal);
-        let pool = m.share();
-        let turns = allowed(&m, typed_turns::<T>(wire.len()));
-        let output = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
-            .expect("a derived literal decodes");
-        if let Some(output) = &output {
-            assert_eq!(output.value(), expected);
+        typed_case::<T>(wire, fault, |value, m| {
+            assert_eq!(value, expected);
             m.assert_units(TURN);
+        })
+    });
+}
+
+#[test]
+fn derived_unit_and_newtype_resume_without_schema_replay() -> Result<(), Vec<Finding>> {
+    every_fixture(2, |case| {
+        match case {
+            0 => resumed_shape(&[0xf6], &Unit),
+            _ => resumed_shape(&[0x61, b'x'], &Wrapper("x".into())),
         }
-        drop(output);
-        drop(operation);
-        support::drain(&mut owner, &mut pool.share());
-        assert_eq!(pool.live_bytes(), 0);
-        support::RefusalRun::of(&m)
-    });
+        Ok(())
+    })
 }
 
 #[test]
-fn derived_unit_and_newtype_resume_without_schema_replay() {
-    every_fixture(2, |case| match case {
-        0 => resumed_shape(&[0xf6], &Unit),
-        _ => resumed_shape(&[0x61, b'x'], &Wrapper("x".into())),
-    });
+fn every_enum_shape_resumes_without_discriminant_replay() -> Result<(), Vec<Finding>> {
+    every_fixture(3, |case| {
+        match case {
+            0 => resumed_shape(&[0x00], &Choice::Empty),
+            1 => resumed_shape(&[0x82, 0x01, 0x61, b'x'], &Choice::Text("x".into())),
+            _ => resumed_shape(
+                &[0x82, 0x02, 0xa1, 0x00, 0x61, b'x'],
+                &Choice::Fields { value: "x".into() },
+            ),
+        }
+        Ok(())
+    })
 }
 
 #[test]
-fn every_enum_shape_resumes_without_discriminant_replay() {
-    every_fixture(3, |case| match case {
-        0 => resumed_shape(&[0x00], &Choice::Empty),
-        1 => resumed_shape(&[0x82, 0x01, 0x61, b'x'], &Choice::Text("x".into())),
-        _ => resumed_shape(
-            &[0x82, 0x02, 0xa1, 0x00, 0x61, b'x'],
-            &Choice::Fields { value: "x".into() },
-        ),
-    });
-}
-
-#[test]
-fn tagged_and_generic_nested_values_resume_without_reconstruction() {
-    every_fixture(2, |case| match case {
-        0 => resumed_shape(
-            &[0xd8, 0x2a, 0xa1, 0x00, 0x61, b'x'],
-            &Tagged { text: "x".into() },
-        ),
-        _ => resumed_shape(
-            &[0xa1, 0x00, 0x82, 0x61, b'a', 0x61, b'b'],
-            &Collection {
-                values: vec![Wrapper("a".into()), Wrapper("b".into())],
-            },
-        ),
-    });
+fn tagged_and_generic_nested_values_resume_without_reconstruction() -> Result<(), Vec<Finding>> {
+    every_fixture(2, |case| {
+        match case {
+            0 => resumed_shape(
+                &[0xd8, 0x2a, 0xa1, 0x00, 0x61, b'x'],
+                &Tagged { text: "x".into() },
+            ),
+            _ => resumed_shape(
+                &[0xa1, 0x00, 0x82, 0x61, b'a', 0x61, b'b'],
+                &Collection {
+                    values: vec![Wrapper("a".into()), Wrapper("b".into())],
+                },
+            ),
+        }
+        Ok(())
+    })
 }
 
 #[test]
@@ -220,14 +287,20 @@ fn derived_discriminants_tags_and_lengths_are_strictly_rejected() {
         &[0x82, 0x20, 0x61, b'x'],
         &[0x82, 0x02, 0xa0],
     ] {
-        let mut m = meter();
-        assert!(decode_typed::<Choice, _>(wire, 8, &mut m).is_err());
-        assert_eq!(m.live_bytes(), 0);
+        synchronous_case(
+            |m| decode_typed::<Choice, _>(wire, 8, m),
+            |result, _| {
+                assert!(result.is_err());
+            },
+        );
     }
     for wire in [&[0xa1, 0x00, 0x60][..], &[0xd8, 0x2b, 0xa1, 0x00, 0x60]] {
-        let mut m = meter();
-        assert!(decode_typed::<Tagged, _>(wire, 8, &mut m).is_err());
-        assert_eq!(m.live_bytes(), 0);
+        synchronous_case(
+            |m| decode_typed::<Tagged, _>(wire, 8, m),
+            |result, _| {
+                assert!(result.is_err());
+            },
+        );
     }
 }
 
@@ -239,28 +312,29 @@ fn derived_record_preserves_unknown_fields_policy_and_rejects_invalid_known_fiel
         &[0xa3, 0x00, 0x60, 0x00, 0x60, 0x01, 0x40],
         &[0xa3, 0x00, 0x60, 0x01, 0x40, 0x02, 0x00],
     ] {
-        let mut m = meter();
-        assert!(
-            decode_typed::<Record, _>(wire, 8, &mut m).is_err(),
-            "{wire:x?}"
+        synchronous_case(
+            |m| decode_typed::<Record, _>(wire, 8, m),
+            |result, _| {
+                assert!(result.is_err(), "{wire:x?}");
+            },
         );
-        assert_eq!(m.live_bytes(), 0);
     }
     // Existing derive semantics ignore unknown fields. Continuation must not
     // turn this compatibility rule into a new rejection policy.
-    let mut m = meter();
-    let value =
-        decode_typed::<Record, _>(&[0xa3, 0x00, 0x60, 0x01, 0x40, 0x03, 0xf5], 8, &mut m).unwrap();
-    assert_eq!(
-        value.value(),
-        &Record {
-            text: String::new(),
-            bytes: ByteString::new(Vec::new()),
-            optional: None,
-        }
+    synchronous_case(
+        |m| decode_typed::<Record, _>(&[0xa3, 0x00, 0x60, 0x01, 0x40, 0x03, 0xf5], 8, m),
+        |result, _| {
+            let value = result.expect("a record with an unknown field");
+            assert_eq!(
+                value.value(),
+                &Record {
+                    text: String::new(),
+                    bytes: ByteString::new(Vec::new()),
+                    optional: None,
+                }
+            );
+        },
     );
-    drop(value);
-    assert_eq!(m.live_bytes(), 0);
 }
 
 #[test]
@@ -276,15 +350,8 @@ fn derived_nested_fields_resume_at_every_admission_without_reconstruction() {
     resumed_shape(&wire, &expected);
     // The published value outlives its decoder and holds its fields'
     // storage; a property of publication, not of the refusal schedule.
-    let mut m = meter();
-    let (mut owner, mut reference) = typed::<Record>(&wire, &mut m);
-    let pool = m.share();
-    let value = drive_within(&mut m, &mut reference, typed_turns::<Record>(wire.len()))
-        .expect("baseline decode");
-    drop(reference);
-    assert!(pool.live_bytes() >= 4);
-    assert_eq!(value.value(), &expected);
-    drop(value);
-    support::drain(&mut owner, &mut pool.share());
-    assert_eq!(pool.live_bytes(), 0);
+    typed_case::<Record>(&wire, Fault::NONE, |value, m| {
+        assert!(m.live_bytes() >= 4);
+        assert_eq!(value, &expected);
+    });
 }

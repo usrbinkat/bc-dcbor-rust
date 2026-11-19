@@ -2,14 +2,14 @@ use std::cell::RefCell;
 
 use dcbor::{prelude::*, walk::WalkElement};
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     println!("=== Testing CONSISTENT stop behavior: 'Prevent descent into children' ===\n");
 
     // Test case 1: Depth-limited traversal
     println!("Test 1: Depth-limited traversal (max_level = 1)");
     let mut map = Map::new();
-    map.insert("shallow", "value");
-    map.insert("deep", vec!["nested", "array"]);
+    map.insert("shallow", "value")?;
+    map.insert("deep", vec!["nested", "array"])?;
     let cbor = CBOR::from(map);
 
     let max_level = 1;
@@ -50,9 +50,9 @@ fn main() {
     // Test case 2: Abort entire walk via visitor state
     println!("\n\nTest 2: Abort entire walk when finding 'abort' text");
     let mut abort_map = Map::new();
-    abort_map.insert("first", "normal");
-    abort_map.insert("second", "abort"); // This should trigger abort
-    abort_map.insert("third", "should_not_see");
+    abort_map.insert("first", "normal")?;
+    abort_map.insert("second", "abort")?; // This should trigger abort
+    abort_map.insert("third", "should_not_see")?;
     let abort_cbor = CBOR::from(abort_map);
 
     let abort_flag = RefCell::new(false);
@@ -103,4 +103,5 @@ fn main() {
     println!("✅ Depth limiting works consistently");
     println!("✅ Full abort works via visitor state");
     println!("✅ Stop flag means 'prevent descent into children' everywhere");
+    Ok(())
 }

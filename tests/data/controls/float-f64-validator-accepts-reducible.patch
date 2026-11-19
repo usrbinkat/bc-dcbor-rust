@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -157,7 +157,8 @@
+ }
+
+ pub(crate) fn validate_canonical_f64(n: f64) -> Result<()> {
+-    if prepare_f64(n) != Numeric::Float64(n.to_bits()) {
++    // Planted: an eight-byte head of a value that reduces is accepted.
++    if n.is_nan() && prepare_f64(n) != Numeric::Float64(n.to_bits()) {
+         return Err(Error::NonCanonicalNumeric);
+     }
+     Ok(())

@@ -134,9 +134,15 @@ impl<K: Schema + Ord, V: Schema> Schema for BTreeMap<K, V> {
     }
 }
 
-// SAFETY: the cursor is the tree's own ([`TreeCursor`]), stored by `start`
-// and read back as the same type by `next`; it borrows the tree, owns
-// nothing and never refers to itself; its moves are `tree_step_moves`'.
+// SAFETY: cursor type: `start` stores the tree's own cursor ([`TreeCursor`],
+// `tree_start`), which `next` reads back as the same type (`tree_next`).
+// self-reference: the cursor borrows the tree, owns nothing and never refers
+// to itself or its slot. transfer: the cursor and every entry it yields refer
+// only into the tree, whose keys and values are `TransferableSchema` wherever
+// the tree is (its impl below), and it holds no thread-local state. moves: a
+// call makes at most `tree_step_moves` node moves beyond its transition, none
+// for the stepped cursor, `tree_moves` of the fixed length for the iterator
+// (`bounded::tests::a_tree_iterators_steps_compare_no_keys`).
 unsafe impl<K: Schema + Ord, V: Schema> Entries for BTreeMap<K, V> {
     fn start(&self, slot: &mut Slot) {
         tree_start(self, slot);
@@ -352,53 +358,148 @@ impl<T: Schema> Schema for Tagged<T> {
     }
 }
 
-// SAFETY: these bindings return only immutable parts of the retained root or
-// descendants carrying the same recursive contract. Tree cursors borrow only
-// that tree; bucket traversal retains no cursor with independent ownership.
+// SAFETY: references: a head, then a child reference to each element the
+// slice holds immutably while retained. cursors: none of its own.
+// recursion: every element is `T: TransferableSchema`.
 unsafe impl<T: TransferableSchema> TransferableSchema for [T] {}
+// SAFETY: references: the null head, or a child reference to the value it
+// holds. cursors: none of its own. recursion: the value is `T:
+// TransferableSchema`.
 unsafe impl<T: TransferableSchema> TransferableSchema for Option<T> {}
+// SAFETY: references: the referent's instructions, the referent borrowed for
+// the whole retention. cursors: the referent's alone. recursion: the
+// referent is `T: TransferableSchema`.
 unsafe impl<T: TransferableSchema + ?Sized> TransferableSchema for &T {}
+// SAFETY: references: the content's instructions, the content kept alive and
+// unchanged by the handle while retained, and shareable between threads as
+// `T: Send + Sync`. cursors: the content's alone. recursion: the content is
+// `T: TransferableSchema`.
 unsafe impl<T: TransferableSchema + Send + ?Sized> TransferableSchema for Arc<T> {}
+// SAFETY: references: a tag head, then a child reference to the value it
+// holds. cursors: none of its own. recursion: the value is `T:
+// TransferableSchema`.
 unsafe impl<T: TransferableSchema> TransferableSchema for Tagged<T> {}
+// SAFETY: references: a counted head, then the tree itself as `Entries`,
+// whose entries refer to keys and values the tree holds. cursors: its one
+// cursor is the tree's own, borrowing only the tree (its `Entries` impl
+// above). recursion: keys and values are `TransferableSchema`.
 unsafe impl<K: TransferableSchema + Ord, V: TransferableSchema> TransferableSchema
     for BTreeMap<K, V>
 {
 }
+// SAFETY: references: the null head, or a child reference to the value it
+// holds; the option itself `Sync` (its permit included) by the bound.
+// cursors: none of its own. recursion: the value is `T: TransferableSchema`.
 unsafe impl<T: TransferableSchema, A: Allocator> TransferableSchema
     for decode::construction::in_place::StableOption<T, A>
 where
     decode::construction::in_place::StableOption<T, A>: Sync,
 {
 }
+// SAFETY: references: a counted head, then the table itself as `Buckets`,
+// whose entries refer to keys and values the table holds, its hasher shared
+// as `S: Sync`. cursors: no `Entries` slot; the engine's bucket cursor
+// (`buckets::BucketCursor`) holds the table's reference and its position
+// alone. recursion: keys and values are `TransferableSchema`.
 #[cfg(feature = "custom-std-collections")]
 unsafe impl<K: TransferableSchema, V: TransferableSchema, S: Sync> TransferableSchema
     for std::collections::HashMap<K, V, S>
 {
 }
+// SAFETY: references: a counted head, then the table itself as `Buckets`,
+// whose entries refer to keys and values the table holds, its hasher shared
+// as `S: Sync`. cursors: no `Entries` slot; the engine's bucket cursor
+// (`buckets::BucketCursor`) holds the table's reference and its position
+// alone. recursion: keys and values are `TransferableSchema`.
 #[cfg(feature = "hashbrown")]
 unsafe impl<K: TransferableSchema, V: TransferableSchema, S: Sync> TransferableSchema
     for hashbrown::HashMap<K, V, S>
 {
 }
+// SAFETY: references: a counted head, then the table itself as `Buckets`,
+// whose entries refer to keys and values the table holds. cursors: no
+// `Entries` slot; the engine's bucket cursor (`buckets::BucketCursor`) holds
+// the table's reference and its position alone. recursion: keys and values
+// are `TransferableSchema`.
 #[cfg(feature = "hashbrown")]
 unsafe impl<K: TransferableSchema, V: TransferableSchema> TransferableSchema
     for hashbrown::HashTable<(K, V)>
 {
 }
+// SAFETY: references: none, its instructions are heads computed from its
+// timestamp. cursors: none. recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for Date {}
+// SAFETY: references: none, its instructions are heads, a float's included.
+// cursors: none. recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for Simple {}
+// SAFETY: references: none, its one instruction is a head. cursors: none.
+// recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for usize {}
+// SAFETY: references: none, its one instruction is a head. cursors: none.
+// recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for f16 {}
+// SAFETY: references: none, its one instruction is a head. cursors: none.
+// recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for f32 {}
+// SAFETY: references: none, its one instruction is a head. cursors: none.
+// recursion: none, no instruction is a child.
 unsafe impl TransferableSchema for f64 {}
 
-// SAFETY: symbolic nodes are immutable and their tree cursors refer only to
-// retained nodes. Their shared backing is transferable in multithreaded builds.
+// SAFETY: references: symbolic nodes are immutable, and their shared backing
+// is transferable in multithreaded builds; text, bytes and children refer
+// into the retained node. cursors: a map's cursor is its tree's own,
+// referring only to retained nodes (`crate::Map`'s `Entries` impl).
+// recursion: every child, key and value is a `CBOR`, under this impl.
 #[cfg(feature = "multithreaded")]
 unsafe impl TransferableSchema for CBOR {}
+// SAFETY: references: a counted head, then the map itself as `Entries`,
+// whose entries refer to its immutable keys and values, transferable in
+// multithreaded builds. cursors: its one cursor is its tree's own, borrowing
+// only the tree (`map.rs`). recursion: every key and value is a `CBOR`,
+// under its impl.
 #[cfg(feature = "multithreaded")]
 unsafe impl TransferableSchema for crate::Map {}
+// SAFETY: references: one `Bignum` instruction referring to the integer
+// itself, whose digits it holds immutably while retained (`bigint.rs`).
+// cursors: none. recursion: none, no instruction is a child.
 #[cfg(feature = "num-bigint")]
 unsafe impl TransferableSchema for num_bigint::BigUint {}
+// SAFETY: references: one `Bignum` instruction referring to the integer's
+// magnitude, whose digits it holds immutably while retained (`bigint.rs`).
+// cursors: none. recursion: none, no instruction is a child.
 #[cfg(feature = "num-bigint")]
 unsafe impl TransferableSchema for num_bigint::BigInt {}
+// SAFETY: references: a plain head, or a tag head and its magnitude, a byte
+// string it holds immutably. cursors: none. recursion: none beyond the
+// magnitude, a `ByteString` (the scalars' impl, `encoding.rs`).
+unsafe impl TransferableSchema for crate::MinimalBigInt {}
+
+/// The symbolic conversion's representation (`minimal_bigint.rs`): inside
+/// the plain range (`minimal_bigint::plain`, its one definition) the
+/// integer's head, major type 0 or 1 of argument `n`; outside it tag 2 or 3
+/// around the magnitude, a byte string, as a byte string is written.
+impl Schema for crate::MinimalBigInt {
+    fn instruction(&self, index: usize) -> Instruction<'_> {
+        let (negative, magnitude) = self.as_parts();
+        if crate::minimal_bigint::plain(negative, magnitude) {
+            if index != 0 {
+                return Instruction::End;
+            }
+            let major = if negative {
+                MajorType::Negative
+            } else {
+                MajorType::Unsigned
+            };
+            return Instruction::Head(
+                major,
+                Argument::Shortest(crate::minimal_bigint::argument(magnitude)),
+            );
+        }
+        let tag = if negative {
+            crate::TAG_NEGATIVE_BIGNUM
+        } else {
+            crate::TAG_POSITIVE_BIGNUM
+        };
+        tagged(tag, self.magnitude(), index)
+    }
+}

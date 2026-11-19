@@ -1,0 +1,13 @@
+--- src/float/reference.rs
++++ src/float/reference.rs
+@@ -213,7 +213,9 @@
+     match decompose(x) {
+         Value::Nan => None,
+         Value::Zero => Some(sign),
+-        Value::Infinite { negative } => Some(BINARY16.infinite(negative) as u16),
++        // Planted: the infinities, which binary16 holds, are not named. Must
++        // fail float::proofs::every_held_value_is_named, "a value binary16 holds is named".
++        Value::Infinite { .. } => None,
+         Value::Finite(value) => BINARY16.exact(value).map(|bits| bits as u16),
+     }
+ }

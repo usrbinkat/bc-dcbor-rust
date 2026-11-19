@@ -6,14 +6,19 @@
 //! construction ([`Construction`]) and typed decoding ([`TypedDecoder`], a
 //! parse followed by a construction).
 use super::{Document, Node, wrong_type};
+use reclamation::Slot;
 
 mod construct;
+#[cfg(test)]
+pub(crate) mod findings;
 pub mod in_place;
 mod input;
 mod operation;
 mod parse;
 pub mod reclamation;
 pub(crate) mod stable;
+mod standalone;
+pub use standalone::Standalone;
 
 pub use construct::{
     ConstructDetail, ConstructPhase, Construction, TypedDecoder, TypedPosition, TypedValue,
@@ -22,6 +27,9 @@ pub use construct::{
 pub use input::{
     Borrowed, DecodeInput, InputAcquisition, InputBorrow, InputDetail, borrow_bound, copy_bound,
 };
+/// The released-prefix witness every prefix record's tests share.
+#[cfg(all(test, feature = "std"))]
+pub(crate) use operation::cuts;
 pub(crate) use operation::{Observed, OperationTerms, Task};
 pub use operation::{Operation, Position};
 pub use parse::{DocumentDecoder, OwnedDocument, ParseDetail, ParsePhase, parse_bound};
@@ -29,6 +37,201 @@ pub use reclamation::{
     Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, Reclaim, Reclaimed,
     Reduction, ScopePosition, Uniform, Written, scope_bound,
 };
+
+/// One construction step's whole input: the document, the node it builds
+/// from, the slot of the value it builds, and the construction's pending
+/// acquisition ([`stable::Pending`]), held together. Fields are private and
+/// nothing public takes a document, a slot and a pending acquisition apart:
+/// a root context is minted only by the engine (`Self::root`, from the
+/// document and the pending acquisition the operation owns, or the
+/// standalone driver holds, for its whole life), and every other context
+/// only from its parent, by projecting the parent's own slot ([`Self::part`]),
+/// so it carries the parent's document and reborrows the parent's pending
+/// acquisition exclusively: parent and child never use it at once. Reads
+/// hand out nodes, which are data and make no context. The engine's entry
+/// points take a context and nothing else, so a session is always stepped
+/// with its own document; which node, the session checks (ledger 29.64).
+///
+/// `'b` is the context's brand: invariant, carried unchanged to every part,
+/// and borne by every record minted from the context
+/// ([`in_place::Initialized`]). A binding's step is generic over it
+/// ([`in_place::InPlace::build_step`]), so a record the step mints cannot
+/// outlive the step: keeping one in any state, a static, or across steps,
+/// constructions or cleanup is a type error, with no counter and no shared
+/// state.
+pub struct Context<'b, 'c, 's, 'a, T, S, A: crate::bounded::Allocator> {
+    document: &'c Document<'a, A::Permit>,
+    index: usize,
+    slot: Slot<'s, T, S>,
+    pending: &'s mut stable::Pending<A::Origin>,
+    /// The dispatch level of this context against its root's declaration
+    /// ([`reclamation::Depth`]): fresh at a root, carried to every part,
+    /// one level deeper at each engine entry that dispatches into a binding.
+    depth: reclamation::Depth,
+    /// Whether a session stepped this context's construction: set by the
+    /// root's session as it steps its binding ([`Self::bind`]) and carried
+    /// to every part; a record checked against a context no session stepped
+    /// is refused ([`in_place::Assembly`]).
+    bound: bool,
+    /// The brand, invariant in `'b`.
+    brand: in_place::Brand<'b>,
+}
+
+impl<'b, 'c, 's, 'a, T, S, A: crate::bounded::Allocator> Context<'b, 'c, 's, 'a, T, S, A> {
+    /// The root context: node 0 of a document the operation owns (the
+    /// root's record) or borrows for its whole life (the standalone
+    /// driver), with the root value's slot and the pending acquisition its
+    /// owner keeps; no session has stepped it yet.
+    pub(crate) fn root(
+        document: &'c Document<'a, A::Permit>,
+        slot: Slot<'s, T, S>,
+        pending: &'s mut stable::Pending<A::Origin>,
+    ) -> Self {
+        Self {
+            document,
+            index: 0,
+            slot,
+            pending,
+            depth: reclamation::Depth::fresh(),
+            bound: false,
+            brand: in_place::Brand::new(),
+        }
+    }
+
+    /// Mark this context stepped by a session: the root's session, as it
+    /// steps its binding (`in_place::enter`).
+    pub(crate) fn bind(&mut self) {
+        self.bound = true;
+    }
+
+    /// The assembly of this context's value: its place, whether a session
+    /// stepped it, and its brand, from which the binding mints its record of
+    /// the value initialized ([`in_place::Assembly::assemble`]), and against
+    /// which the engine entry that dispatched the binding checks that record.
+    /// Read before the context is consumed.
+    pub fn assembly(&self) -> in_place::Assembly<'b, T> {
+        in_place::Assembly::at(self.slot.address(), self.bound)
+    }
+
+    /// Enter one dispatch level into the binding of `declared` dispatch
+    /// depth, the root's declaration taken at its first entry; refused
+    /// [`crate::bounded::BoundedError::PlanMismatch`] past it, nothing
+    /// changed ([`reclamation::Depth`]).
+    pub(crate) fn descend<R>(
+        &mut self,
+        declared: usize,
+    ) -> Result<(), crate::bounded::BoundedError<R>> {
+        self.depth.declare(declared);
+        self.depth.descend()
+    }
+
+    /// The value's slot and the construction's pending acquisition, both for
+    /// the length of a borrow of the context: what an acquisition site
+    /// ([`stable::acquire`], [`stable::admit_release`],
+    /// [`stable::allocate_payload`], [`stable::Stack::push`]) takes beside
+    /// the state it acquires for.
+    pub(crate) fn acquiring(&mut self) -> (Slot<'_, T, S>, &mut stable::Pending<A::Origin>) {
+        (self.slot.reborrow(), &mut *self.pending)
+    }
+
+    /// The node's index in its document: what a session binds.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The node, `None` when the index lies past the document.
+    pub fn node(&self) -> Option<Node<'c, 'a>> {
+        node_at(self.document, self.index)
+    }
+
+    /// Another node of the same document, `None` past it: data to read, as
+    /// a tag's content; never a context.
+    pub fn node_at(&self, index: usize) -> Option<Node<'c, 'a>> {
+        node_at(self.document, index)
+    }
+
+    /// The document's nodes, to read while this context's slot is borrowed
+    /// (a binding that reads several nodes across one step, as a map's
+    /// gather and sort do). Data only: it makes no context and takes no
+    /// slot.
+    pub fn nodes(&self) -> Nodes<'c, 'a, A::Permit> {
+        Nodes {
+            document: self.document,
+        }
+    }
+
+    /// The value's slot for the length of a borrow of the context, which
+    /// outlives it.
+    pub fn slot(&mut self) -> Slot<'_, T, S> {
+        self.slot.reborrow()
+    }
+
+    /// The value's slot for the rest of the step: the context's last use,
+    /// after which nothing is derived from it.
+    pub fn into_slot(self) -> Slot<'s, T, S> {
+        self.slot
+    }
+
+    /// The value's slot and the pending acquisition for the rest of the
+    /// step: the context's last use ([`Self::into_slot`]), for a binding
+    /// that acquires after it projects.
+    pub(crate) fn into_acquiring(self) -> (Slot<'s, T, S>, &'s mut stable::Pending<A::Origin>) {
+        (self.slot, self.pending)
+    }
+
+    /// The context of a part of this value, built from the node at `index`
+    /// of this same document: a child binding (an element, a field, a
+    /// payload, an entry's key or value), stepped through the engine's part
+    /// entries ([`in_place::build_part`]), or the engine's projection of a
+    /// session to its binding's own state. `project` receives this context's
+    /// own slot, for the length of the borrow, and returns the part's; or
+    /// the error that finding it met (a parent's metadata it reads absent),
+    /// which is returned and no context made. The one projection: nothing
+    /// public takes a document and a slot apart.
+    ///
+    /// # Safety
+    /// The slot `project` returns lies within the custody of the slot it
+    /// receives: its place within this value's (or within storage this
+    /// value's state owns), and its state the part's own, held in this
+    /// value's state (as [`Slot::child`] and [`Slot::new`] require). A slot
+    /// obtained anywhere else does not.
+    pub unsafe fn part<'x, C, CS, E>(
+        &'x mut self,
+        index: usize,
+        project: impl FnOnce(Slot<'x, T, S>) -> Result<Slot<'x, C, CS>, E>,
+    ) -> Result<Context<'b, 'c, 'x, 'a, C, CS, A>, E> {
+        Ok(Context {
+            document: self.document,
+            index,
+            slot: project(self.slot.reborrow())?,
+            pending: &mut *self.pending,
+            depth: self.depth,
+            bound: self.bound,
+            brand: self.brand,
+        })
+    }
+}
+
+/// A read-only view of a context's document ([`Context::nodes`]): nodes by
+/// index, and nothing that pairs the document with a slot.
+pub struct Nodes<'c, 'a, P> {
+    document: &'c Document<'a, P>,
+}
+
+impl<P> Clone for Nodes<'_, '_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P> Copy for Nodes<'_, '_, P> {}
+
+impl<'c, 'a, P> Nodes<'c, 'a, P> {
+    /// The node at `index`, `None` past the document.
+    pub fn node(self, index: usize) -> Option<Node<'c, 'a>> {
+        node_at(self.document, index)
+    }
+}
 
 pub fn node_at<'d, 'a, P>(document: &'d Document<'a, P>, index: usize) -> Option<Node<'d, 'a>> {
     (index < document.entries.len()).then(|| Node {
@@ -229,7 +432,7 @@ mod attribution {
         ) -> Self {
             let bound = bounds.iter().fold(scope_bound(), |total, bound| {
                 total
-                    .then::<()>(*bound)
+                    .checked_then(*bound)
                     .expect("a kept scope's bound fits in u64")
             });
             Self {
@@ -301,15 +504,15 @@ mod attribution {
         // emptied slot; its input's record; its released parser's one unit.
         // The record's own release was paid for by its acquisition, which
         // the parse's record term counts.
+        let finished = ResourceBound::of_work(
+            crate::bounded::decode::cursor::finished_cleanup::<()>()
+                .expect("a released parser's cleanup unit fits in u64"),
+        );
         let document = task
             .term(ParsePlace::Cleanup)
-            .then::<()>(task.term(ParsePlace::Input))
-            .and_then(|bound| {
-                bound.then(ResourceBound::of_work(
-                    crate::bounded::decode::cursor::finished_cleanup()?,
-                ))
-            })
-            .unwrap();
+            .checked_then(task.term(ParsePlace::Input))
+            .and_then(|bound| bound.checked_then(finished))
+            .expect("a document record's cleanup bound fits in u64");
         Bounds {
             copy: copy_terms::<A, ()>(len(bytes)).unwrap().0,
             parse,
@@ -765,7 +968,7 @@ mod attribution {
             places::nested(
                 ParsePlace::Parse,
                 task.term(ParsePlace::Parse),
-                crate::bounded::decode::cursor::retained_decode_bound::<places::Permit, ()>(
+                crate::bounded::decode::cursor::retained_decode_bound::<places::Permit, (), ()>(
                     len(bytes),
                     options(),
                 )
@@ -891,10 +1094,10 @@ mod attribution {
             // record is held in the document's.
             let public = copy_bound::<A, ()>(len(&bytes))
                 .unwrap()
-                .then::<()>(
+                .checked_then(
                     typed_decode_bound::<ByteString, Value, A, ()>(len(&bytes), options()).unwrap(),
                 )
-                .unwrap();
+                .expect("a typed decode chain's bound fits in u64");
             let chain = format!("typed decode chain of {name}");
             chains.push((chain.clone(), dimensions, public));
             operations.push(Run {

@@ -5,22 +5,32 @@
 //! keys, variant discriminants, optional fields, newtype and unit shapes,
 //! and the type's tag. Duplicate field keys within one map and duplicate
 //! discriminants within one enum are compile errors. Each derive generates
-//! from that schema, so the symbolic conversions (`From<T> for CBOR`,
-//! `TryFrom<CBOR> for T`) and the bounded encoding
+//! from that schema, so the symbolic encoding (`dcbor::CBOREncodable`), the
+//! symbolic decoding (`TryFrom<CBOR> for T`) and the bounded encoding
 //! (`dcbor::bounded::encoding::Schema`) take every representation decision
 //! from one definition.
+//!
+//! The symbolic encoding is fallible: every field is encoded through its own
+//! `CBOREncodable`, and a field that does not encode (a host map whose keys
+//! collide after numeric reduction or NFC, at any depth) refuses the whole
+//! record with that field's error, propagated, never discarded and never a
+//! panic. No field type needs `Clone`: fields are encoded by reference.
 //!
 //! # Struct encoding
 //!
 //! Structs are encoded as CBOR maps with integer keys for compactness.
 //! Each field must have a `#[cbor(n = N)]` attribute specifying its key.
 //! Fields of type `Option<T>` are omitted from the map when `None`.
+//! Decoding refuses a required field's absence (`MissingMapKey`) and a
+//! present field of another type, an optional one included (its error,
+//! never `None`), and ignores keys no field names. Each field's value is
+//! moved out of the decoded map into its conversion, never copied.
 //!
 //! ```
 //! use dcbor::prelude::*;
 //! use dcbor_derive::{CBOREncodable, CBORDecodable};
 //!
-//! #[derive(Clone, CBOREncodable, CBORDecodable)]
+//! #[derive(CBOREncodable, CBORDecodable)]
 //! struct Person {
 //!     #[cbor(n = 0)]
 //!     name: String,
@@ -31,12 +41,33 @@
 //! }
 //!
 //! let person = Person { name: "Ada".into(), age: 37, email: None };
-//! let bytes = person.to_cbor_data();
+//! let bytes = person.encode_cbor_data().unwrap();
 //! assert_eq!(bytes, [0xa2, 0x00, 0x63, b'A', b'd', b'a', 0x01, 0x18, 37]);
 //! let decoded = Person::try_from(CBOR::try_from_data(bytes).unwrap()).unwrap();
 //! assert_eq!(decoded.name, "Ada");
 //! assert_eq!(decoded.age, 37);
 //! assert_eq!(decoded.email, None);
+//! ```
+//!
+//! A field whose value does not encode refuses the record:
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//! use dcbor::prelude::*;
+//! use dcbor_derive::CBOREncodable;
+//!
+//! #[derive(CBOREncodable)]
+//! struct Labels {
+//!     #[cbor(n = 0)]
+//!     names: BTreeMap<String, u8>,
+//! }
+//!
+//! // "\u{e9}" and "e\u{301}" are distinct Rust strings, one NFC key.
+//! let names = BTreeMap::from([("\u{e9}".to_string(), 1), ("e\u{301}".to_string(), 2)]);
+//! assert!(matches!(
+//!     Labels { names }.encode_cbor(),
+//!     Err(dcbor::Error::DuplicateMapKey)
+//! ));
 //! ```
 //!
 //! # Newtype structs
@@ -46,10 +77,10 @@
 //! ```
 //! use dcbor::prelude::*;
 //! use dcbor_derive::{CBOREncodable, CBORDecodable};
-//! #[derive(Clone, CBOREncodable, CBORDecodable)]
+//! #[derive(CBOREncodable, CBORDecodable)]
 //! struct Wrapper(String);
 //!
-//! let bytes = Wrapper("hello".into()).to_cbor_data();
+//! let bytes = Wrapper("hello".into()).encode_cbor_data().unwrap();
 //! assert_eq!(bytes, [0x65, b'h', b'e', b'l', b'l', b'o']);
 //! let decoded = Wrapper::try_from(CBOR::try_from_data(bytes).unwrap()).unwrap();
 //! assert_eq!(decoded.0, "hello");
@@ -67,7 +98,7 @@
 //! ```
 //! use dcbor::prelude::*;
 //! use dcbor_derive::{CBOREncodable, CBORDecodable};
-//! #[derive(Clone, CBOREncodable, CBORDecodable)]
+//! #[derive(CBOREncodable, CBORDecodable)]
 //! enum Shape {
 //!     #[cbor(n = 0)]
 //!     Circle { #[cbor(n = 0)] radius: f64 },
@@ -80,8 +111,10 @@
 //!     Point,
 //! }
 //!
-//! assert_eq!(Shape::Point.to_cbor_data(), [0x02]);
-//! let bytes = Shape::Rectangle { width: 2.0, height: 3.0 }.to_cbor_data();
+//! assert_eq!(Shape::Point.encode_cbor_data().unwrap(), [0x02]);
+//! let bytes = Shape::Rectangle { width: 2.0, height: 3.0 }
+//!     .encode_cbor_data()
+//!     .unwrap();
 //! assert_eq!(bytes, [0x82, 0x01, 0xa2, 0x00, 0x02, 0x01, 0x03]);
 //! let decoded = Shape::try_from(CBOR::try_from_data(bytes).unwrap()).unwrap();
 //! assert!(matches!(decoded, Shape::Rectangle { width: 2.0, height: 3.0 }));
@@ -92,26 +125,31 @@
 //! Use `#[cbor(tag = N)]` on the type to generate `CBORTagged`,
 //! `CBORTaggedEncodable`, and `CBORTaggedDecodable` implementations.
 //! The `TryFrom<CBOR>` impl will expect and validate the tag. The
-//! `From<T> for CBOR` conversion, and the bounded encoding with it, emit
-//! the untagged value; the tagged form is `CBORTaggedEncodable::tagged_cbor`.
+//! `CBOREncodable` encoding, and the bounded encoding (`CBORBoundedEncodable`),
+//! emit the untagged value; the tagged form is
+//! `CBORTaggedEncodable::tagged_cbor`, whose untagged part is the
+//! `CBOREncodable` encoding, its failure propagated.
 //!
 //! ```
 //! use dcbor::prelude::*;
 //! use dcbor_derive::{CBOREncodable, CBORDecodable};
-//! #[derive(Clone, CBOREncodable, CBORDecodable)]
+//! #[derive(CBOREncodable, CBORDecodable)]
 //! #[cbor(tag = 42)]
 //! struct Tagged {
 //!     #[cbor(n = 0)]
 //!     data: Vec<u8>,
 //! }
 //!
+//! # fn main() -> dcbor::Result<()> {
 //! let value = Tagged { data: vec![1, 2] };
-//! assert_eq!(value.to_cbor_data(), [0xa1, 0x00, 0x82, 0x01, 0x02]);
-//! let bytes = value.tagged_cbor().to_cbor_data();
+//! assert_eq!(value.encode_cbor_data()?, [0xa1, 0x00, 0x82, 0x01, 0x02]);
+//! let bytes = value.tagged_cbor_data()?;
 //! assert_eq!(bytes, [0xd8, 42, 0xa1, 0x00, 0x82, 0x01, 0x02]);
-//! let decoded = Tagged::try_from(CBOR::try_from_data(bytes).unwrap()).unwrap();
+//! let decoded = Tagged::try_from(CBOR::try_from_data(bytes)?)?;
 //! assert_eq!(decoded.data, [1, 2]);
-//! assert!(Tagged::try_from(value.untagged_cbor()).is_err());
+//! assert!(Tagged::try_from(value.untagged_cbor()?).is_err());
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Bounded encoding
@@ -151,10 +189,13 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Error, Fields, Ident, Result, Type, parse_macro_input};
+mod cddl;
 mod construction;
 mod encoding;
 
-/// Derive `From<T> for dcbor::CBOR`, making the type CBOREncodable.
+/// Derive `dcbor::CBOREncodable`: the fallible symbolic encoding, every field
+/// encoded through its own `CBOREncodable` by reference, a field's failure
+/// propagated. A tagged type also gets `CBORTagged` and `CBORTaggedEncodable`.
 #[proc_macro_derive(CBOREncodable, attributes(cbor))]
 pub fn derive_cbor_encodable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -174,7 +215,7 @@ pub fn derive_cbor_decodable(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive both `From<T> for CBOR` and `TryFrom<CBOR> for T`.
+/// Derive both `dcbor::CBOREncodable` and `TryFrom<CBOR> for T`.
 #[proc_macro_derive(CBORCodable, attributes(cbor))]
 pub fn derive_cbor_codable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -199,18 +240,30 @@ pub fn derive_cbor_bounded_encodable(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive `dcbor::bounded::decode::BoundedDecodable` from the same schema as
-/// `TryFrom<CBOR>`: the same field keys, optional-field omission, unknown
-/// keys ignored, discriminants and tag, read from a strictly decoded
-/// document without a symbolic tree.
+/// Derive retained in-place construction
+/// (`dcbor::bounded::decode::construction::in_place::InPlace` and
+/// `reclamation::Reclaim`) from the same schema as `TryFrom<CBOR>`: the same
+/// field keys, optional-field omission, unknown keys ignored, discriminants
+/// and tag, read from a strictly decoded document without a symbolic tree.
+/// The one typed-construction engine: `decode_typed` drives it to
+/// completion.
 #[proc_macro_derive(CBORBoundedDecodable, attributes(cbor))]
 pub fn derive_cbor_bounded_decodable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    match Schema::parse(&input).map(|schema| {
-        let synchronous = schema.constructible();
-        let retained = construction::expand(&schema);
-        quote! { #synchronous #retained }
-    }) {
+    match Schema::parse(&input).map(|schema| construction::expand(&schema)) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Derive `dcbor::cddl::Cddl`: the type's CDDL rule, generated from the
+/// same schema as the symbolic and bounded decoders, so the published
+/// schema and the decoders take every representation decision from one
+/// definition.
+#[proc_macro_derive(CBORCddl, attributes(cbor))]
+pub fn derive_cbor_cddl(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match Schema::parse(&input).map(|schema| cddl::expand(&schema)) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -375,9 +428,11 @@ enum VariantKind {
     Named(MapFields),
 }
 
-enum Shape<'a> {
+/// A schema's representation. A newtype's one field is read from the input
+/// itself where a generator needs its type.
+enum Shape {
     Map(MapFields),
-    Newtype(&'a Type),
+    Newtype,
     Unit,
     Enum(Vec<Variant>),
 }
@@ -387,7 +442,7 @@ enum Shape<'a> {
 struct Schema<'a> {
     input: &'a DeriveInput,
     tag: Option<u64>,
-    shape: Shape<'a>,
+    shape: Shape,
 }
 
 impl<'a> Schema<'a> {
@@ -398,7 +453,7 @@ impl<'a> Schema<'a> {
                 Fields::Named(fields) => Shape::Map(MapFields::parse(fields)?),
                 Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                     reject_tuple_attributes(fields)?;
-                    Shape::Newtype(&fields.unnamed[0].ty)
+                    Shape::Newtype
                 }
                 Fields::Unnamed(_) => {
                     return Err(Error::new_spanned(
@@ -511,7 +566,13 @@ fn bindings(count: usize) -> Vec<Ident> {
 // Encodable expansion
 // ---------------------------------------------------------------------------
 
-/// `map.insert` of every field of `fields`, each read through `access`.
+/// `map.insert` of every field of `fields`, each the alias `access` names
+/// (owned or a reference: `Map::insert` moves an owned field into its
+/// encoding and borrows a referenced one), its encoding's failure (a field
+/// that does not encode, or a key
+/// refused) propagated with `?`, never discarded and never a panic. The keys
+/// are the field keys this derive refuses to repeat at compile time
+/// (`duplicate_keys`), so a refusal comes from a field's own encoding.
 fn map_inserts(
     fields: &MapFields,
     map: &Ident,
@@ -525,13 +586,13 @@ fn map_inserts(
             let value = access(&field.ident);
             if field.optional {
                 quote! {
-                    if let Some(ref v) = #value {
-                        #map.insert(#key, v.clone());
+                    if let ::core::option::Option::Some(v) = #value {
+                        #map.insert(#key, v)?;
                     }
                 }
             } else {
                 quote! {
-                    #map.insert(#key, #value.clone());
+                    #map.insert(#key, #value)?;
                 }
             }
         })
@@ -546,46 +607,122 @@ impl Schema<'_> {
             generics
                 .make_where_clause()
                 .predicates
-                .push(syn::parse_quote!(#ty: Clone + Into<dcbor::CBOR>));
+                .push(syn::parse_quote!(#ty: dcbor::CBOREncodable));
         }
         let (tag_generics, tag_types, tag_where) = self.input.generics.split_for_impl();
-        if self.tag.is_some() {
-            generics
-                .make_where_clause()
-                .predicates
-                .push(syn::parse_quote!(#name #tag_types: Clone));
-        }
         let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-        let core_from = match &self.shape {
-            Shape::Map(fields) => {
-                let map = Ident::new("map", proc_macro2::Span::call_site());
-                let inserts = map_inserts(fields, &map, |field| quote! { value.#field });
-                quote! {
-                    let mut map = dcbor::Map::new();
-                    #(#inserts)*
-                    map.into()
+        let tagged_impls = match self.tag {
+            Some(tag_value) => quote! {
+                impl #tag_generics dcbor::CBORTagged for #name #tag_types #tag_where {
+                    fn cbor_tags() -> dcbor::Vec<dcbor::Tag> {
+                        dcbor::__derive::tags(#tag_value)
+                    }
+                }
+
+                impl #impl_generics dcbor::CBORTaggedEncodable for #name #ty_generics #where_clause {
+                    fn untagged_cbor(&self) -> dcbor::Result<dcbor::CBOR> {
+                        <Self as dcbor::CBOREncodable>::encode_cbor(self)
+                    }
+                }
+            },
+            None => quote! {},
+        };
+
+        let borrowed = self.encode_body(false);
+        let owned = self.encode_body(true);
+        quote! {
+            impl #impl_generics dcbor::CBOREncodable for #name #ty_generics #where_clause {
+                fn encode_cbor(&self) -> dcbor::Result<dcbor::CBOR> {
+                    #borrowed
+                }
+
+                fn into_encoded_cbor(self) -> dcbor::Result<dcbor::CBOR> {
+                    #owned
                 }
             }
-            Shape::Newtype(_) => quote! { value.0.into() },
-            Shape::Unit => quote! { dcbor::CBOR::null() },
+            #tagged_impls
+        }
+    }
+
+    /// The body of the symbolic encoding, by reference (`owned` false, the
+    /// receiver `&self`) or by value (`owned` true, the receiver `self`):
+    /// one definition for both. The value is destructured into
+    /// expansion-owned aliases (`f0`, `f1`, ...), so a field never shadows a
+    /// local of the expansion; under a reference, match ergonomics bind the
+    /// aliases as references. Every field is encoded through
+    /// `CBOREncodable::into_encoded_cbor` (a map insertion calls it too): an
+    /// owned field moves into its encoding, and a borrowed one, a `&T`,
+    /// encodes through the reference's impl, which borrows. Every path is
+    /// fully qualified (`dcbor::__derive`, `dcbor`'s types, `::core`), so
+    /// the expansion resolves whatever the user's crate names `Vec`, `vec!`,
+    /// `From`, `Ok` or `Some`.
+    ///
+    /// A type that implements `Drop` cannot be destructured by value, so it
+    /// cannot derive this encoding; it implements `CBOREncodable` by hand.
+    fn encode_body(&self, owned: bool) -> TokenStream2 {
+        let name = self.name();
+        let value = if owned {
+            quote! { self }
+        } else {
+            quote! { *self }
+        };
+        let ok = quote! { ::core::result::Result::Ok };
+        match &self.shape {
+            Shape::Map(fields) => {
+                let names = fields.idents();
+                let aliases = bindings(names.len());
+                let map = Ident::new("map", proc_macro2::Span::call_site());
+                let inserts = map_inserts(fields, &map, |field| {
+                    let index = names.iter().position(|name| *name == field).unwrap();
+                    let alias = &aliases[index];
+                    quote! { #alias }
+                });
+                let pattern = if owned {
+                    quote! { #name { #(#names: #aliases),* } }
+                } else {
+                    quote! { #name { #(#names: ref #aliases),* } }
+                };
+                quote! {
+                    let #pattern = #value;
+                    let mut map = dcbor::Map::new();
+                    #(#inserts)*
+                    #ok(dcbor::__derive::map(map))
+                }
+            }
+            Shape::Newtype => {
+                let pattern = if owned {
+                    quote! { #name(f0) }
+                } else {
+                    quote! { #name(ref f0) }
+                };
+                quote! {
+                    let #pattern = #value;
+                    dcbor::CBOREncodable::into_encoded_cbor(f0)
+                }
+            }
+            Shape::Unit => quote! { #ok(dcbor::CBOR::null()) },
+            Shape::Enum(variants) if variants.is_empty() => quote! { match #value {} },
             Shape::Enum(variants) => {
+                let binding = if owned {
+                    quote! {}
+                } else {
+                    quote! { ref }
+                };
                 let arms = variants.iter().map(|variant| {
                     let disc = variant.discriminant;
                     let vname = &variant.ident;
                     match &variant.kind {
                         VariantKind::Unit => quote! {
-                            #name::#vname => dcbor::CBOR::from(#disc),
+                            #name::#vname => #ok(dcbor::__derive::discriminant(#disc)),
                         },
                         VariantKind::Tuple(count) => {
                             let bindings = bindings(*count);
                             quote! {
-                                #name::#vname(#(#bindings),*) => {
-                                    let arr: Vec<dcbor::CBOR> = vec![
-                                        dcbor::CBOR::from(#disc),
-                                        #(#bindings.clone().into()),*
-                                    ];
-                                    arr.into()
+                                #name::#vname(#(#binding #bindings),*) => {
+                                    #ok(dcbor::__derive::variant(#disc, [
+                                        #(dcbor::CBOREncodable::into_encoded_cbor(#bindings)?),*
+                                    ]))
                                 }
                             }
                         }
@@ -599,51 +736,23 @@ impl Schema<'_> {
                                 quote! { #alias }
                             });
                             quote! {
-                                #name::#vname { #(#names: #aliases),* } => {
+                                #name::#vname { #(#names: #binding #aliases),* } => {
                                     let mut inner_map = dcbor::Map::new();
                                     #(#inserts)*
-                                    let arr: Vec<dcbor::CBOR> = vec![
-                                        dcbor::CBOR::from(#disc),
-                                        inner_map.into(),
-                                    ];
-                                    arr.into()
+                                    #ok(dcbor::__derive::variant(#disc, [
+                                        dcbor::__derive::map(inner_map),
+                                    ]))
                                 }
                             }
                         }
                     }
                 });
                 quote! {
-                    match value {
+                    match #value {
                         #(#arms)*
                     }
                 }
             }
-        };
-
-        let tagged_impls = match self.tag {
-            Some(tag_value) => quote! {
-                impl #tag_generics dcbor::CBORTagged for #name #tag_types #tag_where {
-                    fn cbor_tags() -> Vec<dcbor::Tag> {
-                        vec![dcbor::Tag::with_value(#tag_value)]
-                    }
-                }
-
-                impl #impl_generics dcbor::CBORTaggedEncodable for #name #ty_generics #where_clause {
-                    fn untagged_cbor(&self) -> dcbor::CBOR {
-                        self.clone().into()
-                    }
-                }
-            },
-            None => quote! {},
-        };
-
-        quote! {
-            impl #impl_generics From<#name #ty_generics> for dcbor::CBOR #where_clause {
-                fn from(value: #name #ty_generics) -> Self {
-                    #core_from
-                }
-            }
-            #tagged_impls
         }
     }
 }
@@ -652,7 +761,12 @@ impl Schema<'_> {
 // Decodable expansion
 // ---------------------------------------------------------------------------
 
-/// The extraction of every field of `fields` from `map`.
+/// The extraction of every field of `fields` from `map`, a `&mut dcbor::Map`
+/// the decoder owns: each field's value removed and moved into its
+/// conversion (`dcbor::__derive::field`, `optional`), never a clone of a
+/// handle the map keeps. A required field absent is `MissingMapKey`; a
+/// present field that does not convert is its conversion's error, an
+/// optional one included; keys no field names are ignored.
 fn map_extracts(fields: &MapFields, map: &Ident) -> Vec<TokenStream2> {
     fields
         .0
@@ -661,9 +775,9 @@ fn map_extracts(fields: &MapFields, map: &Ident) -> Vec<TokenStream2> {
             let fname = &field.ident;
             let key = field.key;
             if field.optional {
-                quote! { #fname: #map.get(#key) }
+                quote! { #fname: dcbor::__derive::optional(#map, #key)? }
             } else {
-                quote! { #fname: #map.extract(#key)? }
+                quote! { #fname: dcbor::__derive::field(#map, #key)? }
             }
         })
         .collect()
@@ -677,27 +791,21 @@ impl Schema<'_> {
             generics
                 .make_where_clause()
                 .predicates
-                .push(syn::parse_quote!(#ty: TryFrom<dcbor::CBOR>));
+                .push(syn::parse_quote!(#ty: ::core::convert::TryFrom<dcbor::CBOR>));
         }
-        // Map extraction accepts any conversion error. Positional fields use
-        // `?` directly, so their errors must also convert into dcbor::Error.
-        let groups: Vec<&Fields> = match &self.input.data {
-            Data::Struct(data) => vec![&data.fields],
-            Data::Enum(data) => data.variants.iter().map(|v| &v.fields).collect(),
-            Data::Union(_) => unreachable!(),
-        };
-        for fields in groups {
-            if let Fields::Unnamed(fields) = fields {
-                for field in &fields.unnamed {
-                    let ty = &field.ty;
-                    generics
-                        .make_where_clause()
-                        .predicates
-                        .push(syn::parse_quote!(
-                            dcbor::Error: From<<#ty as TryFrom<dcbor::CBOR>>::Error>
-                        ));
-                }
-            }
+        // Every field's conversion error propagates as a dcbor::Error: a
+        // required or positional field's through `?`, and an optional field
+        // present in the map but not converting through `Map::get`, which
+        // refuses rather than reading the field as absent.
+        for ty in self.field_types() {
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote!(
+                    dcbor::Error: ::core::convert::From<
+                        <#ty as ::core::convert::TryFrom<dcbor::CBOR>>::Error,
+                    >
+                ));
         }
         if self.tag.is_some() {
             let (_, types, _) = self.input.generics.split_for_impl();
@@ -708,27 +816,32 @@ impl Schema<'_> {
         }
         let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
+        let ok = quote! { ::core::result::Result::Ok };
+        let err = quote! { ::core::result::Result::Err };
         let core_decode = match &self.shape {
             Shape::Map(fields) => {
                 let map = Ident::new("map", proc_macro2::Span::call_site());
                 let extracts = map_extracts(fields, &map);
+                // `ref mut`: a record of no fields never takes from the map,
+                // and a `mut` binding left unmutated would warn in the
+                // user's crate.
                 quote! {
                     match cbor.into_case() {
-                        dcbor::CBORCase::Map(map) => {
-                            Ok(#name { #(#extracts),* })
+                        dcbor::CBORCase::Map(ref mut map) => {
+                            #ok(#name { #(#extracts),* })
                         }
-                        _ => Err(dcbor::Error::WrongType),
+                        _ => #err(dcbor::Error::WrongType),
                     }
                 }
             }
-            Shape::Newtype(_) => quote! {
-                Ok(#name(cbor.try_into()?))
+            Shape::Newtype => quote! {
+                #ok(#name(dcbor::__derive::convert(cbor)?))
             },
             Shape::Unit => quote! {
                 if cbor.is_null() {
-                    Ok(#name)
+                    #ok(#name)
                 } else {
-                    Err(dcbor::Error::WrongType)
+                    #err(dcbor::Error::WrongType)
                 }
             },
             Shape::Enum(variants) => decodable_enum(name, variants),
@@ -743,7 +856,7 @@ impl Schema<'_> {
                     }
                 }
 
-                impl #impl_generics TryFrom<dcbor::CBOR> for #name #ty_generics #where_clause {
+                impl #impl_generics ::core::convert::TryFrom<dcbor::CBOR> for #name #ty_generics #where_clause {
                     type Error = dcbor::Error;
 
                     fn try_from(cbor: dcbor::CBOR) -> dcbor::Result<Self> {
@@ -753,7 +866,7 @@ impl Schema<'_> {
             },
             // For untagged types, TryFrom<CBOR> decodes directly
             None => quote! {
-                impl #impl_generics TryFrom<dcbor::CBOR> for #name #ty_generics #where_clause {
+                impl #impl_generics ::core::convert::TryFrom<dcbor::CBOR> for #name #ty_generics #where_clause {
                     type Error = dcbor::Error;
 
                     fn try_from(cbor: dcbor::CBOR) -> dcbor::Result<Self> {
@@ -765,7 +878,17 @@ impl Schema<'_> {
     }
 }
 
+/// The decoding of an enum: a unit variant from its bare discriminant, a
+/// variant with a payload from the array of its discriminant and payload,
+/// whose length must be exactly the variant's. The array is moved apart
+/// (`dcbor::__derive::variant_array`) and each payload value moved into its
+/// conversion; a named payload's map is moved out and each field removed
+/// from it into its conversion ([`map_extracts`]). No handle is cloned, so
+/// a case held only by the decoded value moves rather than being copied.
+/// Every path is fully qualified, as the encoding expansion's are.
 fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
+    let ok = quote! { ::core::result::Result::Ok };
+    let err = quote! { ::core::result::Result::Err };
     let mut unit_arms = Vec::new();
     let mut array_arms = Vec::new();
 
@@ -775,25 +898,18 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
         match &variant.kind {
             VariantKind::Unit => {
                 unit_arms.push(quote! {
-                    #disc => Ok(#name::#vname),
+                    #disc => #ok(#name::#vname),
                 });
             }
             VariantKind::Tuple(field_count) => {
-                let field_extracts: Vec<TokenStream2> = (0..*field_count)
-                    .map(|i| {
-                        let idx = i + 1; // skip discriminant at index 0
-                        quote! {
-                            arr[#idx].clone().try_into()?
-                        }
-                    })
-                    .collect();
-                let expected_len = field_count + 1;
+                let field_extracts = (0..*field_count)
+                    .map(|_| quote! { dcbor::__derive::convert(payload.take_value()?)? });
                 array_arms.push(quote! {
                     #disc => {
-                        if arr.len() != #expected_len {
-                            return Err(dcbor::Error::WrongType);
+                        if payload.len() != #field_count {
+                            return #err(dcbor::Error::WrongType);
                         }
-                        Ok(#name::#vname(#(#field_extracts),*))
+                        #ok(#name::#vname(#(#field_extracts),*))
                     }
                 });
             }
@@ -802,14 +918,14 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
                 let extracts = map_extracts(fields, &map);
                 array_arms.push(quote! {
                     #disc => {
-                        if arr.len() != 2 {
-                            return Err(dcbor::Error::WrongType);
+                        if payload.len() != 1 {
+                            return #err(dcbor::Error::WrongType);
                         }
-                        match arr[1].clone().into_case() {
-                            dcbor::CBORCase::Map(inner_map) => {
-                                Ok(#name::#vname { #(#extracts),* })
+                        match payload.take_value()?.into_case() {
+                            dcbor::CBORCase::Map(ref mut inner_map) => {
+                                #ok(#name::#vname { #(#extracts),* })
                             }
-                            _ => Err(dcbor::Error::WrongType),
+                            _ => #err(dcbor::Error::WrongType),
                         }
                     }
                 });
@@ -817,294 +933,33 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
         }
     }
 
-    // If all variants are unit, decode from bare integer
-    // If mixed, decode from integer (unit) or array (non-unit)
-    let has_non_unit = !array_arms.is_empty();
-    let has_unit = !unit_arms.is_empty();
-
-    if has_non_unit && has_unit {
-        quote! {
-            match cbor.clone().into_case() {
-                dcbor::CBORCase::Unsigned(disc) => {
-                    match disc {
-                        #(#unit_arms)*
-                        _ => Err(dcbor::Error::WrongType),
-                    }
-                }
-                dcbor::CBORCase::Array(arr) => {
-                    if arr.is_empty() {
-                        return Err(dcbor::Error::WrongType);
-                    }
-                    let disc: u64 = arr[0].clone().try_into()?;
-                    match disc {
-                        #(#array_arms)*
-                        _ => Err(dcbor::Error::WrongType),
-                    }
-                }
-                _ => Err(dcbor::Error::WrongType),
-            }
-        }
-    } else if has_non_unit {
-        quote! {
-            match cbor.into_case() {
-                dcbor::CBORCase::Array(arr) => {
-                    if arr.is_empty() {
-                        return Err(dcbor::Error::WrongType);
-                    }
-                    let disc: u64 = arr[0].clone().try_into()?;
-                    match disc {
-                        #(#array_arms)*
-                        _ => Err(dcbor::Error::WrongType),
-                    }
-                }
-                _ => Err(dcbor::Error::WrongType),
-            }
-        }
-    } else {
-        quote! {
-            match cbor.into_case() {
-                dcbor::CBORCase::Unsigned(disc) => {
-                    match disc {
-                        #(#unit_arms)*
-                        _ => Err(dcbor::Error::WrongType),
-                    }
-                }
-                _ => Err(dcbor::Error::WrongType),
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bounded construction expansion
-// ---------------------------------------------------------------------------
-
-/// Report `values` values a synchronous construction examines to
-/// `allocator` before the work, through typed construction's admission
-/// route.
-fn examine(values: u64) -> TokenStream2 {
-    quote! {
-        dcbor::bounded::decode::visits(#values, allocator)?;
-    }
-}
-
-/// The construction of the map `node` (an expression of a decoded node) as
-/// `path { fields }`: one pass over its entries in canonical key order, each
-/// key a schema field's assigning its slot, every other key ignored as the
-/// symbolic extraction ignores it; a required field without its key is
-/// `MissingMapKey`, an optional one is `None`.
-fn construct_map(fields: &MapFields, path: TokenStream2, node: TokenStream2) -> TokenStream2 {
-    let visit = examine(1);
-    let slots: Vec<Ident> = (0..fields.0.len())
-        .map(|index| {
-            Ident::new(
-                &format!("__dcbor_field_{index}"),
-                proc_macro2::Span::mixed_site(),
-            )
-        })
-        .collect();
-    let arms = fields.0.iter().zip(&slots).map(|(field, slot)| {
-        let key = field.key;
-        quote! {
-            dcbor::bounded::decode::Kind::Unsigned(#key) => {
-                #slot = Some(dcbor::bounded::decode::BoundedDecodable::construct(
-                    __dcbor_value,
-                    permits,
-                    allocator,
-                )?);
-            }
-        }
-    });
-    let values = fields.0.iter().zip(&slots).map(|(field, slot)| {
-        let ident = &field.ident;
-        if field.optional {
-            quote! { #ident: #slot }
-        } else {
-            quote! {
-                #ident: #slot.ok_or(dcbor::bounded::decode::DecodeError::Invalid(
-                    dcbor::Error::MissingMapKey,
-                ))?
-            }
-        }
-    });
-    quote! {{
-        #visit
-        let dcbor::bounded::decode::Kind::Map(_) = (#node).kind() else {
-            return Err(dcbor::bounded::decode::wrong_type());
-        };
-        #(let mut #slots = None;)*
-        let mut __dcbor_entries = (#node).children();
-        while let Some(__dcbor_key) = __dcbor_entries.next() {
-            let __dcbor_value = __dcbor_entries
-                .next()
-                .ok_or_else(dcbor::bounded::decode::wrong_type)?;
-            #visit
-            match __dcbor_key.kind() {
-                #(#arms)*
-                _ => {}
-            }
-        }
-        Ok(#path { #(#values),* })
-    }}
-}
-
-/// The construction of an enum from `node`: a unit variant from its bare
-/// discriminant, a tuple variant from `[discriminant, fields...]`, a struct
-/// variant from `[discriminant, {map}]`, accepting exactly the forms
-/// `TryFrom<CBOR>` accepts.
-fn construct_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
-    let visit = examine(1);
-    let mut unit_arms = Vec::new();
-    let mut array_arms = Vec::new();
-    for variant in variants {
-        let disc = variant.discriminant;
-        let vname = &variant.ident;
-        match &variant.kind {
-            VariantKind::Unit => unit_arms.push(quote! { #disc => Ok(#name::#vname), }),
-            VariantKind::Tuple(count) => {
-                let expected = (*count as u64) + 1;
-                let fields = (0..*count).map(|_| {
-                    quote! {
-                        dcbor::bounded::decode::BoundedDecodable::construct(
-                            __dcbor_items
-                                .next()
-                                .ok_or_else(dcbor::bounded::decode::wrong_type)?,
-                            permits,
-                            allocator,
-                        )?
-                    }
-                });
-                array_arms.push(quote! {
-                    #disc => {
-                        if __dcbor_length != #expected {
-                            return Err(dcbor::bounded::decode::wrong_type());
-                        }
-                        Ok(#name::#vname(#(#fields),*))
-                    }
-                });
-            }
-            VariantKind::Named(fields) => {
-                let map = construct_map(fields, quote! { #name::#vname }, quote! { __dcbor_map });
-                array_arms.push(quote! {
-                    #disc => {
-                        if __dcbor_length != 2 {
-                            return Err(dcbor::bounded::decode::wrong_type());
-                        }
-                        let __dcbor_map = __dcbor_items
-                            .next()
-                            .ok_or_else(dcbor::bounded::decode::wrong_type)?;
-                        #map
-                    }
-                });
-            }
-        }
-    }
     let unit = (!unit_arms.is_empty()).then(|| {
         quote! {
-            dcbor::bounded::decode::Kind::Unsigned(__dcbor_disc) => match __dcbor_disc {
+            dcbor::CBORCase::Unsigned(disc) => match disc {
                 #(#unit_arms)*
-                _ => Err(dcbor::bounded::decode::wrong_type()),
+                _ => #err(dcbor::Error::WrongType),
             },
         }
     });
     let array = (!array_arms.is_empty()).then(|| {
         quote! {
-            dcbor::bounded::decode::Kind::Array(__dcbor_length) => {
-                let mut __dcbor_items = node.children();
-                let __dcbor_disc = match __dcbor_items.next().map(|item| item.kind()) {
-                    Some(dcbor::bounded::decode::Kind::Unsigned(disc)) => disc,
-                    Some(dcbor::bounded::decode::Kind::Negative(_)) => {
-                        return Err(dcbor::bounded::decode::DecodeError::Invalid(
-                            dcbor::Error::OutOfRange,
-                        ));
-                    }
-                    _ => return Err(dcbor::bounded::decode::wrong_type()),
-                };
-                match __dcbor_disc {
+            dcbor::CBORCase::Array(items) => {
+                // `ref mut`: a variant of no payload reads only its length,
+                // and a `mut` binding left unmutated would warn in the
+                // user's crate.
+                let (disc, ref mut payload) = dcbor::__derive::variant_array(items)?;
+                match disc {
                     #(#array_arms)*
-                    _ => Err(dcbor::bounded::decode::wrong_type()),
+                    _ => #err(dcbor::Error::WrongType),
                 }
             }
         }
     });
     quote! {
-        #visit
-        match node.kind() {
+        match cbor.into_case() {
             #unit
             #array
-            _ => Err(dcbor::bounded::decode::wrong_type()),
-        }
-    }
-}
-
-impl Schema<'_> {
-    fn constructible(&self) -> TokenStream2 {
-        let name = self.name();
-        let mut generics = self.input.generics.clone();
-        for ty in self.field_types() {
-            generics
-                .make_where_clause()
-                .predicates
-                .push(syn::parse_quote!(#ty: dcbor::bounded::decode::BoundedDecodable));
-        }
-        let allocator_type = self.fresh("__DcborAllocator");
-        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-        let visit = examine(1);
-        let untagged = match &self.shape {
-            Shape::Map(fields) => construct_map(fields, quote! { #name }, quote! { node }),
-            Shape::Newtype(inner) => quote! {
-                Ok(#name(<#inner as dcbor::bounded::decode::BoundedDecodable>::construct(
-                    node,
-                    permits,
-                    allocator,
-                )?))
-            },
-            Shape::Unit => quote! {
-                #visit
-                match node.kind() {
-                    dcbor::bounded::decode::Kind::Null => Ok(#name),
-                    _ => Err(dcbor::bounded::decode::wrong_type()),
-                }
-            },
-            Shape::Enum(variants) => construct_enum(name, variants),
-        };
-        // A tagged type is read inside its tag, as `TryFrom<CBOR>` reads it.
-        let body = match self.tag {
-            Some(tag) => quote! {
-                #visit
-                let node = match node.kind() {
-                    dcbor::bounded::decode::Kind::Tagged(#tag) => node
-                        .children()
-                        .next()
-                        .ok_or_else(dcbor::bounded::decode::wrong_type)?,
-                    dcbor::bounded::decode::Kind::Tagged(found) => {
-                        return Err(dcbor::bounded::decode::DecodeError::Invalid(
-                            dcbor::Error::WrongTag(
-                                dcbor::Tag::with_value(#tag),
-                                dcbor::Tag::with_value(found),
-                            ),
-                        ));
-                    }
-                    _ => return Err(dcbor::bounded::decode::wrong_type()),
-                };
-                #untagged
-            },
-            None => untagged,
-        };
-        quote! {
-            impl #impl_generics dcbor::bounded::decode::BoundedDecodable for #name #ty_generics #where_clause {
-                #[allow(unused_variables, unused_mut, unreachable_code)]
-                fn construct<#allocator_type: dcbor::bounded::Allocator>(
-                    node: dcbor::bounded::decode::Node<'_, '_>,
-                    permits: &mut dcbor::bounded::Owned<
-                        #allocator_type::Permit,
-                        #allocator_type::Permit,
-                    >,
-                    allocator: &mut #allocator_type,
-                ) -> dcbor::bounded::decode::ConstructResult<Self, #allocator_type> {
-                    #body
-                }
-            }
+            _ => #err(dcbor::Error::WrongType),
         }
     }
 }

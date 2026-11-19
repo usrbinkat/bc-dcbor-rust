@@ -3,9 +3,9 @@ use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::construction::reclamation::Slot;
 use crate::bounded::decode::initialization::{init_field, init_part};
 
-impl<I: Copy, P> ParserContinuation<I, P> {
+impl<I: Copy, P, O: Origin> ParserContinuation<I, P, O> {
     pub(crate) const INIT_STEPS: usize =
-        Storage::<Entry, P>::INIT_STEPS + Storage::<Frame, P>::INIT_STEPS + 17;
+        Storage::<Entry, P, O>::INIT_STEPS + Storage::<Frame, P, O>::INIT_STEPS + 17;
 
     /// Initialize one unit of the parser in `slot`, its stable destination
     /// paired with its units initialized: the node arena and the frame
@@ -14,14 +14,14 @@ impl<I: Copy, P> ParserContinuation<I, P> {
     /// (`normalizer_init`) zero. A partial prefix owns no resources; its
     /// holder reads it as a parser only once this returns true. Refused once
     /// initialized.
-    pub(crate) fn initialize_step<A: Allocator<Permit = P>>(
+    pub(crate) fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: Slot<'_, Self, usize>,
         input: I,
         options: Options,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        let entries = Storage::<Entry, P>::INIT_STEPS;
-        let stack = Storage::<Frame, P>::INIT_STEPS;
+        let entries = Storage::<Entry, P, O>::INIT_STEPS;
+        let stack = Storage::<Frame, P, O>::INIT_STEPS;
         if Bound::new(Predicate::Prefix, entries).below(a, *slot.custody()) {
             init_part!(slot, entries, 0, a, |part| Storage::initialize_step(
                 part, a
@@ -60,12 +60,15 @@ impl<I: Copy, P> ParserContinuation<I, P> {
     }
 }
 
-impl<I, P> Drop for ParserContinuation<I, P> {
+impl<I, P, O: Origin> Drop for ParserContinuation<I, P, O> {
     fn drop(&mut self) {
         // Direct parser users retain ordinary RAII semantics. The owner-backed
-        // typed path instead drains the parser and releases its record without
-        // invoking this destructor. An unfinished initialization owns nothing.
-        if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
+        // path (`construction/parse.rs`, `Parsed`) drains the parser first and
+        // then drops it in place, so this destructor and its arenas' run
+        // with nothing left to free: what they still release is each arena
+        // pending's owner, its session reference. An unfinished
+        // initialization owns nothing.
+        if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
             unsafe { self.normalizer.assume_init_drop() };
         }
     }

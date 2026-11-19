@@ -1,0 +1,558 @@
+# The planted controls, their one table (tests/gate, `controls`): every diff
+# in this directory has a row and every row names a diff that exists, or the
+# gate refuses the table.
+#
+# Columns, tab-separated, `-` where a column does not apply:
+#   name       the control, as the README describes it
+#   diff       the planted diff, an exact `-p0` diff under tests/data/controls
+#              (tests/gate-common.sh `apply_diff`)
+#   runner     loom or shuttle: the concurrency gate's checker builds
+#              (tests/concurrency-models.sh, `gate models control`); native:
+#              one test of a cargo test target, run alone (tests/controls.sh)
+#   toolchain  the development shell's channel a native control runs in:
+#              nightly, or stable where a suite is blessed only there
+#   package    the cargo package of a native control's target
+#   features   `all`, a comma-separated list, or `-` for the defaults
+#   target     `lib`, or the integration test binary's name
+#   test       the exact libtest name, run alone
+#   fixture    a trybuild fixture whose own block must name the pattern
+#   expected   the outcome the refusal must be (tests/gate `outcome`):
+#              failed, or build_refused for a defect the compiler evaluates
+#   pattern    the text the refusal must name, in its own report
+#
+# Loom must refuse the relaxed publication as a causality violation on the
+# record's custody (loom/src/rt/atomic.rs, cell.rs). A substituted write is
+# refused where it is evaluated, by the quantum assertion (src/bounded.rs,
+# write_extent); a substituted block by the I3 witness's allocation check
+# (reclamation/owned.rs, admits_its_production_representation).
+relaxed-publication	tests/data/controls/relaxed-publication.patch	loom	-	-	-	-	-	-	failed	Causality violation
+substituted-write	tests/data/controls/substituted-write.patch	loom	-	-	-	-	-	-	build_refused	one admitted unit stores more than a quantum into retained state
+substituted-write	tests/data/controls/substituted-write.patch	shuttle	-	-	-	-	-	-	build_refused	one admitted unit stores more than a quantum into retained state
+substituted-block	tests/data/controls/substituted-block.patch	loom	-	-	-	-	-	-	failed	the scope's allocation request is not its production block
+substituted-block	tests/data/controls/substituted-block.patch	shuttle	-	-	-	-	-	-	failed	the scope's allocation request is not its production block
+# The root session's node check removed: a text checked on node 1 continues
+# from node 2, and the schedule's refusal check reports the build that
+# succeeded (in_place.rs, adversarial::refused_unchanged).
+session-index-unchecked	tests/data/controls/session-index-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::a_stabilized_text_bound_to_one_node_refuses_another	-	failed	another node: Ok
+# A sequence's build continuing from `Reclaim` as from `Next`: the build in
+# cleanup admits a unit and completes (vector.rs, `refused_at`).
+sequence-built-in-cleanup	tests/data/controls/sequence-built-in-cleanup.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::vector::tests::a_sequence_in_cleanup_refuses_a_build_and_admits_nothing	-	failed	a build in Reclaim: Ok
+# The public document handle restored: the recombination fixture compiles,
+# which trybuild reports in that fixture's block (trybuild 1.0.122
+# message.rs, `should_not_have_compiled`); the suite is blessed on stable.
+context-recombination	tests/data/controls/context-recombination.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/context_recombination.rs	failed	Expected test case to fail to compile, but it succeeded.
+# The cleanup capability's three closed routes (reclamation.rs, Cleanup),
+# each re-opened by its own patch, its own compile-fail fixture compiling,
+# which trybuild reports in that fixture's block, the one block judged: an
+# allocation requested through it, a reborrow of the policy it wraps, its
+# policy field. The dereference also reaches the policy's methods and fields
+# by autoderef, so it compiles the allocation fixture too (tests/data/README.md).
+cleanup-grants-allocation	tests/data/controls/cleanup-grants-allocation.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/cleanup_allocate.rs	failed	Expected test case to fail to compile, but it succeeded.
+cleanup-derefs-to-policy	tests/data/controls/cleanup-derefs-to-policy.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/cleanup_deref.rs	failed	Expected test case to fail to compile, but it succeeded.
+cleanup-policy-public	tests/data/controls/cleanup-policy-public.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/cleanup_field.rs	failed	Expected test case to fail to compile, but it succeeded.
+# The static dispatch-depth check removed from the standalone driver
+# (standalone.rs, `Standalone::new`, `admitted_depth`): a root declaring one
+# past MAX_DISPATCH_DEPTH compiles through it, which trybuild reports in the
+# fixture's block.
+standalone-depth-unchecked	tests/data/controls/standalone-depth-unchecked.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/standalone_depth_beyond_limit.rs	failed	Expected test case to fail to compile, but it succeeded.
+# The run-time dispatch-depth comparison made to pass whatever the depth
+# (reclamation.rs, `Depth::descend`): a binding declaring one level fewer
+# than it dispatches builds and is cleaned past its declaration, each case
+# its own test (in_place.rs, adversarial).
+depth-unchecked-build	tests/data/controls/depth-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::a_binding_understating_its_depth_is_refused_on_build	-	failed	understated build: Ok(
+depth-unchecked-cleanup	tests/data/controls/depth-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::a_binding_understating_its_depth_is_refused_on_cleanup	-	failed	understated cleanup
+# A child's record of initialization (in_place.rs, `Initialized::verify`,
+# `verified`): its brand confines it to its step at compile time (the
+# fixtures below); within the step, each run-time check is removed by its
+# own patch and named by its own test (in_place.rs,
+# `tests::adversarial::records`, a step forging its record): the place not
+# compared, through the part entry and the root entry; the part entry not
+# verifying; the root entry not verifying; the stepped mark not compared.
+record-place-unchecked	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_a_part_entry	-	failed	a record of another place advanced its parent
+record-place-unchecked	tests/data/controls/record-place-unchecked.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_the_root_entry	-	failed	a record of another place built its session
+record-part-unverified	tests/data/controls/record-part-unverified.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_a_part_entry	-	failed	a record of another place advanced its parent
+record-root-unverified	tests/data/controls/record-root-unverified.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_of_another_place_is_refused_by_the_root_entry	-	failed	a record of another place built its session
+record-unbound-context-accepted	tests/data/controls/record-unbound-context-accepted.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::records::a_record_against_an_unbound_context_is_refused	-	failed	a record verified against a context no session bound
+# The same two check removals, against the record check's Kani harness
+# (in_place/proofs.rs), exhaustive over every place and flag: a record of
+# another place, or of a context no session stepped, accepted.
+record-place-unchecked	tests/data/controls/record-place-unchecked.patch	kani	kani	dcbor	-	lib	bounded::decode::construction::in_place::proofs::a_record_is_accepted_exactly_at_its_projected_place_of_a_stepped_context	-	failed	a record is accepted only at its projected place
+record-unbound-context-accepted	tests/data/controls/record-unbound-context-accepted.patch	kani	kani	dcbor	-	lib	bounded::decode::construction::in_place::proofs::a_record_is_accepted_exactly_at_its_projected_place_of_a_stepped_context	-	failed	a record is accepted only at its projected place
+# The record's three closed routes (in_place.rs, `Initialized`, `Assembly`),
+# each re-opened by its own patch, so only its own compile-fail fixture
+# compiles, which trybuild reports in that fixture's block: a record forged
+# from public fields, a record cloned, a record minted without the unsafe
+# obligation.
+record-fields-public	tests/data/controls/record-fields-public.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_forged.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-clone-derived	tests/data/controls/record-clone-derived.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_cloned.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-assembly-safe	tests/data/controls/record-assembly-safe.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_unproven.rs	failed	Expected test case to fail to compile, but it succeeded.
+# The brand's invariance (in_place.rs, `Brand`), each variance re-opened by
+# its own patch: contravariant, a record of its step stored as `'static`
+# (kept across steps, held in state into cleanup); covariant, a `'static`
+# record another construction left presented as this step's.
+record-brand-contravariant	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-covariant	tests/data/controls/record-brand-covariant.patch	native	stable	dcbor-derive	-	ui	bounded_derive_contract	tests/ui/fail/record_of_another_construction.rs	failed	Expected test case to fail to compile, but it succeeded.
+# The cleanup level not restored after a dispatch returns (reclamation.rs,
+# `Cleanup::descend`): a second sibling under one capability is refused at
+# its parent's level, which the resource-free witness names; no scope or
+# record is held, so the failure leaves nothing to reclaim.
+depth-not-restored	tests/data/controls/depth-not-restored.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::tests::successive_siblings_each_enter_the_level_after_their_parents	-	failed	the second sibling was refused at its parent's level
+# The declaration censuses, each margin recorded exactly: the derive's
+# generated declaration one level short (dcbor-derive in_place.rs, adding 5
+# over its deepest field, not 6), which the bindings' census reports at the
+# first derived fixture (in_place.rs, adversarial); `Parsed` declaring one
+# level more over its input chain (parse.rs), which the records' census
+# reports first (construct.rs, depth).
+derive-depth-understated	tests/data/controls/derive-depth-understated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::tests::adversarial::every_bindings_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Scalars: declared 6, measured 2
+parsed-depth-margin-changed	tests/data/controls/parsed-depth-margin-changed.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Parsed: declared
+# `Constructed` declaring one level over its value's (construct.rs): the
+# records' census reports its value case, and the suspended construction's
+# terminal drain reaches one level short of the declaration, which that
+# test keeps as its finding.
+constructed-depth-overstated	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Constructed, its value: declared
+constructed-depth-overstated	tests/data/controls/constructed-depth-overstated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::construct::depth::a_construction_suspended_at_its_declared_depth_drains_terminally	-	failed	the terminal drain's deepest level
+# The resume branch's owner validation removed: a ticket bound under session
+# S resumes under session T, whose numeric identities collide, and the bind
+# itself returns Ok, which the witness's direct assertion on that call
+# reports; no validation on the admission route is reached to mask it
+# (stable.rs, Pending::bind).
+resume-owner-unvalidated	tests/data/controls/resume-owner-unvalidated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::a_resume_under_another_session_is_refused_by_the_bind_itself	-	failed	a resume under another session's policy is refused by the bind itself
+# The payload allocation's resume entered by the holder's ticket alone, not
+# through `bound`: the allocation is requested under session T's policy and
+# granted, which the witness's assertion on the call reports
+# (stable.rs, allocate_payload).
+payload-resume-unvalidated	tests/data/controls/payload-resume-unvalidated.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::a_payload_allocation_under_another_session_is_refused_before_its_request	-	failed	a payload allocation under another session's policy is refused before its request
+# Storage's cleanup settling after its first drain instead of at entry (the
+# order before the ruling): a refused first unit leaves A's grant and B's
+# release held, which W1 reports at its held-credit assertion
+# (storage.rs, reclaim_step).
+storage-settle-after-drain	tests/data/controls/storage-settle-after-drain.patch	native	nightly	dcbor	all	lib	bounded::decode::storage::tests::cleanup_entry_settles_every_family_before_its_first_unit	-	failed	staged false
+# The grown allocation's retry reading nothing admitted and admitting its
+# grant again: the second family's entry, or C's retry, admits work the
+# acquisition already holds, which W2 reports for the grown acquisition, the
+# staging block's cases passing first (storage.rs, allocate_grown).
+storage-readmit-on-refusal	tests/data/controls/storage-readmit-on-refusal.patch	native	nightly	dcbor	all	lib	bounded::decode::storage::tests::a_held_acquisition_is_admitted_once_across_refused_requests	-	failed	staged true
+# A bucket cursor admitting a fresh window at every call, replacing the one
+# it holds: a call within a window under B admits a window's controls, which
+# the witness reports at B's credits (buckets.rs, BucketCursor::step).
+bucket-window-readmitted	tests/data/controls/bucket-window-readmitted.patch	native	nightly	dcbor	all	lib	bounded::encoding::buckets::attribution::a_call_within_a_window_admits_its_base_alone_across_refusal_and_policies	-	failed	a call within the window under B admitted other than its base value
+# A prefix dropped one unit past what it wrote: at two units the pending's
+# owner state, never written, is dropped, its discriminant read uninitialized,
+# which only Miri observes: initialized prefixes currently hold no owned
+# resources (storage.rs, drop_prefix).
+storage-prefix-overdrop	tests/data/controls/storage-prefix-overdrop.patch	tree	nightly	dcbor	all	lib	bounded::decode::storage::tests::every_initialization_prefix_drops_and_releases_its_session	-	undefined_behavior	Undefined Behavior
+# A B-tree metadata prefix's cleanup leaving its block installed: the arenas
+# are dropped and the call reports `Done`, but the block's custody stays in the
+# state and its permit live, which S5 reports at its first prefix
+# (btree/cleanup.rs, reclaim).
+btree-prefix-uninstall-omitted	tests/data/controls/btree-prefix-uninstall-omitted.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::in_place::btree::cleanup::tests::every_metadata_prefix_is_reclaimed_and_releases_its_block	-	failed	the block is freed
+# A whole B-tree's cleanup freeing its metadata block without dropping its
+# released arenas (btree/cleanup.rs, `ReleaseArenas`): each arena's pending
+# owner, made by its first acquisition, outlives the run, so a recorded
+# run of a published tree finishes with its session live, which the
+# terminal-cleanup witness's finalization names.
+btree-arena-owners-undropped	tests/data/controls/btree-arena-owners-undropped.patch	native	nightly	dcbor	all	owned_physical_failure	terminal_tree_cleanup_allocates_nothing_in_either_drop_order	-	failed	the run's recording is no evidence: Live(4)
+# A B-tree metadata prefix's arenas dropped one unit past what each wrote: at
+# the empty prefix every arena's state, never written, is dropped, its
+# discriminant read uninitialized, and a prefix ending inside an arena drops
+# that arena's next unit; only Miri observes it (every prefix field is
+# resource-free natively; btree.rs, drop_prefix_arenas).
+btree-prefix-arena-overdropped	tests/data/controls/btree-prefix-arena-overdropped.patch	tree	nightly	dcbor	all	lib	bounded::decode::construction::in_place::btree::cleanup::tests::every_metadata_prefix_is_reclaimed_and_releases_its_block	-	undefined_behavior	Undefined Behavior
+# A block's acquisition admitting its write again on a retry: the resumed
+# entry, its write and release held, reads them as not yet admitted and
+# admits the write once more (its hold then refused), which the composite
+# S2 witness reports at A's admitted ledger after the first refused request,
+# before the call's own result (stable.rs, acquire).
+pending-readmit-on-refusal	tests/data/controls/pending-readmit-on-refusal.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s2_a_refused_block_acquisition_admits_its_write_and_release_once	-	failed	A across refused request 0: admitted
+# Cleanup entry spending a held grant instead of forfeiting it: the grant's
+# work is consumed in A's ledger where cancellation requires its forfeiture,
+# which S4 reports at A's consumed ledger on the cancel path
+# (stable.rs, Pending::settle_all).
+pending-settle-wrong-disposition	tests/data/controls/pending-settle-wrong-disposition.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s4_cancel_and_drop_forfeit_into_the_admitting_families	-	failed	A, cancel under D: consumed
+# The origin every held admission stores made a detached family: the
+# obligation admitted under A carries an origin, and so an identity, of no
+# family of the session, and its settlements reach no family's ledger. S1
+# reports it at A's held obligations, read by identity from the pending's
+# slots, before any settlement (policy.rs, Limits::origin, which
+# `admit_held_at` stores).
+pending-settle-wrong-origin	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s1_a_release_refused_under_a_is_admitted_once_under_b	-	failed	A after the refusal: held, observed in the slots
+# The same detached origin, through the four-family provenance cases of the
+# decode scope's token and authority (reclamation/owned.rs): the grant's
+# write admitted under a, its release under b, the storage under c, the
+# cleanup under d. Every settlement lands in a family of no session, so a's
+# consumed or forfeited stays zero, which each case's `settled_alone`
+# reports first, its recorded session's refinement naming the unsettled
+# obligations beside it.
+pending-settle-wrong-origin-token-dropped	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::a_tokens_obligations_each_settle_into_their_own_family	-	failed	a: not exactly its own obligation, settled in place
+pending-settle-wrong-origin-token-granted	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::a_granted_tokens_obligations_are_consumed_in_their_own_families	-	failed	a: not exactly its own obligation, settled in place
+pending-settle-wrong-origin-token-cancelled	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::a_cancelled_tokens_obligations_are_forfeited_in_their_own_families	-	failed	a, cancelled: not exactly its own obligation, settled in place
+pending-settle-wrong-origin-owner-initialized	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_initialized_owners_obligations_are_consumed_in_their_own_families	-	failed	a: not exactly its own obligation, settled in place
+pending-settle-wrong-origin-owner-shut-down	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::a_shut_down_owners_obligations_are_forfeited_in_their_own_families	-	failed	a: not exactly its own obligation, settled in place
+# Cleanup entry clearing the release slot instead of forfeiting it: the
+# credit is still settled, `Cancelled`, by the obligation's drop backstop,
+# but with no performer, so the explicit cancellation's performer, D, is
+# lost from the release's forfeit, which S4 reports per obligation on the
+# cancel path (stable.rs, Pending::settle_all). Settlement is not
+# suppressed: no credit is left held.
+pending-slot-cleared-performer-lost	tests/data/controls/pending-slot-cleared-performer-lost.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s4_cancel_and_drop_forfeit_into_the_admitting_families	-	failed	cancel under D: the Release forfeited by the path's performer
+# A physically failed grant leaving its acquisition bound: its release spent
+# and its grant forfeited, the empty slots read as nothing admitted, so a
+# later admission would extend an acquisition whose release is already spent;
+# S3 reports the acquisition still bound (stable.rs, grant).
+pending-admission-after-release-spent	tests/data/controls/pending-admission-after-release-spent.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s3_a_physical_outcome_settles_each_obligation_in_its_own_family	-	failed	failure: the acquisition ended with its release spent, nothing more admissible to it
+# A record's group opened with no owner instead of the one its acquisition's
+# owner stage stored: the record's block and payload permits are custody no
+# stored owner names, which the checkpoint's collector refuses before any
+# boundary is taken (reclamation.rs, Record::observe_custody;
+# tests/support/lifecycle.rs, collect). The owner write itself stays: skipping
+# it would read an uninitialized field, no control.
+record-owner-ungrouped	tests/data/controls/record-owner-ungrouped.patch	native	nightly	dcbor	all	record_owner	a_record_is_checkpointed_under_its_acquisitions_owner_held_and_queued	-	failed	a checkpoint's custody is no observation: Unowned
+# The output's release forgotten at its grant instead of spent: neither the
+# spend nor its drop's forfeit reaches the admitting family, so the ledgers
+# leave the release open while the continuation's custody reports nothing
+# held, which the per-turn oracle reports (text_cursor.rs, Phase::Allocate).
+credit-spend-dropped	tests/data/controls/credit-spend-dropped.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::text_encoding_credit_is_conserved_at_every_suspension_and_settled_at_its_end	-	failed	lost credit
+# The output's release spent twice: a held obligation is settled by value
+# (`Retained::spend` takes `self`), so the second spend is a use of a moved
+# value and the planted copy never builds (bounded.rs, Retained).
+credit-spend-twice	tests/data/controls/credit-spend-twice.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::text_encoding_credit_is_conserved_at_every_suspension_and_settled_at_its_end	-	build_refused	use of moved value
+# A failed output reservation sent back to `ReleaseOutput` instead of
+# cleanup: the cleanup driver's next step admits the release again, requests
+# the output again (the next physical request, not failed) and publishes,
+# which the cleanup driver returns as its stop before the oracle's release
+# count is read (text_cursor.rs, TextEncoder::step; tests/support/lifecycle.rs,
+# finish_within, reached through native_heap.rs `encoded`).
+text-allocation-retried	tests/data/controls/text-allocation-retried.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::every_real_normalization_and_output_allocation_can_fail_without_leaking	-	failed	the operation published where its schedule admits none
+# The second operation's delta begun once it already holds credit: its
+# admissions before the snapshot fall outside the delta, whose settlements
+# then close more than it admitted (native_heap.rs, the delta test itself).
+credit-attribution-misscoped	tests/data/controls/credit-attribution-misscoped.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::two_operations_on_one_policy_are_checked_by_their_deltas	-	failed	the encoding's delta: lost credit
+# A bucket cursor's end marking it finished but keeping its window: the
+# ledgers conserve with what the custody reports, which still holds the
+# window's controls at the run's end, before anything drops it
+# (buckets.rs, BucketCursor::end).
+credit-left-held	tests/data/controls/credit-left-held.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::bucket_credit_is_conserved_at_every_call_and_settled_at_its_end	-	failed	an obligation left held
+# A bucket cursor's window taken and forgotten as it yields an entry: the
+# custody reports nothing held while the ledgers leave the window's controls
+# neither consumed nor forfeited, after that very call (buckets.rs,
+# BucketCursor::step).
+credit-lost-across-suspension	tests/data/controls/credit-lost-across-suspension.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::bucket_credit_is_conserved_at_every_call_and_settled_at_its_end	-	failed	lost credit: the custody reports
+# The terminal policy over counters of its own: forfeits still reach each
+# obligation's stored origin, but the terminal drain's own admitted units
+# no longer reach the originating family (policy.rs, Limits::terminal).
+# The witness uses stop_matrix through the measured publication boundary;
+# it includes the completed decode and every preceding abandoned state.
+credit-terminal-fresh-counters	tests/data/controls/credit-terminal-fresh-counters.patch	native	nightly	dcbor	all	resumable_contract	heap_tests::an_abandoned_scope_conserves_credit_through_its_terminal_drain	-	failed	no terminal drain's admitted work reached the originating family
+# The pending's custody traversal reporting its grant slot alone: a buffer's
+# payload release, held in the root's pending from `ReleasePayload` until
+# its grant, is admitted in the ledgers and reported by no custody, which
+# the witness's conservation check reports at the refused payload request
+# (stable.rs, Pending::observe_custody).
+held-credit-unreported	tests/data/controls/held-credit-unreported.patch	native	nightly	dcbor	all	held_credit	a_buffers_held_credit_is_its_ledgers_held	-	failed	against held
+# The same planted omission, through the refinement machine: a text's
+# metadata block request refused with its write and release held in the
+# root pending, the checkpoint after that step missing the release, and the
+# construction harness's finalization refusing it owner by owner (stable.rs,
+# Pending::observe_custody; tests/support/lifecycle.rs, construction_requests).
+held-credit-unreported-checkpoint	tests/data/controls/held-credit-unreported.patch	native	nightly	dcbor	all	held_credit	a_refused_requests_held_obligations_are_each_checkpointed_under_their_owner	-	failed	which its custody did not report
+# A parsed document's arena transfer (cursor/publication.rs), each control
+# detected by tests/arena_transfer.rs, whose runs checkpoint every transfer
+# part and every cleanup prefix:
+# - the moved permit unreported between the storage's last part and the
+#   owner's write: MissingPermit at that part's checkpoint;
+# - the permit reported in the enclosing record's group: the record owner,
+#   minted before the deferred storage owner of the same family, sorts first
+#   and is examined first, so ExtraPermit (the test asserts that order);
+# - the permit reported twice: the collector's refusal, kept as the run's
+#   defect while the run goes on to its finalization;
+# - cleanup releasing the permit only when the owner stage was never made:
+#   the live bytes left after every capability is dropped, recorded as the
+#   run's defect beside the recording's own refusal.
+arena-permit-omitted-before-owner	tests/data/controls/arena-permit-omitted-before-owner.patch	native	nightly	dcbor	all	arena_transfer	every_transfer_part_is_refused_checkpointed_and_resumed_under_another_policy	-	failed	which its custody did not report
+arena-permit-under-record-owner	tests/data/controls/arena-permit-under-record-owner.patch	native	nightly	dcbor	all	arena_transfer	every_transfer_part_is_refused_checkpointed_and_resumed_under_another_policy	-	failed	which it does not hold
+arena-permit-reported-twice	tests/data/controls/arena-permit-reported-twice.patch	native	nightly	dcbor	all	arena_transfer	every_transfer_part_is_refused_checkpointed_and_resumed_under_another_policy	-	failed	a checkpoint's custody is no observation: DuplicatePermit
+arena-release-skipped-after-owner	tests/data/controls/arena-release-skipped-after-owner.patch	native	nightly	dcbor	all	arena_transfer	a_parse_cancelled_at_every_transfer_prefix_reports_its_arena_once	-	failed	the arena's permit outlived its cleanup
+# A dropped acquisition forgetting its pending whole instead of settling it:
+# neither the explicit forfeit nor the obligations' drop backstop runs, so
+# the admitting family records no forfeit (owned.rs, Acquisition::drop).
+acquisition-drop-unsettled	tests/data/controls/acquisition-drop-unsettled.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::a_dropped_acquisition_forfeits_into_the_admitting_family	-	failed	the admitting family did not record exactly the forfeit
+# A dropped acquisition releasing its scope reference before settling its
+# pending: the last reference frees the abandoned scope, so the scope
+# block's release precedes the token's forfeit in the session, which the
+# witness reads from the finished stream (owned.rs, Acquisition::drop).
+acquisition-drop-reference-first	tests/data/controls/acquisition-drop-reference-first.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_acquisition_outliving_its_owner_forfeits_before_the_scope_is_freed	-	failed	the scope was freed before the token's forfeit
+# An owned preparation's drained preparation left in its record instead of
+# dropped in place (encoding.rs, `Planned`'s `reclaim_step`): the record's
+# block runs no destructor, so each of its arenas' owners keeps its
+# session's store, and the finish of the published run's recording is
+# refused live, which the plan record's witness names.
+plan-preparation-undropped	tests/data/controls/plan-preparation-undropped.patch	native	nightly	dcbor	all	lib	bounded::encoding::plan_record::a_plan_records_cleanup_releases_every_capability_and_admits_nothing_after_done	-	failed	the run's recording is no evidence: Live(
+# An owned preparation's incomplete prefix released as the unstarted prefix
+# instead of released (encoding.rs, `Planned`'s `reclaim_step`): a step
+# after `Done` takes the incomplete-prefix branch again and admits the
+# record's release a second time, which the shared released-prefix witness
+# names (operation.rs, `cuts`).
+# The storage-resumption fixture's tenant restored to 4 KiB
+# (native_schedules.rs): released, it leaves the blocked decode short of its
+# peak, so no release lets the decode finish, which the fixture's own
+# capacity check against the unobstructed decode's peak names before any
+# blocked retry.
+storage-tenant-short-of-peak	tests/data/controls/storage-tenant-short-of-peak.patch	native	nightly	dcbor	all	resumable_contract	schedules::storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacity	-	failed	cannot hold the decode's peak
+# A session's invalidation keeping its last cause instead of its first
+# (policy/record.rs, `exhaust`): concurrent workers over one exhausted pool
+# then name the foreign pairings that follow the exhaustion, which the
+# concurrent integrity witness names (tests/support/lifecycle.rs).
+invalidation-last-cause-kept	tests/data/controls/invalidation-last-cause-kept.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::concurrent_workers_each_name_the_first_invalidation	-	failed	a worker named another first cause
+# A body's finding returned past the recorded run's finalization
+# (tests/support/lifecycle.rs, `recorded_run_with`): the driver's stop
+# reaches the caller alone, the session never finished and its refusal never
+# named, which the event-slot witness names.
+recording-loss-skips-finalization	tests/data/controls/recording-loss-skips-finalization.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots	-	failed	the run's finalization was skipped
+# Every driver's one integrity read left unread (tests/support/lifecycle.rs,
+# `lost`): a grant refused unrecorded once the permit records ran out
+# reaches the caller as the operation's own refusal, its cause lost, which
+# the permit-exhaustion witness names; a copy outgrowing its event slots
+# completes with no stop at all, which the event-slot witness names.
+driver-evidence-unchecked	tests/data/controls/driver-evidence-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_permit_records	-	failed	the stop returned is not the recording's loss by Permits
+driver-evidence-unchecked-events	tests/data/controls/driver-evidence-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots	-	failed	the body returned the driver's stop
+# A fixture runner returning a lost recording alone (native_harness.rs,
+# `every_fixture`): the failures found before the loss are dropped, which the
+# aggregation witness names across its joined workers.
+fixture-loss-drops-findings	tests/data/controls/fixture-loss-drops-findings.patch	native	nightly	dcbor	all	resumable_contract	harness::an_earlier_fixture_failure_and_a_recording_loss_both_reach_finalization	-	failed	each worker returns its earlier failure beside the loss
+# A preparation's published text continuation marked for its next text's
+# initialization without being destroyed (encoding.rs, `Preparation`'s
+# advance): the next text's raw initialization writes over its arenas' and
+# its output's live owners, whose session references then outlive the run,
+# which the repeated-text witness's session finish names.
+text-continuation-reused-live	tests/data/controls/text-continuation-reused-live.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::every_text_continuation_is_destroyed_before_its_next_text	-	failed	the preparation's recording is no evidence: Live(
+plan-prefix-release-unrecorded	tests/data/controls/plan-prefix-release-unrecorded.patch	native	nightly	dcbor	all	lib	bounded::encoding::plan_record::a_plan_records_cleanup_releases_every_capability_and_admits_nothing_after_done	-	failed	a step after Done admitted
+# A dropped uninitialized owner forgetting its pending whole: its held block
+# credit is never forfeited (owned.rs, DecodeOwner::drop).
+owner-drop-unsettled	tests/data/controls/owner-drop-unsettled.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_uninitialized_owner_dropped_holding_credit_settles_it	-	failed	the drop did not forfeit exactly what was held
+# The scope deferral's processing (owned.rs, `process`): one release where
+# n - 1 are owed leaks a reference of three deferred in one step, so the
+# block is never freed; all n performed before the count is cleared frees
+# the block under the clear, a use after free only Miri observes.
+scope-end-in-place	tests/data/controls/scope-end-in-place.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::every_scope_reference_end_is_classified	-	failed	unlisted: input release_scope drop
+deferral-inline-drop	tests/data/controls/deferral-inline-drop.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::retirement_into_abandoned_scopes_never_nests_a_drain	-	failed	more than one terminal drain was active at once
+deferral-one-release	tests/data/controls/deferral-one-release.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::several_handles_of_one_scope_released_in_one_step_are_all_performed	-	failed	a deferred reference was never performed
+deferral-all-releases-first	tests/data/controls/deferral-all-releases-first.patch	stacked	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::several_handles_of_one_scope_released_in_one_step_are_all_performed	-	undefined_behavior	Undefined Behavior
+deferral-all-releases-first	tests/data/controls/deferral-all-releases-first.patch	tree	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::several_handles_of_one_scope_released_in_one_step_are_all_performed	-	undefined_behavior	Undefined Behavior
+# An abandoned scope's shared custody (owned.rs, `ScopeRef::observe_abandoned`
+# and the dispatch unit): left unreported by the handles that keep it alive,
+# reported by every handle with the sink's `shared` gate removed, and
+# reported under no owner with the dispatch unit's owner unwritten. Each
+# changes the handles' report of the scope block from once under the
+# authority's owner.
+abandoned-scope-unreported	tests/data/controls/abandoned-scope-unreported.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_abandoned_scope_is_reported_once_by_its_handles_under_its_owner	-	failed	the abandoned scope block, reported once under its owner
+abandoned-scope-reported-twice	tests/data/controls/abandoned-scope-reported-twice.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_abandoned_scope_is_reported_once_by_its_handles_under_its_owner	-	failed	the abandoned scope block, reported once under its owner
+abandoned-scope-owner-misattributed	tests/data/controls/abandoned-scope-owner-misattributed.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::an_abandoned_scope_is_reported_once_by_its_handles_under_its_owner	-	failed	the abandoned scope block, reported once under its owner
+# A record's payload custody left unobserved (reclamation.rs,
+# `Record::observe_custody`): the holder's group reports its block's permit
+# but none of the three records it holds, which the witness's grouped
+# observation names before its drain.
+record-payload-custody-unobserved	tests/data/controls/record-payload-custody-unobserved.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::several_handles_of_one_scope_released_in_one_step_are_all_performed	-	failed	the holder's custody does not report its three held records
+# The 1-to-0 compare-exchange of `process` replaced by a store: a deferral
+# made by another thread between the load and the store is cleared unpaid,
+# its release lost, so the scope block outlives the drain, which the
+# concurrent deferral model reports in some interleaving (sync/models.rs,
+# `deferral_races_processing`); a schedule defect, so shuttle refuses it too.
+deferral-clear-unchecked	tests/data/controls/deferral-clear-unchecked.patch	loom	-	-	-	-	-	-	failed	deferral racing processing: a record or the scope outlived the drain
+deferral-clear-unchecked	tests/data/controls/deferral-clear-unchecked.patch	shuttle	-	-	-	-	-	-	failed	deferral racing processing: a record or the scope outlived the drain
+# The scope reference census (owned.rs, `every_scope_reference_end_is_classified`),
+# whose identity is the full self type and trait tokens: a second release in
+# `process` (the site count above the table's), a release added to another
+# impl's `drop` (`OwnedRecord`), and the owner's release moved into a
+# same-named type's `Drop` in another module, each unlisted or miscounted.
+scope-release-extra-site	tests/data/controls/scope-release-extra-site.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::every_scope_reference_end_is_classified	-	failed	owned process release_reference: x3, the table lists x2
+scope-release-other-impl	tests/data/controls/scope-release-other-impl.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::every_scope_reference_end_is_classified	-	failed	unlisted: owned <OwnedRecord < '_ , T , A > as Drop>::drop release_reference x1
+scope-release-same-name-impl	tests/data/controls/scope-release-same-name-impl.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::reclamation::owned::tests::every_scope_reference_end_is_classified	-	failed	unlisted: owned <twin :: DecodeOwner < A > as Drop>::drop release_reference x1
+# The unsafe-impl census over every public unsafe trait (tests/unsafe_census.rs,
+# `UNSAFE_TRAITS`, `UNSAFE_IMPLS`): a scalar binding's `Reclaim` SAFETY
+# comment no longer justifying its `count` obligation (in_place/scalars.rs),
+# and the derive's generated `Variants` impl removed from the listing
+# (dcbor-derive enumeration.rs, `expand`), each named by the census.
+reclaim-safety-count-unnamed	tests/data/controls/reclaim-safety-count-unnamed.patch	native	nightly	dcbor	all	unsafe_census	every_unsafe_impl_of_a_governed_trait_is_listed_and_names_its_obligations	-	failed	unsafe impl Reclaim for macro_rules! scalar: its SAFETY comment names no
+derived-variants-unlisted	tests/data/controls/derived-variants-unlisted.patch	native	nightly	dcbor	all	unsafe_census	every_unsafe_impl_of_a_governed_trait_is_listed_and_names_its_obligations	-	failed	unsafe impl Variants for expand: not listed
+# The proof hierarchy's numeric, head and key-order levels (register item 4),
+# each plant refused by the harness or exhaustive test that states the
+# obligation from the specification, never by production: Kani rows check
+# one harness alone in the proof build (tests/gate/src/proofs.rs), named by
+# its path from the crate root, the form `--harness --exact` matches; the
+# exact pretty-name form is read from Kani's first report in the command
+# phase. Native rows run the binary16 and binary32 exhaustive tests.
+float-nan-payload-kept	tests/data/controls/float-nan-payload-kept.patch	kani	kani	dcbor	-	lib	float::proofs::every_f64_reduces_as_its_reference	-	failed	a binary64 value reduces as its reference
+float-f32-width-skipped	tests/data/controls/float-f32-width-skipped.patch	native	nightly	dcbor	all	lib	float::tests::every_f32_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	assertion `left == right` failed: 0x00000001
+# The binary32 test's fast domain (float.rs, `f32_edges`) losing the high
+# mantissas cleared below each bit: 65504, the greatest binary16, is no
+# longer an edge, which the edge set's own reach check names.
+f32-edges-high-mantissas-dropped	tests/data/controls/f32-edges-high-mantissas-dropped.patch	native	nightly	dcbor	all	lib	float::tests::the_f32_edges_reach_every_reduction_class	-	failed	0x477fe000 is not a fast edge
+float-f64-validator-accepts-reducible	tests/data/controls/float-f64-validator-accepts-reducible.patch	kani	kani	dcbor	-	lib	float::proofs::the_f64_validator_accepts_exactly_the_canonical_patterns	-	failed	an eight-byte float head is accepted exactly when it is canonical
+float-f16-validator-accepts-reducible	tests/data/controls/float-f16-validator-accepts-reducible.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0000: the validator differs from the reference
+# The binary16 conversion contract (approach A): the reduction theorem
+# rests on the contract stub, the reference classifier on its consistency
+# harnesses, and each production branch on the exhaustive contract test,
+# natively (the accelerated branch on an f16c host) and under each Miri
+# model (the software branch), one diff on each side.
+float-conversion-contract-broken	tests/data/controls/float-conversion-contract-broken.patch	kani	kani	dcbor	-	lib	float::proofs::every_f64_reduces_as_its_reference	-	failed	a binary64 value reduces as its reference
+float-classifier-over-permissive	tests/data/controls/float-classifier-over-permissive.patch	kani	kani	dcbor	-	lib	float::proofs::every_named_pattern_widens_to_its_value	-	failed	a named binary16 pattern widens to exactly its value
+float-classifier-misses-held	tests/data/controls/float-classifier-misses-held.patch	kani	kani	dcbor	-	lib	float::proofs::every_held_pattern_is_named_back_as_itself	-	failed	a widened binary16 pattern is named back as itself
+float-classifier-misses-infinities	tests/data/controls/float-classifier-misses-infinities.patch	kani	kani	dcbor	-	lib	float::proofs::every_held_value_is_named	-	failed	a value binary16 holds is named
+float-classifier-misses-infinities	tests/data/controls/float-classifier-misses-infinities.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x7c00: the reference does not name a held value
+reference-infinity-sign-dropped	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::the_reference_has_its_fixed_reductions	-	failed	failed: -inf
+reference-infinity-sign-dropped	tests/data/controls/reference-infinity-sign-dropped.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0xfc00: reduction differs from the reference
+float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
+float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	stacked	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
+float-reference-widening-wrong	tests/data/controls/float-reference-widening-wrong.patch	tree	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0001: widening differs from the reference
+float-contract-oracle-broken	tests/data/controls/float-contract-oracle-broken.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0000: a held value does not narrow to its own bits
+float-contract-oracle-broken	tests/data/controls/float-contract-oracle-broken.patch	stacked	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0000: a held value does not narrow to its own bits
+float-contract-oracle-broken	tests/data/controls/float-contract-oracle-broken.patch	tree	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x0000: a held value does not narrow to its own bits
+float-adapter-round-trip-broken	tests/data/controls/float-adapter-round-trip-broken.patch	native	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x3c00: a held value does not narrow to its own bits
+float-adapter-round-trip-broken	tests/data/controls/float-adapter-round-trip-broken.patch	stacked	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x3c00: a held value does not narrow to its own bits
+float-adapter-round-trip-broken	tests/data/controls/float-adapter-round-trip-broken.patch	tree	nightly	dcbor	all	lib	float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical	-	failed	0x3c00: a held value does not narrow to its own bits
+half-version-stale	tests/data/controls/half-version-stale.patch	native	nightly	dcbor	all	lib	float::tests::the_branch_marker_names_the_resolved_half	-	failed	Cargo.lock does not resolve half 2.7.0
+head-shortest-one-late	tests/data/controls/head-shortest-one-late.patch	kani	kani	dcbor	-	lib	varint::proofs::every_integer_head_is_the_shortest_and_reads_back	-	failed	a head takes the fewest following bytes
+head-parser-accepts-nonshortest	tests/data/controls/head-parser-accepts-nonshortest.patch	kani	kani	dcbor	-	lib	varint::proofs::the_decoders_accept_only_the_heads_the_writer_writes	-	failed	an accepted head is the one the writer writes
+decode-negative-range-widened	tests/data/controls/decode-negative-range-widened.patch	kani	kani	dcbor	-	lib	decode::proofs::the_negative_range_rule_is_exact	-	failed	an argument beyond the range is refused OutOfRange, and only such
+decode-simple-undefined-accepted	tests/data/controls/decode-simple-undefined-accepted.patch	kani	kani	dcbor	-	lib	decode::proofs::a_scalar_item_is_accepted_exactly_in_the_profile	-	failed	a scalar item is accepted exactly when its value is in the dCBOR profile
+float-canonical-nan-payload-changed	tests/data/controls/float-canonical-nan-payload-changed.patch	kani	kani	dcbor	-	lib	float::proofs::the_implementation_names_the_specified_nan	-	failed	the implementation's canonical NaN is the specified 7e00
+key-prefix-order-reversed	tests/data/controls/key-prefix-order-reversed.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::short_keys_compare_in_canonical_order	-	failed	two keys compare in the bytewise lexicographic order of their encodings
+key-window-undercharged	tests/data/controls/key-window-undercharged.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::short_keys_compare_in_canonical_order	-	failed	a comparison admits one value and its whole window per turn, before the window
+key-turn-short-of-quantum	tests/data/controls/key-turn-short-of-quantum.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::a_comparison_crosses_its_quantum_and_resumes_after_refusal	-	failed	the first turn examines exactly the quantum
+key-resumed-pair-skipped	tests/data/controls/key-resumed-pair-skipped.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::long_keys_compare_in_canonical_order	-	failed	two keys compare in the bytewise lexicographic order of their encodings
+# The credit ledgers' arithmetic (bounded/policy/proofs.rs): every event's
+# component-wise checked updates and the sticky violation, against a model
+# written from the documented partial-update rule.
+ledger-held-part-consumed	tests/data/controls/ledger-held-part-consumed.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::every_event_updates_its_components_by_checked_adds	-	failed	the consumed ledger is the events' consumption, component by component
+ledger-forfeit-consumed	tests/data/controls/ledger-forfeit-consumed.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::every_event_updates_its_components_by_checked_adds	-	failed	the consumed ledger is the events' consumption, component by component
+ledger-violation-cleared	tests/data/controls/ledger-violation-cleared.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::every_event_updates_its_components_by_checked_adds	-	failed	the violation is sticky
+# A held obligation's forfeit settling nothing into its origin (bounded.rs,
+# `Retained::forfeit`): its remaining work leaves custody unrecorded, which
+# conservation over legal transitions reports.
+retained-forfeit-unrecorded	tests/data/controls/retained-forfeit-unrecorded.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::legal_transitions_conserve_every_family	-	failed	legal transitions conserve: A = C + F + H
+# A delta clearing a violation made before its interval, and conservation
+# ignoring the violation flag (policy.rs, `Credits::checked_sub`,
+# `Credits::conserved_with`).
+ledger-delta-hides-violation	tests/data/controls/ledger-delta-hides-violation.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::a_delta_is_the_interval_unless_violated_and_never_hides_a_violation	-	failed	a delta taken at or after a violation shows it
+ledger-violated-reported-conserved	tests/data/controls/ledger-violated-reported-conserved.patch	kani	kani	dcbor	-	lib	bounded::policy::proofs::a_violated_ledger_is_never_conserved	-	failed	a violated ledger is never reported conserved
+# The count recurrences (bounded/growth_proofs.rs, bounded/encoding/proofs.rs):
+# the growth rule's empty case, the production growth loop and the retained
+# arena's releases, each against the closed form; the B-tree height
+# recurrence's base and `levels`, each against its reference. One row per
+# harness a plant must fail.
+grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::proofs::the_growth_rule_is_exact_and_never_shrinks	-	failed	an empty arena grows to four
+grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::one_growth_preserves_the_invariant	-	failed	one growth preserves the invariant
+grown-capacity-from-empty	tests/data/controls/grown-capacity-from-empty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
+growth-one-too-many	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::owned_growth_is_the_closed_form	-	failed	owned_growth is the closed form, refused exactly when it does not fit
+growth-one-too-many	tests/data/controls/growth-one-too-many.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::storage_growth_is_the_closed_form	-	failed	storage_growth is the closed form, refused exactly when it does not fit
+storage-growth-releases-miscounted	tests/data/controls/storage-growth-releases-miscounted.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::storage_growth_is_the_closed_form	-	failed	storage_growth is the closed form, refused exactly when it does not fit
+growth-base-case-nonempty	tests/data/controls/growth-base-case-nonempty.patch	kani	kani	dcbor	-	lib	bounded::growth_proofs::the_recurrence_starts_at_its_base_case	-	failed	no growth, no counts
+tree-height-base-off-by-one	tests/data/controls/tree-height-base-off-by-one.patch	kani	kani	dcbor	-	lib	bounded::encoding::proofs::tree_height_is_the_greatest_height_its_entries_fill	-	failed	a tree of that height holds no more than its entries
+levels-off-by-one	tests/data/controls/levels-off-by-one.patch	kani	kani	dcbor	-	lib	bounded::encoding::proofs::levels_brackets_its_count	-	failed	levels is floor(log2 n) + 1, one for none
+tree-height-reference-off-by-one	tests/data/controls/tree-height-reference-off-by-one.patch	kani	kani	dcbor	-	lib	bounded::encoding::proofs::the_height_recurrence_keeps_its_invariant	-	failed	the recurrence starts at m(2) = 11
+# The whole-operation bounds (bounded/encoding/writer/proofs.rs,
+# bounded/decode/header/proofs.rs): the emission's segments that gaps end
+# early left unpriced, and the header validation's bytes left unpriced.
+emit-bound-gaps-uncounted	tests/data/controls/emit-bound-gaps-uncounted.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_emission_bound_covers_every_emission	-	failed	the emission completes within its bound's steps
+header-bound-validation-unpriced	tests/data/controls/header-bound-validation-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_every_head	-	failed	the cursor admits no more than its bound
+# A step that changes its cursor before its admission: refused, the change
+# is kept (header.rs, `HeaderState::step`, `finished` set before VALIDATE;
+# writer.rs, `PlanView::segment`, a gap passed before BOUNDARY).
+header-finished-before-admission	tests/data/controls/header-finished-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_every_head	-	failed	a refused step changes nothing the cursor holds
+owned-output-request-unpriced	tests/data/controls/owned-output-request-unpriced.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_owned_emission_bound_covers_every_owned_write	-	failed	the owned write requests no more than its bound
+string-inspect-advanced-before-admission	tests/data/controls/string-inspect-advanced-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_every_input	-	failed	a refused step changes nothing the decode reports
+string-retained-unpriced	tests/data/controls/string-retained-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_every_input	-	failed	the string decode's string retains no more than its bound
+gap-passed-before-admission	tests/data/controls/gap-passed-before-admission.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_emission_bound_covers_every_emission	-	failed	a refused unit moves nothing
+# The whole-operation bounds of preparation, decoding and strict text
+# validation (encoding/preparation_proofs.rs, decode/decode_proofs.rs,
+# text/proofs.rs), each plant an understated storage term: the published
+# plan's retained bytes, the document arena's growth, the normalization
+# buffers' requests.
+preparation-bound-plan-unretained	tests/data/controls/preparation-bound-plan-unretained.patch	kani	kani	dcbor	-	lib	bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source	-	failed	the encoding retains no more than its bound
+decode-bound-arena-halved	tests/data/controls/decode-bound-arena-halved.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_every_input	-	failed	the decode's document retains no more than its bound
+text-bound-buffers-unpriced	tests/data/controls/text-bound-buffers-unpriced.patch	kani	kani	dcbor	-	lib	bounded::text::proofs::the_validation_bound_covers_every_text	-	failed	the validation requests no more than its bound
+# A policy refusal swallowed where it must propagate, one site per harness
+# that schedules a refusal at any attempt and request (proof_budget.rs,
+# `Counting::scheduled`): an allocation refusal in `Owned::reserve`
+# (bounded.rs), a work refusal in strict validation's comparison pass
+# (text.rs, `is_normalized`) and one in emission (writer.rs,
+# `PlanView::segment`). The policy records the refusal and the operation
+# returns as if admitted.
+reserve-refusal-swallowed	tests/data/controls/reserve-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_every_input	-	failed	a refused decode returns its refusal
+validation-pass-refusal-swallowed	tests/data/controls/validation-pass-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::text::proofs::the_validation_bound_covers_every_text	-	failed	a refused validation returns its refusal
+segment-refusal-swallowed	tests/data/controls/segment-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source	-	failed	a refused encoding returns its refusal
+# The retained text encoder's cleanup keeping its output's permit
+# (text_cursor.rs, `reclaim_step`): a text cancelled once its output is
+# allocated still holds the output after its cleanup reports done, which the
+# exhaustive alphabet test's release check names.
+text-cleanup-output-kept	tests/data/controls/text-cleanup-output-kept.patch	native	nightly	dcbor	all	lib	bounded::text_cursor::tests::every_alphabet_text_is_encoded_within_its_bound_at_every_refusal_and_cancellation	-	failed	storage outlived the run
+# The CDDL every derive emits against the items its decoders accept, the
+# independent validator the oracle (tests/cddl, correspondence.rs), each
+# divergence named by kind and item:
+# - a field optional in the decoders rendered required: Record's item with
+#   key 2 removed is accepted by both decoders and refused by its CDDL;
+# - every key rendered one past its own: Record's valid sample refused;
+# - a tagged type's rule rendered untagged: Stamped's item with its tag
+#   stripped is refused by both decoders and admitted by its CDDL;
+# - a derived map closed to the keys no field names: Record's item with an
+#   unknown key 99 is accepted by both decoders and refused by its CDDL.
+# The package states its dcbor features itself, so none are passed.
+cddl-optional-rendered-required	tests/data/controls/cddl-optional-rendered-required.patch	native	nightly	dcbor-cddl-check	-	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: optionality divergence: `key 2 removed`
+cddl-key-off-by-one	tests/data/controls/cddl-key-off-by-one.patch	native	nightly	dcbor-cddl-check	-	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: domain divergence: `valid`
+cddl-tag-omitted	tests/data/controls/cddl-tag-omitted.patch	native	nightly	dcbor-cddl-check	-	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Stamped: tag divergence: `tag 40000 stripped`
+cddl-range-one-too-wide	tests/data/controls/cddl-range-one-too-wide.patch	native	nightly	dcbor-cddl-check	-	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: domain divergence: `key 1 > replaced by u8::MAX + 1`
+cddl-unknown-keys-forbidden	tests/data/controls/cddl-unknown-keys-forbidden.patch	native	nightly	dcbor-cddl-check	-	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: unknown-key divergence: `unknown key 99 added`
+# The foreign-tag class dropped from the mutation domain (tests/cddl
+# src/lib.rs): the domain's own completeness check names the missing kind.
+cddl-domain-tag-kind-dropped	tests/data/controls/cddl-domain-tag-kind-dropped.patch	native	nightly	dcbor-cddl-check	-	correspondence	the_domain_holds_every_kind_of_mutation_a_control_targets	-	failed	no `replaced by tag 2 around a byte string` item
+# The preparation's window custody (encoding.rs): the window arena counted
+# as one cleanup unit while unreleased, as a plain-data clear, understating
+# its per-part drains, which the every-cut schedule names; and the terminal
+# malformation check gated on an unfinished preparation again, so custody
+# left malformed by a terminal error is closed without invalidating its
+# session.
+window-cleanup-understated	tests/data/controls/window-cleanup-understated.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::preparation_cleanup_is_bounded_at_every_cut	-	failed	calls remained after call
+window-malformation-gated-on-finished	tests/data/controls/window-malformation-gated-on-finished.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::malformed_custody_after_a_terminal_error_still_invalidates	-	failed	malformed custody after a terminal error was not invalidated
+# The window custody's mechanisms, one plant each:
+# - the pair append dropping its second part (storage.rs, `Spare::push_pair`):
+#   a cursor is published beside half its pair, which the publication
+#   witness's per-step pair count names;
+# - the pair append growing the allocation (`Spare::push_pair`): reserved
+#   capacity no longer bounds the arena, which the atomic-append witness's
+#   capacity check names;
+# - the root instruction fetched, and the instruction index advanced, before
+#   its admission (encoding.rs, `Preparation::advance`): a refused step has
+#   consumed its instruction, which the refused-reservation witness names;
+# - the relocating traversal skipping a part (storage.rs, `for_each_mut`):
+#   the terminal close leaves a capability behind at a relocation cut;
+# - the terminal close ending acquisitions before settling credits
+#   (encoding.rs, `forfeit_windows`): an end precedes a forfeit;
+# - an acquisition dropped instead of ended (encoding.rs,
+#   `end_window_acquisition`): no end is published;
+# - a window minting a fresh acquisition on every retry (buckets.rs,
+#   `BucketCursor::step`): the credit-free binding is replaced by the next
+#   refused retry;
+# - a window's credit adopting the performing budget's origin (buckets.rs,
+#   `BucketCursor::step`): its spends leave its admitting family, and the
+#   refinement machine refuses the stream.
+window-second-part-skipped	tests/data/controls/window-second-part-skipped.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::cursor_publication_is_whole_and_a_refused_reservation_fetches_nothing	-	failed	a cursor without its whole window pair
+window-append-allocates	tests/data/controls/window-append-allocates.patch	native	nightly	dcbor	all	lib	bounded::decode::storage::tests::pair_append_is_atomic_at_the_reserved_capacity_boundary	-	failed	pair append allocated
+window-premature-publication	tests/data/controls/window-premature-publication.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::cursor_publication_is_whole_and_a_refused_reservation_fetches_nothing	-	failed	a refused step fetched an instruction
+window-traversal-skips-part	tests/data/controls/window-traversal-skips-part.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::window_custody_is_whole_and_closed_in_order_at_every_relocation_boundary	-	failed	a capability survived the terminal close
+window-end-before-settlement	tests/data/controls/window-end-before-settlement.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::window_custody_is_whole_and_closed_in_order_at_every_relocation_boundary	-	failed	an acquisition ended before every credit was settled
+window-end-omitted	tests/data/controls/window-end-omitted.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::window_custody_is_whole_and_closed_in_order_at_every_relocation_boundary	-	failed	each acquisition ended once
+window-remint-on-retry	tests/data/controls/window-remint-on-retry.patch	native	nightly	dcbor	all	held_credit	preparation_repeated_refusal_admits_the_window_exactly_once	-	failed	refusal replaced the credit-free acquisition
+window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly	dcbor	all	held_credit	preparation_continues_a_window_across_families	-	failed	the run's recording does not refine the protocol
+# A retired record linked into the scope queue with its custody still
+# `Handle` (reclamation.rs, `Reclaimer::enqueue`): a stopped decoder's records
+# stay handles in the queue, which the retirement orchestration's comparison
+# names for the stopped value (tests/support lifecycle.rs, `retired`).
+retirement-record-left-unqueued	tests/data/controls/retirement-record-left-unqueued.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_stopped_decoder_queues_every_record_it_held	-	failed	the value's Handle record
+# A standalone consumer's unwind bypassing the held cleanup schedule:
+# its initialized destination outlives finalization, which the unwind
+# witness refuses independently of the original consumer panic.
+standalone-unwind-cleanup-skipped	tests/data/controls/standalone-unwind-cleanup-skipped.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::standalone_consumer_unwind_reclaims_before_finalization	-	failed	standalone unwind did not reclaim before finalization
+# Recording loss aborting cleanup before its first unit leaves the initialized
+# destination's payload held, independently of the finalizer's evidence refusal.
+standalone-loss-cleanup-skipped	tests/data/controls/standalone-loss-cleanup-skipped.patch	native	nightly	dcbor-test-support	dcbor/std	lib	reclamation::tests::standalone_recording_loss_reclaims_without_accepting_evidence	-	failed	standalone cleanup did not finish before finalization

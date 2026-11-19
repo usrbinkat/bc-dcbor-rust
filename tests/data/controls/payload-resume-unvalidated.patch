@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -249,7 +249,7 @@
+     if holder.is_none() {
+         return Err(BoundedError::PlanMismatch);
+     }
+-    let ticket = bound(pending, holder, a)?;
++    let ticket = holder.ok_or(BoundedError::PlanMismatch)?;
+     // A payload's acquisition holds its release alone; one holding a
+     // grant's work is a block's or a node's ([`grant`]).
+     if pending.admitted(ticket)? != Admitted::Release

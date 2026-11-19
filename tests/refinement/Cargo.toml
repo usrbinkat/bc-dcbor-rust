@@ -1,0 +1,25 @@
+[package]
+name = "dcbor-refinement"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The refinement machine every recorded admission trace is checked against, and the trace record's one row format."
+license = "BSD-2-Clause-Patent"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The vocabulary a trace is written in, imported, never redeclared: the
+# admission calls and their answers (`Call`, `LimitRefusal`, `Event`), the
+# credit events (`Credit`, `Obligation`, `Forfeit`), the work amounts
+# (`WriteWork`) and the outcome classes (`Class`). Without dcbor's defaults:
+# the test support crate depends on this one, and a default `std` here would
+# turn every --no-default-features no_std test into a std test through Cargo
+# feature unification; the root test leg selects the domain.
+dcbor = { path = "../..", default-features = false }
+# The record format and the evidence classes rows carry.
+dcbor-record = { path = "../record" }
+
+[lints]
+workspace = true

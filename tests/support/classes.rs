@@ -20,7 +20,7 @@
 use core::fmt::Debug;
 use dcbor::ByteString;
 use dcbor::bounded::Limits;
-use dcbor::bounded::decode::construction::in_place::BufferObservation;
+use dcbor::bounded::decode::construction::in_place::{BufferObservation, Session};
 use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reduction};
 use dcbor::bounded::decode::construction::{
     ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase, Position, TypedPosition,
@@ -36,8 +36,9 @@ use dcbor::bounded::text_cursor::{Phase as TextPhase, Position as TextPosition};
 /// and value types compare as their renderings, which name every field.
 pub type Class = String;
 
-/// The position of a typed decode of `T`.
-pub type Typed<T> = TypedPosition<<<T as Reclaim<Limits>>::State as Custody>::Observation>;
+/// The position of a typed decode of `T`: its construction's detail carries
+/// the value's root session observation, its stage and the binding's own.
+pub type Typed<T> = TypedPosition<<Session<<T as Reclaim<Limits>>::State> as Custody>::Observation>;
 
 /// The classifiers of one pipeline run: an input acquisition's, a parse's,
 /// a typed decode's of the value the run decodes, the owned preparation's of
@@ -193,11 +194,12 @@ enum ParserStage {
 
 /// What the cleanup of an arena of plain data reads
 /// (`Storage::reclaim_copy_step`): its stage, the permits it holds, and its
-/// elements only where they are drained one per unit. Settled with no growth
-/// begun, its elements are discarded in one unit whatever their number, so
-/// only whether it holds any; with a staged block, the block is released
-/// first and the same holds after. While staging, relocating or relocated,
-/// each element is drained in its own unit, so their number. Capacities
+/// elements only where they are drained one per unit. Settled, its elements
+/// are discarded in one unit whatever their number, so only whether it holds
+/// any; with a staged block, the block is released first and the same holds
+/// after. While relocating or relocated, each element is drained in its own
+/// unit, so their number. What a growth's acquisition holds is settled at
+/// cleanup entry and changes no unit here. Capacities
 /// change no unit: each allocation's release is one, paid for by its
 /// acquisition.
 #[derive(Debug)]
@@ -213,7 +215,7 @@ struct Arena {
 fn arena(position: &StoragePosition) -> Arena {
     let drained_one_by_one = matches!(
         position.stage,
-        StorageStage::Staging(_) | StorageStage::Relocating | StorageStage::Relocated
+        StorageStage::Relocating | StorageStage::Relocated
     );
     Arena {
         stage: position.stage,
@@ -296,8 +298,8 @@ struct Parse {
 /// before reclamation alike), the arena parts transferred and released,
 /// and its input slot; the parser's cleanup reads its phase (every parsing
 /// phase alike), its node and frame arenas, each of plain data
-/// ([`arena`]), its normalizer's own cleanup when one is initialized
-/// ([`normalizer`]: the parser reads only that it is, not how far a partial
+/// (`arena`), its normalizer's own cleanup when one is initialized
+/// (`normalizer`: the parser reads only that it is, not how far a partial
 /// initialization went, which owns nothing), and whether a normalized
 /// output is held. The input offset, header bytes, payload validated, bytes
 /// compared and children completed are never read by cleanup, and are
@@ -419,7 +421,7 @@ where
             Some(operation_with(
                 construct,
                 Initialized::Partial,
-                Construct::<<T::State as Reduction>::Class> {
+                Construct::<<Session<T::State> as Reduction>::Class> {
                     record: None,
                     document: construct.detail.document,
                     input: false,
@@ -429,7 +431,7 @@ where
         }
         TypedPosition::Construct(construct) => Some(operation(
             construct,
-            construction::<T::State>(&construct.detail),
+            construction::<Session<T::State>>(&construct.detail),
         )),
         TypedPosition::Finished => Some("finished".into()),
     }
@@ -536,7 +538,7 @@ fn plan(detail: &PlanDetail) -> Prepare {
     }
 }
 
-/// An emission boundary's class: its plan record's cleanup ([`plan`]),
+/// An emission boundary's class: its plan record's cleanup (`plan`),
 /// marked as an emission's, the emission's own progress dropped. Every stop
 /// at an emission boundary retires the writer (it holds no operation in
 /// progress), which hands its record to the scope's drain; the drain reads

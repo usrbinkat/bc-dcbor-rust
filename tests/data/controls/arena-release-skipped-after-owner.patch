@@ -1,0 +1,12 @@
+--- src/bounded/decode/cursor/publication.rs
++++ src/bounded/decode/cursor/publication.rs
+@@ -142,7 +142,8 @@
+             }
+             1 => {
+                 Self::PERMIT.admit(a)?;
+-                if boundary!(a, Predicate::Prefix, transferred, STORAGE_PARTS).is_ge() {
++                // Planted: the permit released only before the owner's stage.
++                if boundary!(a, Predicate::Prefix, transferred, STORAGE_PARTS).is_eq() {
+                     // SAFETY: as above, the storage's last part transferred
+                     // is the permit written.
+                     unsafe { core::ptr::drop_in_place(addr_of_mut!((*raw).entries.permit)) };

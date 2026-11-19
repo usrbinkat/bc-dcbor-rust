@@ -1,7 +1,6 @@
 use super::*;
-use dcbor::bounded::decode::construction::reclamation::Place;
+use dcbor::bounded::decode::construction::Standalone;
 use std::mem::MaybeUninit;
-use std::ptr::NonNull;
 
 #[path = "enumeration.rs"]
 mod enumeration;
@@ -27,80 +26,21 @@ fn reclaims_as_declared(what: &str, declared: u64, mut reclaim: impl FnMut() -> 
     assert_eq!(taken, declared, "{what}: the cleanup's declared calls");
 }
 
-/// Construct `T` from `wire`, observing that every transition is first
-/// refused, without releasing anything, before it is admitted. An invalid
-/// input fails once, then its cleanup runs to `Finished` under the same
-/// refuse-then-admit discipline.
+/// Construct `T` from `wire`, every turn's next admission first refused,
+/// checked to move, charge and release nothing, before it is admitted
+/// ([`super::Discipline::RefusedFirst`]): published and given to `inspect`
+/// unless `invalid`, or rejected once as invalid input and then cleaned up
+/// to `Finished` under the same refuse-then-admit discipline, the scope
+/// holding no record afterwards. One recorded run, its finalizer refining
+/// the stream.
 fn fixture<T: Transferable<Limits> + 'static>(wire: &[u8], inspect: impl Fn(&T), invalid: bool) {
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-    let mut operation = Construction::<_, T, Limits>::construct(document);
-    let mut failed = false;
-    let mut terminal = false;
-    let refusals = m.refusals();
-    // Construction to publication, or to its rejection and then its cleanup,
-    // is within its cost, which the typed decode's bound includes.
-    for _ in 0..support::typed_turns::<T>(wire.len()) {
-        // Each transition first observes refusal with no released reservations.
-        let held = m.live_bytes();
-        let admitted = m.admitted().len();
-        m.clear_refusal();
-        m.exhaust();
-        match support::contracted(&mut m, &mut operation) {
-            Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Ok(Step::Finished) if failed => {
-                terminal = true;
-                break;
-            }
-            Ok(Step::Progress) => {
-                assert!(
-                    m.live_bytes() < held
-                        || (m.admitted().len() > admitted
-                            && m.admitted()[admitted..]
-                                .iter()
-                                .all(|call| matches!(call, dcbor::bounded::Call::Allocate(_)))),
-                    "progress neither released storage nor completed a prepaid acquisition"
-                );
-                continue;
-            }
-            other => panic!(
-                "transition did work without admission: {} at {:?}",
-                support::label(&other),
-                operation.position()
-            ),
-        }
-        assert_eq!(m.live_bytes(), held);
-        match support::checked(&mut m, |m| support::contracted(m, &mut operation)) {
-            Ok(Step::Progress) => {}
-            Ok(Step::Complete(value)) => {
-                assert!(!invalid);
-                support::exhausted(&mut m, &mut operation);
-                inspect(value.value());
-                drop(value);
-                terminal = true;
-                break;
-            }
-            Ok(Step::Finished) if failed => {
-                support::exhausted(&mut m, &mut operation);
-                terminal = true;
-                break;
-            }
-            Err(DecodeError::Invalid(_)) => {
-                assert!(invalid);
-                assert!(!failed, "terminal error replayed");
-                failed = true;
-            }
-            Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            _ => panic!("unexpected schema transition"),
-        }
-    }
-    drop(operation);
-    drain(&mut owner, &mut m);
-    assert!(terminal);
-    assert_eq!(failed, invalid);
-    assert!(m.refusals() > refusals);
-    assert_eq!(owner.outstanding(), 0);
-    assert_eq!(m.live_bytes(), 0);
+    let built = super::constructed::<T>(
+        wire,
+        super::Discipline::RefusedFirst,
+        |error| matches!(error, DecodeError::Invalid(_)),
+        |value| inspect(value.value()),
+    );
+    assert_eq!(built, !invalid, "{wire:02x?}");
 }
 
 #[test]
@@ -235,25 +175,24 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
     let document = dcbor::bounded::decode::decode(&wire, 1, &mut parser).unwrap();
     let mut a = Limits::unlimited();
     let mut value = MaybeUninit::<Choice>::uninit();
-    let mut state = <Choice as Reclaim<Limits>>::INITIAL;
-    // SAFETY: the test owns the destination and pairs it with its initial
-    // state; every access to either is through this slot for the test.
-    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+    // The enum at the root, through the engine's standalone driver.
+    let mut driver = Standalone::<Choice, Limits>::new(&document, &mut value);
     let count = <Choice as Variants<Limits>>::COUNT;
     let (mut selecting, mut charged) = (0u64, 0u64);
-    // Installation, the tag, shape and discriminant inspections, then at
-    // most one selection call per variant and the rejection.
+    // The root session's bind unit, installation, the tag, shape and
+    // discriminant inspections, then at most one selection call per variant
+    // and the rejection.
     let mut rejection = None;
-    for _ in 0..4 + count + 1 {
+    for _ in 0..5 + count + 1 {
         let selects = matches!(
-            slot.custody().observe(),
+            driver.observe().inner,
             EnumObservation::Held {
                 phase: EnumPhase::Select { .. },
                 ..
             }
         );
         let before = a.used().values;
-        let result = enumeration::build::<Choice, Limits>(&document, 0, slot.reborrow(), &mut a);
+        let result = driver.build_step(&mut a);
         if selects {
             selecting += 1;
             charged += a.used().values - before;
@@ -283,10 +222,10 @@ fn an_unknown_discriminant_takes_exactly_the_declared_selection() {
         STEP_COST.checked_mul(selecting),
         "the declared selection against the measured"
     );
-    let declared = enumeration::remaining::<Choice, Limits>(slot.observe());
-    reclaims_as_declared("an enum", declared, || {
-        enumeration::reclaim::<Choice, Limits>(slot.reborrow(), &mut a).unwrap()
-    });
+    let declared = driver
+        .remaining()
+        .expect("an enum's cleanup count fits in u64");
+    reclaims_as_declared("an enum", declared, || driver.reclaim_step(&mut a).unwrap());
     assert_eq!(a.live_bytes(), 0);
     // The same enum's known discriminants select their variants and build
     // their payloads.
@@ -317,34 +256,33 @@ where
             >,
         >,
 {
-    use dcbor::bounded::decode::construction::in_place::fields::{self, FieldsObservation, Phase};
-    use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
+    use dcbor::bounded::decode::construction::in_place::fields::{FieldsObservation, Phase};
+    use dcbor::bounded::decode::construction::in_place::{Built, InPlace, root_cost};
     let mut parser = Limits::unlimited();
     let document = dcbor::bounded::decode::decode(wire, 1, &mut parser).unwrap();
     let mut a = Limits::unlimited();
     let mut value = MaybeUninit::<T>::uninit();
-    let mut state = <T as Reclaim<Limits>>::INITIAL;
-    // SAFETY: the function owns the destination and pairs it with its initial
-    // state; every access to either is through this slot until it returns.
-    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+    // The record at the root, through the engine's standalone driver.
+    let mut driver = Standalone::<T, Limits>::new(&document, &mut value);
     let (mut searching, mut charged) = (0u64, 0u64);
     let mut built = false;
-    // The record's own cost bounds its build calls; the unlimited policy
+    // The record's root cost bounds its build calls; the unlimited policy
     // never refuses.
     let calls = support::turns(
-        <T as InPlace<Limits>>::COST
+        root_cost(<T as InPlace<Limits>>::COST)
+            .expect("the root cost of a fixture fits in u64")
             .bound::<()>(wire.len() as u64)
             .expect("the cost of a fixture fits in u64"),
     );
     for _ in 0..calls {
         let entry = matches!(
-            slot.custody().observe(),
+            driver.observe().inner,
             FieldsObservation::Held(custody)
                 if matches!(custody.phase, Phase::Find | Phase::Search)
                     && custody.next != custody.end
         );
         let before = a.used().values;
-        let result = fields::build::<T, Limits>(&document, 0, slot.reborrow(), &mut a);
+        let result = driver.build_step(&mut a);
         if entry {
             searching += 1;
             charged += a.used().values - before;
@@ -356,9 +294,11 @@ where
     }
     assert!(built, "the record was not built within {calls} calls");
     assert_eq!(charged, searching, "one value per find and search call");
-    let declared = fields::remaining::<T, Limits>(slot.observe());
+    let declared = driver
+        .remaining()
+        .expect("a record's cleanup count fits in u64");
     reclaims_as_declared("a record", declared, || {
-        fields::reclaim::<T, Limits>(slot.reborrow(), &mut a).unwrap()
+        driver.reclaim_step(&mut a).unwrap()
     });
     assert_eq!(a.live_bytes(), 0);
     searching
@@ -516,22 +456,23 @@ fn a_text_whose_every_copy_backs_off_is_within_its_cost() {
     let document = dcbor::bounded::decode::decode(&wire, 1, &mut parser).unwrap();
     let mut a = Limits::unlimited();
     let mut value = MaybeUninit::<String>::uninit();
-    let mut state = <String as Reclaim<Limits>>::INITIAL;
-    // SAFETY: the test owns the destination and pairs it with its initial
-    // state; every access to either is through this slot for the test.
-    let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+    // The text at the root, through the engine's standalone driver.
+    let mut driver = Standalone::<String, Limits>::new(&document, &mut value);
     // Bytes covered and values charged by each copy call, in order.
     let mut copies = Vec::new();
     let mut built = false;
-    // The text's own cost bounds its build calls; the unlimited policy never
-    // refuses.
+    // The text's root cost bounds its build calls; the unlimited policy
+    // never refuses.
     let calls = support::turns(
-        <String as InPlace<Limits>>::COST
-            .bound::<()>(wire.len() as u64)
-            .expect("the cost of a fixture fits in u64"),
+        dcbor::bounded::decode::construction::in_place::root_cost(
+            <String as InPlace<Limits>>::COST,
+        )
+        .expect("the root cost of a fixture fits in u64")
+        .bound::<()>(wire.len() as u64)
+        .expect("the cost of a fixture fits in u64"),
     );
     for _ in 0..calls {
-        let copying = match slot.custody().observe() {
+        let copying = match driver.observe().inner {
             BufferObservation::Held(BufferCustody {
                 phase: BufferPhase::Copy,
                 copied,
@@ -540,10 +481,9 @@ fn a_text_whose_every_copy_backs_off_is_within_its_cost() {
             _ => None,
         };
         let before = a.used().values;
-        let step = <String as InPlace<Limits>>::build_step(&document, 0, slot.reborrow(), &mut a)
-            .expect("the text builds");
+        let step = driver.build_step(&mut a).expect("the text builds");
         if let (Some(start), BufferObservation::Held(BufferCustody { copied, .. })) =
-            (copying, slot.custody().observe())
+            (copying, driver.observe().inner)
         {
             copies.push((copied - start, a.used().values - before));
         }
@@ -575,10 +515,10 @@ fn a_text_whose_every_copy_backs_off_is_within_its_cost() {
         charged * PER_BYTE_SCALE.div_ceil(fewest),
         "the per-byte copy term against the fewest bytes a copy covered ({fewest})"
     );
-    let declared = <String as Reclaim<Limits>>::remaining(slot.observe());
-    reclaims_as_declared("a text", declared, || {
-        <String as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a).unwrap()
-    });
+    let declared = driver
+        .remaining()
+        .expect("a text's cleanup count fits in u64");
+    reclaims_as_declared("a text", declared, || driver.reclaim_step(&mut a).unwrap());
     assert_eq!(a.live_bytes(), 0);
 }
 

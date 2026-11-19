@@ -18,7 +18,7 @@ fn policy(refuse_at: Option<usize>) -> Limits {
         .observe(heap::admitted)
 }
 
-#[derive(Clone, CBOREncodable, CBORBoundedEncodable)]
+#[derive(CBOREncodable, CBORBoundedEncodable)]
 struct Record {
     #[cbor(n = 256)]
     text: Vec<String>,
@@ -139,7 +139,7 @@ fn peak_live_limit_counts_old_and_new_reservations() {
 #[test]
 fn every_write_refusal_preserves_guards_and_allows_retry_without_allocating() {
     let value = record();
-    let symbolic = CBOR::from(value.clone()).to_cbor_data();
+    let symbolic = value.encode_cbor_data().unwrap();
     let mut allocator = policy(None);
     let prepared = prepare(&value, &mut allocator).unwrap();
     let len = prepared.len();
@@ -465,13 +465,17 @@ fn pointer_forwarding_writes_without_cloning_or_allocating() {
 #[test]
 fn reservation_growth_holds_old_permit_until_replacement_succeeds() {
     let mut policy = policy(None);
+    // The custody holding the vector, made once: every growth is one of its
+    // acquisitions.
+    let owner = policy.owner().expect("an ordinary policy's owner");
     let mut owned = Owned::<u8, Reservation>::new();
-    owned.push(1, &mut policy).unwrap();
+    owned.push(1, &mut policy, &owner).unwrap();
     let old = policy.live_bytes();
     assert!(old > 0);
     // Force growth beyond the admitted capacity without assuming its size.
     let additional = usize::try_from(old).unwrap();
-    let (result, heap) = Observation::run(Some(0), || owned.reserve(additional, &mut policy));
+    let (result, heap) =
+        Observation::run(Some(0), || owned.reserve(additional, &mut policy, &owner));
     assert!(matches!(result, Err(BoundedError::Allocation { .. })));
     assert_eq!(heap.denied, 1);
     assert_eq!(
@@ -481,7 +485,7 @@ fn reservation_growth_holds_old_permit_until_replacement_succeeds() {
     );
     assert_eq!(owned.as_slice(), &[1]);
     let failed_peak = policy.peak_bytes();
-    owned.reserve(additional, &mut policy).unwrap();
+    owned.reserve(additional, &mut policy, &owner).unwrap();
     let new = policy.live_bytes();
     assert!(new > old);
     assert!(
@@ -569,7 +573,7 @@ fn decoder_refuses_every_admission_and_real_allocation_without_leaking() {
 fn extended_failures<T: Schema + ?Sized>(name: &str, value: &T) {
     let source: &dyn Schema = &value;
     let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
-    let bound = encode_bound::<Reservation, ()>(shape).expect("the bound fits in u64");
+    let bound = encode_bound::<Reservation, Family, ()>(shape).expect("the bound fits in u64");
     let mut baseline = policy(None);
     let (result, heap) = Observation::run(None, || encode(value, &mut baseline));
     let expected = result.unwrap();
@@ -644,7 +648,9 @@ fn extended_encoders_and_output_owner_handle_all_resource_failures() {
         ("b", vec![None, Some("q\u{301}")]),
     ]);
     extended_failures("an ordered map", &map);
-    let value = CBOR::from(record());
+    let value: CBOR = record()
+        .into_encoded_cbor()
+        .expect("the record's text, flag, byte and float fields encode");
     extended_failures("a symbolic record", &value);
     extended_failures(
         "a tagged date",

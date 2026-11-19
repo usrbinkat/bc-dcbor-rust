@@ -1,0 +1,12 @@
+--- src/decode.rs
++++ src/decode.rs
+@@ -54,7 +54,8 @@
+                 return Err(Error::Underrun);
+             }
+             let val = data[1] as u64;
+-            if val < 24 {
++            // Planted: a one-byte head of 23 is accepted beside its shortest.
++            if val < 23 {
+                 return Err(Error::NonCanonicalNumeric);
+             }
+             (val, 2)

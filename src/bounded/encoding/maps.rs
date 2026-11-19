@@ -5,5 +5,5 @@ pub use order::{OrderPhase, OrderPosition};
 
 /// Compatibility name for the shared preparation engine. No child preparation
 /// arenas or second payload assembly are introduced by this entry point.
-pub type MapPreparation<'a, P> = Preparation<'a, P>;
+pub type MapPreparation<'a, P, O> = Preparation<'a, P, O>;
 pub type MapPosition = Position;

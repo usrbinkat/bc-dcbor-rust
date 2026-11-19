@@ -10,8 +10,9 @@ use crate::{CBOR, CBORCase, Error, Result};
 /// - This ensures that semantically equivalent strings (like composed vs
 ///   decomposed characters) are always encoded identically
 ///
-/// dCBOR provides conversions for both `String` and `&str` types through the
-/// `Into<CBOR>` trait, making it easy to create CBOR values from Rust strings.
+/// dCBOR provides infallible conversions for both `String` and `&str` types
+/// (`From<_> for CBOR`), and both are [`crate::CBOREncodable`] by those
+/// conversions; an owned `String` moves into the value.
 ///
 /// ## Examples
 ///
@@ -27,8 +28,8 @@ use crate::{CBOR, CBORCase, Error, Result};
 ///
 /// // Use in collections
 /// let mut map = Map::new();
-/// map.insert("key", "value");
-/// map.insert("array", [1, 2, 3]);
+/// map.insert("key", "value").unwrap();
+/// map.insert("array", [1, 2, 3]).unwrap();
 ///
 /// // Convert back to String
 /// let value: String = cbor_str.try_into().unwrap();
@@ -51,9 +52,10 @@ impl From<&str> for CBOR {
     }
 }
 
+/// The string moved into the value, never copied.
 impl From<String> for CBOR {
     fn from(value: String) -> Self {
-        CBORCase::Text(value.clone()).into()
+        CBORCase::Text(value).into()
     }
 }
 

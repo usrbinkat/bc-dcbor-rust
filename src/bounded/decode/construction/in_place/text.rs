@@ -6,8 +6,8 @@ use alloc::{string::String, vec::Vec};
 use super::*;
 use crate::bounded::Capped;
 use crate::bounded::boundary::{Bound, Predicate, boundary};
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction, Uniform};
-use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::bounded::decode::construction::reclamation::{Custody, Reduction, Uniform};
+use crate::bounded::decode::construction::stable::{self, Installed, Pending, Ticket};
 use crate::sync::{Atomics, Representation};
 
 /// Where a byte buffer's construction or cleanup is: its empty header
@@ -52,18 +52,21 @@ const fn contract<P>() -> stable::Contract<Meta<P>, Meta<P>, P> {
 }
 
 /// The construction state of a byte buffer with permits of `P`: its
-/// metadata, once installed, and what that installation has admitted. Only
-/// the shared buffer engine reads or changes it.
+/// metadata, once installed, and the ticket of its acquisition pending, the
+/// metadata block's or the payload's ([`Ticket`]); the acquisition's credit
+/// is the operation's ([`Pending`]). Only the shared buffer engine reads or
+/// changes it. Two words: a record's payload state, its write within the
+/// record's one-quantum unit.
 pub struct BufferState<P> {
     meta: Option<Installed<Meta<P>, P>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
 }
 
 impl<P> BufferState<P> {
     /// Nothing installed, nothing copied.
     pub const INITIAL: Self = Self {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
     };
 
     /// The installed metadata, borrowed from the state: released before the
@@ -76,16 +79,19 @@ impl<P> BufferState<P> {
     }
 }
 
-/// What a byte buffer's construction holds: no metadata block, with the
-/// admissions held toward it; or the block.
+/// What a byte buffer's construction holds: no metadata block, or the
+/// block. Progress alone: an acquisition bound for either block is the root
+/// pending's custody, reported by its observation (`CustodySink::bound`),
+/// never by this one, so a bind that admits nothing changes no progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferObservation {
-    Unallocated(Admitted),
+    Unallocated,
     Held(BufferCustody),
 }
 
 /// A byte buffer's custody once its metadata is held: the phase, whether
-/// its payload permit is held, and the source bytes copied into the payload.
+/// its payload permit is held, and the source bytes copied into the
+/// payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BufferCustody {
     pub phase: Phase,
@@ -112,16 +118,16 @@ pub enum BufferClass {
 
 // Cleanup (`reclaim_buffer`) reads the metadata's presence, the phase only
 // to separate `Empty`, the written phases and `BufferFreed`, and the payload
-// permit's presence; the bytes copied and the admissions held toward an
-// unacquired block never change a cleanup unit. Each class above maps to
-// one cleanup unit and one successor class, so the relation is a
-// simulation of cleanup.
+// permit's presence; the bytes copied and a pending acquisition, whose
+// credit the operation settles at its cleanup entry, never change a cleanup
+// unit. Each class above maps to one cleanup unit and one successor class,
+// so the relation is a simulation of cleanup.
 impl<P> Reduction for BufferState<P> {
     type Class = BufferClass;
 
     fn class(observation: &BufferObservation) -> BufferClass {
         match *observation {
-            BufferObservation::Unallocated(_) => BufferClass::Unallocated,
+            BufferObservation::Unallocated => BufferClass::Unallocated,
             BufferObservation::Held(BufferCustody { phase, payload, .. }) => match phase {
                 Phase::Empty => BufferClass::Empty,
                 Phase::BufferFreed => BufferClass::Freed { payload },
@@ -148,7 +154,7 @@ impl<P> Custody for BufferState<P> {
 
     fn observe(&mut self) -> BufferObservation {
         let Some(installed) = self.meta.as_mut() else {
-            return BufferObservation::Unallocated(self.admitted);
+            return BufferObservation::Unallocated;
         };
         let meta = installed.get();
         BufferObservation::Held(BufferCustody {
@@ -157,6 +163,26 @@ impl<P> Custody for BufferState<P> {
             copied: meta.copied,
         })
     }
+}
+
+/// Report the permits a byte buffer's state owns
+/// ([`Reclaim::observe_permits`]), inside the caller's open group: its
+/// metadata block's, once installed, and its payload's, once granted. A
+/// buffer holds no obligation: its acquisitions' credit is the root
+/// pending's ([`Pending::observe_custody`]). Read under the state's
+/// custody, admitting and releasing nothing. A buffer holds no nested
+/// custody, so its report is always complete.
+pub(crate) fn buffer_permits<P>(
+    state: &mut BufferState<P>,
+    sink: &mut dyn CustodySink<P>,
+) -> PermitsObserved {
+    if let Some(installed) = state.meta.as_mut() {
+        sink.permit(installed.permit(), None);
+        if let Some(payload) = installed.get().payload.as_ref() {
+            sink.permit(payload, None);
+        }
+    }
+    PermitsObserved::Complete
 }
 
 /// A byte buffer header the shared engine builds and reclaims in place
@@ -214,12 +240,20 @@ unsafe impl Buffer for String {
 /// Copying source bytes into the buffer: one value and at most a quantum.
 const COPY: Capped<Caller> = Capped::new(Caller, 1, stable::QUANTUM as u64);
 
-/// The bytes every copy but the last covers at least: a quantum less the
-/// continuation bytes a text copy backs off to end on a scalar.
-const COPIED: u64 = COPY.cap() - (char::MAX.len_utf8() as u64 - 1);
+/// The bytes a window of at most `cap` bytes over a text covers at least
+/// whenever it is not the text's last: `cap` less the continuation bytes it
+/// backs off to end on a scalar. The one definition every windowed pass over
+/// a text's bytes ([`COPY`], the stabilized-text check) costs its windows by.
+pub(crate) const fn scalar_window(cap: u64) -> u64 {
+    cap - (char::MAX.len_utf8() as u64 - 1)
+}
+
+/// The bytes every copy but the last covers at least ([`scalar_window`]).
+const COPIED: u64 = scalar_window(COPY.cap());
 
 fn allocate_meta<A: Allocator>(
     state: &mut BufferState<A::Permit>,
+    pending: &mut Pending<A::Origin>,
     a: &mut A,
 ) -> BoundedResult<(), A> {
     // SAFETY: the header is the whole metadata, every field written.
@@ -227,7 +261,8 @@ fn allocate_meta<A: Allocator>(
         stable::install::<Meta<A::Permit>, Meta<A::Permit>, A>(
             const { contract::<A::Permit>() },
             &mut state.meta,
-            &mut state.admitted,
+            pending,
+            &mut state.ticket,
             || Meta {
                 phase: Phase::Empty,
                 payload: None,
@@ -282,14 +317,17 @@ pub(crate) const fn buffer_cleanup<H>() -> ResourceBound {
 
 /// One admitted unit of byte-buffer cleanup, shared by every binding: the
 /// header `H` in `slot`, once written, dropped in place. Releasing the
-/// metadata leaves the state `INITIAL`.
+/// metadata leaves the state `INITIAL`. A pending acquisition's credit was
+/// settled into its origins at the operation's cleanup entry
+/// ([`Pending::settle_all`]); cleanup only forgets the ticket.
 pub(crate) fn reclaim_buffer<H: Buffer, A: Allocator>(
     mut slot: Slot<'_, H, BufferState<A::Permit>>,
-    a: &mut A,
+    a: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let (place, state) = slot.parts();
     if state.meta.is_none() {
         STEP.admit(a)?;
+        state.ticket = None;
         return Ok(Reclaimed::Done);
     }
     match state.installed()?.phase {
@@ -303,6 +341,10 @@ pub(crate) fn reclaim_buffer<H: Buffer, A: Allocator>(
         | Phase::Copy
         | Phase::Complete => {
             sized::<H>().admit(a)?;
+            // A payload's acquisition pending (`ReleasePayload` admitted,
+            // `AllocatePayload` not granted) had its release settled at the
+            // operation's cleanup entry: the ticket is forgotten.
+            state.ticket = None;
             // SAFETY: the slot pairs the place with this state, whose written
             // phases prove the header initialized; a `Buffer`'s drop frees
             // only its bytes.
@@ -325,27 +367,47 @@ pub(crate) fn reclaim_buffer<H: Buffer, A: Allocator>(
 /// `state`: none installed, one; nothing written, or the header written in
 /// any phase, two (the header dropped or the empty buffer marked freed, then
 /// the releases); freed, one.
-pub(crate) fn buffer_remaining<P>(state: &mut BufferState<P>) -> u64 {
-    match state.meta.as_mut().map(|installed| installed.get().phase) {
-        None | Some(Phase::BufferFreed) => 1,
-        Some(_) => 2,
-    }
+pub(crate) fn buffer_remaining<P>(state: &mut BufferState<P>) -> Option<u64> {
+    Some(
+        match state.meta.as_mut().map(|installed| installed.get().phase) {
+            None | Some(Phase::BufferFreed) => 1,
+            Some(_) => 2,
+        },
+    )
 }
 
-// SAFETY: every initialized String is recorded before returning. String's
-// byte buffer has no element destructors. Its storage is freed in one admitted
-// step, then its payload permit and the metadata storage and its permit,
-// releases their acquisitions paid for.
+// SAFETY: initial: `BufferState::INITIAL`, nothing installed or allocated.
+// state: every initialized String is recorded before returning: the
+// installed metadata, its phase, the bytes copied and the payload's permit.
+// admission: each cleanup unit (`reclaim_buffer`) is admitted before it runs,
+// a refusal changing nothing. cleanup: String's byte buffer has no element
+// destructors; its storage is freed in one admitted step, then its payload
+// permit and the metadata storage and its permit, releases their
+// acquisitions paid for; nothing is allocated and nothing unwinds. done:
+// `Done` once the buffer, the metadata and both permits are released. order:
+// a step after `Done` reports `Done`; the count and the observation read the
+// state alone. depth: a leaf, the default 1. count: `buffer_remaining`
+// counts the units left.
 unsafe impl<A: Allocator> Reclaim<A> for String {
     type State = BufferState<A::Permit>;
     const INITIAL: Self::State = BufferState::INITIAL;
 
-    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        reclaim_buffer::<String, A>(slot, a)
+    fn reclaim_step(
+        slot: Slot<'_, Self, Self::State>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        reclaim_buffer::<String, A>(slot, cleanup)
     }
 
-    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
         buffer_remaining(slot.custody())
+    }
+
+    fn observe_permits(
+        mut slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        buffer_permits(slot.custody(), sink)
     }
 }
 
@@ -362,12 +424,13 @@ unsafe impl<A: Allocator> Reclaim<A> for String {
 pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
     source: &H::Source,
     mut slot: Slot<'_, H, BufferState<A::Permit>>,
+    pending: &mut Pending<A::Origin>,
     a: &mut A,
 ) -> BoundedResult<Built, A> {
     let (place, state) = slot.parts();
     let bytes = H::source(source);
     if state.meta.is_none() {
-        allocate_meta(state, a)?;
+        allocate_meta(state, pending, a)?;
         return Ok(Built::Progress);
     }
     match state.installed()?.phase {
@@ -383,27 +446,36 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
             state.installed()?.phase = Phase::ReleasePayload;
         }
         Phase::ReleasePayload => {
-            stable::admit_release(a)?;
+            stable::admit_release(pending, &mut state.ticket, a)?;
             state.installed()?.phase = Phase::AllocatePayload;
         }
         Phase::AllocatePayload => {
-            if state.installed()?.payload.is_some() {
-                // A permit is already held: a step after a failed
-                // reservation, refused rather than releasing it unadmitted.
-                return Err(BoundedError::PlanMismatch);
-            }
             let requested = u64::try_from(bytes.len()).map_err(|_| BoundedError::Overflow)?;
-            state.installed()?.payload =
-                Some(a.allocate(requested).map_err(BoundedError::Refused)?);
-            // SAFETY: Initialized proves a valid empty header, which holds no
-            // place; reserving leaves its vector empty, a valid header's
-            // bytes.
-            unsafe {
-                place.with_mut(state, |header| {
-                    H::bytes(header).try_reserve_exact(bytes.len())
-                })
-            }
-            .map_err(|_| BoundedError::Allocation { bytes: requested })?;
+            // The ticket moves out of the state for the call, which borrows
+            // the state as the payload's custody, and back whatever the call
+            // returns.
+            let mut ticket = state.ticket.take();
+            let allocated = stable::allocate_payload(
+                state,
+                |state| Ok(&mut state.installed()?.payload),
+                requested,
+                // SAFETY: Initialized proves a valid empty header, which
+                // holds no place; reserving leaves its vector empty, a valid
+                // header's bytes.
+                |state| {
+                    unsafe {
+                        place.with_mut(state, |header| {
+                            H::bytes(header).try_reserve_exact(bytes.len())
+                        })
+                    }
+                    .is_ok()
+                },
+                pending,
+                &mut ticket,
+                a,
+            );
+            state.ticket = ticket;
+            allocated?;
             state.installed()?.phase = Phase::Copy;
         }
         Phase::Copy => {
@@ -459,22 +531,35 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
     Ok(Built::Progress)
 }
 
-// SAFETY: construction writes the String header directly into its final place,
-// reserves its byte allocation once, and appends only admitted UTF-8 chunks.
-// All phases, including allocation failures, are understood by Reclaim above.
+// SAFETY: admission: every phase of `copy_buffer` (metadata, header, release,
+// payload allocation, each chunk) is admitted before it runs, the boundary
+// and capacity checks made before the chunk's admission. state: each phase
+// is recorded before the step returns; every phase, allocation failures
+// included, is one the Reclaim above cleans up. done: `Done` only once every
+// byte is copied, the phase `Complete`. escape: the byte vector's pointer
+// stays in the header the value owns. provenance: construction writes the
+// String header directly into its final place, through the slot's, and
+// reaches it only through that place. order: a phase it does not continue,
+// a chunk off a boundary or beyond the reserved capacity, or a step past
+// completion or in cleanup is refused `PlanMismatch` and changes nothing; a
+// node not a text is refused by one admitted unit (`rejected`). cost:
+// `buffer_cost::<String, A::Permit>()`, the engine's own.
 unsafe impl<A: Allocator> InPlace<A> for String {
     const COST: ConstructionCost = crate::const_cost!(buffer_cost::<String, A::Permit>());
 
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        let Some(Kind::Text(source)) = node_at(document, index).map(|n| n.kind()) else {
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let Some(Kind::Text(text)) = ctx.node().map(|n| n.kind()) else {
             return rejected(a);
         };
-        copy_buffer::<String, A>(source, slot, a).map_err(Into::into)
+        let assembly = ctx.assembly();
+        let (slot, pending) = ctx.into_acquiring();
+        let built = copy_buffer::<String, A>(text, slot, pending, a)?;
+        // SAFETY: the buffer engine reports `Done` only once every byte is
+        // copied into the header it wrote, its phase `Complete`.
+        Ok(unsafe { reported(built, assembly) })
     }
 }
 

@@ -1,0 +1,11 @@
+--- dcbor-derive/src/construction/in_place.rs
++++ dcbor-derive/src/construction/in_place.rs
+@@ -28,7 +28,7 @@
+     quote!({
+         let mut maximum = 0usize;
+         #(#bounds)*
+-        maximum.saturating_add(6)
++        maximum.saturating_add(5)
+     })
+ }
+

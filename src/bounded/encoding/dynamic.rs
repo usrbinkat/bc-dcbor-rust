@@ -1,5 +1,6 @@
 //! Postorder map preparation with flat storage and no recursive continuations.
 use super::*;
+use crate::bounded::boundary::{boundary, side};
 use maps::order::{Entry, Order};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,22 +71,22 @@ pub(super) const CHECK: Unit<PreparationPlace> = Unit::new(PreparationPlace::Che
 pub(super) const COMPLETE: Unit<PreparationPlace> =
     Unit::of::<Frame<'static>>(PreparationPlace::Completion);
 
-pub(super) struct Dynamic<P> {
-    pub entries: Storage<Entry, P>,
-    order: Order<P>,
-    permutation: permutation::Permutation<P>,
+pub(super) struct Dynamic<P, O: Origin> {
+    pub entries: Storage<Entry, P, O>,
+    order: Order<P, O>,
+    permutation: permutation::Permutation<P, O>,
     compact: Option<Compact>,
     phase: DynamicPhase,
     entry: usize,
     byte: usize,
 }
 
-impl<P> Dynamic<P> {
+impl<P, O: Origin> Dynamic<P, O> {
     /// Every unit of [`Self::initialize_step`]: the entry arena, the ordering
     /// and permutation engines, and four scalar fields.
-    pub(super) const INIT_STEPS: usize = Storage::<Entry, P>::INIT_STEPS
-        + Order::<P>::INIT_STEPS
-        + permutation::Permutation::<P>::INIT_STEPS
+    pub(super) const INIT_STEPS: usize = Storage::<Entry, P, O>::INIT_STEPS
+        + Order::<P, O>::INIT_STEPS
+        + permutation::Permutation::<P, O>::INIT_STEPS
         + 4;
 
     /// Initialize one unit of the empty engine [`Self::new`] builds in
@@ -93,14 +94,14 @@ impl<P> Dynamic<P> {
     /// arena, the ordering and the permutation, each on its own units, then
     /// one scalar field per unit. An incomplete prefix owns nothing.
     /// Refused once initialized.
-    pub(super) fn initialize_step<A: Allocator<Permit = P>>(
+    pub(super) fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: reclamation::Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         use decode::initialization::{init_field, init_part};
-        let storage = Storage::<Entry, P>::INIT_STEPS;
-        let order = Order::<P>::INIT_STEPS;
-        let permutation = permutation::Permutation::<P>::INIT_STEPS;
+        let storage = Storage::<Entry, P, O>::INIT_STEPS;
+        let order = Order::<P, O>::INIT_STEPS;
+        let permutation = permutation::Permutation::<P, O>::INIT_STEPS;
         let units = *slot.custody();
         if Bound::new(Predicate::Prefix, storage).below(a, units) {
             init_part!(slot, entries, 0, a, |entries| Storage::initialize_step(
@@ -139,8 +140,9 @@ impl<P> Dynamic<P> {
 
     /// One admitted unit releasing the entry descriptors, then the ordering
     /// and permutation scratch. Called only while [`Self::is_released`] is
-    /// false.
-    pub(super) fn reclaim_step<A: Allocator<Permit = P>>(
+    /// false. Bounded on [`Releasing`]: no new allocation through the
+    /// supplied cleanup capability.
+    pub(super) fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,
     ) -> BoundedResult<(), A> {
@@ -157,11 +159,25 @@ impl<P> Dynamic<P> {
 
     /// The most calls [`Self::reclaim_step`] still takes until
     /// [`Self::is_released`]: each arena not yet released, its own count.
-    pub(super) fn reclaim_remaining(&self) -> u64 {
+    /// `None` when the count does not fit in `u64`.
+    pub(super) fn reclaim_remaining(&self) -> Option<u64> {
         self.entries
-            .unreleased_remaining()
-            .saturating_add(self.order.scratch.unreleased_remaining())
-            .saturating_add(self.permutation.visited.unreleased_remaining())
+            .unreleased_remaining()?
+            .checked_add(self.order.scratch.unreleased_remaining()?)?
+            .checked_add(self.permutation.visited.unreleased_remaining()?)
+    }
+
+    /// The engine's custody: its three owning components, each its own
+    /// arena with its own pending owner, the descriptors, the merge scratch
+    /// and the visited bitmap, reported as their groups
+    /// ([`Storage::observe_custody`]) in that order. The engine has no owner
+    /// of its own, so the groups are siblings inside its holder's.
+    pub(super) fn observe_custody(&self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        observed_all([
+            self.entries.observe_custody(sink),
+            self.order.scratch.observe_custody(sink),
+            self.permutation.visited.observe_custody(sink),
+        ])
     }
 
     pub fn new() -> Self {
@@ -200,14 +216,14 @@ impl<P> Dynamic<P> {
     }
 }
 
-impl<P> Preparation<'_, P> {
+impl<P, O: Origin> Preparation<'_, P, O> {
     /// One unit of the top unordered map's own work, once a child frame has
     /// completed: a key or value compacted, or the map sorted, checked,
     /// permuted and completed. True when the step did work, a unit of an
     /// arena's relocation included; false when the top frame has no
     /// unordered map past its scan. Nested maps have already removed their
     /// descriptors, so the last descriptor belongs to this map.
-    pub(super) fn dynamic_step<A: Allocator<Permit = P>>(
+    pub(super) fn dynamic_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
@@ -244,7 +260,10 @@ impl<P> Preparation<'_, P> {
         }
     }
 
-    fn compact_child<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
+    fn compact_child<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<(), A> {
         let frames = &mut self.frames;
         let Some(frames) = at(PreparationPlace::Frames, || frames.settle_step(a))? else {
             return Ok(());
@@ -352,7 +371,10 @@ impl<P> Preparation<'_, P> {
         Ok(())
     }
 
-    fn sort_map<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
+    fn sort_map<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<(), A> {
         let frames = &mut self.frames;
         let Some(frames) = at(PreparationPlace::Frames, || frames.settle_step(a))? else {
             return Ok(());
@@ -416,6 +438,10 @@ impl<P> Preparation<'_, P> {
                         if let Some(ordering) = at(PreparationPlace::Comparisons, || {
                             decode::comparison::compare_step(previous, entry, byte, a)
                         })? {
+                            // The ordering is the predecessor's against the
+                            // key's: reversed, it is the key's against its
+                            // predecessor. Recorded, then acted on as before.
+                            boundary!(a, Predicate::KeyOrder => side(ordering.reverse()));
                             match ordering {
                                 cmp::Ordering::Less => {
                                     *at_entry += 1;

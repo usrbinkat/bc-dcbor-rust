@@ -43,10 +43,13 @@ gate_prepare
 # its records are written under.
 suffixes=()
 features=()
+# Captured first: `set -e` does not see a process substitution's failure,
+# so a list cut short by the tool would otherwise pass.
+variants="$(gate variants)"
 while IFS=$'\t' read -r variant_features variant_suffix; do
 	features+=("$variant_features")
 	suffixes+=("$variant_suffix")
-done < <(gate variants)
+done <<<"$variants"
 ((${#features[@]} > 0)) || {
 	echo "the gate names no record variant" >&2
 	exit 2

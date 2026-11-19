@@ -2,68 +2,64 @@ use super::*;
 
 /// Construct `["a", "b"]` from `wire`, cancelling the construction after
 /// `stop` turns: cancellation releases nothing synchronously, and its own
-/// cleanup takes every unit refused once, releasing nothing, before it is
-/// admitted, within the decode's bound. The turns construction took to
-/// publish, when it published within `stop`, and the boundary valuations
-/// the run reached.
+/// cleanup takes every unit refused once before it is admitted
+/// ([`support::pipeline::Refusal::Each`]), each refused step checked to
+/// leave the construction where it was and the holding stack checkpointed
+/// after every turn, within the decode's bound. The turns construction took
+/// to publish, when it published within `stop`, and the boundary valuations
+/// the run reached. One recorded run, its finalizer refining the stream.
 fn cancelled(wire: &[u8], stop: usize) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
     let bound = support::typed_turns::<Vec<String>>(wire.len());
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-    let mut construction = Construction::<_, Vec<String>, Limits>::construct(document);
-    let mut output = None;
-    let mut published = None;
-    for turn in 0..stop.min(bound) {
-        match support::checked(&mut m, |m| support::contracted(m, &mut construction)) {
-            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Ok(Step::Complete(value)) => {
-                assert_eq!(value.value(), &["a", "b"]);
-                output = Some(value);
-                published = Some(turn + 1);
-                break;
-            }
-            _ => panic!("construction skipped publication"),
-        }
-    }
-    let held = m.live_bytes();
-    construction.cancel();
-    assert_eq!(m.live_bytes(), held, "cancellation released synchronously");
-    // Every cleanup unit is refused once, without release, before it runs.
-    let mut finished = false;
-    for _ in 0..bound {
-        m.clear_refusal();
-        m.exhaust();
-        let held = m.live_bytes();
-        match support::contracted(&mut m, &mut construction) {
-            Err(DecodeError::Resource(BoundedError::Refused(_))) => {
-                assert_eq!(m.live_bytes(), held);
-            }
-            Ok(Step::Finished) => {
-                finished = true;
-                break;
-            }
-            Ok(Step::Progress) => {
-                assert!(m.live_bytes() < held, "unpaid cleanup progress");
-                continue;
-            }
-            _ => panic!("cleanup advanced without admission"),
-        }
-        if matches!(
-            support::checked(&mut m, |m| support::contracted(m, &mut construction)).unwrap(),
-            Step::Finished
-        ) {
-            finished = true;
-            break;
-        }
-    }
-    assert!(finished, "cleanup exceeded its bound of {bound} turns");
-    support::exhausted(&mut m, &mut construction);
-    drop(construction);
-    drop(output);
-    drain(&mut owner, &mut m);
-    assert_eq!(owner.outstanding(), 0);
-    assert_eq!(m.live_bytes(), 0);
-    (published, m.reached())
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let published = run.scoped(policy, &Unwitnessed, |owner| {
+            owner.copied(policy, wire, |input| {
+                input.parse(policy, Options::normalizing(8), |document| {
+                    document.transfer(
+                        Construction::<_, Vec<String>, Limits>::construct,
+                        Retirement::Stopped,
+                        |construction| {
+                            let mut turns = 0;
+                            let published = construction.controlled(
+                                policy,
+                                bound,
+                                Retirement::Published,
+                                true,
+                                |_, _, at| {
+                                    turns = at + 1;
+                                    at == stop
+                                },
+                                |value| assert_eq!(value.value().value(), &["a", "b"]),
+                            )?;
+                            if published.is_some() {
+                                return Ok::<_, Finding>(Some(turns));
+                            }
+                            construction.with_policy(policy, |construction, m| {
+                                let held = m.live_bytes();
+                                construction.cancel();
+                                assert_eq!(
+                                    m.live_bytes(),
+                                    held,
+                                    "cancellation released synchronously"
+                                );
+                                support::refuse(m, support::pipeline::Refusal::Each);
+                            });
+                            construction.finish(policy, bound, Retirement::Published)?;
+                            construction.with_policy(policy, |_, m| {
+                                m.fail_call(None);
+                                m.clear_refusal();
+                            });
+                            Ok(None)
+                        },
+                    )
+                })
+            })??
+        })?;
+        run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            Ok((published, m.reached()))
+        })
+    })
 }
 
 /// The construction cancelled after every number of turns through its
@@ -86,19 +82,75 @@ fn cancelled_construction_reclaims_at_every_boundary() {
     });
 }
 
+/// A construction whose scope closed while its document was live fails at
+/// its first step with the scope's refusal of a new record, not a
+/// retryable refusal, and is not replayed: its own cleanup runs to
+/// `Finished`, and the scope then drains to nothing. The document is held
+/// beside the scope, outside it, so the scope is shut down exclusively
+/// while the document lives.
 #[test]
 fn terminal_allocation_error_is_not_replayed() {
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, &[7], Options::normalizing(8));
-    // Close the scope: the live document keeps it from completing.
-    assert_eq!(owner.shutdown_step(&mut m).unwrap(), Reclaimed::Waiting);
-    let mut construction = Construction::<_, u64, Limits>::construct(document);
-    assert!(matches!(
-        support::checked(&mut m, |m| support::contracted(m, &mut construction)),
-        Err(DecodeError::Resource(BoundedError::PlanMismatch))
-    ));
-    support::finish_within(&mut m, &mut construction, support::typed_turns::<u64>(1));
-    drop(construction);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    type Document =
+        dcbor::bounded::decode::construction::OwnedDocument<'static, ByteString, Limits>;
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.holding(
+            CustodyBatch::<Document>::slots(1),
+            Retirement::Exhausted,
+            &Unwitnessed,
+            |documents| {
+                documents.lending(Retirement::Exhausted, Lent::new, |lent| {
+                    let documents = lent.value().get();
+                    lent.holding(DecodeOwner::new(), Retirement::Scope, |owner| {
+                        owner.initialize(policy)?;
+                        owner.copied(policy, &[7], |input| {
+                            input.parse(policy, Options::normalizing(8), |document| {
+                                document.deposit(documents, 0)
+                            })
+                        })??;
+                        // Close the scope: the live document keeps it from
+                        // completing.
+                        let closing = owner.with_policy(policy, |owner, m| {
+                            m.fresh();
+                            owner.shutdown_step(m)
+                        });
+                        assert_eq!(
+                            closing.map_err(support::failed("the closing shutdown step"))?,
+                            Reclaimed::Waiting
+                        );
+                        let turns = support::typed_turns::<u64>(1);
+                        owner.drawn(documents, 0, Retirement::Published, |document| {
+                            document.transfer(
+                                Construction::<_, u64, Limits>::construct,
+                                Retirement::Stopped,
+                                |construction| {
+                                    match construction.drive(
+                                        policy,
+                                        turns,
+                                        Retirement::Published,
+                                        |_| (),
+                                    ) {
+                                        Err(Stopped::Operation(DecodeError::Resource(
+                                            BoundedError::PlanMismatch,
+                                        ))) => {}
+                                        other => {
+                                            return Err(Finding::Driver(format!(
+                                                "a construction in a closed scope reached \
+                                                 {other:?}"
+                                            )));
+                                        }
+                                    }
+                                    construction.finish(policy, turns, Retirement::Published)?;
+                                    Ok(())
+                                },
+                            )
+                        })?;
+                        owner.drain(policy)
+                    })
+                })
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }

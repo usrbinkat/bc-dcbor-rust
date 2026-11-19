@@ -207,8 +207,19 @@ handle's cleanup at its own place, accounted by the other operation's bound.
 
 ## Borrowed interfaces
 
-The borrowed interfaces remain available: the synchronous `decode`,
-`decode_with` and `decode_typed`; the retained `cursor::Decoder` and its
-`Document`; the string, header and text cursors; and the borrowed
-`encoding::Preparation`, `Prepared` and `Writer`. No lifetime extension or
-self-referential consumer wrapper is used by the owned interfaces.
+The borrowed interfaces remain available: the synchronous `decode` and
+`decode_with`, which validate into a document borrowing its input; the
+retained `cursor::Decoder` and its `Document`; the string, header and text
+cursors; and the borrowed `encoding::Preparation`, `Prepared` and `Writer`.
+No lifetime extension or self-referential consumer wrapper is used by the
+owned interfaces.
+
+Typed decoding has one engine, the owned construction above. `decode_typed`
+is its one-call form, not a second engine: it makes a scope of its own,
+copies the input into it, and steps `TypedDecoder` to completion within the
+steps of `decode_typed_bound`, as `bounded::prepare` steps the retained
+preparation. Its result is the `TypedValue` in its record, holding the scope
+and the copied input, so it outlives the input it was given. A refusal or
+an error cancels the operation in progress and steps its cleanup and the
+scope's shutdown under the caller's policy before the error returns; what a
+refused cleanup unit leaves is released by the scope's terminal drain.

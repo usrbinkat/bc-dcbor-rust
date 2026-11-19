@@ -1,5 +1,5 @@
 use super::*;
-use crate::bounded::boundary::boundary;
+use crate::bounded::boundary::{boundary, side};
 use decode::comparison::compare_step;
 use decode::initialization::{init_field, init_part};
 
@@ -48,28 +48,28 @@ pub struct OrderPosition {
     pub scratch: usize,
 }
 
-pub(in crate::bounded::encoding) struct Order<P> {
-    pub(in crate::bounded::encoding) scratch: Storage<Entry, P>,
+pub(in crate::bounded::encoding) struct Order<P, O: Origin> {
+    pub(in crate::bounded::encoding) scratch: Storage<Entry, P, O>,
     position: OrderPosition,
     pub(in crate::bounded::encoding) middle: usize,
     pub(in crate::bounded::encoding) end: usize,
     pub(in crate::bounded::encoding) forward: bool,
 }
 
-impl<P> Order<P> {
+impl<P, O: Origin> Order<P, O> {
     /// Every unit of [`Self::initialize_step`]: the scratch arena and four
     /// scalar fields.
-    pub const INIT_STEPS: usize = Storage::<Entry, P>::INIT_STEPS + 4;
+    pub const INIT_STEPS: usize = Storage::<Entry, P, O>::INIT_STEPS + 4;
 
     /// Initialize one unit of the empty ordering [`Self::new`] builds in
     /// `slot`, its destination paired with its units initialized: the
     /// scratch arena, then one scalar field per unit. An incomplete prefix
     /// owns nothing. Refused once initialized.
-    pub fn initialize_step<A: Allocator<Permit = P>>(
+    pub fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: decode::construction::reclamation::Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        let storage = Storage::<Entry, P>::INIT_STEPS;
+        let storage = Storage::<Entry, P, O>::INIT_STEPS;
         let units = *slot.custody();
         if Bound::new(Predicate::Prefix, storage).below(a, units) {
             init_part!(slot, scratch, 0, a, |scratch| Storage::initialize_step(
@@ -95,8 +95,12 @@ impl<P> Order<P> {
     }
 
     /// One admitted unit releasing the merge scratch; true once released.
-    /// The caller supplies the place.
-    pub fn reclaim_step<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<bool, A> {
+    /// The caller supplies the place. Bounded on [`Releasing`]: no new
+    /// allocation through the supplied cleanup capability.
+    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<bool, A> {
         self.scratch.reclaim_copy_step(a)
     }
 
@@ -117,7 +121,10 @@ impl<P> Order<P> {
         }
     }
 
-    pub fn reset<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<(), A> {
+    pub fn reset<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<(), A> {
         RESET.admit(a)?;
         self.position = OrderPosition::default();
         Ok(())
@@ -125,14 +132,14 @@ impl<P> Order<P> {
 
     /// The merge scratch, settled; or, while it relocates, one unit of its
     /// relocation as the step's work and `None`.
-    fn settled<'s, A: Allocator<Permit = P>>(
-        scratch: &'s mut Storage<Entry, P>,
+    fn settled<'s, A: Allocator<Permit = P, Origin = O>>(
+        scratch: &'s mut Storage<Entry, P, O>,
         a: &mut A,
     ) -> BoundedResult<Option<&'s mut Owned<Entry, P>>, A> {
         at(PreparationPlace::Scratch, || scratch.settle_step(a))
     }
 
-    pub fn step<A: Allocator<Permit = P>>(
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         entries: &mut [Entry],
         bytes: &[u8],
@@ -245,6 +252,13 @@ impl<P> Order<P> {
                             a,
                         )
                     })? {
+                        // In both directions `left` is the earlier run's
+                        // current merge candidate and `right` the later run's
+                        // (heads merging forward, tails merging backward),
+                        // not adjacent keys: the later candidate against the
+                        // earlier is the ordering reversed, recorded as a
+                        // merge decision (`MergeOrder`), then acted on.
+                        boundary!(a, Predicate::MergeOrder => side(ordering.reverse()));
                         if ordering == cmp::Ordering::Equal {
                             return Err(BoundedError::DuplicateKey);
                         }

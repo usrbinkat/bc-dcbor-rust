@@ -1,0 +1,13 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -380,8 +380,8 @@
+         // SAFETY: forwarded from the caller; each projection reaches one
+         // initialized field by field syntax, forming no reference.
+         unsafe {
+-            if written > 2 {
+-                stable::drop_pending(core::ptr::addr_of_mut!((*raw).pending), written - 2);
++            if written >= 2 {
++                stable::drop_pending(core::ptr::addr_of_mut!((*raw).pending), written - 1);
+             }
+             // The holder, written by the second unit, is an
+             // `Option<Ticket>`: `Copy`, owning nothing, so it needs no drop.

@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -757,7 +757,7 @@
+     by: Performer,
+ ) {
+     if let Some(acquisition) = acquisition.take() {
+-        acquisition.end(by);
++        drop(acquisition);
+     }
+ }
+ 

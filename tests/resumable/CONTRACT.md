@@ -52,9 +52,11 @@ and finite completion. Eventual completion alone is insufficient.
   child's whole. It holds counts and phases, never an address. Observing
   requires the state's exclusive custody, admits nothing, allocates nothing,
   and changes neither the state nor the trace; observing twice yields equal
-  observations. Each arena's growth stage (`StorageStage`) is part of it,
-  since a settled arena and one staging or relocating a growth clean up
-  differently.
+  observations. Each arena's physical growth stage (`StorageStage`) is part
+  of it, since a settled arena and one holding a staged block or relocating
+  clean up differently. What a growth's acquisition has admitted is never
+  part of it: that is acquisition custody, reported by the custody
+  traversal (`CustodySink`).
 - A refusal must preserve all work successfully admitted before it. A step may
   contain successful admissions before a later refusal; assertions must account
   for that committed progress separately from the refused work.
@@ -126,15 +128,28 @@ and finite completion. Eventual completion alone is insufficient.
 - Every admission an engine of this crate makes, and every admission
   derive-generated code makes, goes through one route: a charge rule's
   `admit` (`Unit`, `Capped`, `Scan`, `Rate`), whose admission carries its
-  place, or, in generated decoding code, the public helpers built on those
-  rules (`bounded::decode::visits`,
-  `bounded::decode::construction::in_place::step`). Generated encoding code
+  place, or, in generated decoding code, the public helper built on those
+  rules (`bounded::decode::construction::in_place::step`). Generated
+  decoding code is in-place construction only: one typed-construction
+  engine, the retained one, serves every typed decode. Generated encoding code
   admits nothing: it is a `Schema`, whose instructions the engine admits.
-- User implementations of the public traits (`Budget`, `Allocator`,
-  `InPlace`, `Reclaim`, `Resumable`) are trusted to admit their own work, as
-  those traits document. A `Schema` (and an `Entries` cursor) is trusted to
+- User implementations of the public traits (`Budget`, `Releasing`,
+  `Allocator`, `InPlace`, `Reclaim`, `Resumable`) are trusted to admit their own work, as
+  those traits document. Every public `unsafe` trait a user implements for
+  the engine (`TransferableSchema`, `Entries`, `TerminalAllocator`,
+  `Reclaim`, `InPlace`, `DecodeInput`, `Task`, `Placeholder`, `TreeKey`,
+  `Variants`, `Payload`, `Fields`) labels its obligations in its `# Safety`
+  section, and every shipped impl, the derive's generated ones included,
+  names each label in its `// SAFETY:` comment, which the unsafe census
+  checks (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`, `UNSAFE_IMPLS`). A
+  `Schema` (and an `Entries` cursor) is trusted to
   keep each instruction to constant work and to announce what it examines
-  beyond it (`Instruction::Inspect`, `Entries::moves`). No source inspects a
+  beyond it (`Instruction::Inspect`, `Entries::moves`). An `Entries`
+  cursor's moves happen inside its own code and are reported to nothing, so
+  the engine cannot observe an overspend: the resource bounds (I5) hold for
+  a cursor only under its resource obligation (`Entries`, "Resource
+  obligation"), part of this trusted domain, which the unsafe census lists
+  at every impl (`tests/unsafe_census.rs`). No source inspects a
   hash table's buckets: it hands the table to the engine
   (`Instruction::Buckets`), whose bucket accessors are a sealed set (std's
   `HashMap` on the forked library, hashbrown's `HashMap` and `HashTable`),
@@ -190,8 +205,10 @@ and finite completion. Eventual completion alone is insufficient.
   simulation of cleanup). Nothing declares one by default; a state without
   it is never reduced, and every stop over it runs. A binding over a child
   declares one only over a child that does, and states its argument at its
-  definition. Containers declare none: they count older children whose
-  custody may differ.
+  definition. Scalars, buffers, stabilized text, the minimal big integer,
+  both options, tagged values and sequences over uniform elements declare
+  one; the derived field map and enum and the B-tree declare none, since
+  their older children's custody may differ.
 - Every reclaimable state declares the most cleanup calls it can still take
   (`Reclaim::remaining`), completion included; the scope enforces it, and a
   call beyond it is a defect. An arena of plain data settled with no growth

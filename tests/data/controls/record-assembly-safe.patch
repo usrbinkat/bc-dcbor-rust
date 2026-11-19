@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -174,7 +174,7 @@
+     /// by the binding's own admitted write or by a child record verified and
+     /// consumed in the step it arrived, and the place has not been reclaimed
+     /// since.
+-    pub unsafe fn assemble(self) -> Initialized<'b, T> {
++    pub fn assemble(self) -> Initialized<'b, T> {
+         Initialized {
+             place: self.place,
+             bound: self.bound,

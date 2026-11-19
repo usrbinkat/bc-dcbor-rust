@@ -9,14 +9,16 @@
 //! independent of every other record in the scope. Dropping an operation at
 //! any point only hands its records to the scope queue.
 use super::reclamation::{
-    Acquisition, OwnedInitialized, OwnedRecord, PeekSlot, Reclaim, Reclaimed, ScopeRef, Slot,
-    record_cost,
+    Acquisition, Cleanup, OwnedInitialized, OwnedRecord, PeekSlot, Reclaim, Reclaimed, ScopeRef,
+    Slot, record_cost,
 };
+use super::stable::Pending;
 use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::fields;
 use crate::bounded::{
-    Allocator, BoundedError, BoundedResult, Failure, Places, ResourceBound, Resumable, Step, Unit,
-    WriteWork, at, widen,
+    Allocator, BoundedError, BoundedResult, Budget, Custodial, CustodySink, Failure, Performer,
+    PermitsObserved, Places, ResourceBound, Resumable, Step, TerminalAllocator, Unit, WriteWork,
+    at, observed_all, total_held, widen,
 };
 
 places! {
@@ -63,7 +65,8 @@ impl OperationTerms {
         // release, admitted with it.
         let admitted = write
             .work()
-            .then(super::stable::release_cost::<A::Permit>().work())?;
+            .checked_then(super::stable::release_cost::<A::Permit>().work())
+            .ok_or(BoundedError::Overflow)?;
         Ok(Self {
             // Its whole block held.
             record: ResourceBound {
@@ -94,7 +97,10 @@ impl Places for OperationTerms {
 
     /// The record is held throughout, the task's peak beside it.
     fn peak<R>(&self) -> Result<u64, BoundedError<R>> {
-        self.record.then::<R>(self.task).map(|bound| bound.peak)
+        self.record
+            .checked_then(self.task)
+            .map(|bound| bound.peak)
+            .ok_or(BoundedError::Overflow)
     }
 }
 
@@ -119,18 +125,27 @@ pub(crate) type Observed<'r, 's, K, A> =
 /// nothing to promise.
 ///
 /// # Safety
-/// `initialize` writes the next unit of the record's resource-free prefix and
-/// records it in the progress, which [`Self::initialized`] then counts; the
-/// prefix after any unit must be reclaimable by the record's `reclaim_step`;
-/// once `INIT_STEPS` units are recorded it refuses and changes nothing.
-/// `advance` refuses and changes nothing until [`Self::initialized`] reports
-/// `INIT_STEPS`, keeps the record reclaimable after every return, and reports
-/// completion only once the record's value is fully initialized: the
-/// operation publishes the record on that report. `detail` reads only the
-/// parts the progress records as initialized, and changes, admits and
-/// allocates nothing. The record is reached only through its slot's place,
-/// one for its whole life, so a place derived within it in one call stays
-/// valid in every later one.
+/// An implementation keeps four obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *prefix*: `initialize` writes the next unit of the record's
+///   resource-free prefix and records it in the progress, which
+///   [`Self::initialized`] then counts; the prefix after any unit is
+///   reclaimable by the record's `reclaim_step`; once `INIT_STEPS` units are
+///   recorded, or once the record's cleanup released a progress that is a
+///   [`super::reclamation::Prefix`], it refuses and changes nothing.
+/// - *advance*: `advance` refuses and changes nothing until
+///   [`Self::initialized`] reports `INIT_STEPS`, keeps the record
+///   reclaimable after every return, and reports completion only once the
+///   record's value is fully initialized: the operation publishes the record
+///   on that report.
+/// - *detail*: `detail` and `observe_custody` read only the parts the
+///   progress records as initialized, and change, admit and allocate
+///   nothing.
+/// - *provenance*: the record is reached only through its slot's place, one
+///   for its whole life, so a place derived within it in one call stays
+///   valid in every later one.
 pub unsafe trait Task<'s, A: Allocator>: Sized {
     type State: Reclaim<A, State: Send> + Send + 's;
     type Output;
@@ -154,10 +169,20 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
     ) -> Result<(), Self::Error>;
 
     /// One unit of the task's work on its initialized record ([`Task`]):
-    /// true once the record's value is complete.
+    /// true once the record's value is complete. `pending` is the
+    /// operation's one acquisition custody, the record's own acquisition's,
+    /// idle once the record is owned and bound under the owner the record
+    /// stores: a task whose value acquires with no custody field of its own
+    /// to keep a pending in (a copied input, whose record is the byte string
+    /// itself) binds those acquisitions here, so everything the record holds
+    /// is bound under the record's own owner, and the operation settles it
+    /// with the record's at cleanup entry and drop
+    /// ([`Acquisition::cancel`]). A task whose record keeps its own pending
+    /// leaves this one idle.
     fn advance(
         &mut self,
         slot: Slot<'_, Self::State, <Self::State as Reclaim<A>>::State>,
+        pending: &mut Pending<A::Origin>,
         a: &mut A,
     ) -> Result<bool, Self::Error>;
 
@@ -165,13 +190,41 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
 
     /// One admitted unit of cleanup of resources the task holds outside its
     /// record, such as an input not yet moved into it. Every call admits its
-    /// unit, including the one that reports `Done`.
-    fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A>;
+    /// unit, including the one that reports `Done`. Runs under `cleanup`,
+    /// the capability the operation's cleanup dispatch minted ([`Cleanup`]).
+    fn reclaim_step(&mut self, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A>;
+
+    /// Settle, by origin and `by` the performer, the credit of any
+    /// acquisition the task itself holds pending outside its record
+    /// ([`super::stable::Pending::settle_all`]): called at the operation's
+    /// cleanup entry, before anything installed is reclaimed, and when the
+    /// operation is dropped. Idempotent; admits, allocates and refuses
+    /// nothing, and does not unwind. A task holding no pending credit of
+    /// its own (its record's custody keeps any) settles nothing.
+    fn settle(&mut self, by: Performer);
 
     /// The task's observation of `record`, its slot observed once
     /// allocated: only the parts the progress records as initialized are
     /// read, and nothing is changed, admitted or allocated.
     fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail;
+
+    /// The task's custody outside its record, each independently owning
+    /// component as a group of its own owner ([`CustodySink`]): an input
+    /// handle not yet moved into the record, under the owner its own record
+    /// stores; a pending acquisition the task itself keeps, under its
+    /// pending's owner. Everything inside the record, its value's custody
+    /// included, is the record's to report through its
+    /// [`Reclaim::observe_permits`]; `record` is the record as
+    /// [`Self::detail`] reads it, for a task whose outside custody depends
+    /// on how far the record has taken it. Takes `&mut self` because a held
+    /// input handle's record state is observed through its exclusive
+    /// custody ([`OwnedInitialized::observe_custody`]). Read-only; returns
+    /// the completeness of every group reported, combined.
+    fn observe_custody(
+        &mut self,
+        record: Observed<'_, 's, Self, A>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved;
 }
 
 /// Allocation-free observation of an operation.
@@ -187,7 +240,7 @@ pub struct Position<D> {
 }
 
 /// The controller. Construction allocates nothing.
-pub struct Operation<'s, K: Task<'s, A>, A: Allocator> {
+pub struct Operation<'s, K: Task<'s, A>, A: TerminalAllocator> {
     task: K,
     record: Option<OwnedRecord<'s, K::State, A>>,
     acquisition: Acquisition<'s, K::State, A>,
@@ -195,7 +248,7 @@ pub struct Operation<'s, K: Task<'s, A>, A: Allocator> {
     finished: bool,
 }
 
-impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> Operation<'s, K, A> {
     pub(crate) const fn new(task: K) -> Self {
         Self {
             task,
@@ -244,24 +297,81 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
             detail: self.task.detail(record),
         }
     }
+}
+
+/// The operation's custody, one traversal, each independently owning
+/// component a group of its own owner ([`CustodySink`]): its record's
+/// acquisition token's (the record's write and release held toward a block
+/// not yet granted, under the token's owner); its record, once allocated
+/// (the block and the value's custody under the owner the record stores);
+/// and the task's outside the record ([`Task::observe_custody`]). Read-only;
+/// the completeness of every part, combined.
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> Custodial<A::Permit> for Operation<'s, K, A> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        let acquisition = self.acquisition.observe_custody(sink);
+        let record = match self.record.as_mut() {
+            Some(record) => record.observe_custody(sink),
+            None => PermitsObserved::Complete,
+        };
+        // The record and the task are disjoint fields.
+        let observed = self
+            .record
+            .as_mut()
+            .map(|record| record.destination().into_observe());
+        let task = self.task.observe_custody(observed, sink);
+        // The task's own scope reference, before its record holds one.
+        let shared = self
+            .task
+            .scope()
+            .map_or(PermitsObserved::Complete, |scope| {
+                scope.observe_abandoned(sink)
+            });
+        observed_all([acquisition, record, task, shared])
+    }
+}
+
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> Operation<'s, K, A> {
+    /// The credit the operation holds ([`Custodial::observe_custody`], summed);
+    /// `None` when it does not fit in `u64`, or when the observation is not
+    /// whole.
+    pub fn held_credit(&mut self) -> Option<WriteWork> {
+        total_held(|sink| self.observe_custody(sink))
+    }
 
     pub fn step(&mut self, a: &mut A) -> Result<Step<K::Output>, K::Error> {
         if self.finished {
             return Ok(Step::Finished);
         }
         if self.cancelling {
-            if self.record.is_some() {
-                at(OperationPlace::Task, || {
-                    OwnedRecord::reclaim_step(&mut self.record, a)
-                })?;
+            // Cleanup's entry, before any installed resource is reclaimed:
+            // the credit pending outside the record, the task's own and the
+            // record's acquisition's if it was never granted, settled by
+            // origin under this step's performer. Idempotent, so every
+            // cleanup step after the first, and a refused one retried,
+            // settles nothing again.
+            self.task.settle(a.performer());
+            // The operation's cleanup dispatch, an outermost frame: everything
+            // cleanup steps from here runs under the capability minted over
+            // `a`, and every scope reference it ends, the acquisition's
+            // included, is deferred and released once the step returns.
+            let (record, task, acquisition) =
+                (&mut self.record, &mut self.task, &mut self.acquisition);
+            let reclaimed = super::reclamation::with_cleanup(a, |cleanup| {
+                let by = cleanup.performer();
+                acquisition.cancel_into(by, cleanup.worklist());
+                if record.is_some() {
+                    at(OperationPlace::Task, || {
+                        OwnedRecord::reclaim_under(record, cleanup)
+                    })?;
+                    return Ok(Reclaimed::Progress);
+                }
+                // The task's cleanup admits each unit, including the one
+                // that completes it.
+                at(OperationPlace::Task, || task.reclaim_step(cleanup))
+            })?;
+            if reclaimed != Reclaimed::Done {
                 return Ok(Step::Progress);
             }
-            // The task's cleanup admits each unit, including the one that
-            // completes it.
-            if at(OperationPlace::Task, || self.task.reclaim_step(a))? != Reclaimed::Done {
-                return Ok(Step::Progress);
-            }
-            self.acquisition = Acquisition::new();
             self.finished = true;
             return Ok(Step::Finished);
         }
@@ -293,7 +403,11 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
             })?;
             return Ok(Step::Progress);
         }
-        if !at(OperationPlace::Task, || task.advance(slot.reborrow(), a))? {
+        // The record, the task and the acquisition are disjoint fields.
+        let pending = self.acquisition.pending();
+        if !at(OperationPlace::Task, || {
+            task.advance(slot.reborrow(), pending, a)
+        })? {
             return Ok(Step::Progress);
         }
         let record = self.record.take().ok_or(BoundedError::PlanMismatch)?;
@@ -305,7 +419,18 @@ impl<'s, K: Task<'s, A>, A: Allocator> Operation<'s, K, A> {
     }
 }
 
-impl<'s, K: Task<'s, A>, A: Allocator> Resumable<A> for Operation<'s, K, A> {
+/// Dropped at any point: the credit pending outside the record, the task's
+/// own and the record's acquisition's, settled explicitly by origin with no
+/// performing policy, never left to the retained obligations' own drop
+/// backstop; the records are handed to the scope queue as before.
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> Drop for Operation<'s, K, A> {
+    fn drop(&mut self) {
+        self.task.settle(Performer::None);
+        self.acquisition.cancel(Performer::None);
+    }
+}
+
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> Resumable<A> for Operation<'s, K, A> {
     type Output = K::Output;
     type Error = K::Error;
     type Position = Position<K::Detail>;
@@ -316,5 +441,247 @@ impl<'s, K: Task<'s, A>, A: Allocator> Resumable<A> for Operation<'s, K, A> {
 
     fn position(&mut self) -> Position<K::Detail> {
         Operation::position(self)
+    }
+}
+
+/// The witness every record whose progress is a
+/// [`super::reclamation::Prefix`] shares: its task's record driven unit by
+/// unit in a destination of the test's own, under a recorded session whose
+/// finish refuses while any owner, family, permit or held obligation of it
+/// lives ([`crate::bounded::Session::finish`]). Each run is cut at one step,
+/// every step from none to completion, then cleaned up to `Done`; from
+/// there, released prefix or terminal phase alike, a further cleanup step
+/// reports `Done` admitting nothing, the count is the one call reporting it,
+/// no permit or credit is observed, initialization and advance are refused
+/// admitting nothing, and the task's detail is read, which reads nothing of
+/// a dropped or released part. A record cut before its prefix completed is
+/// released; one cut after ends in its own terminal phase, or, without one,
+/// released. Every capability is released exactly once: the scope shuts
+/// down and the session finishes.
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod cuts {
+    use super::*;
+    use crate::bounded::decode::construction::reclamation::{
+        DecodeOwner, Place, Prefix, with_cleanup,
+    };
+    use crate::bounded::{Capacity, Limits, Releasing, Session, permits_of};
+    use core::fmt::Debug;
+    use core::mem::MaybeUninit;
+    use core::ptr::NonNull;
+
+    /// The most calls any loop of a run takes: a witness's operation is
+    /// small, so a loop that does not end fails here.
+    const CALLS: usize = 4096;
+
+    /// The record's slot: its one place paired with `prefix`, its progress,
+    /// for one call. Every slot of a run is made here, from the run's one
+    /// place over a destination the run owns and reaches only through it,
+    /// so the place and the progress are always each other's.
+    fn slot<S>(place: Place<S>, prefix: &mut Prefix) -> Slot<'_, S, Prefix> {
+        // SAFETY: as above: the destination is the run's own, reached only
+        // through `place`, and `prefix` is its progress.
+        unsafe { Slot::new(place, prefix) }
+    }
+
+    /// Whether `error`, the task's, is the plan mismatch a refused unit
+    /// reports.
+    fn mismatch(error: &impl Debug) -> bool {
+        format!("{error:?}").contains("PlanMismatch")
+    }
+
+    /// `owner` shut down to `Done` under `a`.
+    fn shut_down(mut owner: DecodeOwner<'static, Limits>, a: &mut Limits, what: &str) {
+        for _ in 0..CALLS {
+            if owner
+                .shutdown_step(a)
+                .unwrap_or_else(|error| panic!("{what}: shutdown: {error:?}"))
+                == Reclaimed::Done
+            {
+                return;
+            }
+        }
+        panic!("{what}: the scope did not shut down");
+    }
+
+    /// One run of `setup`'s task, cut after `cut` steps, or run to
+    /// completion when `None`; `after_done` reads the task's detail of the
+    /// record once its cleanup reported `Done`, told whether the record was
+    /// released. The steps taken.
+    fn run<K>(
+        name: &str,
+        cut: Option<usize>,
+        setup: &impl Fn(&mut Limits) -> (DecodeOwner<'static, Limits>, K),
+        after_done: &impl Fn(&K::Detail, bool, &str),
+    ) -> usize
+    where
+        K: Task<'static, Limits>,
+        K::State: Reclaim<Limits, State = Prefix>,
+        K::Error: Debug,
+    {
+        let what = format!("{name}, cut {cut:?}");
+        let session = Session::new(Capacity {
+            permits: 1 << 10,
+            events: 1 << 14,
+        });
+        let mut a = Limits::recorded_unlimited(&session);
+        let (owner, mut task) = setup(&mut a);
+        let mut record = MaybeUninit::<K::State>::uninit();
+        let mut prefix = Prefix::EMPTY;
+        let mut pending = Pending::deferred();
+        // SAFETY: the test owns the record's destination, reached only
+        // through this place, each call pairing it with its own progress.
+        let place: Place<K::State> = unsafe { Place::root(NonNull::from(&mut record)) };
+        let mut steps = 0;
+        let mut published = false;
+        while !published && cut != Some(steps) {
+            assert!(steps < CALLS, "{what}: the task did not complete");
+            if prefix.initialized() < K::INIT_STEPS {
+                task.initialize(slot(place, &mut prefix), &mut a)
+                    .unwrap_or_else(|error| panic!("{what}: initialization: {error:?}"));
+            } else {
+                published = task
+                    .advance(slot(place, &mut prefix), &mut pending, &mut a)
+                    .unwrap_or_else(|error| panic!("{what}: advance: {error:?}"));
+            }
+            steps += 1;
+        }
+        let complete = prefix.initialized() == K::INIT_STEPS;
+        let declared =
+            <K::State as Reclaim<Limits>>::remaining(slot(place, &mut prefix).into_observe())
+                .expect("a witness's cleanup count fits in u64");
+        let mut taken = 0u64;
+        loop {
+            assert!(
+                taken < declared,
+                "{what}: cleanup beyond its declared {declared} calls"
+            );
+            let reclaimed = with_cleanup(&mut a, |cleanup| {
+                <K::State as Reclaim<Limits>>::reclaim_step(slot(place, &mut prefix), cleanup)
+            })
+            .unwrap_or_else(|error| panic!("{what}: cleanup: {error:?}"));
+            taken += 1;
+            if reclaimed == Reclaimed::Done {
+                break;
+            }
+        }
+        let attempts = a.attempts();
+        assert_eq!(
+            with_cleanup(&mut a, |cleanup| {
+                <K::State as Reclaim<Limits>>::reclaim_step(slot(place, &mut prefix), cleanup)
+            }),
+            Ok(Reclaimed::Done),
+            "{what}: a step after Done"
+        );
+        assert_eq!(a.attempts(), attempts, "{what}: a step after Done admitted");
+        // A record cut before its prefix completed is released; one cut
+        // after ended in its own terminal phase, or, a record with none,
+        // released too.
+        assert!(
+            complete || prefix.released(),
+            "{what}: an incomplete prefix's cleanup left it unreleased"
+        );
+        assert_eq!(
+            <K::State as Reclaim<Limits>>::remaining(slot(place, &mut prefix).into_observe()),
+            Some(1),
+            "{what}: the count after Done"
+        );
+        let mut permits = 0;
+        let observed = permits_of::<Limits>(
+            |sink| {
+                <K::State as Reclaim<Limits>>::observe_permits(
+                    slot(place, &mut prefix).into_observe(),
+                    sink,
+                )
+            },
+            &mut |_| permits += 1,
+        );
+        assert_eq!(observed, PermitsObserved::Complete, "{what}");
+        assert_eq!(permits, 0, "{what}: a permit observed after Done");
+        let held = total_held::<<Limits as Releasing>::Permit>(|sink| {
+            <K::State as Reclaim<Limits>>::observe_permits(
+                slot(place, &mut prefix).into_observe(),
+                sink,
+            )
+        });
+        assert_eq!(
+            held,
+            Some(WriteWork::default()),
+            "{what}: credit after Done"
+        );
+        let initialized = task.initialize(slot(place, &mut prefix), &mut a);
+        assert!(
+            initialized.as_ref().is_err_and(mismatch),
+            "{what}: initialization after Done: {initialized:?}"
+        );
+        let advanced = task.advance(slot(place, &mut prefix), &mut pending, &mut a);
+        assert!(
+            advanced.as_ref().is_err_and(mismatch),
+            "{what}: advance after Done: {advanced:?}"
+        );
+        assert_eq!(a.attempts(), attempts, "{what}: a call after Done admitted");
+        let detail = task.detail(Some(slot(place, &mut prefix).into_observe()));
+        after_done(&detail, prefix.released(), &what);
+        for call in 0.. {
+            assert!(call < CALLS, "{what}: the task's cleanup did not finish");
+            if with_cleanup(&mut a, |cleanup| task.reclaim_step(cleanup))
+                .unwrap_or_else(|error| panic!("{what}: the task's cleanup: {error:?}"))
+                == Reclaimed::Done
+            {
+                break;
+            }
+        }
+        shut_down(owner, &mut a, &what);
+        assert_eq!(a.live_bytes(), 0, "{what}: storage kept");
+        drop((task, pending, a));
+        session.finish().unwrap_or_else(|incomplete| {
+            panic!("{what}: the run's recording is no evidence: {incomplete:?}")
+        });
+        steps
+    }
+
+    /// [`run`] to completion, then cut at every step it took.
+    pub(crate) fn every_cut<K>(
+        name: &str,
+        setup: impl Fn(&mut Limits) -> (DecodeOwner<'static, Limits>, K),
+        after_done: impl Fn(&K::Detail, bool, &str),
+    ) where
+        K: Task<'static, Limits>,
+        K::State: Reclaim<Limits, State = Prefix>,
+        K::Error: Debug,
+    {
+        let steps = run(name, None, &setup, &after_done);
+        assert!(
+            steps > K::INIT_STEPS,
+            "{name}: the task completed within its initialization"
+        );
+        for cut in 0..steps {
+            run(name, Some(cut), &setup, &after_done);
+        }
+    }
+
+    /// `operation` stepped to its output: a witness's setup, its input or
+    /// document made by the operation that makes it in production.
+    pub(crate) fn completed<'s, T: Task<'s, Limits>>(
+        mut operation: Operation<'s, T, Limits>,
+        a: &mut Limits,
+    ) -> T::Output
+    where
+        T::Error: Debug,
+    {
+        for _ in 0..CALLS {
+            match operation.step(a).unwrap() {
+                Step::Complete(output) => return output,
+                Step::Progress => {}
+                Step::Finished => panic!("an operation finished without its output"),
+            }
+        }
+        panic!("an operation took more than {CALLS} steps");
+    }
+
+    /// An initialized scope under `a`.
+    pub(crate) fn scope(a: &mut Limits) -> DecodeOwner<'static, Limits> {
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(a).unwrap();
+        owner
     }
 }

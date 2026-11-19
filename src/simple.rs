@@ -72,13 +72,27 @@ pub enum Simple {
 
 impl Eq for Simple {}
 
+/// Hashes exactly what [`PartialEq`] compares: a float by its value, so zero
+/// of either sign hashes as `0.0` and every NaN as the one NaN, the values
+/// equality makes equal. Hashing raw bits would hash equal values apart and
+/// let a hash set or map keyed by them hold both or miss one.
 impl hash::Hash for Simple {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         match self {
             Self::False => (0u8).hash(state),
             Self::True => (1u8).hash(state),
             Self::Null => (2u8).hash(state),
-            Self::Float(v) => v.to_bits().hash(state),
+            Self::Float(v) => {
+                (3u8).hash(state);
+                let value = if v.is_nan() {
+                    f64::NAN
+                } else if *v == 0.0 {
+                    0.0
+                } else {
+                    *v
+                };
+                value.to_bits().hash(state);
+            }
         }
     }
 }
@@ -147,7 +161,7 @@ impl Simple {
 /// using the `Simple` type.
 impl From<Simple> for CBOR {
     fn from(value: Simple) -> Self {
-        CBORCase::Simple(value.clone()).into()
+        CBORCase::Simple(value).into()
     }
 }
 
@@ -240,5 +254,54 @@ impl fmt::Display for Simple {
             }
         };
         f.write_str(&s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hasher recording every byte written to it: two values hash alike
+    /// exactly when they write the same bytes, under any hasher.
+    #[derive(Default)]
+    struct Written(Vec<u8>);
+
+    impl hash::Hasher for Written {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+
+    fn hashed(value: &Simple) -> Vec<u8> {
+        let mut hasher = Written::default();
+        hash::Hash::hash(value, &mut hasher);
+        hasher.0
+    }
+
+    /// `Hash` agrees with `PartialEq`: values equal as floats, zero of
+    /// either sign and every NaN, hash alike, so a hash set or map keyed by
+    /// them neither misses one nor holds two. Unequal values still hash
+    /// apart.
+    #[test]
+    fn equal_simple_values_hash_alike() {
+        let payload = f64::from_bits(0x7ff8_0000_0000_0001);
+        for (a, b) in [
+            (Simple::Float(0.0), Simple::Float(-0.0)),
+            (Simple::Float(f64::NAN), Simple::Float(payload)),
+            (Simple::Float(f64::NAN), Simple::Float(-f64::NAN)),
+        ] {
+            assert_eq!(a, b, "{a:?} and {b:?}");
+            assert_eq!(
+                hashed(&a),
+                hashed(&b),
+                "{a:?} and {b:?} are equal but hash apart"
+            );
+        }
+        assert_ne!(hashed(&Simple::Float(1.0)), hashed(&Simple::Float(2.0)));
+        assert_ne!(hashed(&Simple::Float(0.0)), hashed(&Simple::Null));
     }
 }

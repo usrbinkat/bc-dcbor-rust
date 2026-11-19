@@ -278,6 +278,21 @@ impl Observation {
         with(|state| state.stats).unwrap_or_default()
     }
 
+    /// Start a measured request interval after setup. Keep live allocations,
+    /// admission matching and defect counters: setup custody still has to be
+    /// released and a setup violation must remain visible at finalization.
+    pub fn measure(&self, fail_at: Option<usize>) {
+        with(|state| {
+            assert!(!state.armed, "measurement starts outside a physical window");
+            assert_eq!(
+                state.stats.denied, 0,
+                "setup cannot inject a physical failure"
+            );
+            state.stats.calls = 0;
+            state.fail_at = fail_at;
+        });
+    }
+
     pub fn stop(&self) {
         with(|state| state.armed = false);
     }

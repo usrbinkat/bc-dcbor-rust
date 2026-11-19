@@ -69,22 +69,21 @@ done
 export RUST_BACKTRACE=0
 page="$(getconf PAGESIZE)" || exit 2
 
-# The planted controls, one per line, tab-separated: a name, its diff, the
-# checker it runs under, and the text its refusal must name. The relaxed
-# publication must be a causality violation loom reports (loom/src/rt/
-# atomic.rs, cell.rs). A substituted write must be refused where it is
-# evaluated, by the quantum assertion (src/bounded.rs, write_extent); a
-# substituted block, by the I3 witness's allocation check
-# (reclamation/owned.rs, admits_its_production_representation).
-WRITE_FAILURE='one admitted unit stores more than a quantum into retained state'
-BLOCK_FAILURE="the scope's allocation request is not its production block"
-CONTROLS=(
-	"relaxed-publication"$'\t'"tests/data/controls/relaxed-publication.patch"$'\t'"loom"$'\t'"Causality violation"
-	"substituted-write"$'\t'"tests/data/controls/substituted-write.patch"$'\t'"loom"$'\t'"$WRITE_FAILURE"
-	"substituted-write"$'\t'"tests/data/controls/substituted-write.patch"$'\t'"shuttle"$'\t'"$WRITE_FAILURE"
-	"substituted-block"$'\t'"tests/data/controls/substituted-block.patch"$'\t'"loom"$'\t'"$BLOCK_FAILURE"
-	"substituted-block"$'\t'"tests/data/controls/substituted-block.patch"$'\t'"shuttle"$'\t'"$BLOCK_FAILURE"
-)
+# The planted controls of the checkers, one table row per line, from the
+# controls' one table (tests/data/controls/controls.tsv, tests/gate
+# `controls`), which names each one's diff, checker, planned refusal and
+# the text it must name. The table is refused, and nothing runs, when a diff
+# in the controls directory has no row or a row's diff does not exist.
+listed="$(gate control list "$PWD" - loom shuttle)" || {
+	event "FAIL the controls' table is refused; nothing was run"
+	exit 1
+}
+CONTROLS=()
+mapfile -t CONTROLS <<<"$listed"
+if ((${#CONTROLS[@]} == 0)) || [[ -z "${CONTROLS[0]}" ]]; then
+	event "FAIL the controls' table holds no model control; nothing was run"
+	exit 1
+fi
 
 # The run's identity: the input closure (the control diffs and the bounds
 # record among it), the mode, the page size, the environment every run
@@ -97,7 +96,10 @@ CONTROLS=(
 		printf 'checker\t%s\tRUSTFLAGS\t%s\n' "$checker" "${RUSTFLAGS:-} --cfg $checker"
 	done
 	printf 'control\t%s\n' "${CONTROLS[@]}"
-} | identity "$logs"
+} | identity "$logs" || {
+	event "FAIL the run's identity could not be written; nothing was run"
+	exit 2
+}
 echo "identity: $(cat "$logs/identity.txt")"
 
 if [[ "$mode" == derive ]]; then
@@ -127,7 +129,7 @@ else
 fi
 
 for line in "${CONTROLS[@]}"; do
-	IFS=$'\t' read -r name diff checker pattern <<<"$line"
+	IFS=$'\t' read -r name diff checker _ <<<"$line"
 	run="control-$name-$checker"
 	mkdir -p "$logs/$run"
 	cp "$logs/identity.txt" "$logs/$run/identity.txt"
@@ -138,10 +140,10 @@ for line in "${CONTROLS[@]}"; do
 		continue
 	fi
 	event "START $run ($logs/$run)"
-	if gate models control "$copies/$run" "$logs/$run" "$checker" "$pattern"; then
-		event "PASS $run: the planted defect was refused"
+	if gate models control "$copies/$run" "$logs/$run" "$name" "$checker"; then
+		event "PASS $run: the planted defect was refused by its own rule"
 	else
-		event "FAIL $run: the planted defect was not refused with /$pattern/"
+		event "FAIL $run: the planted defect was not refused by its own rule ($logs/$run)"
 		status=1
 	fi
 done

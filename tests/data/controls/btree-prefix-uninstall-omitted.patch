@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/in_place/btree/cleanup.rs
++++ src/bounded/decode/construction/in_place/btree/cleanup.rs
+@@ -147,7 +147,6 @@
+         // below, so nothing reads them again.
+         unsafe {
+             drop_prefix_arenas(raw, state.initialized);
+-            stable::uninstall(&mut state.meta);
+         }
+         state.initialized = 0;
+         return Ok(Reclaimed::Done);

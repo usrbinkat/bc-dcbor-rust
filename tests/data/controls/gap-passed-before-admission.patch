@@ -1,0 +1,14 @@
+--- src/bounded/encoding/writer.rs
++++ src/bounded/encoding/writer.rs
+@@ -81,9 +81,10 @@
+         if let Some(&(start, skip)) = self.holes.get(at.hole)
+             && at.source == start
+         {
+-            BOUNDARY.admit(b)?;
+             at.source += skip;
+             at.hole += 1;
++            // Planted: the gap is passed before its unit is admitted.
++            BOUNDARY.admit(b)?;
+             return Ok(Segment::Skip);
+         }
+         if at.source == self.bytes.len() {

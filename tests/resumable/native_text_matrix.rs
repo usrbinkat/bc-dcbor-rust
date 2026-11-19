@@ -1,9 +1,10 @@
 use super::bindings::text_encoder;
 use super::harness::*;
-use super::support::rigor::rigor;
+use super::support::rigor::{Rigor, rigor};
 use super::support::{
-    Fault, allowed, drive_faulted, drive_within, fail_within, finish_within, pipeline::Refusal,
-    reason_matrix, refusal_matrix, refuse, resume_within,
+    Fault, Finding, Retirement, Stopped, TurnSchedule,
+    pipeline::{Refusal, Unwitnessed},
+    reason_matrix, refusal_matrix,
 };
 use dcbor::bounded::WriteWork;
 use dcbor::bounded::decode::{DecodeError, Kind, Options, cursor::Decoder, decode};
@@ -13,23 +14,16 @@ use dcbor::bounded::decode::{DecodeError, Kind, Options, cursor::Decoder, decode
 /// cancelled at its refusal, releasing everything. Returns the calls
 /// attempted.
 fn encode_run(source: &str, expected: &[u8], fault: Fault) -> super::support::RefusalRun {
-    let mut m = meter();
-    refuse(&mut m, fault.refusal);
-    let pool = m.share();
-    let mut operation = text_encoder(source);
-    let turns = allowed(&m, normalize_turns(source));
-    let output =
-        drive_faulted(&mut m, &mut operation, turns, fault.cancel).expect("a text normalizes");
-    drop(operation);
-    if let Some(output) = output {
-        assert_eq!(output.as_ref(), expected);
-        m.assert_units(TURN);
-        assert!(pool.live_bytes() >= expected.len() as u64);
-        assert_eq!(output.as_ref(), expected);
-        drop(output);
-    }
-    assert_eq!(pool.live_bytes(), 0);
-    super::support::RefusalRun::of(&m)
+    retained_case(
+        text_encoder(source),
+        normalize_turns(source),
+        fault,
+        |output, m| {
+            assert_eq!(output.as_ref(), expected);
+            assert!(m.live_bytes() >= expected.len() as u64);
+            assert_eq!(output.as_ref(), expected);
+        },
+    )
 }
 
 fn fixture(source: &str, expected: &[u8]) {
@@ -62,14 +56,34 @@ fn fixture(source: &str, expected: &[u8]) {
             run.reached()
         },
     );
-    // Independent decoder oracles.
-    let mut m = meter();
-    let parsed = decode(expected, 8, &mut m).unwrap();
-    assert_eq!(parsed.root().kind(), Kind::Text(canonical));
-    drop(parsed);
-    assert_eq!(m.live_bytes(), 0);
+    // Independent decoder oracles: the synchronous decode's document held by
+    // the run and retired, releasing its storage.
+    suite(|run, policy| {
+        let parsed = run
+            .with_policy(policy, |m| decode(expected, 8, m))
+            .map_err(|error| {
+                Finding::Driver(format!("the expected encoding did not decode: {error:?}"))
+            })?;
+        run.holding(parsed, Retirement::Released, &Unwitnessed, |parsed| {
+            assert_eq!(parsed.value().root().kind(), Kind::Text(canonical));
+        });
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
     if source != canonical {
-        assert!(decode(&text_wire(source), 8, &mut meter()).is_err());
+        let wire = text_wire(source);
+        suite(|run, policy| {
+            let rejected = run.with_policy(policy, |m| decode(&wire, 8, m));
+            match rejected {
+                Err(_) => Ok(()),
+                Ok(document) => {
+                    run.holding(document, Retirement::Released, &Unwitnessed, |_| ());
+                    Err(Finding::Defect(format!(
+                        "the non-canonical text {source:?} decoded"
+                    )))
+                }
+            }
+        });
     }
 }
 
@@ -128,51 +142,158 @@ fn long_combining_run_requires_retained_progress_not_whole_run_admission() {
     let source = format!("q{}", "\u{301}\u{316}".repeat(4096));
     let normal = format!("q{}{}", "\u{316}".repeat(4096), "\u{301}".repeat(4096));
     let expected = text_wire(&normal);
-    let mut m = meter();
-    // One quantum before the first refusal; every later turn is one quantum.
-    m.set_limit(WriteWork::new(TURN.values, TURN.bytes));
-    let pool = m.share();
-    let mut operation = text_encoder(&source);
-    let (_, output) = resume_within(
-        &mut m,
-        &mut operation,
-        LimitRefusal::Work,
-        normalize_turns(&source),
-    );
-    assert_eq!(output.as_ref(), expected);
-    m.assert_units(TURN);
-    drop(operation);
-    assert!(pool.live_bytes() >= expected.len() as u64);
-    drop(output);
-    assert_eq!(pool.live_bytes(), 0);
+    // A combining run of 8,193 scalars normalized and encoded a quantum per
+    // turn: 279,243 observations and 53 permit records, measured.
+    let recording = super::support::measured(279_243, 53);
+    suite_with(POOL, recording, |run, policy| {
+        // One quantum before the first refusal; every later turn is one
+        // quantum.
+        run.with_policy(policy, |m| {
+            m.set_limit(WriteWork::new(TURN.values, TURN.bytes))
+        });
+        run.holding(
+            text_encoder(&source),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                operation.suspend(
+                    policy,
+                    LimitRefusal::Work,
+                    normalize_turns(&source),
+                    TurnSchedule::Retained,
+                    Retirement::Released,
+                )?;
+                // The encoder retired before its output is consumed: the
+                // output holds its bytes beyond the encoder's life.
+                operation.drive_faulted(
+                    policy,
+                    normalize_turns(&source),
+                    Retirement::Released,
+                    Fault::NONE,
+                    |_, _| {},
+                    |output| {
+                        output.with_policy(policy, |output, m| {
+                            assert_eq!(output.as_ref(), expected);
+                            m.assert_units(TURN);
+                            assert!(m.live_bytes() >= expected.len() as u64);
+                        });
+                    },
+                )?;
+                Ok::<_, Finding>(())
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
 fn long_valid_combining_sequence_is_accepted_and_one_late_disordered_mark_rejects_it() {
+    // The fast witness crosses several byte quanta; the exhaustive witness
+    // stresses the same acceptance and late-disorder paths at 100,000 marks.
+    let marks = match rigor() {
+        Rigor::Fast => 128,
+        Rigor::Exhaustive => 100_000,
+    };
+    let measuring = match std::env::var("DCBOR_MEASURE_RECORDING") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        other => panic!("DCBOR_MEASURE_RECORDING must be 1 or unset: {other:?}"),
+    };
+    let capacity = |events, permits| {
+        if measuring {
+            dcbor::bounded::Capacity {
+                events: 1 << 23,
+                permits: super::support::CAPACITY.permits,
+            }
+        } else {
+            match rigor() {
+                Rigor::Fast => super::support::CAPACITY,
+                Rigor::Exhaustive => super::support::measured(events, permits),
+            }
+        }
+    };
+    let inspect = move |run: &mut super::support::RecordedRun, name: &'static str| {
+        if measuring {
+            run.inspect_evidence(move |observed, _| {
+                use dcbor::bounded::{Answer, Call, Event};
+                let permits = observed
+                    .iter()
+                    .filter(|observation| {
+                        matches!(
+                            observation.event,
+                            Event::Call(Call::Allocate(_), Answer::Granted(_))
+                                | Event::Split { .. }
+                        )
+                    })
+                    .count();
+                eprintln!(
+                    "long combining {name}, {marks} marks: {} events, {permits} permits",
+                    observed.len()
+                );
+            });
+        }
+    };
     // q composes with no mark, and every mark has the same combining class:
     // the text is NFC however long the run.
-    let valid = format!("q{}", "\u{301}".repeat(100_000));
+    let valid = format!("q{}", "\u{301}".repeat(marks));
     let wire = text_wire(&valid);
-    let mut m = meter();
-    let mut operation = Decoder::new(&wire, Options::normalizing(8));
-    // The retained parse bound includes proving the text's normalization.
-    let document = drive_within(&mut m, &mut operation, decode_turns(wire.len()))
-        .expect("canonical text rejected");
-    assert_eq!(document.root().kind(), Kind::Text(&valid));
-    m.assert_units(TURN);
-    drop(operation);
-    drop(document);
-    assert_eq!(m.live_bytes(), 0);
+    suite_with(POOL, capacity(3_331_604, 67), |run, policy| {
+        inspect(run, "valid");
+        run.holding(
+            Decoder::new(&wire, Options::normalizing(8)),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                // The retained parse bound includes proving the text's
+                // normalization.
+                operation.drive(
+                    policy,
+                    decode_turns(wire.len()),
+                    Retirement::Released,
+                    |document| {
+                        assert_eq!(document.value().root().kind(), Kind::Text(&valid));
+                        document.with_policy(policy, |_, m| m.assert_units(TURN));
+                    },
+                )
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
     // A class-220 mark after the class-230 run is out of canonical order; it
-    // is found only after the whole run has been validated.
+    // is found only after the whole run has been validated, then the decoder
+    // steps its own cleanup to its end.
     let disordered = format!("{valid}\u{316}");
     let wire = text_wire(&disordered);
-    let mut m = meter();
-    let mut operation = Decoder::new(&wire, Options::normalizing(8));
-    let error = fail_within(&mut m, &mut operation, decode_turns(wire.len()));
-    assert!(matches!(error, DecodeError::Invalid(_)), "{error:?}");
-    finish_within(&mut m, &mut operation, decode_turns(wire.len()));
-    m.assert_units(TURN);
-    drop(operation);
-    assert_eq!(m.live_bytes(), 0);
+    suite_with(POOL, capacity(200_026, 0), |run, policy| {
+        inspect(run, "disordered");
+        run.holding(
+            Decoder::new(&wire, Options::normalizing(8)),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                match operation.drive(
+                    policy,
+                    decode_turns(wire.len()),
+                    Retirement::Released,
+                    |_| (),
+                ) {
+                    Err(Stopped::Operation(DecodeError::Invalid(_))) => {}
+                    Err(stop) => return Err(Finding::from(stop)),
+                    Ok(()) => {
+                        return Err(Finding::Defect(
+                            "a disordered combining run decoded".to_owned(),
+                        ));
+                    }
+                }
+                operation.finish(policy, decode_turns(wire.len()), Retirement::Released)?;
+                Ok(())
+            },
+        )?;
+        run.with_policy(policy, |m| m.assert_units(TURN));
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
+    assert!(!measuring, "recording measurement is not qualification");
 }

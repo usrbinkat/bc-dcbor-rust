@@ -1,0 +1,11 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -1484,5 +1484,7 @@
+     fn terminal(permit: &Reservation) -> Self {
+-        let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, permit.counters.clone());
++        // Planted: the terminal policy records into counters of its own.
++        let _ = permit;
++        let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, Arc::default());
+         policy.terminal = true;
+         policy
+     }

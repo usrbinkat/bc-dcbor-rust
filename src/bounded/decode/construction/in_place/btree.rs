@@ -4,14 +4,18 @@ extern crate alloc;
 mod cleanup;
 mod cost;
 use super::*;
+use crate::bounded::Forfeit;
 use crate::bounded::boundary::{Bound, Predicate, Valuation, boundary, units};
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place};
-use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::bounded::decode::construction::Nodes;
+use crate::bounded::decode::construction::reclamation::{Custody, Place};
+use crate::bounded::decode::construction::stable::{self, Installed, Pending, Ticket};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::storage::{Storage, StoragePosition};
 use crate::sync::{Atomics, Representation};
 use alloc::collections::{BTreeMap, btree_map::InPlaceNode};
 use alloc::string::String;
+// Only the test oracle `planned` and the test modules build vectors here.
+#[cfg(test)]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::{ManuallyDrop, MaybeUninit, size_of};
@@ -26,34 +30,55 @@ pub enum TreeKeyView<'a> {
 /// A key whose Rust ordering can be established before constructing it.
 ///
 /// # Safety
-/// `view` does constant work, never unwinds, allocates nothing, and returns a view exactly
-/// when the kind can construct this key. Comparing views must agree with
-/// `Self::Ord` for the constructed values. Bytes compare lexicographically;
-/// integers compare numerically. A binding must always use the same variant.
-/// A byte view borrows the key's own payload and is no longer than its encoded
-/// subtree; this is required by the comparison bound.
+/// An implementation keeps four obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *view*: `view` does constant work, never unwinds, allocates nothing,
+///   and returns a view exactly when the kind can construct this key.
+/// - *order*: comparing views agrees with `Self::Ord` for the constructed
+///   values: bytes compare lexicographically, integers numerically.
+/// - *variant*: a binding always uses the same view variant.
+/// - *span*: a byte view borrows the key's own payload and is no longer than
+///   its encoded subtree, which the comparison bound requires.
 pub unsafe trait TreeKey: Ord {
     fn view(kind: Kind<'_>) -> Option<TreeKeyView<'_>>;
 }
 
-// SAFETY: children are constructed only in their final node slots. Custody
-// records cover every initialized prefix. Publication never moves a child.
-// A build from any phase past publication is refused and changes nothing.
+// SAFETY: admission: every unit of `build` (gather, sort, plan, allocation,
+// each child step, sealing, publication) is admitted before it runs, the
+// children's through their own bindings. state: custody records cover every
+// initialized prefix: the installed metadata, the node arena and each child
+// slot's state, recorded before each step returns, on error too. done: `Done`
+// only once every entry's key and value is built and the tree published.
+// escape: node and child places stay within the installed blocks; the
+// published tree owns them and nothing else keeps one. provenance: children
+// are constructed only in their final node slots, reached through places
+// derived from the node block's, and publication never moves a child. order:
+// a build from any phase past publication, or once cleanup began, is refused
+// and changes nothing. cost: `cost::cost::<K, V, A>()` (btree/cost.rs) prices
+// every admitted unit, allocation and child cost.
 unsafe impl<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator> InPlace<A> for BTreeMap<K, V> {
     const COST: ConstructionCost = crate::const_cost!(cost::cost::<K, V, A>());
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        build(document, index, slot, a)
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        build(ctx, a)
     }
 }
 
-// SAFETY: cleanup detaches a published tree, reclaims children in reverse
-// construction order, then frees nodes without reading their reclaimed slots.
-// A step once cleanup is done reports `Done` and touches nothing.
+// SAFETY: initial: no metadata, no ticket, nothing initialized. state: the
+// metadata, ticket and initialized count record every acquired block and
+// built child. admission: each cleanup unit is admitted before it runs
+// (btree/cleanup.rs), a refusal leaving the state unchanged. cleanup: it
+// detaches a published tree, reclaims children in reverse construction order
+// through their own bindings, then frees nodes without reading their
+// reclaimed slots; it allocates nothing, never unwinds and runs no
+// destructor. done: `Done` once every child is reclaimed and every block
+// released. order: a step once cleanup is done reports `Done` and touches
+// nothing; the count reads only the state. depth: one level above the deeper
+// of `K` and `V`, exact. count: `cleanup::remaining` counts every unit left.
 unsafe impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Reclaim<A> for BTreeMap<K, V> {
     const DISPATCH_DEPTH: usize = if K::DISPATCH_DEPTH > V::DISPATCH_DEPTH {
         K::DISPATCH_DEPTH.saturating_add(1)
@@ -63,20 +88,34 @@ unsafe impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Reclaim<A> for BTreeMap<
     type State = State<K, V, A>;
     const INITIAL: Self::State = State {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
         initialized: 0,
     };
-    fn reclaim_step(slot: Slot<'_, Self, Self::State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        cleanup::reclaim(slot, a)
+    fn reclaim_step(
+        slot: Slot<'_, Self, Self::State>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        cleanup::reclaim(slot, cleanup)
     }
 
-    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
         cleanup::remaining(slot.custody())
+    }
+
+    fn observe_permits(
+        slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        permits_tree::<K, V, A>(slot, sink)
     }
 }
 
-// SAFETY: String construction copies the validated NFC text unchanged, and
-// Rust's string ordering is lexicographic ordering of its UTF-8 bytes.
+// SAFETY: view: one match on the kind, allocating nothing and never
+// unwinding, `Some` exactly for a text, the kind String's binding constructs.
+// order: String construction copies the validated NFC text unchanged, and
+// Rust's string order is the lexicographic order of its UTF-8 bytes. variant:
+// always `Bytes`. span: the view is the text payload itself, borrowed, no
+// longer than its encoded subtree.
 unsafe impl TreeKey for String {
     fn view(kind: Kind<'_>) -> Option<TreeKeyView<'_>> {
         match kind {
@@ -86,7 +125,11 @@ unsafe impl TreeKey for String {
     }
 }
 
-// SAFETY: ByteString preserves its bytes and orders them lexicographically.
+// SAFETY: view: one match on the kind, allocating nothing and never
+// unwinding, `Some` exactly for a byte string, the kind ByteString's binding
+// constructs. order: ByteString preserves its bytes and orders them
+// lexicographically. variant: always `Bytes`. span: the view is the byte
+// payload itself, borrowed, no longer than its encoded subtree.
 unsafe impl TreeKey for crate::ByteString {
     fn view(kind: Kind<'_>) -> Option<TreeKeyView<'_>> {
         match kind {
@@ -98,8 +141,11 @@ unsafe impl TreeKey for crate::ByteString {
 
 macro_rules! integer_keys {
     ($($ty:ty),* $(,)?) => {$ (
-        // SAFETY: these bindings accept precisely the representable integers;
-        // their Rust order is the numeric order of this lossless i128 view.
+        // SAFETY: view: one match and one checked conversion, allocating
+        // nothing and never unwinding, `Some` exactly for an integer the type
+        // represents, the kinds its binding constructs. order: the type's
+        // Rust order is the numeric order of this lossless i128 view.
+        // variant: always `Integer`. span: an integer view borrows nothing.
         unsafe impl TreeKey for $ty {
             fn view(kind: Kind<'_>) -> Option<TreeKeyView<'_>> {
                 let n = match kind {
@@ -115,7 +161,11 @@ macro_rules! integer_keys {
 }
 integer_keys!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
 
-// SAFETY: bool construction preserves the source boolean; false sorts first.
+// SAFETY: view: one match on the kind, allocating nothing and never
+// unwinding, `Some` exactly for a boolean, the kind bool's binding
+// constructs. order: bool construction preserves the source boolean, and
+// false (0) sorts before true (1) as in Rust. variant: always `Integer`. span:
+// an integer view borrows nothing.
 unsafe impl TreeKey for bool {
     fn view(kind: Kind<'_>) -> Option<TreeKeyView<'_>> {
         match kind {
@@ -202,11 +252,16 @@ struct Entry<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
     value_state: ManuallyDrop<V::State>,
 }
 
+/// An arena of the tree's metadata: its own pending acquisition's credit
+/// held with its origin ([`Storage`]).
+type Arena<T, A> =
+    Storage<T, <A as crate::bounded::Releasing>::Permit, <A as crate::bounded::Budget>::Origin>;
+
 struct Meta<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
     phase: Phase,
-    order: [Storage<usize, A::Permit>; 2],
-    nodes: Storage<Node<K, V, A::Permit>, A::Permit>,
-    entries: Storage<Entry<K, V, A>, A::Permit>,
+    order: [Arena<usize, A>; 2],
+    nodes: Arena<Node<K, V, A::Permit>, A>,
+    entries: Arena<Entry<K, V, A>, A>,
     count: usize,
     position: usize,
     source: usize,
@@ -220,14 +275,19 @@ struct Meta<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
     pending_permit: Option<A::Permit>,
 }
 
-/// Typed custody of a partially constructed or published B-tree.
+/// Typed custody of a partially constructed or published B-tree: its
+/// metadata block, once installed; the ticket of the tree's pending
+/// acquisition ([`Ticket`]), the metadata block's and then, one at a time,
+/// each node's, whose credit is the operation's; and the metadata prefix
+/// written.
 pub struct State<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> {
     meta: Option<MetadataBlock<K, V, A>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
     initialized: u8,
 }
 
-type MetadataBlock<K, V, A> = Installed<MaybeUninit<Meta<K, V, A>>, <A as Allocator>::Permit>;
+type MetadataBlock<K, V, A> =
+    Installed<MaybeUninit<Meta<K, V, A>>, <A as crate::bounded::Releasing>::Permit>;
 
 impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Representation for Meta<K, V, A> {
     type In<S: Atomics> = Self;
@@ -242,24 +302,29 @@ const fn contract<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>()
     stable::Contract::of()
 }
 
-/// What a tree's construction holds, by stage: no metadata block, with the
-/// admissions held toward it; the block held with a prefix of its fields
-/// written, each a plain value or an empty arena released with the block;
-/// or every field written.
+/// What a tree's construction has reached, by stage: no metadata block; the
+/// block held with a prefix of its fields written, each a plain value or an
+/// empty arena released with the block; or every field written. An
+/// acquisition's binding and credit (the metadata block's, a node's in
+/// `AllocateRelease` and `Allocate`) are the operation's custody, reported by
+/// the root pending's observation, never this progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[expect(
     clippy::large_enum_variant,
     reason = "custody snapshots include every arena and active child inline; observation must not allocate"
 )]
 pub enum TreeObservation<K, V> {
-    Unallocated(Admitted),
+    Unallocated,
     Initializing(u8),
     Held(TreeCustody<K, V>),
 }
 
 /// A tree's custody once its metadata is written, `K` and `V` its key's and
-/// value's observations: the phase; each arena's stage and counts (the two
-/// index arenas, the nodes, the entry records); the entries the map holds and
+/// value's observations: the phase; each arena's execution observation, its
+/// physical stage and counts (the two index arenas, the nodes, the entry
+/// records; [`StoragePosition`], the admissions an arena's growth holds
+/// reported by its own custody traversal in [`permits_tree`], never here);
+/// the entries the map holds and
 /// the tree's height; a node allocated with its permit before it enters the
 /// node arena; the sort, planning and slot progress that fix every following
 /// step; and the newest entry record's key and value, which is the entry
@@ -308,7 +373,7 @@ impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Custody for State<K, V, A> {
 
     fn observe(&mut self) -> Self::Observation {
         let Some(block) = self.meta.as_mut() else {
-            return TreeObservation::Unallocated(self.admitted);
+            return TreeObservation::Unallocated;
         };
         if self.initialized < INIT {
             return TreeObservation::Initializing(self.initialized);
@@ -342,6 +407,60 @@ impl<K: Reclaim<A>, V: Reclaim<A>, A: Allocator> Custody for State<K, V, A> {
     }
 }
 
+/// The custody the tree in `slot` holds ([`Reclaim::observe_permits`]),
+/// reported inside the caller's open group, the root's whose pending every
+/// acquisition of the tree's own binds under: its metadata block's permit;
+/// once every metadata unit is written, every node's in the node arena, a
+/// node allocated and not yet stored, and each entry record's key's and
+/// value's own ([`observe_part`]), read at the places cleanup reads them.
+/// Each of the four arenas is an independently owning custody, its own
+/// pending's acquisitions bound under its own owner, so each reports as a
+/// group of its own nested here ([`Storage::observe_custody`]): its held
+/// growth credit and its allocations' permits under the arena's owner,
+/// never the root's. A prefix's arenas hold no permit: none acquires before
+/// the prefix is complete.
+fn permits_tree<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, BTreeMap<K, V>, State<K, V, A>>,
+    sink: &mut dyn CustodySink<A::Permit>,
+) -> PermitsObserved {
+    let state = slot.custody();
+    let Some(block) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    sink.permit(block.permit(), None);
+    if state.initialized < INIT {
+        return PermitsObserved::Complete;
+    }
+    // SAFETY: the complete prefix initializes every metadata field, and the
+    // state's custody, held exclusively here, reaches the block.
+    let m = unsafe { block.get().assume_init_mut() };
+    let mut whole = observed_all([
+        m.order[0].observe_custody(sink),
+        m.order[1].observe_custody(sink),
+        m.nodes.observe_custody(sink),
+        m.entries.observe_custody(sink),
+    ]);
+    m.nodes.for_each_mut(|node| sink.permit(&node.permit, None));
+    if let Some(permit) = m.pending_permit.as_ref() {
+        sink.permit(permit, None);
+    }
+    m.entries.for_each_mut(|entry| {
+        // SAFETY: each record holds its key's and value's stable places in
+        // the node it was built in, paired with their own states.
+        let (value, key) = unsafe {
+            (
+                observe_part::<V, A>(
+                    Slot::new(entry.value.observe(), &mut *entry.value_state),
+                    sink,
+                ),
+                observe_part::<K, A>(Slot::new(entry.key.observe(), &mut *entry.key_state), sink),
+            )
+        };
+        whole = observed_all([whole, value, key]);
+    });
+    whole
+}
+
 // SAFETY: all pointed-to allocations are exclusively owned by this state.
 // Child destinations never move; their states and all permits are Send.
 unsafe impl<K: Reclaim<A> + Send, V: Reclaim<A> + Send, A: Allocator> Send for State<K, V, A>
@@ -352,14 +471,58 @@ where
 {
 }
 
-const INIT: u8 = 16;
+/// The units of one arena of the metadata ([`Storage::INIT_STEPS`]): the
+/// same for every element, permit and origin type.
+const ARENA_STEPS: u8 = Storage::<u8, (), ()>::INIT_STEPS as u8;
+
+/// The metadata's arenas, in field and initialization order: `order[0]`,
+/// `order[1]`, `nodes`, `entries`.
+const ARENAS: u8 = 4;
+
+/// The first unit after the arenas': the phase is unit 0, then each
+/// arena's units in turn.
+const PLAIN: u8 = 1 + ARENAS * ARENA_STEPS;
+
+/// Every unit of the metadata ([`initialize`]): the phase, the arenas'
+/// units, then the eleven plain fields from `count` to `pending_permit`.
+const INIT: u8 = PLAIN + 11;
+
 const COMPARE: crate::bounded::Capped<Caller> = crate::bounded::Capped::new(Caller, 3, 64);
 
-/// One unit of the tree's metadata: its block installed, then one field per
-/// unit, each recorded in the state's prefix before returning. A call once
-/// the prefix is complete is refused.
+/// One admitted unit of the arena at `raw` ([`Storage::initialize_step`]),
+/// its `within`th: the arena's own units in place, its pending credit's
+/// owner made by its first acquisition entry.
+///
+/// # Safety
+/// `raw` is valid, aligned and writable for the arena, exactly its first
+/// `within` units are written, and nothing else reaches it meanwhile.
+unsafe fn arena_unit<T, A: Allocator>(
+    raw: *mut Arena<T, A>,
+    within: u8,
+    a: &mut A,
+) -> BoundedResult<(), A> {
+    let mut units = usize::from(within);
+    // SAFETY: forwarded from the caller; the place roots the arena's own
+    // field, the progress its written units.
+    let slot = unsafe {
+        Slot::new(
+            Place::root(core::ptr::NonNull::new_unchecked(
+                raw.cast::<MaybeUninit<Arena<T, A>>>(),
+            )),
+            &mut units,
+        )
+    };
+    Storage::initialize_step(slot, a)?;
+    Ok(())
+}
+
+/// One unit of the tree's metadata: its block installed, its acquisition's
+/// credit held in `pending`, then one field per unit, each recorded in the
+/// state's prefix before returning. A call once the prefix is complete is
+/// refused.
 fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
     state: &mut State<K, V, A>,
+    pending: &mut Pending<A::Origin>,
     a: &mut A,
 ) -> BoundedResult<bool, A> {
     if state.meta.is_none() {
@@ -370,7 +533,8 @@ fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
             stable::install::<MaybeUninit<Meta<K, V, A>>, (), A>(
                 const { contract::<K, V, A>() },
                 &mut state.meta,
-                &mut state.admitted,
+                pending,
+                &mut state.ticket,
                 // Uninitialized bytes already form a valid MaybeUninit. Do
                 // not synthesize or copy the large metadata value here.
                 || (),
@@ -386,37 +550,97 @@ fn initialize<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
         .ok_or(BoundedError::PlanMismatch)?
         .get()
         .as_mut_ptr();
-    // SAFETY: the prefix records which fields are written, so each unit
-    // initializes the next resource-free field once, recorded before
-    // returning; the match refuses every unit past the last. No field is
-    // read before all are initialized.
+    let unit = state.initialized;
+    // SAFETY: the prefix records which units are written, so each unit
+    // initializes the next part once, recorded before returning: the phase,
+    // each arena's own units in place, then each plain field; the match
+    // refuses every unit past the last. No field is read before all are
+    // initialized.
     unsafe {
-        match state.initialized {
-            0 => field(addr_of_mut!((*raw).phase), || Phase::Header, a)?,
-            1 => field(addr_of_mut!((*raw).order[0]), Storage::new, a)?,
-            2 => field(addr_of_mut!((*raw).order[1]), Storage::new, a)?,
-            3 => field(addr_of_mut!((*raw).nodes), Storage::new, a)?,
-            4 => field(addr_of_mut!((*raw).entries), Storage::new, a)?,
-            5 => field(addr_of_mut!((*raw).count), || 0, a)?,
-            6 => field(addr_of_mut!((*raw).position), || 0, a)?,
-            7 => field(addr_of_mut!((*raw).source), || 0, a)?,
-            8 => field(addr_of_mut!((*raw).sort), Sort::default, a)?,
-            9 => field(addr_of_mut!((*raw).parent), || 0, a)?,
-            10 => field(addr_of_mut!((*raw).slot), || 0, a)?,
-            11 => field(addr_of_mut!((*raw).height), || 0, a)?,
-            12 => field(
-                addr_of_mut!((*raw).maximum),
-                || InPlaceNode::<K, V>::CAPACITY,
-                a,
-            )?,
-            13 => field(addr_of_mut!((*raw).pending_shape), Shape::default, a)?,
-            14 => field(addr_of_mut!((*raw).pending_node), || None, a)?,
-            15 => field(addr_of_mut!((*raw).pending_permit), || None, a)?,
-            _ => return Err(BoundedError::PlanMismatch),
+        if unit == 0 {
+            field(addr_of_mut!((*raw).phase), || Phase::Header, a)?;
+        } else if Bound::new(Predicate::Prefix, PLAIN).below(a, unit) {
+            let within = (unit - 1) % ARENA_STEPS;
+            match (unit - 1) / ARENA_STEPS {
+                0 => arena_unit::<usize, A>(addr_of_mut!((*raw).order[0]), within, a)?,
+                1 => arena_unit::<usize, A>(addr_of_mut!((*raw).order[1]), within, a)?,
+                2 => arena_unit::<Node<K, V, A::Permit>, A>(addr_of_mut!((*raw).nodes), within, a)?,
+                _ => arena_unit::<Entry<K, V, A>, A>(addr_of_mut!((*raw).entries), within, a)?,
+            }
+        } else {
+            match unit - PLAIN {
+                0 => field(addr_of_mut!((*raw).count), || 0, a)?,
+                1 => field(addr_of_mut!((*raw).position), || 0, a)?,
+                2 => field(addr_of_mut!((*raw).source), || 0, a)?,
+                3 => field(addr_of_mut!((*raw).sort), Sort::default, a)?,
+                4 => field(addr_of_mut!((*raw).parent), || 0, a)?,
+                5 => field(addr_of_mut!((*raw).slot), || 0, a)?,
+                6 => field(addr_of_mut!((*raw).height), || 0, a)?,
+                7 => field(
+                    addr_of_mut!((*raw).maximum),
+                    || InPlaceNode::<K, V>::CAPACITY,
+                    a,
+                )?,
+                8 => field(addr_of_mut!((*raw).pending_shape), Shape::default, a)?,
+                9 => field(addr_of_mut!((*raw).pending_node), || None, a)?,
+                10 => field(addr_of_mut!((*raw).pending_permit), || None, a)?,
+                _ => return Err(BoundedError::PlanMismatch),
+            }
         }
     }
     state.initialized += 1;
     Ok(state.initialized == INIT)
+}
+
+/// Drop in place, newest first, every arena of a metadata prefix of
+/// `initialized` units: each written in part or whole, owning no allocation
+/// and no admitted credit (no arena acquires before the prefix is
+/// complete), but holding its own pending credit's owner state, which the
+/// custody block, running no destructor, must release. A partly written
+/// arena drops its written units ([`Storage::drop_prefix`]), a whole one
+/// itself. The other fields of the prefix are plain values, the pending
+/// node and permit still `None`. Allocation-free and non-unwinding.
+///
+/// # Safety
+/// `raw` is the metadata of a block whose first `initialized` units (unit 0
+/// the phase) are written and hold no admitted credit and no allocation,
+/// and nothing reads those fields afterwards.
+unsafe fn drop_prefix_arenas<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
+    raw: *mut Meta<K, V, A>,
+    initialized: u8,
+) {
+    // SAFETY: forwarded from the caller; each projection reaches one
+    // arena by field syntax, forming no reference to the rest.
+    unsafe {
+        for arena in (0..ARENAS).rev() {
+            let start = 1 + arena * ARENA_STEPS;
+            let written = usize::from(initialized.saturating_sub(start).min(ARENA_STEPS));
+            match arena {
+                0 => drop_arena::<usize, A>(addr_of_mut!((*raw).order[0]), written),
+                1 => drop_arena::<usize, A>(addr_of_mut!((*raw).order[1]), written),
+                2 => drop_arena::<Node<K, V, A::Permit>, A>(addr_of_mut!((*raw).nodes), written),
+                _ => drop_arena::<Entry<K, V, A>, A>(addr_of_mut!((*raw).entries), written),
+            }
+        }
+    }
+}
+
+/// Drop in place the first `written` units of the arena at `raw`: none, a
+/// prefix ([`Storage::drop_prefix`]), or the whole arena, its own drop
+/// releasing what it holds.
+///
+/// # Safety
+/// `raw` holds an arena whose first `written` units are initialized, owning
+/// no allocation and no admitted credit, read by nothing afterwards.
+unsafe fn drop_arena<T, A: Allocator>(raw: *mut Arena<T, A>, written: usize) {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        if written == usize::from(ARENA_STEPS) {
+            core::ptr::drop_in_place(raw);
+        } else {
+            Storage::drop_prefix(raw, written);
+        }
+    }
 }
 
 /// The tree's metadata, borrowed from the state: released before the tree's
@@ -434,7 +658,7 @@ fn meta<K: Reclaim<A>, V: Reclaim<A>, A: Allocator, R>(
 }
 
 fn compare<K: TreeKey, A: Allocator>(
-    document: &Document<'_, A::Permit>,
+    nodes: Nodes<'_, '_, A::Permit>,
     left: usize,
     right: usize,
     offset: &mut usize,
@@ -442,10 +666,8 @@ fn compare<K: TreeKey, A: Allocator>(
 ) -> ConstructResult<Option<Ordering>, A> {
     // Both views are constant-work reads. Admission precedes their inspection.
     COMPARE.admit(a, 64)?;
-    let left =
-        K::view(node_at(document, left).ok_or_else(wrong_type)?.kind()).ok_or_else(wrong_type)?;
-    let right =
-        K::view(node_at(document, right).ok_or_else(wrong_type)?.kind()).ok_or_else(wrong_type)?;
+    let left = K::view(nodes.node(left).ok_or_else(wrong_type)?.kind()).ok_or_else(wrong_type)?;
+    let right = K::view(nodes.node(right).ok_or_else(wrong_type)?.kind()).ok_or_else(wrong_type)?;
     match (left, right) {
         (TreeKeyView::Integer(l), TreeKeyView::Integer(r)) => Ok(Some(l.cmp(&r))),
         (TreeKeyView::Bytes(l), TreeKeyView::Bytes(r)) => {
@@ -491,13 +713,13 @@ const fn raised(maximum: usize) -> usize {
 /// Every branch planning and building a tree of a count takes is selected
 /// by these alone. Construction branches on emptiness (`PlanRoot` publishes
 /// an empty map at once), on the height (the `Height` loop, leaf against
-/// internal in [`shape`], [`Shape::rank`] and the node's layout) and on root
+/// internal in `shape`, `Shape::rank` and the node's layout) and on root
 /// against non-root, which the height fixes per level; every other
 /// condition is a loop bound over a node's keys, edges or slots, each taken
 /// for every nonempty tree. The fork's node code (`InPlaceNode`) branches
 /// only on leaf against internal. The arithmetic within a class, every
 /// node's keys, span and ranks for each count, is certified for every count
-/// separately ([`planned`], its tests), so one tree per class, and the
+/// separately (`planned`, its tests), so one tree per class, and the
 /// counts on each side of a class's edge, witness every planning path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Occupancy {
@@ -505,13 +727,29 @@ pub enum Occupancy {
     Height(u8),
 }
 
-/// The occupancy class of a tree of `count` entries ([`Occupancy`]).
+/// The occupancy class of a tree of `count` entries ([`Occupancy`]), from
+/// its planned height alone (`height`): no node is planned and nothing is
+/// allocated, whatever the count.
 pub fn occupancy(count: usize) -> Occupancy {
     if count == 0 {
         Occupancy::Empty
     } else {
-        Occupancy::Height(planned(count).0)
+        Occupancy::Height(height(count).0)
     }
+}
+
+/// The height a tree of `count` entries is planned at, and the most entries
+/// a child of its root holds: the height raised by [`raised`] until `count`
+/// fits, as construction's `Height` phase raises it one admitted unit at a
+/// time. At most a few iterations: each multiplies the capacity by twelve.
+fn height(count: usize) -> (u8, usize) {
+    let (mut height, mut maximum, mut child_max) = (0u8, InPlaceNode::<(), ()>::CAPACITY, 0);
+    while count > maximum {
+        child_max = maximum;
+        maximum = raised(maximum);
+        height += 1;
+    }
+    (height, child_max)
 }
 
 /// The boundary valuation of a tree of `count` entries planned at `height`
@@ -533,14 +771,12 @@ fn occupancy_valuation(count: usize, height: u8) -> Valuation {
 /// `PlanRoot` does, and each internal node's children by [`Shape::child`],
 /// as `Expand` does. The root comes first; the rest follow in a walk of the
 /// tree, not construction's breadth-first order, on which nothing here
-/// depends.
+/// depends. A test oracle only (`plan_tests`): it allocates a shape per
+/// node, outside any policy, so no shipped path calls it ([`occupancy`]
+/// reads [`height`] alone).
+#[cfg(test)]
 pub(crate) fn planned(count: usize) -> (u8, Vec<Shape>) {
-    let (mut height, mut maximum, mut child_max) = (0u8, InPlaceNode::<(), ()>::CAPACITY, 0);
-    while count > maximum {
-        child_max = maximum;
-        maximum = raised(maximum);
-        height += 1;
-    }
+    let (height, child_max) = height(count);
     let mut shapes = Vec::new();
     if count == 0 {
         return (height, shapes);
@@ -602,23 +838,40 @@ impl Shape {
     }
 }
 
-/// One unit of the tree's construction in `slot`.
-fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
-    document: &Document<'_, A::Permit>,
-    index: usize,
-    mut slot: Slot<'_, BTreeMap<K, V>, State<K, V, A>>,
+/// One unit of the tree's construction in the context's slot, from the
+/// context's node, a map.
+///
+/// Each entry's key and value are parts ([`build_part`]), built from
+/// `m.position`, the one record of which node they continue from: set in
+/// `Entry` from the sorted order when the entry's record is pushed, advanced
+/// past the key only once the key reports `Done` (`Key` to `Value`), and
+/// replaced only by the next entry's `Entry`; a refused or erroring part
+/// leaves it, the phase and the record unchanged. No part is built once
+/// cleanup began: cleanup ([`cleanup::reclaim`]) first moves the phase to
+/// `ReclaimValue`, and every cleanup phase falls to this function's last
+/// arm, refused `PlanMismatch`, nothing changed. A tree reclaimed to its end
+/// is `INITIAL` again, which a build would restart: only its owner's own
+/// phase (a parent's cleanup phase, or the root's released session) keeps
+/// it from being built again.
+fn build<'b, K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
+    ctx: Context<'b, '_, '_, '_, BTreeMap<K, V>, State<K, V, A>, A>,
     a: &mut A,
-) -> ConstructResult<Built, A> {
+) -> ConstructResult<Building<'b, BTreeMap<K, V>>, A> {
+    let mut ctx = ctx;
+    let assembly = ctx.assembly();
+    let index = ctx.index();
+    let nodes = ctx.nodes();
+    let (mut slot, pending) = ctx.acquiring();
     let (place, state) = slot.parts();
     if Bound::new(Predicate::Prefix, INIT).below(a, state.initialized) {
-        initialize(state, a)?;
-        return Ok(Built::Progress);
+        initialize(state, pending, a)?;
+        return Ok(Building::Progress);
     }
     let m = meta(state)?;
     match m.phase {
         Phase::Header => {
             STEP.admit(a)?;
-            let Kind::Map(count) = node_at(document, index).ok_or_else(wrong_type)?.kind() else {
+            let Kind::Map(count) = nodes.node(index).ok_or_else(wrong_type)?.kind() else {
                 return Err(wrong_type());
             };
             m.count = usize::try_from(count).map_err(|_| BoundedError::Overflow)?;
@@ -632,12 +885,11 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
                 m.phase = Phase::SortStart;
             } else if let Some(spare) = m.order[0].reserve_step(m.count, a)? {
                 sized::<usize>().admit(a)?;
-                K::view(node_at(document, m.position).ok_or_else(wrong_type)?.kind())
+                K::view(nodes.node(m.position).ok_or_else(wrong_type)?.kind())
                     .ok_or_else(wrong_type)?;
                 let value =
-                    super::super::next_index(node_at(document, m.position).ok_or_else(wrong_type)?);
-                let next =
-                    super::super::next_index(node_at(document, value).ok_or_else(wrong_type)?);
+                    super::super::next_index(nodes.node(m.position).ok_or_else(wrong_type)?);
+                let next = super::super::next_index(nodes.node(value).ok_or_else(wrong_type)?);
                 spare.push(m.position);
                 m.position = next;
                 m.phase = Phase::Scratch;
@@ -668,10 +920,10 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Sort => {
             let Some(_) = m.order[0].settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             let Some(_) = m.order[1].settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             let s = &mut m.sort;
             if s.out == s.end {
@@ -695,8 +947,8 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
                     STEP.admit(a)?;
                     true
                 } else {
-                    match compare::<K, A>(document, input[s.i], input[s.j], &mut s.offset, a)? {
-                        None => return Ok(Built::Progress),
+                    match compare::<K, A>(nodes, input[s.i], input[s.j], &mut s.offset, a)? {
+                        None => return Ok(Building::Progress),
                         Some(Ordering::Equal) => return Err(BoundedError::DuplicateKey.into()),
                         Some(ordering) => ordering == Ordering::Less,
                     }
@@ -708,7 +960,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::SortWrite => {
             let Some(output) = m.order[m.source ^ 1].settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             sized::<usize>().admit(a)?;
             output.as_mut_slice()[m.sort.out] = m.position;
@@ -742,20 +994,48 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             }
         }
         Phase::AllocateWrite => {
-            // Only parent and length are written by the fork's allocation.
-            const { cost::allocate_write::<K, V, A::Permit>() }.admit(a)?;
-            m.phase = Phase::AllocateRelease;
+            // Only parent and length are written by the fork's allocation:
+            // the grant's work, admitted held in the operation's pending
+            // acquisition, under the state's ticket, until the node is
+            // granted.
+            stable::admit_grant(
+                pending,
+                &mut state.ticket,
+                const { cost::allocate_write::<K, V, A::Permit>() },
+                a,
+            )?;
+            meta(state)?.phase = Phase::AllocateRelease;
         }
         Phase::AllocateRelease => {
-            stable::admit_release(a)?;
-            m.phase = Phase::Allocate;
+            stable::admit_release(pending, &mut state.ticket, a)?;
+            meta(state)?.phase = Phase::Allocate;
         }
         Phase::Allocate => {
             let leaf = m.pending_shape.height == 0;
             let bytes = InPlaceNode::<K, V>::layout(leaf).size() as u64;
-            let permit = a.allocate(bytes).map_err(BoundedError::Refused)?;
-            let raw =
-                InPlaceNode::try_allocate(leaf).map_err(|_| BoundedError::Allocation { bytes })?;
+            // A refused request keeps the grant's work and the release held
+            // in the pending acquisition, in this phase; the retry's grant
+            // spends them. A physical failure forfeits the grant's work at
+            // the permit, which drops performing its release, and ends the
+            // acquisition: nothing is held any more (`AllocateWrite` holds
+            // nothing), and the failure is terminal: cleanup follows.
+            let granted = stable::grant(
+                pending,
+                &mut state.ticket,
+                bytes,
+                || InPlaceNode::try_allocate(leaf).map_err(|_| Forfeit::AcquisitionFailed),
+                a,
+            );
+            let m = meta(state)?;
+            let (permit, raw) = match granted {
+                Ok(granted) => granted,
+                Err(error) => {
+                    if matches!(error, BoundedError::Allocation { .. }) {
+                        m.phase = Phase::AllocateWrite;
+                    }
+                    return Err(error.into());
+                }
+            };
             m.pending_permit = Some(permit);
             m.pending_node = Some(raw);
             m.phase = Phase::Store;
@@ -773,7 +1053,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Link => {
             let Some(nodes) = m.nodes.settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             const { cost::link::<K, V>() }.admit(a)?;
             let nodes = nodes.as_mut_slice();
@@ -792,7 +1072,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Expand => {
             let Some(nodes) = m.nodes.settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             STEP.admit(a)?;
             if m.parent == nodes.len() {
@@ -819,7 +1099,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Entry => {
             let Some(nodes) = m.nodes.settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             if m.parent == nodes.len() {
                 STEP.admit(a)?;
@@ -856,28 +1136,51 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             }
         }
         Phase::Key | Phase::Value => {
-            let Some(entries) = m.entries.settle_step(a)? else {
-                return Ok(Built::Progress);
-            };
-            let entry = entries
-                .as_mut_slice()
-                .last_mut()
-                .ok_or(BoundedError::PlanMismatch)?;
-            // SAFETY: the entry record pairs each final, stable destination,
-            // rooted at its node slot, with the state that records its
-            // initialized prefix throughout construction and cleanup.
-            let done = if m.phase == Phase::Key {
-                let key = unsafe { Slot::new(entry.key, &mut *entry.key_state) };
-                K::build_step(document, m.position, key, a)?
+            if m.entries.settle_step(a)?.is_none() {
+                return Ok(Building::Progress);
+            }
+            let key_phase = m.phase == Phase::Key;
+            let position = m.position;
+            // SAFETY: the newest entry record, in the settled entry arena
+            // this tree's metadata holds, pairs each final, stable
+            // destination, rooted at its node slot, with the state that
+            // records its initialized prefix throughout construction and
+            // cleanup.
+            let done = if key_phase {
+                let key = unsafe {
+                    ctx.part(position, |slot| {
+                        let entry = meta(slot.into_parts().1)?
+                            .entries
+                            .last_mut()
+                            .ok_or(BoundedError::PlanMismatch)?;
+                        Ok::<_, BoundedError<A::Refusal>>(Slot::new(
+                            entry.key,
+                            &mut *entry.key_state,
+                        ))
+                    })
+                }?;
+                build_part::<K, A>(key, a)?
             } else {
-                let value = unsafe { Slot::new(entry.value, &mut *entry.value_state) };
-                V::build_step(document, m.position, value, a)?
+                let value = unsafe {
+                    ctx.part(position, |slot| {
+                        let entry = meta(slot.into_parts().1)?
+                            .entries
+                            .last_mut()
+                            .ok_or(BoundedError::PlanMismatch)?;
+                        Ok::<_, BoundedError<A::Refusal>>(Slot::new(
+                            entry.value,
+                            &mut *entry.value_state,
+                        ))
+                    })
+                }?;
+                build_part::<V, A>(value, a)?
             };
             if done == Built::Done {
-                if m.phase == Phase::Key {
-                    m.position = super::super::next_index(
-                        node_at(document, m.position).ok_or_else(wrong_type)?,
-                    );
+                let mut slot = ctx.slot();
+                let m = meta(slot.custody())?;
+                if key_phase {
+                    m.position =
+                        super::super::next_index(nodes.node(position).ok_or_else(wrong_type)?);
                     m.phase = Phase::Value;
                 } else {
                     m.slot += 1;
@@ -887,7 +1190,7 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
         }
         Phase::Seal => {
             let Some(nodes) = m.nodes.settle_step(a)? else {
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             };
             if m.parent == nodes.len() {
                 STEP.admit(a)?;
@@ -924,11 +1227,18 @@ fn build<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator>(
             // phase nothing is written to it yet; the write is admitted above.
             unsafe { place.write(state, map) };
             meta(state)?.phase = Phase::Complete;
-            return Ok(Built::Done);
+            // SAFETY: the map is written at the tree's place above. Each of
+            // its entries entered it through `Entry` only after its key's and
+            // its value's `Done`, each record, confined by its brand to the
+            // step that minted it, verified by `build_part` against the node
+            // slot this tree projected for that part. `Seal` set every
+            // node's length over those entries. The slot is not reclaimed: cleanup moves the
+            // phase to `ReclaimValue`, which this function refuses.
+            return Ok(Building::Done(unsafe { assembly.assemble() }));
         }
         _ => return Err(BoundedError::PlanMismatch.into()),
     }
-    Ok(Built::Progress)
+    Ok(Building::Progress)
 }
 
 /// The plan's certification: for every count, the shapes construction plans
@@ -951,8 +1261,15 @@ mod plan_tests {
     /// between the two children beside it, their spans and its keys its own
     /// span; and the keys, over every node, exactly the entries, each ranked
     /// once.
-    fn violations(count: usize, height: u8, shapes: &[Shape]) -> Vec<String> {
+    fn violations(
+        count: usize,
+        height: u8,
+        shapes: &[Shape],
+        ranks: &mut Vec<bool>,
+    ) -> Vec<String> {
         let mut found = Vec::new();
+        ranks.resize(count, false);
+        ranks.fill(false);
         let capacity = InPlaceNode::<(), ()>::CAPACITY;
         if count == 0 {
             if !shapes.is_empty() {
@@ -964,7 +1281,7 @@ mod plan_tests {
         if root.span != count || root.first != 0 || root.height != height {
             found.push(format!("{count}: the root is {root:?}"));
         }
-        let mut ranks = Vec::new();
+        let mut ranked_once = true;
         for (at, node) in shapes.iter().enumerate() {
             let keys = usize::from(node.keys);
             if keys > capacity {
@@ -977,7 +1294,13 @@ mod plan_tests {
                 found.push(format!("{count}: {node:?} is below the standard occupancy"));
             }
             for slot in 0..keys {
-                ranks.push(node.rank(slot));
+                match ranks.get_mut(node.rank(slot)) {
+                    Some(seen) => {
+                        ranked_once &= !*seen;
+                        *seen = true;
+                    }
+                    None => ranked_once = false,
+                }
             }
             if node.height == 0 {
                 if node.span != keys {
@@ -1011,8 +1334,7 @@ mod plan_tests {
                 ));
             }
         }
-        ranks.sort_unstable();
-        if ranks != (0..count).collect::<Vec<_>>() {
+        if !ranked_once || ranks.contains(&false) {
             found.push(format!("{count}: the keys are not each entry ranked once"));
         }
         found
@@ -1025,13 +1347,14 @@ mod plan_tests {
     fn every_count_plans_a_valid_tree_of_its_occupancy() {
         let mut maximum = InPlaceNode::<(), ()>::CAPACITY;
         let mut height = 0u8;
+        let mut ranks = Vec::new();
         for count in 0..=20_000usize {
             if count > maximum {
                 maximum = raised(maximum);
                 height += 1;
             }
             let (planned_height, shapes) = planned(count);
-            let found = violations(count, planned_height, &shapes);
+            let found = violations(count, planned_height, &shapes, &mut ranks);
             assert!(found.is_empty(), "{found:#?}");
             assert_eq!(planned_height, height, "{count}");
             let expected = if count == 0 {
@@ -1051,21 +1374,25 @@ mod plan_tests {
     #[test]
     fn a_planted_plan_defect_is_refused() {
         let (height, shapes) = planned(144);
+        let mut ranks = Vec::new();
         let mut extra = shapes.clone();
         extra[0].keys += 1;
         assert!(
-            !violations(144, height, &extra).is_empty(),
+            !violations(144, height, &extra, &mut ranks).is_empty(),
             "an extra root key"
         );
         let mut moved = shapes.clone();
         moved[0].span -= 1;
-        assert!(!violations(144, height, &moved).is_empty(), "a span moved");
+        assert!(
+            !violations(144, height, &moved, &mut ranks).is_empty(),
+            "a span moved"
+        );
         let mut sparse = shapes;
         let last = sparse.len() - 1;
         sparse[last].keys = 1;
         sparse[last].span = 1;
         assert!(
-            !violations(144, height, &sparse).is_empty(),
+            !violations(144, height, &sparse, &mut ranks).is_empty(),
             "a sparse node"
         );
     }
@@ -1082,7 +1409,7 @@ mod attribution {
     use super::*;
     use crate::bounded::decode::decode;
     use crate::bounded::places::{self, Ledgered, Run};
-    use crate::bounded::{Places, ResourceBound, at};
+    use crate::bounded::{Budget, Places, ResourceBound, at};
     use alloc::string::ToString;
     use core::ops::ControlFlow;
     use core::ptr::NonNull;
@@ -1120,6 +1447,7 @@ mod attribution {
             .and_then(|cost| cost.bound::<()>(wire.len() as u64))
             .expect("the cost of a fixture fits in u64");
         let mut policy = Ledgered::new();
+        let mut pending = Pending::new(policy.owner().expect("an ordinary family mints an owner"));
         let mut destination = MaybeUninit::<BTreeMap<K, u64>>::uninit();
         let mut state = <BTreeMap<K, u64> as Reclaim<Ledgered>>::INITIAL;
         // SAFETY: the test owns the destination and pairs it with its initial
@@ -1128,18 +1456,37 @@ mod attribution {
             unsafe { Slot::new(Place::root(NonNull::from(&mut destination)), &mut state) };
         crate::bounded::within(name, cost, || {
             let built = at(TreePlace::Construction, || {
-                build::<K, u64, Ledgered>(&document, 0, slot.reborrow(), &mut policy)
+                // The tree is stepped directly, outside a session, so its
+                // root context is marked stepped here: its parts' records
+                // verify against it, within this step.
+                let mut root = Context::root(&document, slot.reborrow(), &mut pending);
+                root.bind();
+                build::<K, u64, Ledgered>(root, &mut policy)
             });
             match built.expect("the map builds") {
-                Built::Done => ControlFlow::Break(()),
-                Built::Progress => ControlFlow::Continue(()),
+                Building::Done(_) => ControlFlow::Break(()),
+                Building::Progress => ControlFlow::Continue(()),
             }
         });
+        let mut steps = 0usize;
         crate::bounded::within(name, cost, || {
             let reclaimed = at(TreePlace::Construction, || {
-                cleanup::reclaim::<K, u64, Ledgered>(slot.reborrow(), &mut policy)
+                // The tree is the root of its cleanup, dispatched as the
+                // engine dispatches a record's root (`reclamation.rs`,
+                // `advance`): its declared depth taken, then one level
+                // entered, so its parts' dispatches are within the
+                // declaration.
+                let mut cleanup = Cleanup::new(&mut policy);
+                cleanup.declare(<BTreeMap<K, u64> as Reclaim<Ledgered>>::DISPATCH_DEPTH);
+                cleanup.descend(|cleanup| {
+                    cleanup::reclaim::<K, u64, Ledgered>(slot.reborrow(), cleanup)
+                })
             });
-            match reclaimed.expect("an unlimited policy never refuses") {
+            steps += 1;
+            let reclaimed = reclaimed.unwrap_or_else(|error| {
+                panic!("{name}: cleanup step {steps} under an unlimited policy failed: {error:?}")
+            });
+            match reclaimed {
                 Reclaimed::Done => ControlFlow::Break(()),
                 Reclaimed::Progress => ControlFlow::Continue(()),
                 Reclaimed::Waiting => unreachable!("a tree's own cleanup never waits"),
@@ -1157,7 +1504,7 @@ mod attribution {
     fn integers(count: u64) -> Vec<u8> {
         let mut map = crate::Map::new();
         for n in 0..count {
-            map.insert(n, n);
+            map.insert(n, n).unwrap();
         }
         crate::CBOR::from(map).to_cbor_data()
     }
@@ -1166,7 +1513,7 @@ mod attribution {
     fn texts(count: u64) -> Vec<u8> {
         let mut map = crate::Map::new();
         for n in 0..count {
-            map.insert(alloc::format!("{n:x}"), n);
+            map.insert(alloc::format!("{n:x}"), n).unwrap();
         }
         crate::CBOR::from(map).to_cbor_data()
     }

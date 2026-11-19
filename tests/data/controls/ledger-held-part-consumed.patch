@@ -1,0 +1,12 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -220,7 +220,8 @@
+             Credit::Admit { work, held } => {
+                 let consumed = match held {
+                     None => Some(work),
+-                    Some(hold) => less(work, hold.work),
++                    // Planted: a held part counted consumed as well (double count).
++                    Some(_) => Some(work),
+                 };
+                 let Some(consumed) = consumed else {
+                     self.violate();

@@ -1,0 +1,13 @@
+--- tests/support/lifecycle.rs
++++ tests/support/lifecycle.rs
+@@ -3313,6 +3313,10 @@
+ /// nothing. `position` renders the held operation's position, read only
+ /// when the recording is lost.
+ fn lost(m: &Limits, turn: usize, position: impl FnOnce() -> Option<String>) -> Option<Lost> {
++    // Planted: the turn's recording validity left unread.
++    if turn < usize::MAX {
++        return None;
++    }
+     match m.evidence() {
+         Ok(()) | Err(dcbor::bounded::Unreadable::Unrecorded) => None,
+         Err(dcbor::bounded::Unreadable::Session(incomplete)) => Some(Lost {

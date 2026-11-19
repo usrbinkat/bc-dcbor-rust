@@ -1,0 +1,18 @@
+--- src/bounded/text_cursor.rs
++++ src/bounded/text_cursor.rs
+@@ -1078,8 +1078,11 @@
+                 // it and whose drop performs it on every path below; the
+                 // acquisition ends here.
+-                self.output_release
+-                    .take()
+-                    .ok_or(BoundedError::PlanMismatch)?
+-                    .spend(Some(id), allocator.performer());
++                // Planted: the release's spend dropped, its obligation lost
++                // with neither a spend nor its drop's forfeit.
++                core::mem::forget(
++                    self.output_release
++                        .take()
++                        .ok_or(BoundedError::PlanMismatch)?,
++                );
+                 self.acquisition = None;
+                 // The permit stays local until the reservation succeeds: on

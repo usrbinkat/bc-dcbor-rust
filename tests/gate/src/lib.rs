@@ -11,6 +11,8 @@
 //! gate linked with it would run, and measure, under test instrumentation.
 
 pub mod cfgs;
+pub mod controls;
+pub mod conversion;
 pub mod costs;
 pub mod domains;
 pub mod inventory;
@@ -19,6 +21,7 @@ pub mod models;
 pub mod mutation;
 pub mod outcome;
 pub mod process;
+pub mod proofs;
 pub mod reach;
 pub mod records;
 pub mod rows;

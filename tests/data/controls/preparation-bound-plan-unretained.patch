@@ -1,0 +1,12 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -2472,7 +2472,8 @@
+     let plan = terms.term(PreparationPlace::PlanBytes).retained;
+     let encoding = ResourceBound {
+         peak: plan,
+-        retained: plan,
++        // Planted: the published plan's bytes are not counted as retained.
++        retained: 0,
+         ..ResourceBound::default()
+     };
+     let emitted = emit_bound::<R>(shape.appended()?)?;

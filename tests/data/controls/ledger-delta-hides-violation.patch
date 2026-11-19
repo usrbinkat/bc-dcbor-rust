@@ -1,0 +1,13 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -547,7 +547,9 @@
+             admitted: less(self.admitted, earlier.admitted)?,
+             consumed: less(self.consumed, earlier.consumed)?,
+             forfeited: less(self.forfeited, earlier.forfeited)?,
+-            violated: self.violated,
++            // Planted: a violation before the interval is attributed away.
++            // Must fail "a delta taken at or after a violation shows it".
++            violated: self.violated && !earlier.violated,
+         })
+     }
+

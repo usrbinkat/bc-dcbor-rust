@@ -1,0 +1,13 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -949,7 +949,9 @@
+     /// is abandoned to its references' terminal drain, a partially
+     /// initialized one freed.
+     fn drop(&mut self) {
+-        self.pending.settle_all(Performer::None);
++        // Planted: the authority's pending credit, both its retained slots,
++        // forgotten whole: neither settled nor dropped.
++        core::mem::forget(core::mem::replace(&mut self.pending, Pending::deferred()));
+         if let Some(block) = self.scope.take() {
+             if self.ready {
+                 scope(&block).owner.closed.store(true, Ordering::Release);

@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -657,7 +657,8 @@
+         Stage::Building {
+             node: bound,
+             entry: entered,
+-        } if bound == node && entered == entry => {
++        } if entered == entry => {
++            let _ = bound;
+             ctx.bind();
+             // SAFETY: the binding's slot is the session's own slot projected
+             // to the state the session wraps ([`inner`]).

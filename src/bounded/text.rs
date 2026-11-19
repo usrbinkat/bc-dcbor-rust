@@ -33,8 +33,8 @@ use unicode_normalization::{
 };
 
 use super::{
-    Allocator, BoundedError, BoundedResult, Budget, Capped, Owned, Places, Rate, ResourceBound,
-    Scan, Unit, WriteWork, at, owned_growth, widen,
+    Allocator, BoundedError, BoundedResult, Budget, Capped, Growth, Owned, Owner, Places, Rate,
+    ResourceBound, Scan, Unit, WriteWork, at, owned_growth, widen,
 };
 
 places! {
@@ -89,6 +89,9 @@ const EMITTED: Capped<ValidationPlace> =
 /// The normalization of one text: its buffers and the composition state.
 struct Normalizer<'b, A: Allocator> {
     allocator: &'b mut A,
+    /// The normalization's owner capability: every buffer growth is one of
+    /// its acquisitions.
+    owner: Owner,
     /// Combining characters since the last starter, in source order.
     pending: Owned<(u8, char), A::Permit>,
     /// Reusable destination for stable counting sort.
@@ -108,7 +111,8 @@ impl<A: Allocator> Normalizer<'_, A> {
         let mut encoded = [0u8; 4];
         let bytes = ch.encode_utf8(&mut encoded).as_bytes();
         at(ValidationPlace::Buffers, || {
-            self.normal.extend_from_slice(bytes, &mut *self.allocator)
+            self.normal
+                .extend_from_slice(bytes, &mut *self.allocator, &self.owner)
         })
     }
 
@@ -124,7 +128,8 @@ impl<A: Allocator> Normalizer<'_, A> {
             return self.composed(ch);
         }
         at(ValidationPlace::Buffers, || {
-            self.pending.push((class, ch), &mut *self.allocator)
+            self.pending
+                .push((class, ch), &mut *self.allocator, &self.owner)
         })
     }
 
@@ -140,7 +145,8 @@ impl<A: Allocator> Normalizer<'_, A> {
         // admitted before reading or filling either buffer.
         COUNTING.admit(&mut *self.allocator, widen(count)?)?;
         at(ValidationPlace::Buffers, || {
-            self.ordered.reserve(count, &mut *self.allocator)
+            self.ordered
+                .reserve(count, &mut *self.allocator, &self.owner)
         })?;
         let mut offsets = [0usize; CLASSES as usize];
         for &(class, _) in self.pending.as_slice() {
@@ -218,7 +224,7 @@ impl<A: Allocator> Normalizer<'_, A> {
 
     fn block(&mut self, ch: char, class: u8) -> BoundedResult<(), A> {
         at(ValidationPlace::Buffers, || {
-            self.blocked.push(ch, &mut *self.allocator)
+            self.blocked.push(ch, &mut *self.allocator, &self.owner)
         })?;
         self.last_ccc = Some(class);
         Ok(())
@@ -252,14 +258,17 @@ impl<A: Allocator> Normalizer<'_, A> {
 /// character before its decomposition, each decomposed character, each
 /// ordering pass and each emitted character before it is processed. The three
 /// working buffers are released when it returns; the normal form keeps its
-/// allocation.
+/// allocation. The normalization is one synchronous custody: its buffers'
+/// growths are acquisitions of the one owner minted when it begins.
 fn normalize<A: Allocator>(
     text: &str,
     allocator: &mut A,
 ) -> BoundedResult<Owned<u8, A::Permit>, A> {
     PASS.admit(allocator, widen(text.len())?)?;
+    let owner = allocator.owner().map_err(BoundedError::Refused)?;
     let mut normalizer = Normalizer {
         allocator,
+        owner,
         pending: Owned::new(),
         ordered: Owned::new(),
         blocked: Owned::new(),
@@ -487,10 +496,14 @@ impl ValidationTerms {
         // The parts of every text sum without rounding (`of * P <= per * L`
         // for each); the head bytes cover the rounding of its releases
         // (`2 * of - 1 <= per`).
-        const { assert!(2 * PARTS_PER_BYTE.1 - 1 <= PARTS_PER_BYTE.0) };
+        const {
+            assert!(2 * PARTS_PER_BYTE.1 - 1 <= PARTS_PER_BYTE.0);
+        }
         // A quick check and a character visit are one value each, so the
         // `T + sum L <= input` of them are `input` values together.
-        const { assert!(QUICK.values() == CHARACTER.values()) };
+        const {
+            assert!(QUICK.values() == CHARACTER.values());
+        }
         let pair = widen(core::mem::size_of::<(u8, char)>())?;
         let scalar = widen(core::mem::size_of::<char>())?;
         // Only an unproven text is normalized, each at least a head byte and
@@ -528,40 +541,40 @@ impl ValidationTerms {
             mul(texts, 4)?,
         )?;
         let released = crate::bounded::RELEASED.times(allocations)?;
-        // One text's buffers held at once, and the one relocation in
-        // progress.
-        let buffers = [
+        let overflow = || BoundedError::Overflow;
+        // One text's buffers held at once, one growing at a time, every
+        // one released before the next text's.
+        let held = Growth::one_growing::<R>(&[
             owned_growth::<R>(combining, pair)?,
             owned_growth(combining, pair)?,
             owned_growth(combining, scalar)?,
             owned_growth(emitted_bytes, 1)?,
-        ];
-        let mut held = 0u64;
-        let mut overlap = 0u64;
-        for growth in buffers {
-            held = add(held, growth.held)?;
-            overlap = overlap.max(growth.peak - growth.held);
+        ])?
+        .checked_followed_by(ResourceBound::default())
+        .ok_or_else(overflow)?;
+        // Their relocations, requests and releases, made while they are held.
+        let accounted = ResourceBound {
+            bytes: relocated,
+            allocated: requested,
+            ..ResourceBound::default()
         }
-        let peak = add(held, overlap)?;
+        .checked_then(ResourceBound::of_work(released))
+        .ok_or_else(overflow)?;
+        let work = |parts: &[WriteWork]| WriteWork::checked_sequence(parts).ok_or_else(overflow);
         Ok(Self {
             // The quick checks and character visits; the check, the source
             // pass and the comparison, each over the payloads.
-            reading: CHARACTER
-                .times(input)?
-                .then(QUICK.units(0, input)?)?
-                .then(PASS.units(0, mul(input, 2)?)?)?,
+            reading: work(&[
+                CHARACTER.times(input)?,
+                QUICK.units(0, input)?,
+                PASS.units(0, mul(input, 2)?)?,
+            ])?,
             decomposing: PART.times(parts)?,
             // Each release's counting pass, and each part it hands on.
-            ordering: COUNTING.over(releases, parts)?.then(HANDED.times(parts)?)?,
+            ordering: work(&[COUNTING.over(releases, parts)?, HANDED.times(parts)?])?,
             // A value per emitted character, and the normal form's bytes.
             emitting: WriteWork::new(mul(parts, EMITTED.values())?, emitted_bytes),
-            buffers: ResourceBound {
-                values: released.values,
-                bytes: add(relocated, released.bytes)?,
-                allocated: requested,
-                peak,
-                retained: 0,
-            },
+            buffers: accounted.checked_add(held).ok_or_else(overflow)?,
         })
     }
 }
@@ -592,9 +605,16 @@ pub(super) fn is_proven_normal<B: Budget>(text: &str, budget: &mut B) -> Bounded
 /// text and the payload bytes, at most `input` of each (every text has a
 /// head byte), nothing allocated or retained.
 pub const fn quick_validation_bound(input: u64) -> ResourceBound {
-    const { assert!(QUICK.values() == 1) };
+    const {
+        assert!(QUICK.values() == 1);
+    }
     ResourceBound::of_work(WriteWork::new(input, input))
 }
+
+/// Kani harness of strict validation's bound (register item 4): compiled
+/// only by `cargo kani`.
+#[cfg(kani)]
+mod proofs;
 
 #[cfg(test)]
 mod tests {

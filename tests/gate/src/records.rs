@@ -163,7 +163,8 @@ mod tests {
     /// and a record with no row are each refused as what they are.
     #[test]
     fn only_a_measured_record_of_this_configuration_is_current() {
-        let record = dcbor_record::render("this", ["4\t2\tmeasured\tpublished\ta values"]);
+        let record =
+            dcbor_record::render("this", ["4\t2\tmeasured\tobserved\tpublished\ta values"]);
         assert_eq!(current(&record, "this"), Ok(()));
         assert_eq!(current("", "this"), Err(Fault::Missing));
         assert_eq!(current("4\t2\n", "this"), Err(Fault::NotARecord));

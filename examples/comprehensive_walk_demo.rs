@@ -5,25 +5,25 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     println!("=== DCBOR Walk Module Demonstration ===\n");
 
     // Create a complex nested CBOR structure
     let mut person = Map::new();
-    person.insert("name", "Alice Smith");
-    person.insert("age", 30);
-    person.insert("email", "alice@example.com");
+    person.insert("name", "Alice Smith")?;
+    person.insert("age", 30)?;
+    person.insert("email", "alice@example.com")?;
 
     let mut address = Map::new();
-    address.insert("street", "123 Main St");
-    address.insert("city", "San Francisco");
-    address.insert("zip", 94102);
-    person.insert("address", address);
+    address.insert("street", "123 Main St")?;
+    address.insert("city", "San Francisco")?;
+    address.insert("zip", 94102)?;
+    person.insert("address", address)?;
 
     let mut profile = Map::new();
-    profile.insert("skills", vec!["Rust", "CBOR", "Cryptography"]);
-    profile.insert("years_experience", 5);
-    person.insert("profile", profile);
+    profile.insert("skills", vec!["Rust", "CBOR", "Cryptography"])?;
+    profile.insert("years_experience", 5)?;
+    person.insert("profile", profile)?;
 
     let cbor = CBOR::from(person);
 
@@ -218,4 +218,5 @@ fn main() {
     println!("  ❌ OLD: Complex state tracking for map traversal");
     println!();
     println!("🏗️  Suitable for dcbor-pattern crate: ✅");
+    Ok(())
 }

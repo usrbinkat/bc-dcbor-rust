@@ -6,7 +6,7 @@
 //! Retirement is a wait-free push onto an intrusive multi-producer queue: one
 //! swap of the tail, then one store of the predecessor's link. Only the owner's
 //! `step` removes records, and a stepping flag admits one caller at a time.
-//! The borrowed [`Reclaimer`] erases its payload types, so it stays confined to
+//! The borrowed `Reclaimer` erases its payload types, so it stays confined to
 //! one thread; the owned scope re-exposes the same queue across threads only for
 //! payloads its allocation path has proven `Send`.
 use core::marker::{PhantomData, PhantomPinned};
@@ -17,7 +17,10 @@ use super::operation::OperationPlace;
 use super::stable::{self, Held};
 use crate::bounded::ResourceBound;
 use crate::bounded::boundary::{Predicate, boundary};
-use crate::bounded::{Allocator, BoundedError, BoundedResult, at};
+use crate::bounded::{
+    Allocator, BoundedError, BoundedResult, Caller, CustodySink, Identity, PermitsObserved,
+    RecordStage, Releasing, Unit, at, observed_all,
+};
 use crate::sync::{
     AtomicBool, AtomicPtr, AtomicUsize, Atomics, Ordered, Ordering, Plain, Representation, Shipped,
 };
@@ -50,9 +53,264 @@ pub enum Reclaimed {
     Done,
 }
 
+/// The capability every cleanup step receives ([`Reclaim::reclaim_step`]):
+/// the policy the cleanup runs under, as a [`Releasing`] budget only. Through
+/// it a cleanup step admits work, observes, settles and names permits; no
+/// new allocation can be requested through it, because it implements no
+/// [`Allocator`], exposes no field, and has no method, `Deref` or `AsMut`
+/// returning the policy it wraps.
+///
+/// The enforcement is this wrapper, not a generic bound: a concrete policy
+/// that is [`Releasing`] may also be an [`Allocator`], so a step generic over
+/// `A: Releasing` alone could still be handed one; a step given a `Cleanup`
+/// cannot reach it. What a step allocates by other means (the global
+/// allocator, an allocator it owns) is outside this capability: the
+/// physical-allocation checks of the verification layer and the trusted
+/// domain's contract govern it.
+///
+/// Minted by the engine alone (its constructor is crate-private), where it
+/// dispatches cleanup: a record's advance, an operation's or a standalone
+/// driver's cleanup step. Callers outside the crate never hold one; every
+/// public stepping entry takes the policy and mints it.
+///
+/// Each property is a compile-fail fixture of its own, with its planted
+/// control (`dcbor-derive/tests/ui/fail`): no allocation requested through
+/// it (`cleanup_allocate.rs`, E0599), no dereference to the policy
+/// (`cleanup_deref.rs`, E0614), and no access to its field
+/// (`cleanup_field.rs`, E0616).
+pub struct Cleanup<'a, A: Allocator> {
+    policy: &'a mut A,
+    /// The scope references this step released inside cleanup, deferred
+    /// rather than released in place ([`owned::Worklist`]): the minting
+    /// frame's combinator processes them once the step returns
+    /// ([`with_cleanup`]), or the queue's step hands them to its caller.
+    worklist: owned::Worklist<A>,
+    /// The dispatch level this step is at against its root's declaration
+    /// ([`Depth`]): fresh at every mint, so each root, and each record a
+    /// drain steps, starts at level zero.
+    depth: Depth,
+}
+
+// The build's threads' own locals ([`crate::sync::thread_local`]), as the
+// nesting hooks' (`owned`): a model thread's dispatch level is its own.
+#[cfg(all(test, feature = "std"))]
+crate::sync::thread_local! {
+    /// The deepest dispatch level entered on this thread since the last
+    /// [`deepest_reached`]: the measurement the declaration census reads.
+    /// Test builds only; no shipped code keeps it.
+    static DEEPEST: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The deepest dispatch level `run` enters on this thread, construction and
+/// cleanup alike ([`Depth::descend`]): the census's measurement of a
+/// binding's dispatch against its declaration.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn deepest_reached(run: impl FnOnce()) -> usize {
+    DEEPEST.with(|deepest| deepest.set(0));
+    run();
+    DEEPEST.with(core::cell::Cell::get)
+}
+
+/// The run-time check of dispatch depth, one definition for construction
+/// ([`super::Context`]) and cleanup ([`Cleanup`]): the level a dispatch is
+/// at, against the dispatch depth its root declared ([`Reclaim::DISPATCH_DEPTH`],
+/// at most [`MAX_DISPATCH_DEPTH`] by [`admitted_depth`]). Every engine
+/// dispatch into a binding or a record (a root's session entry, a part's
+/// entry, a record's advance) descends one level first and is refused
+/// [`BoundedError::PlanMismatch`], nothing changed, past the declaration: a
+/// binding understating its depth is refused at the dispatch that exceeds
+/// it, never recursing unbounded. The root session's own frame is a
+/// constant one per root and is not a level. In cleanup the level lives in
+/// the one capability every dispatch of a step shares, so each dispatch
+/// restores it on return ([`Cleanup::descend`]); in construction each part's
+/// context carries a copy ([`super::Context::part`]), so a sibling never
+/// sees another's level and there is nothing to restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Depth {
+    at: usize,
+    /// The root's declaration, taken at its first dispatch; `None` before.
+    declared: Option<usize>,
+}
+
+impl Depth {
+    /// No level entered and no root declared.
+    pub(crate) const fn fresh() -> Self {
+        Self {
+            at: 0,
+            declared: None,
+        }
+    }
+
+    /// Take `declared`, the root's dispatch depth, unless a root already
+    /// declared one: a nested record reached through its parent continues
+    /// the parent's declaration, which contains its own.
+    pub(crate) fn declare(&mut self, declared: usize) {
+        if self.declared.is_none() {
+            self.declared = Some(declared);
+        }
+    }
+
+    /// Enter one dispatch level, refused past the declaration (or with
+    /// none taken), the level unchanged.
+    pub(crate) fn descend<R>(&mut self) -> Result<(), BoundedError<R>> {
+        let at = self.at.checked_add(1).ok_or(BoundedError::Overflow)?;
+        match self.declared {
+            Some(declared) if at <= declared => {
+                self.at = at;
+                #[cfg(all(test, feature = "std"))]
+                DEEPEST.with(|deepest| deepest.set(deepest.get().max(at)));
+                Ok(())
+            }
+            _ => Err(BoundedError::PlanMismatch),
+        }
+    }
+
+    /// Leave the level [`Self::descend`] entered.
+    fn ascend(&mut self) {
+        self.at -= 1;
+    }
+}
+
+impl<'a, A: Allocator> Cleanup<'a, A> {
+    /// Run `dispatch` one dispatch level deeper ([`Depth::descend`]),
+    /// refused before it runs past the root's declaration; the level is
+    /// restored on its return.
+    pub(crate) fn descend<R>(
+        &mut self,
+        dispatch: impl FnOnce(&mut Self) -> BoundedResult<R, A>,
+    ) -> BoundedResult<R, A> {
+        self.depth.descend()?;
+        let result = dispatch(self);
+        self.depth.ascend();
+        result
+    }
+
+    /// Take the root's declared dispatch depth ([`Depth::declare`]).
+    pub(crate) fn declare(&mut self, declared: usize) {
+        self.depth.declare(declared);
+    }
+    /// The capability over `policy`, minted where the engine dispatches
+    /// cleanup, with an empty worklist. Every minting site hands the
+    /// worklist on: the outermost frames through [`with_cleanup`], the
+    /// queue's step into its caller's list ([`Reclaimer::step`]).
+    pub(crate) fn new(policy: &'a mut A) -> Self {
+        Self {
+            policy,
+            worklist: owned::Worklist::new(),
+            depth: Depth::fresh(),
+        }
+    }
+
+    /// The worklist the step's deferred scope references go to: every
+    /// release of a scope reference inside cleanup defers into it
+    /// ([`owned::ScopeRef`]).
+    pub(crate) fn worklist(&mut self) -> &mut owned::Worklist<A> {
+        &mut self.worklist
+    }
+}
+
+/// Run `step` under a cleanup capability minted over `policy`, then perform
+/// every scope release the step deferred ([`owned::with_worklist`]): the one
+/// wrapper every outermost cleanup dispatch mints through: a handle's public
+/// step, a standalone driver's, an operation's, the scope authority's.
+pub(crate) fn with_cleanup<A: Allocator, R>(
+    policy: &mut A,
+    step: impl FnOnce(&mut Cleanup<'_, A>) -> R,
+) -> R {
+    owned::with_worklist(|worklist| {
+        let mut cleanup = Cleanup::new(policy);
+        let result = step(&mut cleanup);
+        worklist.append(&mut cleanup.worklist);
+        result
+    })
+}
+
+impl<A: Allocator> crate::bounded::Budget for Cleanup<'_, A> {
+    type Refusal = A::Refusal;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "forwards an admission already made through the route"
+    )]
+    fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+        self.policy.traverse(values, bytes)
+    }
+
+    fn boundary(&mut self, boundary: crate::bounded::boundary::Boundary) {
+        self.policy.boundary(boundary)
+    }
+
+    type Origin = A::Origin;
+
+    fn origin(&self) -> Self::Origin {
+        self.policy.origin()
+    }
+
+    fn admitted(&mut self, work: crate::bounded::WriteWork) {
+        self.policy.admitted(work)
+    }
+
+    fn identify(&mut self) -> Result<Identity, Self::Refusal> {
+        self.policy.identify()
+    }
+
+    fn held(&mut self, work: crate::bounded::WriteWork, hold: crate::bounded::Hold) {
+        self.policy.held(work, hold)
+    }
+
+    fn effect(&mut self, effect: crate::bounded::Effect) {
+        self.policy.effect(effect)
+    }
+
+    fn owner(&mut self) -> Result<crate::bounded::Owner, Self::Refusal> {
+        self.policy.owner()
+    }
+
+    fn acquisition(
+        &mut self,
+        owner: &crate::bounded::Owner,
+    ) -> Result<crate::bounded::Acquisition<Self::Origin>, Self::Refusal> {
+        self.policy.acquisition(owner)
+    }
+
+    fn validate_owner(&mut self, owner: &crate::bounded::Owner) -> Result<(), Self::Refusal> {
+        self.policy.validate_owner(owner)
+    }
+
+    fn performer(&self) -> crate::bounded::Performer {
+        self.policy.performer()
+    }
+}
+
+impl<A: Allocator> Releasing for Cleanup<'_, A> {
+    type Permit = A::Permit;
+
+    fn permit_identity(permit: &Self::Permit) -> Identity {
+        A::permit_identity(permit)
+    }
+
+    fn custody(permit: &Self::Permit, owner: Identity, stage: RecordStage) {
+        A::custody(permit, owner, stage)
+    }
+}
+
 /// Maximum declared synchronous dispatch depth of an admitted stable record.
 /// This is independent of input depth and checked before allocating the record.
 pub const MAX_DISPATCH_DEPTH: usize = 64;
+
+/// The one static check of a root's declared dispatch depth: evaluated in a
+/// `const` block at every place a root is admitted, a scope record's
+/// allocation ([`Reclaimer::allocate`]) and the standalone driver's
+/// creation (`Standalone::new`), so a root declaring more than
+/// [`MAX_DISPATCH_DEPTH`] fails to compile (E0080) where it is used, before
+/// any work could be admitted for it. The run-time check of each dispatch
+/// against the declaration is beside it (`Depth`).
+pub(crate) const fn admitted_depth<T: Reclaim<A>, A: Allocator>() {
+    assert!(
+        T::DISPATCH_DEPTH <= MAX_DISPATCH_DEPTH,
+        "a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH"
+    );
+}
 
 /// The custody a construction state holds, observed: a projection of the
 /// one typed state that construction and cleanup themselves read and
@@ -160,36 +418,83 @@ impl Uniform for Written {
 }
 
 /// The state of a record an operation initializes in a fixed number of
-/// units: how many units of its resource-free prefix are initialized. A
-/// count, not an authority, so it may be copied; only the crate advances it.
+/// units: how many units of its resource-free prefix are initialized, or
+/// released, the terminal state its incomplete prefix's cleanup leaves. A
+/// value, not an authority, so it may be copied; only the crate advances or
+/// releases it.
+///
+/// Released is not the initial state, though neither holds an initialized
+/// unit: from it cleanup reports `Done` admitting nothing, the count is the
+/// one call that reports it, and initialization is refused, as a session's
+/// `Released` refuses every later build (`in_place::Session`). Without it a
+/// released prefix would read as an unstarted one, whose first cleanup unit
+/// admits the record's release again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Prefix {
-    initialized: usize,
+    state: PrefixState,
 }
+
+/// What a [`Prefix`] records: its initialized units, held as their count
+/// plus one so the count's zero is the niche `Released` occupies, or its
+/// release. The state is then one word, as the bare count it replaced: every
+/// record's block, and so every bound and recorded figure over it, is
+/// unchanged by the released state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PrefixState {
+    Initialized(core::num::NonZeroUsize),
+    Released,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<Prefix>() == core::mem::size_of::<usize>(),
+    "a prefix's released state widens every prefix record"
+);
 
 impl Prefix {
     /// No unit initialized.
-    pub const EMPTY: Self = Self { initialized: 0 };
+    pub const EMPTY: Self = Self {
+        state: PrefixState::Initialized(core::num::NonZeroUsize::MIN),
+    };
 
-    /// The initialized units.
+    /// The initialized units: none once released.
     pub const fn initialized(&self) -> usize {
-        self.initialized
+        match self.state {
+            PrefixState::Initialized(units) => units.get() - 1,
+            PrefixState::Released => 0,
+        }
     }
 
-    /// Record the next unit as initialized.
+    /// Whether the record's cleanup released it: terminal.
+    pub const fn released(&self) -> bool {
+        matches!(self.state, PrefixState::Released)
+    }
+
+    /// Record the next unit as initialized. Initialization refuses a
+    /// released prefix before it writes, so this is never reached on one.
     pub(crate) fn advance(&mut self) {
-        self.initialized += 1;
+        self.set(self.initialized() + 1);
     }
 
     /// Record exactly `units` as initialized, for a prefix whose nested part
-    /// counts its own units.
+    /// counts its own units: at most its task's `INIT_STEPS`, which every
+    /// initialization checks before it writes, so the count plus one fits.
     pub(crate) fn set(&mut self, units: usize) {
-        self.initialized = units;
+        match core::num::NonZeroUsize::MIN.checked_add(units) {
+            Some(stored) => self.state = PrefixState::Initialized(stored),
+            None => unreachable!("a prefix's units are bounded by its INIT_STEPS"),
+        }
+    }
+
+    /// Record the record released: its incomplete prefix's cleanup released
+    /// every unit it wrote.
+    pub(crate) fn release(&mut self) {
+        self.state = PrefixState::Released;
     }
 }
 
-/// The initialized units: each is a distinct field written, and cleanup
-/// releases what the first holds, so the count is the whole custody.
+/// The initialized units, or the release: each unit is a distinct field
+/// written, and cleanup releases what the first holds, so the count, or the
+/// release that ended it, is the whole custody.
 impl Custody for Prefix {
     type Observation = Self;
 
@@ -198,7 +503,8 @@ impl Custody for Prefix {
     }
 }
 
-// The count is the custody and fixes the cleanup that follows: identity.
+// The count, or the release, is the custody and fixes the cleanup that
+// follows: identity.
 impl Reduction for Prefix {
     type Class = Self;
 
@@ -219,7 +525,7 @@ pub enum Build {}
 /// ([`Reclaim::remaining`]) and an operation's detail receive: shared reads
 /// and projection of the value, no write to it and no exclusive access to
 /// any of its bytes. The one exclusive access it keeps is to a record's own
-/// custody ([`Place::custody`]): a phase, a handle, a child's construction
+/// custody (`Place::custody`): a phase, a handle, a child's construction
 /// state, which no reader of a published value borrows and no place lies
 /// within.
 pub enum Observe {}
@@ -582,6 +888,13 @@ impl<'c, T, S: ?Sized, M: Mode> Slot<'c, T, S, M> {
         }
     }
 
+    /// The address of the slot's place: what a construction's record of the
+    /// value there names ([`super::in_place::Assembly`]). An address, never
+    /// a pointer to dereference.
+    pub(crate) fn address(&self) -> usize {
+        self.place.place.as_ptr().addr()
+    }
+
     /// The custody: plain state, which its own type keeps consistent.
     pub fn custody(&mut self) -> &mut S {
         self.custody
@@ -627,7 +940,7 @@ impl<'c, T, S: ?Sized, M: Mode> Slot<'c, T, S, M> {
 /// whole life: it starts as [`Self::INITIAL`], is threaded through every
 /// construction and cleanup step, and is never copied by the engine. A state
 /// that holds an allocation holds it as a typed handle
-/// ([`stable::Installed`]), never as an integer: the handle exists exactly
+/// (`stable::Installed`), never as an integer: the handle exists exactly
 /// while its block is live and owned by this state, so a state that names a
 /// block always names one it may access and must release.
 ///
@@ -635,22 +948,41 @@ impl<'c, T, S: ?Sized, M: Mode> Slot<'c, T, S, M> {
 /// this state together, so a caller holding one has nothing to promise.
 ///
 /// # Safety
-/// [`Self::INITIAL`] must mean "nothing initialized, nothing acquired". The
-/// state must record exactly what construction initialized and acquired, on
-/// every return. Every unit must be admitted before work; refusal must
-/// preserve that unit's state. Cleanup must not allocate, unwind, recursively
-/// destroy a value, or invoke an arbitrary user destructor. `Done` promises
-/// that no initialized subobject or owned child allocation remains and that
-/// releasing the outer allocation without `Drop` is sound. Every method is
-/// sound for every call a slot's holder can make, in any order: a cleanup
-/// step after `Done` reports `Done` and touches nothing, and a count at any
-/// point reads only the state and what it records as initialized.
+/// An implementation keeps eight obligations, and the `// SAFETY:` comment
+/// on it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *initial*: [`Self::INITIAL`] means nothing initialized, nothing
+///   acquired.
+/// - *state*: the state records exactly what construction initialized and
+///   acquired, on every return.
+/// - *admission*: every unit is admitted before its work; a refusal
+///   preserves that unit's state.
+/// - *cleanup*: cleanup does not allocate, unwind, recursively destroy a
+///   value, or invoke an arbitrary user destructor.
+/// - *done*: `Done` means no initialized subobject or owned child allocation
+///   remains, so releasing the outer allocation without `Drop` is sound.
+/// - *order*: every method is sound for every call a slot's holder can make,
+///   in any order: a cleanup step after `Done` reports `Done` and touches
+///   nothing, and a count at any point reads only the state and what it
+///   records as initialized.
+/// - *depth*: [`Self::DISPATCH_DEPTH`] is not understated.
+/// - *count*: [`Self::remaining`] is not understated.
 pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// Upper bound on nested construction/reclamation dispatch, including self.
     /// Implementations delegating to children must add their own fixed dispatch
     /// overhead to the maximum child's bound, using saturating arithmetic.
     /// The default is valid only for leaf bindings with no child dispatch.
     /// Understating this bound violates the unsafe implementation contract.
+    /// A root past [`MAX_DISPATCH_DEPTH`] fails to compile ([`admitted_depth`]);
+    /// an understated declaration is refused at run time at the dispatch
+    /// that exceeds it (`Depth`): construction is refused
+    /// [`BoundedError::PlanMismatch`], nothing changed; a stepped cleanup is
+    /// refused the same on every call, the record retained and still
+    /// reported by its custody observation, never reclaimed; a terminal
+    /// drain meeting it aborts, as it does on every error. Neither is
+    /// reclamation: the declaration bounds dispatch only for a binding that
+    /// keeps this contract.
     const DISPATCH_DEPTH: usize = 1;
 
     /// The progress construction and cleanup retain across suspension, and
@@ -663,18 +995,21 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
 
     /// One unit of cleanup of the value in `slot`: its place and the state
     /// that describes its initialized parts. No references into those parts
-    /// remain live while the slot is held.
+    /// remain live while the slot is held. It runs under `cleanup`, the
+    /// engine's cleanup capability ([`Cleanup`]), through which no new
+    /// allocation can be requested.
     fn reclaim_step(
         slot: Slot<'_, Self, Self::State>,
-        allocator: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A>;
 
     /// The most successful [`Self::reclaim_step`] calls cleanup from `state`
     /// can take, the one that returns `Done` included: at least one. A refused
     /// call is not counted; it changes nothing and is repeated. Read under the
     /// state's exclusive custody, admitting nothing and changing nothing, like
-    /// an observation ([`Custody`]); arithmetic saturates, a saturated count
-    /// still bounding the cleanup. The scope holds every queued record to the
+    /// an observation ([`Custody`]); arithmetic is checked: `None` when the
+    /// count does not fit in `u64`, never a saturated count, which a reader
+    /// refuses as [`BoundedError::Overflow`]. The scope holds every queued record to the
     /// count its state declares when its cleanup begins, so a drain, stepped
     /// or terminal, is finite: a record that would take more calls is a
     /// defect. Overstating is sound; understating violates this trait's
@@ -684,9 +1019,31 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// published value is by a preparation traversing it, so the count
     /// reads it only through its slot observed ([`PeekSlot`]), whose place
     /// cannot write the value or reborrow any of its bytes exclusively; it
-    /// reaches exclusively only a record's own custody ([`Place::custody`]),
+    /// reaches exclusively only a record's own custody (`Place::custody`),
     /// which no reader borrows, through the slot's custody.
-    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64;
+    fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> Option<u64>;
+
+    /// Each permit the value's state owns, reported once to `sink`
+    /// ([`CustodySink::permit`]): its installed metadata blocks, its payload
+    /// allocations, its child records' blocks, and every live child's own.
+    /// A binding opens no group of its own: the root holding it brackets
+    /// these permits in its owner's group, since every acquisition a binding
+    /// makes is bound under that root's pending ([`stable::Pending`]). A
+    /// binding holds no obligation (its credit is the root pending's) and
+    /// reports none; a state that holds an independently owning custody of
+    /// its own (an arena with its own pending) reports that custody as a
+    /// nested group of its own owner. Read as [`Self::remaining`] is,
+    /// through the slot observed, admitting, allocating, publishing and
+    /// releasing nothing; a permit is named, never moved. A permit the
+    /// operation's own record or a parent holds is that holder's to report.
+    /// A value that owns no permit reports nothing. Returns the completeness
+    /// of every nested custody reported (an arena's, a queue's), combined
+    /// ([`crate::bounded::observed_all`]); a value reporting none is
+    /// `Complete`.
+    fn observe_permits(
+        slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved;
 }
 
 /// One cleanup unit of the record inside `slot`'s handle: `unwrap` takes the
@@ -695,28 +1052,46 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
 /// cleanup is this one routine over its own record type.
 pub(crate) fn reclaim_within<W, R, A: Allocator>(
     slot: &mut Option<W>,
-    a: &mut A,
+    cleanup: &mut Cleanup<'_, A>,
     unwrap: impl FnOnce(W) -> R,
     wrap: impl FnOnce(R) -> W,
-    reclaim: impl FnOnce(&mut Option<R>, &mut A) -> BoundedResult<Reclaimed, A>,
+    reclaim: impl FnOnce(&mut Option<R>, &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let mut record = slot.take().map(unwrap);
-    let result = reclaim(&mut record, a);
+    let result = reclaim(&mut record, cleanup);
     *slot = record.map(wrap);
     result
 }
 
-type Advance<A> = unsafe fn(NonNull<Header<A>>, &mut A) -> BoundedResult<Reclaimed, A>;
-type Finish<A> = unsafe fn(NonNull<Header<A>>, Ending) -> u64;
+type Advance<A> = unsafe fn(NonNull<Header<A>>, &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A>;
+type Finish<A> =
+    for<'v> unsafe fn(NonNull<Header<A>>, Ending<'v, <A as Releasing>::Permit>) -> Option<u64>;
 
 /// What a record's [`Finish`] entry does: report the cleanup calls its state
-/// declares ([`Reclaim::remaining`]), or free the block of a record whose
-/// cleanup is done. One entry for both keeps the header within the bytes a
-/// record's metadata may write in one unit.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Ending {
+/// declares ([`Reclaim::remaining`]); publish its cleanup's completion
+/// ([`RecordStage::Reclaimed`]) and free the block of a record whose cleanup
+/// is done; report the permits the record owns, its block's and its
+/// payload's ([`Reclaim::observe_permits`]), to the sink, inside the group
+/// its caller opened, and store the report's completeness in the second
+/// field; or publish the record's entry into a holder's stage through its
+/// block's permit ([`Releasing::custody`]), which a type-erased holder (the
+/// queue) cannot name. One entry for all four keeps the header within the
+/// bytes a record's metadata may write in one unit.
+enum Ending<'v, P> {
     Count,
     Free,
+    Permits(&'v mut dyn CustodySink<P>, &'v mut PermitsObserved),
+    Custody(RecordStage),
+}
+
+/// The record stage of a record held by `holder` ([`Holder`]): the one
+/// mapping every report and publication of a record's holder reads.
+const fn stage_of(holder: Holder) -> RecordStage {
+    match holder {
+        Holder::Handle => RecordStage::Handle,
+        Holder::Queued => RecordStage::Queued,
+        Holder::Active => RecordStage::Active,
+    }
 }
 
 /// Who holds a record's block: its handle, the queue, or the stepping
@@ -761,14 +1136,28 @@ struct Head<T: Reclaim<A>, A: Allocator, S: Atomics = Shipped> {
 
 /// A record's metadata and payload. The head is first, its header first in
 /// it, and `Held` places its value first, so a header pointer is a block
-/// pointer.
+/// pointer. Between the head and the payload, the identity of the owner of
+/// the acquisition that allocated the record: observational identity, the
+/// key its custody is reported under through every holder (the operation,
+/// the published handle, the queue), never an owner capability and never
+/// settlement authority. Written once, by an admitted unit of its own
+/// ([`OWNER`]) that is the acquisition's second stage, before any handle to
+/// the record exists ([`owned::Acquisition`]); never written again.
 #[repr(C)]
-struct Entry<T: Reclaim<A>, A: Allocator, S: Atomics = Shipped> {
+pub(crate) struct Entry<T: Reclaim<A>, A: Allocator, S: Atomics = Shipped> {
     head: Head<T, A, S>,
+    owner: MaybeUninit<Identity>,
     value: MaybeUninit<T>,
 }
 
-type Block<T, A, S = Shipped> = Held<Entry<T, A, S>, <A as Allocator>::Permit>;
+/// A record's owner stage: its owner's identity written in one admitted unit
+/// of its own bytes, after the head's unit and within the same acquisition.
+/// The head's unit cannot carry it: a record's head is its header (32 bytes
+/// in the production representation) and its payload's state beside a
+/// 16-byte permit, already a quantum for a two-word state.
+const OWNER: Unit<Caller> = Unit::written::<Identity>(Caller);
+
+type Block<T, A, S = Shipped> = Held<Entry<T, A, S>, <A as Releasing>::Permit>;
 
 impl<T: Reclaim<A>, A: Allocator, S: Atomics> Representation for Head<T, A, S> {
     type In<F: Atomics> = Head<T, A, F>;
@@ -789,22 +1178,28 @@ const fn contract<T: Reclaim<A>, A: Allocator>()
     stable::Contract::of()
 }
 
-/// What allocating one record holding a `T` admits and requests: the unit
-/// of its write, and its whole block ([`contract`]).
+/// What allocating one record holding a `T` admits and requests: its two
+/// units, the head's write ([`contract`]) and the owner stage's
+/// ([`OWNER`]), and its whole block.
 pub(crate) const fn record_cost<T: Reclaim<A>, A: Allocator>() -> (ResourceBound, usize) {
     let contract = contract::<T, A>();
-    (contract.write(), contract.block())
+    let written = match contract.write().checked_add(OWNER.bound()) {
+        Some(written) => written,
+        None => panic!("a record's two acquisition units overflow u64"),
+    };
+    (written, contract.block())
 }
 
-/// The production representation's record write and block, read directly
-/// from `Core`'s types and not through [`contract`]: the oracle the I3
-/// witness (`crate::sync::models`) holds what a record admits to in every
-/// build.
+/// The production representation's record head write, owner write and
+/// block, read directly from `Core`'s types and not through [`contract`] or
+/// [`OWNER`]: the oracle the I3 witness (`crate::sync::models`) holds what a
+/// record admits to in every build.
 #[cfg(test)]
-pub(crate) fn production_record<T: Reclaim<A>, A: Allocator>() -> (usize, usize) {
+pub(crate) fn production_record<T: Reclaim<A>, A: Allocator>() -> (usize, usize, usize) {
     use crate::sync::Core;
     (
         core::mem::size_of::<Head<T, A, Core>>() + core::mem::size_of::<A::Permit>(),
+        core::mem::size_of::<Identity>(),
         core::mem::size_of::<Block<T, A, Core>>(),
     )
 }
@@ -875,10 +1270,15 @@ impl<A: Allocator> Reclaimer<A> {
         self.removal_admitted.load(Ordering::Relaxed)
     }
 
-    /// Allocate uninitialized stable storage and its embedded custody record,
-    /// its write and its release admitted first and kept in `admitted`. No
-    /// `T` is created or moved. A failed physical allocation releases its
-    /// reservation without registering a nonexistent block.
+    /// The head stage of a record's acquisition: uninitialized stable
+    /// storage and its embedded custody record, its write and its release
+    /// admitted first and held, with their origins, in `pending` for the
+    /// acquisition `holder` names, outside the record being acquired
+    /// ([`stable::acquire`]): the acquiring token's own custody, validated
+    /// against on every entry. No `T` is created or moved. A failed physical
+    /// allocation releases its reservation without registering a nonexistent
+    /// block. The granted block is the acquiring token's until its owner
+    /// stage ([`Self::own`]) makes it a record; no handle exists before.
     ///
     /// # Safety
     /// Every borrow in T must remain valid until this owner's final cleanup,
@@ -886,17 +1286,13 @@ impl<A: Allocator> Reclaimer<A> {
     pub(crate) unsafe fn allocate<T: Reclaim<A>>(
         &self,
         a: &mut A,
-        admitted: &mut stable::Admitted,
-    ) -> BoundedResult<Record<'_, T, A>, A> {
+        pending: &mut stable::Pending<A::Origin>,
+        holder: &mut Option<stable::Ticket>,
+    ) -> BoundedResult<NonNull<Block<T, A>>, A> {
         // A record's dispatch depth is fixed by its type: one beyond the
         // limit fails to compile where the record type is used, before any
         // work could be admitted for it.
-        const {
-            assert!(
-                T::DISPATCH_DEPTH <= MAX_DISPATCH_DEPTH,
-                "a record's declared dispatch depth exceeds MAX_DISPATCH_DEPTH"
-            )
-        };
+        const { admitted_depth::<T, A>() };
         // Below or at the limit, the valuation the record reaches; past it is
         // the compile-time refusal above (`dispatch_depth_beyond_limit`).
         boundary!(
@@ -912,7 +1308,8 @@ impl<A: Allocator> Reclaimer<A> {
         let block = unsafe {
             stable::acquire::<Entry<T, A>, Head<T, A>, A>(
                 const { contract::<T, A>() },
-                admitted,
+                pending,
+                holder,
                 || !self.is_closed(),
                 || Head {
                     header: Header {
@@ -932,11 +1329,63 @@ impl<A: Allocator> Reclaimer<A> {
         // Each outstanding block occupies a distinct live allocation, so the
         // count cannot exceed the number of addressable blocks.
         self.outstanding.fetch_add(1, Ordering::AcqRel);
+        // The block classified a record block, granted to the acquiring
+        // token's owner, once its initialization is complete: no ordinary
+        // permit is ever taken for it, so its release is checked as a
+        // record's ([`RecordStage::Granted`]). An acquisition is bound only
+        // under a made owner, so the pending names it.
+        // SAFETY: the block was just granted and initialized, and the caller
+        // holds it exclusively; its permit is only read.
+        A::custody(
+            unsafe { block.as_ref() }.permit(),
+            pending.owner_id().unwrap_or(Identity::UNOBSERVED),
+            RecordStage::Granted,
+        );
+        Ok(block)
+    }
+
+    /// The owner stage of a record's acquisition: `owner`, the identity the
+    /// acquiring token's pending stores, written into the granted `block` in
+    /// one admitted unit ([`OWNER`]), after which the block is a record and
+    /// its handle is returned. A refused unit writes nothing and leaves the
+    /// block the token's, for a retry of this stage alone.
+    ///
+    /// # Safety
+    /// `block` came from [`Self::allocate`] on this owner, its owner stage
+    /// not yet made, and the caller holds it exclusively.
+    pub(crate) unsafe fn own<T: Reclaim<A>>(
+        &self,
+        block: NonNull<Block<T, A>>,
+        owner: Identity,
+        a: &mut A,
+    ) -> BoundedResult<Record<'_, T, A>, A> {
+        OWNER.admit(a)?;
+        // SAFETY: forwarded from the caller: a live block of this entry type,
+        // its owner field unwritten, reached by field syntax; once written
+        // the block is a record, its handle's from here.
+        unsafe {
+            (*block.as_ptr()).value.owner.write(owner);
+            publish::<T, A>(block, RecordStage::Handle);
+        }
         Ok(Record {
             block,
             owner: self,
             marker: PhantomData,
         })
+    }
+
+    /// Release a block granted to an acquisition stopped before its owner
+    /// stage: freed without its owner, never written, being read, a release
+    /// its acquisition paid for, and no longer counted outstanding.
+    ///
+    /// # Safety
+    /// `block` came from [`Self::allocate`] on this owner, its owner stage
+    /// not made, the caller holds it exclusively and does not use it again.
+    /// Its payload state is the initial one: nothing initialized.
+    pub(crate) unsafe fn release_unowned<T: Reclaim<A>>(&self, block: NonNull<Block<T, A>>) {
+        // SAFETY: forwarded from the caller; an initial payload owns nothing.
+        unsafe { stable::free(block) };
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Wait-free retirement: the caller exclusively owns `header` until the
@@ -947,9 +1396,13 @@ impl<A: Allocator> Reclaimer<A> {
     unsafe fn enqueue(&self, header: NonNull<Header<A>>) {
         // SAFETY: the handle has exclusive custody; both writes precede the
         // releasing publication below.
+        // The queue's custody is published before the tail swap makes the
+        // record reachable by the stepping caller, through the block's own
+        // permit: retirement has no budget.
         unsafe {
             assert!((*header.as_ptr()).custody.get() == Holder::Handle);
             (*header.as_ptr()).custody.set(Holder::Queued);
+            ((*header.as_ptr()).finish)(header, Ending::Custody(RecordStage::Queued));
             (*header.as_ptr())
                 .next
                 .store(ptr::null_mut(), Ordering::Relaxed);
@@ -1020,7 +1473,14 @@ impl<A: Allocator> Reclaimer<A> {
     /// can advance until a handle retires, a retiring thread links its record,
     /// or the caller already stepping, on another thread, returns. One caller
     /// steps at a time; a concurrent caller performs and admits nothing.
-    pub(crate) fn step(&self, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    /// Every scope reference the record's cleanup releases is deferred into
+    /// `worklist`, the caller's, never released here: an inner frame, so a
+    /// drain of another scope never runs inside this one's step.
+    pub(crate) fn step(
+        &self,
+        a: &mut A,
+        worklist: &mut owned::Worklist<A>,
+    ) -> BoundedResult<Reclaimed, A> {
         if self.stepping.swap(true, Ordering::Acquire) {
             return Ok(Reclaimed::Waiting);
         }
@@ -1053,15 +1513,23 @@ impl<A: Allocator> Reclaimer<A> {
             self.removal_admitted.store(false, Ordering::Relaxed);
             // SAFETY: removal transferred exclusive custody to this caller,
             // and the declared count reads its state as an observation does.
+            // A count that does not fit in `u64` is a defect of the record's
+            // `Reclaim::remaining`, refused as an overflow; one beyond the
+            // header's `u32` budget is held at `u32::MAX`, an understatement
+            // only past four billion calls (register 29.63).
             unsafe {
                 assert!((*head.as_ptr()).custody.get() == Holder::Queued);
                 (*head.as_ptr()).custody.set(Holder::Active);
-                let declared = ((*head.as_ptr()).finish)(head, Ending::Count);
+                // The removal's exclusive custody, published before the step
+                // returns its progress.
+                ((*head.as_ptr()).finish)(head, Ending::Custody(RecordStage::Active));
+                self.active.store(head.as_ptr(), Ordering::Relaxed);
+                let declared =
+                    ((*head.as_ptr()).finish)(head, Ending::Count).ok_or(BoundedError::Overflow)?;
                 (*head.as_ptr())
                     .budget
                     .set(u32::try_from(declared).unwrap_or(u32::MAX));
             }
-            self.active.store(head.as_ptr(), Ordering::Relaxed);
             return Ok(Reclaimed::Progress);
         };
         // SAFETY: the active slot exclusively owns this block, and callbacks
@@ -1076,9 +1544,15 @@ impl<A: Allocator> Reclaimer<A> {
             if budget == 0 {
                 return Err(BoundedError::PlanMismatch);
             }
-            // The record's own cleanup is its operation's task's.
+            // The record's own cleanup is its operation's task's, under the
+            // cleanup capability the queue's dispatch mints over `a`.
             let advance = (*head.as_ptr()).advance;
-            let advanced = at(OperationPlace::Task, || advance(head, a))?;
+            let mut cleanup = Cleanup::new(a);
+            let advanced = at(OperationPlace::Task, || advance(head, &mut cleanup));
+            // Whatever the step deferred, refused or not, is the caller's
+            // to perform.
+            worklist.append(cleanup.worklist());
+            let advanced = advanced?;
             // A successful call spends one; a refused one changed nothing.
             (*head.as_ptr()).budget.set(budget - 1);
             if advanced != Reclaimed::Done {
@@ -1095,9 +1569,60 @@ impl<A: Allocator> Reclaimer<A> {
         })
     }
 
-    pub(crate) fn shutdown_step(&self, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    pub(crate) fn shutdown_step(
+        &self,
+        a: &mut A,
+        worklist: &mut owned::Worklist<A>,
+    ) -> BoundedResult<Reclaimed, A> {
         self.closed.store(true, Ordering::Release);
-        self.step(a)
+        self.step(a, worklist)
+    }
+
+    /// Report every record the queue owns, once each: the active record and
+    /// every queued record, each as a group of its own under the owner its
+    /// entry stores ([`Record::observe_custody`], through the record's own
+    /// dispatch), the owner of the acquisition that allocated it, never the
+    /// scope that queues it. Records still held by their handles are their
+    /// handles' to report. The queue is walked as a stepper walks it, under the stepping
+    /// flag, so no record is removed or freed meanwhile; `Contended`,
+    /// nothing reported, when another caller is stepping. A record a
+    /// retiring thread has published but not yet linked is not reached: the
+    /// observer reads at a point where no handle is retiring. Admits,
+    /// allocates and releases nothing.
+    pub(crate) fn observe_custody(&self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        if self.stepping.swap(true, Ordering::Acquire) {
+            return PermitsObserved::Contended;
+        }
+        struct Stepping<'a>(&'a AtomicBool);
+        impl Drop for Stepping<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _stepping = Stepping(&self.stepping);
+        let mut whole = PermitsObserved::Complete;
+        if let Some(active) = NonNull::new(self.active.load(Ordering::Relaxed)) {
+            let mut observed = PermitsObserved::Complete;
+            // SAFETY: the active slot owns this block exclusively, and the
+            // stepping flag held here excludes its cleanup meanwhile.
+            unsafe {
+                ((*active.as_ptr()).finish)(active, Ending::Permits(&mut *sink, &mut observed))
+            };
+            whole = observed_all([whole, observed]);
+        }
+        let mut next = self.head.load(Ordering::Acquire);
+        while let Some(queued) = NonNull::new(next) {
+            let mut observed = PermitsObserved::Complete;
+            // SAFETY: only the stepping caller removes and frees queued
+            // blocks, and this caller holds the stepping flag; the record's
+            // dispatch was installed for its own block.
+            unsafe {
+                ((*queued.as_ptr()).finish)(queued, Ending::Permits(&mut *sink, &mut observed));
+                next = (*queued.as_ptr()).next.load(Ordering::Acquire);
+            }
+            whole = observed_all([whole, observed]);
+        }
+        whole
     }
 }
 
@@ -1114,12 +1639,46 @@ pub(crate) struct Record<'r, T: Reclaim<A>, A: Allocator> {
 }
 
 impl<'r, T: Reclaim<A>, A: Allocator> Record<'r, T, A> {
+    /// The record `block` holds, as a group of its own under the owner its
+    /// entry stores ([`Entry`]): its block's permit and its payload's
+    /// custody ([`Reclaim::observe_permits`], whose independently owning
+    /// parts nest their own groups). The one record observation every
+    /// holder makes, its handle and the queue alike, so a record keeps one
+    /// owner association from its acquisition to its release. Returns the
+    /// payload's completeness.
+    ///
+    /// # Safety
+    /// The block is a record (its owner stage made, [`Reclaimer::own`]),
+    /// live, and the caller holds its custody (its handle, or the queue
+    /// under the stepping flag).
+    pub(crate) unsafe fn observe_custody(
+        block: NonNull<Block<T, A>>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        // SAFETY: forwarded from the caller: the owner is written before any
+        // holder of the record exists and never again; the permit is only
+        // read, and the payload is read through its slot observed.
+        unsafe {
+            sink.begin(Some((*block.as_ptr()).value.owner.assume_init()));
+            // Its block's permit under its actual holder's stage, read from
+            // the header the holder transitions write.
+            let holder = (*block.cast::<Header<A>>().as_ptr()).custody.get();
+            sink.permit(block.as_ref().permit(), Some(stage_of(holder)));
+            let observed = T::observe_permits(destination::<T, A>(block).into_observe(), sink);
+            sink.end();
+            observed
+        }
+    }
+
     /// Reclaim a still-owned record, preserving it on every refusal. This is
     /// the terminal-error path: completion means this record's storage and
     /// reservation were released, independent of other records in the owner.
+    /// Runs under `cleanup`, the capability of the cleanup that reaches the
+    /// record: a handle's public step mints it, a parent's cleanup passes its
+    /// own.
     pub(crate) fn reclaim_step(
         record: &mut Option<Self>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A> {
         let Some(current) = record.as_mut() else {
             return Ok(Reclaimed::Done);
@@ -1131,7 +1690,7 @@ impl<'r, T: Reclaim<A>, A: Allocator> Record<'r, T, A> {
             assert!((*header.as_ptr()).custody.get() == Holder::Handle);
             // The record's own cleanup is its operation's task's.
             let advance = (*header.as_ptr()).advance;
-            if at(OperationPlace::Task, || advance(header, a))? != Reclaimed::Done {
+            if at(OperationPlace::Task, || advance(header, cleanup))? != Reclaimed::Done {
                 return Ok(Reclaimed::Progress);
             }
             // The cleanup is complete: the block is freed in this same unit, a
@@ -1198,24 +1757,68 @@ impl<T: Reclaim<A>, A: Allocator> Drop for Record<'_, T, A> {
 
 unsafe fn advance<T: Reclaim<A>, A: Allocator>(
     header: NonNull<Header<A>>,
-    a: &mut A,
+    cleanup: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     // SAFETY: the vtable was installed for exactly this Block<T, A>, and the
     // caller has exclusive custody after the public handle was dropped.
     let slot = unsafe { destination::<T, A>(header.cast()) };
-    T::reclaim_step(slot, a)
+    // A record dispatched by a fresh capability (a queue step, a handle's
+    // public step) is its root and declares; one reached through a parent
+    // continues the parent's declaration.
+    cleanup.declare(T::DISPATCH_DEPTH);
+    cleanup.descend(|cleanup| T::reclaim_step(slot, cleanup))
 }
 
-unsafe fn finish<T: Reclaim<A>, A: Allocator>(header: NonNull<Header<A>>, ending: Ending) -> u64 {
+/// Publish that the record `block` entered `stage` under the owner its
+/// entry stores, through its block's permit's own family
+/// ([`Releasing::custody`]), whatever budget, or none, performs the step.
+///
+/// # Safety
+/// `block` is a live record (its owner stage made) in the caller's custody.
+unsafe fn publish<T: Reclaim<A>, A: Allocator>(block: NonNull<Block<T, A>>, stage: RecordStage) {
+    // SAFETY: forwarded from the caller: the owner is written before any
+    // holder exists and never again; the permit is only read.
+    unsafe {
+        A::custody(
+            block.as_ref().permit(),
+            (*block.as_ptr()).value.owner.assume_init(),
+            stage,
+        );
+    }
+}
+
+unsafe fn finish<T: Reclaim<A>, A: Allocator>(
+    header: NonNull<Header<A>>,
+    ending: Ending<'_, A::Permit>,
+) -> Option<u64> {
     match ending {
         // SAFETY: the vtable was installed for exactly this Block<T, A>, and
         // the caller has exclusive custody of the record.
         Ending::Count => T::remaining(unsafe { destination::<T, A>(header.cast()) }.into_observe()),
         Ending::Free => {
             // SAFETY: cleanup returned Done, so the payload owns nothing; the
-            // block's allocation admitted this release.
-            unsafe { stable::free(header.cast::<Block<T, A>>()) };
-            0
+            // block's allocation admitted this release. Its completion is
+            // published before the block is freed, so its permit's release
+            // follows it.
+            unsafe {
+                publish::<T, A>(header.cast::<Block<T, A>>(), RecordStage::Reclaimed);
+                stable::free(header.cast::<Block<T, A>>());
+            }
+            Some(0)
+        }
+        Ending::Custody(stage) => {
+            // SAFETY: the vtable was installed for exactly this Block<T, A>,
+            // a record, live and in the caller's exclusive custody.
+            unsafe { publish::<T, A>(header.cast::<Block<T, A>>(), stage) };
+            Some(0)
+        }
+        Ending::Permits(sink, observed) => {
+            // SAFETY: the vtable was installed for exactly this Block<T, A>,
+            // a record (only records are queued), live and in the caller's
+            // exclusive custody.
+            *observed =
+                unsafe { Record::<T, A>::observe_custody(header.cast::<Block<T, A>>(), sink) };
+            Some(0)
         }
     }
 }
@@ -1224,6 +1827,42 @@ unsafe fn finish<T: Reclaim<A>, A: Allocator>(header: NonNull<Header<A>>, ending
 mod tests {
     use super::*;
     use crate::bounded::Limits;
+
+    /// Successive siblings under one cleanup capability each enter the
+    /// level after their parent's, the parent's level restored after each
+    /// ([`Cleanup::descend`]): under a declaration of two, a parent level
+    /// then two sibling dispatches, both admitted, the level back at zero at
+    /// the end. Resource-free: no record, no scope, nothing to reclaim,
+    /// whatever the outcome. Planted control
+    /// `tests/data/controls/depth-not-restored.patch` (the level not
+    /// restored) refuses the second sibling, the assertion "the second
+    /// sibling was refused at its parent's level".
+    #[test]
+    fn successive_siblings_each_enter_the_level_after_their_parents() {
+        let mut policy = Limits::unlimited();
+        let mut cleanup = Cleanup::new(&mut policy);
+        cleanup.declare(2);
+        let (first, second) = cleanup
+            .descend(|cleanup| {
+                let first = cleanup.descend(|_| Ok(()));
+                let second = cleanup.descend(|_| Ok(()));
+                Ok((first, second))
+            })
+            .expect("the parent's level is within the declaration");
+        assert_eq!(first, Ok(()), "the first sibling was refused");
+        assert_eq!(
+            second,
+            Ok(()),
+            "the second sibling was refused at its parent's level"
+        );
+        assert_eq!(
+            cleanup.depth,
+            Depth {
+                at: 0,
+                declared: Some(2)
+            }
+        );
+    }
 
     /// A prefix's class is its count: two prefixes of one count are one
     /// class, of different counts two.
@@ -1238,6 +1877,17 @@ mod tests {
         assert_ne!(
             <Prefix as Reduction>::class(&one),
             <Prefix as Reduction>::class(&two)
+        );
+        // Released: no unit initialized, yet its own class, never the
+        // unstarted prefix's.
+        let mut released = two;
+        released.release();
+        assert!(released.released());
+        assert_eq!(released.initialized(), 0);
+        assert!(!Prefix::EMPTY.released());
+        assert_ne!(
+            <Prefix as Reduction>::class(&released),
+            <Prefix as Reduction>::class(&Prefix::EMPTY)
         );
     }
 
@@ -1258,15 +1908,17 @@ mod tests {
     }
 
     /// A record's cost evaluated at run time is the constant the scope
-    /// admits: its header and state written whole with the permit, and the
-    /// whole block, both the production representation's.
+    /// admits: its header and state written whole with the permit, then its
+    /// owner's identity in a unit of its own, and the whole block, each the
+    /// production representation's.
     #[test]
-    fn a_records_cost_at_run_time_is_its_write_and_its_block() {
+    fn a_records_cost_at_run_time_is_its_two_writes_and_its_block() {
         let (write, block) = record_cost::<u64, Limits>();
         assert_eq!((write, block), const { record_cost::<u64, Limits>() });
-        let (written, production) = production_record::<u64, Limits>();
-        assert_eq!(write.values, 1);
-        assert_eq!(write.bytes, written as u64);
+        let (head, owner, production) = production_record::<u64, Limits>();
+        assert_eq!(write.values, 2, "the head's unit and the owner's");
+        assert_eq!(write.bytes, (head + owner) as u64);
+        assert_eq!(OWNER.bound().bytes, owner as u64);
         assert_eq!(block, production);
     }
 

@@ -1,0 +1,14 @@
+--- src/decode.rs
++++ src/decode.rs
+@@ -217,7 +217,10 @@
+             _ => match value {
+                 20 => Ok((CBOR::r#false(), header_varint_len)),
+                 21 => Ok((CBOR::r#true(), header_varint_len)),
+-                22 => Ok((CBOR::null(), header_varint_len)),
++                // Planted: `undefined` (23) accepted as `null`. Must fail
++                // decode::proofs::a_scalar_item_is_accepted_exactly_in_the_profile,
++                // "a scalar item is accepted exactly when its value is in the dCBOR profile".
++                22 | 23 => Ok((CBOR::null(), header_varint_len)),
+                 _ => Err(Error::InvalidSimpleValue),
+             },
+         },

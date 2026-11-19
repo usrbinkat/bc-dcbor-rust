@@ -1,0 +1,12 @@
+--- src/bounded/decode/header.rs
++++ src/bounded/decode/header.rs
+@@ -128,7 +128,8 @@
+         let acquired = input.min(MAX_HEAD_LEN as u64);
+         Self {
+             acquisition: WriteWork::new(acquired, acquired),
+-            validation: WriteWork::new(1, acquired),
++            // Planted: the validation's bytes are not priced.
++            validation: WriteWork::new(1, 0),
+         }
+     }
+ }

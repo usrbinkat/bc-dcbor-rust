@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -214,6 +214,7 @@
+         }
+     }
+     release_reference(block, worklist);
++    release_reference(block, worklist);
+ }
+
+ impl<A: Allocator, S: Atomics> Representation for ScopeHead<A, S> {

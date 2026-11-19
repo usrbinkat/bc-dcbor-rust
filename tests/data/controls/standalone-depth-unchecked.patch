@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/standalone.rs
++++ src/bounded/decode/construction/standalone.rs
+@@ -53,7 +53,6 @@
+     /// (E0080), as a scope record's allocation does
+     /// ([`super::reclamation::admitted_depth`]).
+     pub fn new(document: &'d Document<'a, A::Permit>, value: &'v mut MaybeUninit<T>) -> Self {
+-        const { super::reclamation::admitted_depth::<T, A>() };
+         Self {
+             document,
+             // SAFETY: the destination is borrowed exclusively for `'v`, the

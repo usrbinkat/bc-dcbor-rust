@@ -1,80 +1,137 @@
 use dcbor::bounded::decode::construction::{
     Acquisition, DecodeOwner, TypedDecoder, TypedValue,
-    in_place::{Built, ConstructionCost, InPlace, unit},
-    reclamation::{Custody, PeekSlot, Reclaim, Reclaimed, Slot},
+    in_place::{BindingContext, Building, ConstructionCost, InPlace, admit, unit},
+    reclamation::{Cleanup, Custody, PeekSlot, Reclaim, Reclaimed, Slot},
 };
-use dcbor::bounded::decode::{ConstructResult, Document, Options};
-use dcbor::bounded::{Allocator, BoundedError, BoundedResult, Budget, Limits, Step};
-use dcbor_test_support::{self as support, Instrumented, acquire, drain, instrumented, scope};
+use dcbor::bounded::decode::{ConstructResult, Options};
+use dcbor::bounded::{
+    BoundedError, BoundedResult, CustodySink, Limits, PermitsObserved, Reservation,
+};
+use dcbor_test_support::{
+    self as support, CustodyBatch, Finding, Instrumented, Lent, Retirement, instrumented,
+    pipeline::Unwitnessed,
+};
 use std::sync::{Arc, atomic::AtomicUsize};
 
 #[cfg(feature = "custom-std-collections")]
 #[path = "owned_pipeline/tree_state.rs"]
 mod tree_state;
 
-fn meter() -> Limits {
-    Limits::unlimited().logged().strict()
-}
-
+/// One acquisition refused in the first of two scopes keeps its binding to
+/// that scope: the second refuses it as a plan mismatch. Once it acquires
+/// its record in the first, its token is reset, scope binding included, and
+/// it acquires in the second. Both scopes drain to nothing.
 #[test]
 fn refused_acquisition_cannot_move_admission_to_another_scope() {
-    let mut m = meter();
-    let mut first = scope(&mut m);
-    let mut second = scope(&mut m);
-    let mut acquisition = Acquisition::<Instrumented, Limits>::new();
-    m.clear_refusal();
-    m.exhaust();
-    let refused = matches!(
-        first.allocate_step(&mut m, &mut acquisition),
-        Err(BoundedError::Refused(_))
-    );
-    m.clear_refusal();
-    m.fresh();
-    let mismatch = matches!(
-        second.allocate_step(&mut m, &mut acquisition),
-        Err(BoundedError::PlanMismatch)
-    );
-    let record = acquire(&first, &mut m, &mut acquisition);
-    drop(record);
-    // Successful consumption resets the token, including its scope binding.
-    m.fresh();
-    let other = acquire(&second, &mut m, &mut acquisition);
-    drop(other);
-    drop(acquisition);
-    drain(&mut first, &mut m);
-    drain(&mut second, &mut m);
-    assert!(refused && mismatch);
-    assert_eq!(m.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let (refused, mismatch) = run.scoped(policy, &Unwitnessed, |first| {
+            first.lending(Retirement::Exhausted, Lent::new, |first| {
+                let first_scope = first.value().get();
+                first.holding(DecodeOwner::new(), Retirement::Scope, |second| {
+                    second.initialize(policy)?;
+                    let checked = second.lending(Retirement::Exhausted, Lent::new, |second| {
+                        let second_scope = second.value().get();
+                        second.holding(
+                            Acquisition::<Instrumented, Limits>::new(),
+                            Retirement::Stopped,
+                            |acquisition| {
+                                let checked = acquisition.with_policy(policy, |acquisition, m| {
+                                    m.clear_refusal();
+                                    m.exhaust();
+                                    let refused = matches!(
+                                        first_scope.allocate_step(m, acquisition),
+                                        Err(BoundedError::Refused(_))
+                                    );
+                                    m.clear_refusal();
+                                    m.fresh();
+                                    let mismatch = matches!(
+                                        second_scope.allocate_step(m, acquisition),
+                                        Err(BoundedError::PlanMismatch)
+                                    );
+                                    (refused, mismatch)
+                                });
+                                acquisition.acquire(policy, first_scope, |_| ())?;
+                                acquisition.with_policy(policy, |_, m| m.fresh());
+                                acquisition.acquire(policy, second_scope, |_| ())?;
+                                Ok::<_, Finding>(checked)
+                            },
+                        )
+                    })?;
+                    second.drain(policy)?;
+                    Ok::<_, Finding>(checked)
+                })
+            })
+        })?;
+        assert!(refused, "an exhausted acquisition was not refused");
+        assert!(mismatch, "a refused acquisition moved to another scope");
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
+/// A scope whose one record is live waits without spending work, and its
+/// shutdown closes admission while it waits: a later acquisition is refused
+/// as a plan mismatch. The record is held beside the scope, outside it, so
+/// the scope is stepped exclusively while the record lives; once the record
+/// retires the scope drains to nothing.
 #[test]
 fn live_record_waiting_spends_no_work_and_shutdown_closes_admission() {
-    let mut m = meter();
-    let mut owner = scope(&mut m);
-    m.fresh();
-    let record = acquire::<Instrumented>(&owner, &mut m, &mut Acquisition::new());
-    m.fresh();
-    let allowance = m.remaining();
-    let waiting = owner.step(&mut m);
-    let closing = owner.shutdown_step(&mut m);
-    let spent = m.remaining();
-    let rejected = matches!(
-        owner.allocate_step::<Instrumented>(&mut m, &mut Acquisition::new()),
-        Err(BoundedError::PlanMismatch)
-    );
-    drop(record);
-    drain(&mut owner, &mut m);
-    assert_eq!(waiting.unwrap(), Reclaimed::Waiting);
-    assert_eq!(closing.unwrap(), Reclaimed::Waiting);
-    assert_eq!(spent, allowance);
-    assert!(rejected);
-    assert_eq!(m.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let (waiting, closing, spent, rejected) = run.holding(
+            CustodyBatch::slots(1),
+            Retirement::Exhausted,
+            &Unwitnessed,
+            |records| {
+                records.lending(Retirement::Exhausted, Lent::new, |lent| {
+                    let records = lent.value().get();
+                    lent.holding(DecodeOwner::new(), Retirement::Scope, |owner| {
+                        owner.initialize(policy)?;
+                        owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                            let scope = view.value().get();
+                            view.holding(
+                                Acquisition::<Instrumented, Limits>::new(),
+                                Retirement::Stopped,
+                                |acquisition| {
+                                    acquisition.with_policy(policy, |_, m| m.fresh());
+                                    acquisition
+                                        .acquire(policy, scope, |record| record.deposit(records, 0))
+                                },
+                            )
+                        })?;
+                        let observed = owner.with_policy(policy, |owner, m| {
+                            m.fresh();
+                            let allowance = m.remaining();
+                            let waiting = owner.step(m);
+                            let closing = owner.shutdown_step(m);
+                            let spent = m.remaining() == allowance;
+                            let rejected = matches!(
+                                owner.allocate_step::<Instrumented>(m, &mut Acquisition::new()),
+                                Err(BoundedError::PlanMismatch)
+                            );
+                            (waiting, closing, spent, rejected)
+                        });
+                        owner.drawn(records, 0, Retirement::Published, |_| ());
+                        owner.drain(policy)?;
+                        Ok::<_, Finding>(observed)
+                    })
+                })
+            },
+        )?;
+        assert_eq!(waiting.unwrap(), Reclaimed::Waiting);
+        assert_eq!(closing.unwrap(), Reclaimed::Waiting);
+        assert!(spent, "a waiting scope spent work");
+        assert!(rejected, "a shut-down scope admitted an acquisition");
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 /// Decode an instrumented input, moving the whole consumer state between
-/// turns and cancelling at turn `cancel_at`. Returns the turns taken,
-/// whether the value was published, and the boundary valuations the run
-/// reached.
+/// turns and cancelling at turn `cancel_at`, as one recorded run. Returns
+/// the turns taken, whether the value was published, and the boundary
+/// valuations the run reached.
 fn run(cancel_at: Option<usize>) -> (usize, bool, dcbor::bounded::boundary::Reached) {
     let wire = [0x62, b'o', b'k'];
     // The decode within its own bound; a cancelled one also reclaims the
@@ -90,55 +147,68 @@ fn run(cancel_at: Option<usize>) -> (usize, bool, dcbor::bounded::boundary::Reac
             >(wire.len() as u64, Options::normalizing(8))
             .expect("the typed decode bound of an input held in memory fits in u64"),
         ) + 3;
-    let mut m = meter();
-    let mut owner = scope(&mut m);
-    let released = Arc::new(AtomicUsize::new(0));
-    let input = instrumented(&owner, &mut m, &wire, &released);
-    let mut decoder = TypedDecoder::<_, String, Limits>::new(input, Options::normalizing(8));
-    let mut finished = false;
-    let mut published = false;
-    let mut turns = 0;
-    for turn in 0..bound {
-        turns += 1;
-        // Transfer the entire ordinary consumer state between turns.
-        let moved = (owner, decoder);
-        (owner, decoder) = moved;
-        if cancel_at == Some(turn) {
-            decoder.cancel();
-        }
-        let step = match support::checked(&mut m, |m| support::contracted(m, &mut decoder)) {
-            Ok(step) => step,
-            Err(error) if support::ordinary_exhaustion(&m, &error) => continue,
-            Err(error) => panic!("{error:?}"),
-        };
-        match step {
-            Step::Progress => {}
-            Step::Complete(value) => {
-                support::exhausted(&mut m, &mut decoder);
-                let address = value.value() as *const String;
-                drop(decoder);
-                let moved = value;
-                assert_eq!(moved.value(), "ok");
-                assert_eq!(moved.value() as *const String, address);
-                assert_eq!(moved.bytes(), [0x62, b'o', b'k']);
-                drop(moved);
-                finished = true;
-                published = true;
-                break;
-            }
-            Step::Finished => {
-                support::exhausted(&mut m, &mut decoder);
-                drop(decoder);
-                finished = true;
-                break;
-            }
-        }
-    }
-    assert!(finished, "decode/cancellation did not finish");
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
-    assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
-    (turns, published, m.reached())
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut turns = 0;
+        let published = run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                let input =
+                    owner.with_policy(policy, |owner, m| instrumented(owner, m, &wire, &released));
+                let published = owner.holding(input, Retirement::Published, |input| {
+                    input.transfer(
+                        |input| {
+                            TypedDecoder::<_, String, Limits>::new(input, Options::normalizing(8))
+                        },
+                        Retirement::Stopped,
+                        |decoder| {
+                            let published = decoder.controlled(
+                                policy,
+                                bound,
+                                Retirement::Published,
+                                true,
+                                |_, _, turn| {
+                                    turns = turn + 1;
+                                    cancel_at == Some(turn)
+                                },
+                                |value| {
+                                    let address = value.value().value() as *const String;
+                                    value.transfer(
+                                        |value| value,
+                                        Retirement::Published,
+                                        |moved| {
+                                            assert_eq!(moved.value().value(), "ok");
+                                            assert_eq!(
+                                                moved.value().value() as *const String,
+                                                address
+                                            );
+                                            assert_eq!(moved.value().bytes(), wire);
+                                        },
+                                    );
+                                },
+                            )?;
+                            if published.is_none() {
+                                decoder.value().cancel();
+                                decoder.finish(policy, bound, Retirement::Published)?;
+                            }
+                            Ok::<_, Finding>(published.is_some())
+                        },
+                    )
+                })?;
+                owner.drain(policy)?;
+                Ok::<_, Finding>(published)
+            },
+        )?;
+        run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
+            Ok((turns, published, m.reached()))
+        })
+    })
 }
 
 #[test]
@@ -168,50 +238,86 @@ fn cancellation_through_initialization_parse_build_and_publication() {
 
 #[test]
 fn cancelled_operation_finishes_while_unrelated_output_remains_live() {
-    let mut m = meter();
-    let mut owner = scope(&mut m);
-    let released = Arc::new(AtomicUsize::new(0));
-    let first = instrumented(&owner, &mut m, &[0x62, b'o', b'k'], &released);
-    let second = instrumented(&owner, &mut m, &[0x62, b'o', b'k'], &released);
-    let output = support::decode::<_, String>(&mut m, first, Options::normalizing(8))
-        .expect("unexpected producer result");
-    let mut cancelled = TypedDecoder::<_, String, Limits>::new(second, Options::normalizing(8));
-    cancelled.cancel();
-    let bound =
-        support::turns(
-            dcbor::bounded::decode::construction::typed_decode_bound::<
-                Instrumented,
-                String,
-                Limits,
-                (),
-            >(3, Options::normalizing(8))
-            .expect("the literal's typed decode bound fits in u64"),
-        ) + 3; // The instrumented input's three cleanup units.
-    support::finish_within(&mut m, &mut cancelled, bound);
-    assert_eq!(
-        output.value(),
-        "ok",
-        "cancellation disturbed an unrelated output"
-    );
-    drop(cancelled);
-    drop(output);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
-    assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 2);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let released = Arc::new(AtomicUsize::new(0));
+        run.scoped(policy, &Unwitnessed, |owner| {
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let scope = view.value().get();
+                let first = view.with_policy(policy, |_, m| {
+                    instrumented(scope, m, &[0x62, b'o', b'k'], &released)
+                });
+                view.holding(first, Retirement::Published, |first| {
+                    first.decode::<String, _>(policy, Options::normalizing(8), |output| {
+                        let second = output.with_policy(policy, |_, m| {
+                            instrumented(scope, m, &[0x62, b'o', b'k'], &released)
+                        });
+                        output.holding(second, Retirement::Published, |second| {
+                            second.transfer(
+                                |input| {
+                                    TypedDecoder::<_, String, Limits>::new(
+                                        input,
+                                        Options::normalizing(8),
+                                    )
+                                },
+                                Retirement::Stopped,
+                                |cancelled| {
+                                    cancelled.value().cancel();
+                                    let bound = support::turns(
+                                        dcbor::bounded::decode::construction::typed_decode_bound::<
+                                            Instrumented,
+                                            String,
+                                            Limits,
+                                            (),
+                                        >(
+                                            3, Options::normalizing(8)
+                                        )
+                                        .expect("the literal's typed decode bound fits in u64"),
+                                    ) + 3;
+                                    cancelled.finish(policy, bound, Retirement::Published)
+                                },
+                            )
+                        })?;
+                        assert_eq!(
+                            output.value().value(),
+                            "ok",
+                            "cancellation disturbed an unrelated output",
+                        );
+                        Ok::<_, Finding>(())
+                    })?
+                })
+            })
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    });
 }
 
 #[test]
 fn shutdown_is_terminal_and_cannot_reopen_admission() {
-    let mut m = meter();
-    let mut owner = scope(&mut m);
-    m.fresh();
-    assert_eq!(owner.shutdown_step(&mut m).unwrap(), Reclaimed::Done);
-    m.fresh();
-    let reopened = owner.initialize_step(&mut m).is_ok();
-    m.fresh();
-    owner.shutdown_step(&mut m).unwrap();
-    assert_eq!(m.live_bytes(), 0);
-    assert!(!reopened, "closed owner accepted initialization again");
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.with_policy(policy, |owner, m| {
+                    m.fresh();
+                    assert_eq!(owner.shutdown_step(m).unwrap(), Reclaimed::Done);
+                    m.fresh();
+                    let reopened = owner.initialize_step(m).is_ok();
+                    m.fresh();
+                    owner.shutdown_step(m).unwrap();
+                    assert_eq!(m.live_bytes(), 0);
+                    assert!(!reopened, "closed owner accepted initialization again");
+                });
+                Ok::<_, Finding>(())
+            },
+        )
+    });
 }
 
 static PROBE_DROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -248,22 +354,20 @@ unsafe impl InPlace<Limits> for StableProbe {
         ))
     ));
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own construction, as `InPlace` documents"
-    )]
-    fn build_step(
-        _: &Document<'_, <Limits as Allocator>::Permit>,
-        _: usize,
-        mut slot: Slot<'_, Self, ProbeState>,
+    /// A third-party binding admits its own construction through the one
+    /// route ([`admit`]), as `InPlace` documents.
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, Limits>,
         a: &mut Limits,
-    ) -> ConstructResult<Built, Limits> {
+    ) -> ConstructResult<Building<'b, Self>, Limits> {
+        let assembly = ctx.assembly();
+        let mut slot = ctx.into_slot();
         let (place, state) = slot.parts();
         // Each field is written by raw projection alone, never through a
         // reference to the partly initialized probe.
         let raw = place.as_ptr(state);
         if state.chunks < 4 {
-            a.traverse(1, 64).map_err(BoundedError::Refused)?;
+            admit(a, 64)?;
             // SAFETY: the next 64 bytes of the slot's own destination, within
             // its 256, written by raw projection.
             unsafe {
@@ -273,17 +377,20 @@ unsafe impl InPlace<Limits> for StableProbe {
                     .write_bytes(0x5a, 64);
             }
             state.chunks += 1;
-            Ok(Built::Progress)
+            Ok(Building::Progress)
         } else {
-            a.traverse(1, core::mem::size_of::<usize>() as u64)
-                .map_err(BoundedError::Refused)?;
+            admit(a, core::mem::size_of::<usize>())?;
             // SAFETY: a plain field of the slot's own destination, written by
             // raw projection.
             unsafe {
                 core::ptr::addr_of_mut!((*raw).address).write(raw as usize);
             }
             state.addressed = true;
-            Ok(Built::Done)
+            // SAFETY: all four 64-byte chunks and the address are written,
+            // each by an admitted unit recorded in this state, and the probe
+            // holds no other field; the slot is not reclaimed while it
+            // builds.
+            Ok(Building::Done(unsafe { assembly.assemble() }))
         }
     }
 }
@@ -296,22 +403,28 @@ unsafe impl Reclaim<Limits> for StableProbe {
         addressed: false,
     };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
-    )]
+    /// A third-party binding admits its own cleanup through the one route
+    /// ([`admit`]), as `Reclaim` documents.
     fn reclaim_step(
         mut slot: Slot<'_, Self, ProbeState>,
-        a: &mut Limits,
+        cleanup: &mut Cleanup<'_, Limits>,
     ) -> BoundedResult<Reclaimed, Limits> {
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        admit(cleanup, 0)?;
         *slot.custody() = Self::INITIAL;
         Ok(Reclaimed::Done)
     }
 
     /// One call, which is `Done`.
-    fn remaining(_: PeekSlot<'_, Self, ProbeState>) -> u64 {
-        1
+    fn remaining(_: PeekSlot<'_, Self, ProbeState>) -> Option<u64> {
+        Some(1)
+    }
+
+    /// The probe's bytes are inline: it owns no permit.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, ProbeState>,
+        _: &mut dyn CustodySink<Reservation>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
@@ -321,20 +434,57 @@ fn owned_publication_preserves_construction_address_and_never_runs_payload_drop(
         core::mem::size_of::<TypedValue<'static, Instrumented, StableProbe, Limits>>(),
         core::mem::size_of::<TypedValue<'static, Instrumented, String, Limits>>()
     );
-    let mut m = meter();
-    let mut owner: DecodeOwner<'static, Limits> = scope(&mut m);
-    let released = Arc::new(AtomicUsize::new(0));
-    let input = instrumented(&owner, &mut m, &[0x62, b'o', b'k'], &released);
-    let output = support::decode::<_, StableProbe>(&mut m, input, Options::normalizing(8))
-        .expect("finite probe publication");
-    assert_eq!(
-        output.value().address,
-        output.value() as *const StableProbe as usize
-    );
-    assert_eq!(output.value().bytes, [0x5a; 256]);
-    drop(output);
-    assert_eq!(PROBE_DROPS.load(std::sync::atomic::Ordering::SeqCst), 0);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
-    assert_eq!(PROBE_DROPS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let released = Arc::new(AtomicUsize::new(0));
+        run.holding(
+            DecodeOwner::<'static, Limits>::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                let input = owner.with_policy(policy, |owner, m| {
+                    instrumented(owner, m, &[0x62, b'o', b'k'], &released)
+                });
+                owner.holding(input, Retirement::Published, |input| {
+                    input.transfer(
+                        |input| {
+                            TypedDecoder::<_, StableProbe, Limits>::new(
+                                input,
+                                Options::normalizing(8),
+                            )
+                        },
+                        Retirement::Stopped,
+                        |decoder| {
+                            decoder.drive(
+                                policy,
+                                support::turns(
+                                    dcbor::bounded::decode::construction::typed_decode_bound::<
+                                        Instrumented,
+                                        StableProbe,
+                                        Limits,
+                                        (),
+                                    >(
+                                        3, Options::normalizing(8)
+                                    )
+                                    .expect("the literal's typed decode bound fits in u64"),
+                                ),
+                                Retirement::Published,
+                                |output| {
+                                    let value = output.value().value();
+                                    assert_eq!(value.address, value as *const StableProbe as usize);
+                                    assert_eq!(value.bytes, [0x5a; 256]);
+                                },
+                            )
+                        },
+                    )
+                })?;
+                assert_eq!(PROBE_DROPS.load(std::sync::atomic::Ordering::SeqCst), 0);
+                owner.drain(policy)
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        assert_eq!(PROBE_DROPS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    });
 }

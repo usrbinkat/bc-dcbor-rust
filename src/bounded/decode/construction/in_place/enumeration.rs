@@ -1,8 +1,8 @@
 //! Retained discriminant selection and tag-last enum construction.
 use super::*;
 use crate::bounded::boundary::{Predicate, boundary, position};
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
-use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::bounded::decode::construction::reclamation::Custody;
+use crate::bounded::decode::construction::stable::{self, Installed, Ticket};
 use crate::sync::{Atomics, Representation};
 
 /// Representation-specific projections generated from explicit enum layouts.
@@ -12,16 +12,23 @@ use crate::sync::{Atomics, Representation};
 /// holding one has nothing to promise.
 ///
 /// # Safety
-/// Descriptors select unique wire discriminants. [`Self::start`] must return,
-/// for each variant index below COUNT, a [`Self::Payload`] naming that
-/// variant and holding its payload's initial state, and must neither
-/// allocate nor unwind. Payload callbacks must project the variant the state
-/// names using its declared Rust representation, retaining the same payload
-/// state through cleanup. Commit writes only that variant's native tag, into
-/// the tag's own bytes, which no payload place covers. No callback may
-/// construct an enum value by value or form a reference to a partially
-/// initialized enum. Each callback is sound for every call, in any order, as
-/// its payload's own methods are.
+/// An implementation keeps six obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *discriminants*: the descriptors select unique wire discriminants.
+/// - *start*: [`Self::start`] returns, for each variant index below COUNT, a
+///   [`Self::Payload`] naming that variant and holding its payload's initial
+///   state, and neither allocates nor unwinds.
+/// - *projection*: payload callbacks project the variant the state names
+///   using its declared Rust representation, retaining the same payload
+///   state through cleanup.
+/// - *tag*: commit writes only that variant's native tag, into the tag's
+///   own bytes, which no payload place covers.
+/// - *reference*: no callback constructs an enum value by value or forms a
+///   reference to a partially initialized enum.
+/// - *order*: each callback is sound for every call, in any order, as its
+///   payload's own methods are.
 pub unsafe trait Variants<A: Allocator>: Sized {
     const COUNT: usize;
     const TAG: Option<u64>;
@@ -34,23 +41,31 @@ pub unsafe trait Variants<A: Allocator>: Sized {
     /// The initial payload state of variant `variant`, or `None` for an index
     /// past the last variant.
     fn start(variant: usize) -> Option<Self::Payload>;
-    /// One unit of construction of the payload of the variant the slot's
-    /// state names.
+    /// One unit of construction of the payload of the variant the context's
+    /// state names, from the context's node, the payload's: a part of the
+    /// enum, built within the enum's own construction.
     fn build_variant(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::Payload>,
+        ctx: Context<'_, '_, '_, '_, Self, Self::Payload, A>,
         a: &mut A,
     ) -> ConstructResult<Built, A>;
     /// One unit of cleanup of the payload of the variant the slot's state
     /// names.
     fn reclaim_variant(
         slot: Slot<'_, Self, Self::Payload>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A>;
     /// The calls [`Self::reclaim_variant`] still takes from the slot's state:
-    /// the [`Reclaim::remaining`] of the variant's payload it names.
-    fn remaining_variant(slot: PeekSlot<'_, Self, Self::Payload>) -> u64;
+    /// the [`Reclaim::remaining`] of the variant's payload it names, `None`
+    /// when it does not fit in `u64`.
+    fn remaining_variant(slot: PeekSlot<'_, Self, Self::Payload>) -> Option<u64>;
+    /// The permits the payload of the variant the slot's state names owns,
+    /// reported inside the caller's open group: its
+    /// [`Reclaim::observe_permits`], projected as for
+    /// [`Self::remaining_variant`].
+    fn observe_variant(
+        slot: PeekSlot<'_, Self, Self::Payload>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved;
     /// Write the native tag of the variant the slot's state names, the
     /// state, the enum place's custody while a variant is selected, borrowed
     /// exclusively for the write. The engine commits once the payload is
@@ -77,19 +92,40 @@ enum Phase<V> {
     Build(V),
     Commit(V),
     Complete(V),
+    /// The selected payload's cleanup under way: entered by the first
+    /// cleanup step the payload completes, so no build reaches a payload
+    /// being cleaned up.
+    Reclaim(V),
     Release,
 }
 
 /// Move the payload state `phase` holds into the phase `next` makes of it.
 fn carry<V>(phase: &mut Phase<V>, next: fn(V) -> Phase<V>) {
     *phase = match core::mem::replace(phase, Phase::Release) {
-        Phase::Build(child) | Phase::Commit(child) | Phase::Complete(child) => next(child),
+        Phase::Build(child)
+        | Phase::Commit(child)
+        | Phase::Complete(child)
+        | Phase::Reclaim(child) => next(child),
         other => other,
     };
 }
 
+/// Written whole with its permit in one admitted unit of at most a quantum
+/// ([`contract`]). For a derived enum, `V` holds one variant's record state,
+/// a field map's (`fields::State`, 24 bytes: its block and ticket handles,
+/// the fields completed as `u32` and its phase) behind the derived payload
+/// enum's tag, so at most 32; [`Phase`] holds `V` or the selection's two
+/// words behind its own tag, at most 40; with the index, 48, and the 16-byte
+/// permit, 64: one quantum for any variant count, with no niche assumed.
+/// Checked where the type is used (`Contract::of`, E0080) and by
+/// `a_two_variant_enums_metadata_fits_one_quantum`.
 struct Meta<V> {
-    /// The document index of the node the current phase reads.
+    /// The document index of the node the current phase reads: the enum's
+    /// own progress through its node and that node's heads (the tag's
+    /// content, the array's discriminant, the payload), set from the
+    /// context's node at installation and advanced only by the inspection
+    /// that read the node before it. The one record of which node the
+    /// selected payload is built from.
     index: usize,
     phase: Phase<V>,
 }
@@ -106,12 +142,13 @@ const fn contract<V, P>() -> stable::Contract<Meta<V>, Meta<V>, P> {
 }
 
 /// The construction state of an enum whose payloads' states are `V`, with
-/// permits of `P`: its metadata, once installed; what that installation has
-/// admitted; and the variant index the selection has reached. Only the enum
-/// engine reads or changes it.
+/// permits of `P`: its metadata, once installed; the ticket of that
+/// installation's acquisition while it is pending ([`Ticket`]), whose credit
+/// is the operation's; and the variant index the selection has reached. Only
+/// the enum engine reads or changes it.
 pub struct State<V, P> {
     meta: Option<Installed<Meta<V>, P>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
     variant: usize,
 }
 
@@ -119,7 +156,7 @@ impl<V, P> State<V, P> {
     /// Nothing installed, no variant passed.
     pub const INITIAL: Self = Self {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
         variant: 0,
     };
 }
@@ -130,13 +167,14 @@ impl<V, P> State<V, P> {
 // enum's proof is one obligation per level.
 unsafe impl<V: Send, P: Send> Send for State<V, P> {}
 
-/// What an enum's construction holds: no metadata block, with the
-/// admissions held toward it; or the block, at a document index, past
-/// `variant` variants in the selection, in a phase that carries the
-/// selected payload's whole observation once a variant is selected.
+/// What an enum's construction holds: no metadata block; or the block, at a
+/// document index, past `variant` variants in the selection, in a phase that
+/// carries the selected payload's whole observation once a variant is
+/// selected. Progress alone: an acquisition bound for the block is the root
+/// pending's custody (`CustodySink::bound`), never this observation's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EnumObservation<V> {
-    Unallocated(Admitted),
+    Unallocated,
     Held {
         index: usize,
         variant: usize,
@@ -154,6 +192,7 @@ pub enum EnumPhase<V> {
     Build(V),
     Commit(V),
     Complete(V),
+    Reclaim(V),
     Release,
 }
 
@@ -162,7 +201,7 @@ impl<V: Custody, P> Custody for State<V, P> {
 
     fn observe(&mut self) -> Self::Observation {
         let Some(installed) = self.meta.as_mut() else {
-            return EnumObservation::Unallocated(self.admitted);
+            return EnumObservation::Unallocated;
         };
         let meta = installed.get();
         let phase = match &mut meta.phase {
@@ -179,6 +218,7 @@ impl<V: Custody, P> Custody for State<V, P> {
             Phase::Build(child) => EnumPhase::Build(child.observe()),
             Phase::Commit(child) => EnumPhase::Commit(child.observe()),
             Phase::Complete(child) => EnumPhase::Complete(child.observe()),
+            Phase::Reclaim(child) => EnumPhase::Reclaim(child.observe()),
             Phase::Release => EnumPhase::Release,
         };
         EnumObservation::Held {
@@ -232,15 +272,31 @@ pub const fn cost<V, P>(
     ConstructionCost::fixed(fixed).checked_add(payload)
 }
 
-/// One unit of construction of the enum in `slot`. Without metadata the state
-/// is `INITIAL` (every cleanup that releases the metadata restores it), so
-/// construction begins; a completed or released enum is refused.
-pub fn build<T: Variants<A>, A: Allocator>(
-    document: &Document<'_, A::Permit>,
-    index: usize,
-    mut slot: Slot<'_, T, State<T::Payload, A::Permit>>,
+/// One unit of construction of the enum in the context's slot, from the
+/// context's node. Without metadata the state is `INITIAL` (every cleanup
+/// that releases the metadata restores it), so construction begins; a
+/// completed or released enum is refused.
+///
+/// The selected payload is a part of the enum, built from `meta.index`,
+/// which no step changes once a variant is selected: a refused or erroring
+/// payload step leaves it, the phase and the payload's state unchanged. No
+/// payload is built once cleanup began: cleanup ([`reclaim`]) steps a
+/// selected payload only from its own state and moves every phase toward
+/// `Release`, which this function refuses, nothing changed. Cleanup of a
+/// payload under `Build` does not move the phase until the payload reports
+/// `Done`; a build in that window would step a payload being cleaned up,
+/// so only the enum's owner's phase (a parent's cleanup phase, or the root's
+/// session once cleaning) keeps a build from reaching it. A enum reclaimed
+/// to its end is `INITIAL` again, under the same owner's guard.
+pub fn build<'b, T: Variants<A>, A: Allocator>(
+    ctx: Context<'b, '_, '_, '_, T, State<T::Payload, A::Permit>, A>,
     a: &mut A,
-) -> ConstructResult<Built, A> {
+) -> ConstructResult<Building<'b, T>, A> {
+    let mut ctx = ctx;
+    let assembly = ctx.assembly();
+    let index = ctx.index();
+    let nodes = ctx.nodes();
+    let (mut slot, pending) = ctx.acquiring();
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         if state.variant != 0 {
@@ -251,7 +307,8 @@ pub fn build<T: Variants<A>, A: Allocator>(
             stable::install::<Meta<T::Payload>, Meta<T::Payload>, A>(
                 const { contract::<T::Payload, A::Permit>() },
                 &mut state.meta,
-                &mut state.admitted,
+                pending,
+                &mut state.ticket,
                 || Meta {
                     index,
                     phase: Phase::Tag,
@@ -260,14 +317,14 @@ pub fn build<T: Variants<A>, A: Allocator>(
                 a,
             )?
         };
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     };
     let meta = installed.get();
     match meta.phase {
         Phase::Tag => {
             STEP.admit(a)?;
             if let Some(expected) = T::TAG {
-                match node_at(document, meta.index).map(|n| n.kind()) {
+                match nodes.node(meta.index).map(|n| n.kind()) {
                     Some(Kind::Tagged(found)) if found == expected => {}
                     Some(Kind::Tagged(found)) => {
                         return Err(crate::bounded::decode::DecodeError::Invalid(
@@ -285,7 +342,7 @@ pub fn build<T: Variants<A>, A: Allocator>(
         }
         Phase::Shape => {
             STEP.admit(a)?;
-            match node_at(document, meta.index).map(|n| n.kind()) {
+            match nodes.node(meta.index).map(|n| n.kind()) {
                 Some(Kind::Unsigned(discriminant)) => {
                     meta.phase = Phase::Select {
                         discriminant,
@@ -301,7 +358,7 @@ pub fn build<T: Variants<A>, A: Allocator>(
         }
         Phase::Discriminant { length } => {
             STEP.admit(a)?;
-            let discriminant = match node_at(document, meta.index).map(|n| n.kind()) {
+            let discriminant = match nodes.node(meta.index).map(|n| n.kind()) {
                 Some(Kind::Unsigned(discriminant)) => discriminant,
                 Some(Kind::Negative(_)) => {
                     return Err(crate::bounded::decode::DecodeError::Invalid(
@@ -338,11 +395,31 @@ pub fn build<T: Variants<A>, A: Allocator>(
                 state.variant += 1;
             }
         }
-        Phase::Build(ref mut child) => {
+        Phase::Build(_) => {
+            let payload_index = meta.index;
             // SAFETY: the enum's root place, and the selected variant's
-            // payload state, started for that variant by `T::start`.
-            let payload = unsafe { Slot::new(place, child) };
-            if T::build_variant(document, meta.index, payload, a)? == Built::Done {
+            // payload state in this enum's metadata, started for that
+            // variant by `T::start`.
+            let payload = unsafe {
+                ctx.part(payload_index, |slot| {
+                    let (place, state) = slot.into_parts();
+                    let meta = state.meta.as_mut().ok_or(BoundedError::PlanMismatch)?.get();
+                    match meta.phase {
+                        Phase::Build(ref mut child) => {
+                            Ok::<_, BoundedError<A::Refusal>>(Slot::new(place, child))
+                        }
+                        _ => Err(BoundedError::PlanMismatch),
+                    }
+                })
+            }?;
+            if T::build_variant(payload, a)? == Built::Done {
+                let mut slot = ctx.slot();
+                let meta = slot
+                    .custody()
+                    .meta
+                    .as_mut()
+                    .ok_or(BoundedError::PlanMismatch)?
+                    .get();
                 carry(&mut meta.phase, Phase::Commit);
             }
         }
@@ -350,38 +427,56 @@ pub fn build<T: Variants<A>, A: Allocator>(
             // The native tag is committed in one unit, its extent checked
             // where the enum's type is used.
             const { commit(T::TAG_BYTES) }.admit(a)?;
-            // SAFETY: as in `Build`.
+            // SAFETY: the enum's root place, and the selected variant's
+            // payload state.
             T::commit(unsafe { Slot::new(place, child) });
             carry(&mut meta.phase, Phase::Complete);
-            return Ok(Built::Done);
+            // SAFETY: `Commit` is entered only from `Build` after
+            // `build_variant` returned `Done`, a result whose record,
+            // confined by its brand to the step that minted it, was verified
+            // against the payload place this enum projected for the selected
+            // variant (`fields::build_payload`); the native tag is written
+            // above. So the selected variant's payload
+            // and tag are initialized, and the slot is not reclaimed: cleanup
+            // moves the phase toward `Release`, which this function refuses.
+            return Ok(Building::Done(unsafe { assembly.assemble() }));
         }
-        Phase::Complete(_) | Phase::Release => return Err(BoundedError::PlanMismatch.into()),
+        Phase::Complete(_) | Phase::Reclaim(_) | Phase::Release => {
+            return Err(BoundedError::PlanMismatch.into());
+        }
     }
-    Ok(Built::Progress)
+    Ok(Building::Progress)
 }
 
 /// One unit of cleanup of the enum in `slot`. Releasing the metadata restores
 /// `INITIAL`, so a later step reports `Done` and a later build begins anew.
 pub fn reclaim<T: Variants<A>, A: Allocator>(
     mut slot: Slot<'_, T, State<T::Payload, A::Permit>>,
-    a: &mut A,
+    a: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         STEP.admit(a)?;
+        // The metadata's acquisition, if pending, had its credit settled at
+        // the operation's cleanup entry: the ticket is forgotten.
+        state.ticket = None;
         return Ok(Reclaimed::Done);
     };
     let meta = installed.get();
     match meta.phase {
         Phase::Build(ref mut child)
         | Phase::Commit(ref mut child)
-        | Phase::Complete(ref mut child) => {
+        | Phase::Complete(ref mut child)
+        | Phase::Reclaim(ref mut child) => {
             // SAFETY: the enum's root place, and the selected variant's
             // payload state.
             let payload = unsafe { Slot::new(place, child) };
-            if T::reclaim_variant(payload, a)? == Reclaimed::Done {
+            match T::reclaim_variant(payload, a)? {
                 // The reclaimed payload state owns nothing; it ends here.
-                meta.phase = Phase::Release;
+                Reclaimed::Done => meta.phase = Phase::Release,
+                // The payload's cleanup began: no build reaches it again.
+                // A refused step returned above, the phase unchanged.
+                _ => carry(&mut meta.phase, Phase::Reclaim),
             }
         }
         Phase::Release => {
@@ -406,20 +501,49 @@ pub fn reclaim<T: Variants<A>, A: Allocator>(
 /// one; `Release`, one.
 pub fn remaining<T: Variants<A>, A: Allocator>(
     mut slot: PeekSlot<'_, T, State<T::Payload, A::Permit>>,
-) -> u64 {
+) -> Option<u64> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
-        return 1;
+        return Some(1);
     };
     match installed.get().phase {
         Phase::Build(ref mut child)
         | Phase::Commit(ref mut child)
-        | Phase::Complete(ref mut child) => {
+        | Phase::Complete(ref mut child)
+        | Phase::Reclaim(ref mut child) => {
             // SAFETY: the state names the selected variant's payload.
-            T::remaining_variant(unsafe { Slot::new(place, child) }).saturating_add(1)
+            T::remaining_variant(unsafe { Slot::new(place, child) })?.checked_add(1)
         }
-        Phase::Release => 1,
-        Phase::Tag | Phase::Shape | Phase::Discriminant { .. } | Phase::Select { .. } => 2,
+        Phase::Release => Some(1),
+        Phase::Tag | Phase::Shape | Phase::Discriminant { .. } | Phase::Select { .. } => Some(2),
+    }
+}
+
+/// The permits the enum in `slot` owns, reported inside the caller's open
+/// group: its metadata block's, then the selected payload's while one is
+/// selected ([`Variants::observe_variant`]); none without metadata.
+pub fn observe_permits<T: Variants<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, T, State<T::Payload, A::Permit>>,
+    sink: &mut dyn CustodySink<A::Permit>,
+) -> PermitsObserved {
+    let (place, state) = slot.parts();
+    let Some(installed) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    sink.permit(installed.permit(), None);
+    match installed.get().phase {
+        Phase::Build(ref mut child)
+        | Phase::Commit(ref mut child)
+        | Phase::Complete(ref mut child)
+        | Phase::Reclaim(ref mut child) => {
+            // SAFETY: the state names the selected variant's payload.
+            T::observe_variant(unsafe { Slot::new(place, child) }, sink)
+        }
+        Phase::Tag
+        | Phase::Shape
+        | Phase::Discriminant { .. }
+        | Phase::Select { .. }
+        | Phase::Release => PermitsObserved::Complete,
     }
 }
 
@@ -427,6 +551,38 @@ pub fn remaining<T: Variants<A>, A: Allocator>(
 mod tests {
     use super::*;
     use crate::bounded::Reservation;
+
+    /// A derived enum's payload state for two dataful variants, each a field
+    /// map's record state, as the derive's expansion holds them.
+    #[expect(
+        dead_code,
+        reason = "a layout fixture: its variants are measured, not built"
+    )]
+    enum TwoVariants {
+        First(super::super::fields::State<Written, Reservation>),
+        Second(super::super::fields::State<Written, Reservation>),
+    }
+
+    /// The metadata of an enum of two field-map variants is written in one
+    /// unit of at most a quantum: its contract evaluated in a constant here,
+    /// which refuses an overrun to compile (E0080) in the crate's own tests;
+    /// and the sizes [`Meta`]'s derivation rests on, measured.
+    #[test]
+    fn a_two_variant_enums_metadata_fits_one_quantum() {
+        let contract = const { contract::<TwoVariants, Reservation>() };
+        assert!(contract.write().bytes <= stable::QUANTUM as u64);
+        assert_eq!(
+            core::mem::size_of::<super::super::fields::State<Written, Reservation>>(),
+            24,
+            "a field map's record state"
+        );
+        assert!(core::mem::size_of::<TwoVariants>() <= 32);
+        assert!(core::mem::size_of::<Phase<TwoVariants>>() <= 40);
+        assert!(
+            core::mem::size_of::<Meta<TwoVariants>>() + core::mem::size_of::<Reservation>()
+                <= stable::QUANTUM
+        );
+    }
 
     /// An enum's cost, evaluated at run time as the derive evaluates it in
     /// constants: the native tag committed in one unit of its own bytes;

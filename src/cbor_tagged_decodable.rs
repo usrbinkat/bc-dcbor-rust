@@ -102,8 +102,8 @@ use crate::{CBOR, CBORCase, CBORTagged, Error, Result};
 ///
 /// // Legacy data with tag 200 can still be decoded
 /// let mut map = Map::new();
-/// map.insert("version", 1);
-/// map.insert("value", "legacy");
+/// map.insert("version", 1).unwrap();
+/// map.insert("value", "legacy").unwrap();
 /// let legacy_cbor = CBOR::to_tagged_value(200, map);
 ///
 /// let data = VersionedData::from_tagged_cbor(legacy_cbor).unwrap();
@@ -130,6 +130,12 @@ pub trait CBORTaggedDecodable: TryFrom<CBOR> + CBORTagged {
     /// versions of types to still accept data tagged with older/alternative
     /// tag values.
     ///
+    /// A tag outside the list is refused [`Error::WrongTag`], naming the
+    /// preferred tag; a type whose list is empty accepts no tag and is
+    /// refused [`Error::NoTag`], as its tagged encoding is
+    /// ([`crate::CBORTaggedEncodable::tagged_cbor`]), never a panic indexing
+    /// the empty list.
+    ///
     /// In most cases, you don't need to override this method.
     fn from_tagged_cbor(cbor: CBOR) -> Result<Self>
     where
@@ -137,11 +143,13 @@ pub trait CBORTaggedDecodable: TryFrom<CBOR> + CBORTagged {
     {
         match cbor.into_case() {
             CBORCase::Tagged(tag, item) => {
-                let cbor_tags = Self::cbor_tags();
+                let mut cbor_tags = Self::cbor_tags();
                 if cbor_tags.contains(&tag) {
                     Self::from_untagged_cbor(item)
+                } else if cbor_tags.is_empty() {
+                    Err(Error::NoTag)
                 } else {
-                    Err(Error::WrongTag(cbor_tags[0].clone(), tag))
+                    Err(Error::WrongTag(cbor_tags.swap_remove(0), tag))
                 }
             }
             _ => Err(Error::WrongType),
@@ -170,5 +178,65 @@ pub trait CBORTaggedDecodable: TryFrom<CBOR> + CBORTagged {
         Self: Sized,
     {
         Self::from_untagged_cbor(CBOR::try_from_data(data)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Tag;
+
+    import_stdlib!();
+
+    /// A type that lists no tag.
+    #[derive(Debug)]
+    struct Untagged;
+
+    impl CBORTagged for Untagged {
+        fn cbor_tags() -> Vec<Tag> {
+            Vec::new()
+        }
+    }
+
+    impl CBORTaggedDecodable for Untagged {
+        fn from_untagged_cbor(_: CBOR) -> Result<Self> {
+            Ok(Untagged)
+        }
+    }
+
+    impl TryFrom<CBOR> for Untagged {
+        type Error = Error;
+
+        fn try_from(cbor: CBOR) -> Result<Self> {
+            Self::from_tagged_cbor(cbor)
+        }
+    }
+
+    /// A type listing no tag decodes no tagged value: refused `NoTag`, never
+    /// a panic indexing the empty list; a value not tagged at all is the
+    /// wrong type; its untagged decoding stands.
+    #[test]
+    fn a_type_listing_no_tag_is_refused_a_tagged_decoding() {
+        let tagged = CBOR::to_tagged_value(1, 0u64);
+        assert!(matches!(
+            Untagged::from_tagged_cbor(tagged.clone()),
+            Err(Error::NoTag)
+        ));
+        assert!(matches!(Untagged::try_from(tagged), Err(Error::NoTag)));
+        assert!(matches!(
+            Untagged::from_tagged_cbor(CBOR::from(0u64)),
+            Err(Error::WrongType)
+        ));
+        assert!(Untagged::from_untagged_cbor(CBOR::from(0u64)).is_ok());
+    }
+
+    /// A tag outside a non-empty list is refused naming the preferred tag.
+    #[test]
+    fn a_tag_outside_the_list_names_the_preferred_tag() {
+        let refused = crate::Date::from_tagged_cbor(CBOR::to_tagged_value(2, 0u64));
+        assert!(
+            matches!(&refused, Err(Error::WrongTag(expected, got)) if expected.value() == 1 && got.value() == 2),
+            "{refused:?}"
+        );
     }
 }

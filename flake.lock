@@ -1,12 +1,36 @@
 {
   "nodes": {
+    "kani": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": [
+          "rust-overlay"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794252438,
+        "narHash": "sha256-vc0KcpKimDlJJI61O+W9YNGrUcHUO6Y6KG4P1HUaYW0=",
+        "owner": "lalvesl",
+        "repo": "kani",
+        "rev": "c0eb2af3ac4279ef51512d9a16a2d1b0d78c7186",
+        "type": "github"
+      },
+      "original": {
+        "owner": "lalvesl",
+        "repo": "kani",
+        "rev": "c0eb2af3ac4279ef51512d9a16a2d1b0d78c7186",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1792773339,
-        "narHash": "sha256-rZLrzrC6i+jnTAlvPZHogKDulY7WWDEv9hJeHieO7Zw=",
+        "lastModified": 1794042290,
+        "narHash": "sha256-ziZn2PvCJE5JEEpqTdxXwJpPB+L3YqoCpTAMCzyaP3U=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+        "rev": "f4a03c008967841f2a0b3cb7c436fc6fc31671f6",
         "type": "github"
       },
       "original": {
@@ -18,6 +42,7 @@
     },
     "root": {
       "inputs": {
+        "kani": "kani",
         "nixpkgs": "nixpkgs",
         "rust-fork": "rust-fork",
         "rust-overlay": "rust-overlay"
@@ -47,11 +72,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792825530,
-        "narHash": "sha256-aphXA2IFNd3q48++TKmfuuvDDjkrgGdJDnDIhij9684=",
+        "lastModified": 1794216702,
+        "narHash": "sha256-J+4v+Olc/2mN/bSc9CuAQ/PB7c0w1mzDJK8JvS7rKmM=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "5b9f1198b59bcb31c5c3250b332e7d77590e6306",
+        "rev": "b70538330f20adc9665afa2976471eb5b85ebd1f",
         "type": "github"
       },
       "original": {

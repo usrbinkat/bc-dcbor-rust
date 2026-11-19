@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -142,7 +142,8 @@
+             let half = narrowed(value);
+             if widened(half) == value {
+                 Numeric::Float16(half.to_bits())
+-            } else if (value as f32) as f64 == value {
++            // Planted: a value binary32 holds is written at binary64.
++            } else if (value as f32) as f64 == value && false {
+                 Numeric::Float32((value as f32).to_bits())
+             } else {
+                 Numeric::Float64(value.to_bits())

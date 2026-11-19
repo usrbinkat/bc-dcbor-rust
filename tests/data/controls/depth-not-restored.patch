@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -181,7 +181,6 @@
+     ) -> BoundedResult<R, A> {
+         self.depth.descend()?;
+         let result = dispatch(self);
+-        self.depth.ascend();
+         result
+     }
+

@@ -1,0 +1,23 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -287,6 +287,20 @@
+     }
+ }
+
++impl<A: Allocator> core::ops::Deref for Cleanup<'_, A> {
++    type Target = A;
++
++    fn deref(&self) -> &A {
++        &*self.policy
++    }
++}
++
++impl<A: Allocator> core::ops::DerefMut for Cleanup<'_, A> {
++    fn deref_mut(&mut self) -> &mut A {
++        &mut *self.policy
++    }
++}
++
+ /// Maximum declared synchronous dispatch depth of an admitted stable record.
+ /// This is independent of input depth and checked before allocating the record.
+ pub const MAX_DISPATCH_DEPTH: usize = 64;

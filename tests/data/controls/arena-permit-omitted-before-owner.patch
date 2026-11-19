@@ -1,0 +1,12 @@
+--- src/bounded/decode/cursor/publication.rs
++++ src/bounded/decode/cursor/publication.rs
+@@ -177,7 +177,8 @@
+             transferred,
+             released,
+         } = *parts;
+-        if transferred < STORAGE_PARTS || released >= 2 {
++        // Planted: the moved permit is not reported until its owner is written.
++        if transferred <= STORAGE_PARTS || released >= 2 {
+             return PermitsObserved::Complete;
+         }
+         let owner = if transferred > STORAGE_PARTS {

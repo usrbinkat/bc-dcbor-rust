@@ -113,6 +113,130 @@ pub fn build(
     Ok(executables)
 }
 
+/// Build the test target `target` (`lib`, or an integration test binary) of
+/// `package` in `root`, with `features` (`all`, a comma-separated list, or
+/// none for the package's defaults), into `target_dir`, logging the build's
+/// diagnostics to `log`. Its test executable ([`crate::reach::executable`]),
+/// or, when the build failed, its log: a compiler refusal is what a run
+/// produced, not a failure of the gate. Colour is off (`TERM=dumb`), so a
+/// report is read as its text.
+pub fn build_target(
+    root: &Path,
+    package: &str,
+    features: Option<&str>,
+    target: &str,
+    target_dir: &Path,
+    log: &Path,
+) -> Result<Result<PathBuf, String>, String> {
+    let mut command = controlled("cargo");
+    command
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("TERM", "dumb")
+        .args(["test", "--package", package]);
+    match features {
+        Some("all") => {
+            command.arg("--all-features");
+        }
+        Some(list) => {
+            command.args(["--features", list]);
+        }
+        None => {}
+    }
+    if target == dcbor_model_bounds::LIBRARY {
+        command.arg("--lib");
+    } else {
+        command.args(["--test", target]);
+    }
+    let output = command
+        .args(["--no-run", "--message-format", "json"])
+        .output()
+        .map_err(|error| format!("cargo: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    std::fs::write(log, &stderr).map_err(|error| format!("{}: {error}", log.display()))?;
+    if !output.status.success() {
+        return Ok(Err(stderr));
+    }
+    crate::reach::executable(&String::from_utf8_lossy(&output.stdout))
+        .map(|found| Ok(PathBuf::from(found)))
+}
+
+/// One run of `test` alone in `executable` (`--exact`, one thread, output
+/// uncaptured), its environment `environment` beside the controlled one and
+/// `TERM=dumb`, logged to `log`: its termination and its log's text.
+pub fn run_test(
+    executable: &Path,
+    test: &str,
+    environment: &[(&str, String)],
+    log: &Path,
+) -> Result<(Termination, String), String> {
+    let mut environment = environment.to_vec();
+    environment.push(("TERM", "dumb".to_string()));
+    let (termination, text, _, _) = run_once(executable, test, &environment, log)?;
+    Ok((termination, text))
+}
+
+/// One `cargo kani` run of harness `harness` alone in `root`
+/// ([`crate::proofs::arguments`], then `--harness HARNESS --exact`, which
+/// kani-driver's `VerificationArgs` declares: the filter matching only that
+/// fully qualified name), its artifacts under `target_dir`, one thread
+/// (no `-j`: `NumThreads::NoMultithreading`), colour off, its standard
+/// output and error logged to `log`: its termination and its log's text.
+pub fn run_kani(
+    root: &Path,
+    harness: &str,
+    target_dir: &Path,
+    log: &Path,
+) -> Result<(Termination, String), String> {
+    kani(root, &["--harness", harness, "--exact"], target_dir, log)
+}
+
+/// One `cargo kani` run of every harness of the library in `root`
+/// ([`crate::proofs::arguments`], no harness filter), as [`run_kani`] runs
+/// one: the proof suite's evidence run.
+pub fn run_kani_suite(
+    root: &Path,
+    target_dir: &Path,
+    log: &Path,
+) -> Result<(Termination, String), String> {
+    kani(root, &[], target_dir, log)
+}
+
+/// The one `cargo kani` invocation, `selection` after the build's own
+/// arguments.
+fn kani(
+    root: &Path,
+    selection: &[&str],
+    target_dir: &Path,
+    log: &Path,
+) -> Result<(Termination, String), String> {
+    let file = std::fs::File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    let error = file
+        .try_clone()
+        .map_err(|error| format!("{}: {error}", log.display()))?;
+    let status = controlled("cargo")
+        .current_dir(root)
+        .env("TERM", "dumb")
+        .args(crate::proofs::arguments())
+        .args(selection)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .stdout(file)
+        .stderr(error)
+        .status()
+        .map_err(|error| format!("cargo kani: {error}"))?;
+    let termination = {
+        use std::os::unix::process::ExitStatusExt;
+        match status.signal() {
+            Some(signal) => Termination::Signaled(signal),
+            None => Termination::Exited(status.code().unwrap_or(-1)),
+        }
+    };
+    let text =
+        std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    Ok((termination, text))
+}
+
 /// The models of `checker` the `target` binary `executable` lists.
 pub fn list(checker: Checker, target: &str, executable: &Path) -> Result<Vec<Listed>, String> {
     let output = controlled(executable)

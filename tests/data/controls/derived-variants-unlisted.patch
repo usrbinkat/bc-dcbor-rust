@@ -1,0 +1,11 @@
+--- tests/unsafe_census.rs
++++ tests/unsafe_census.rs
+@@ -2086,7 +2086,7 @@
+     (NAMED, "Fields", "expand_fields"),
+     (NAMED, "InPlace", "expand_fields"),
+     (NAMED, "Reclaim", "expand_fields"),
+-    (VARIANTS, "Variants", "expand"),
++    // Planted: the derive's generated `Variants` impl unlisted.
+     (VARIANTS, "InPlace", "expand"),
+     (VARIANTS, "Reclaim", "expand"),
+ ];

@@ -1,9 +1,9 @@
 use super::harness::*;
 use super::support::{
-    drive_faulted_observed, exhausted, ordinary_exhaustion, prepare_turns, shape,
+    Fault, Finding, Retirement, Stopped, pipeline::Unwitnessed, shape,
 };
 use dcbor::bounded::{
-    BoundedError, Failure,
+    BoundedError,
     encoding::{Preparation, Schema},
 };
 use dcbor_derive::CBORBoundedEncodable;
@@ -117,60 +117,47 @@ fn chain(depth: usize) -> Chain {
 fn deep_tables_have_bounded_all_ready_steps_and_a_finite_completion_bound() {
     for depth in [1usize, 8, 32, 127] {
         let source = chain(depth);
-        let mut operation = Preparation::new(&source);
-        let mut m = meter();
         // Every depth through 127 is within the frame limit, so the source's
         // own shape gives the preparation's production bound: its values and
         // requested bytes bound its turns, a prepaid release step included
         // through the allocation it releases.
-        let bound = prepare_turns(shape(&source));
-        let plan = drive_faulted_observed(&mut m, &mut operation, bound, false, |m, _, result| {
-            if let Err(error) = result {
-                assert!(
-                    ordinary_exhaustion(m, error),
-                    "unexpected preparation error: {error:?}"
-                );
-            }
-        })
-        .expect("nested preparation failed")
-        .expect("no cancellation selected");
+        let bound = shape(&source);
         let mut expected = Vec::new();
         for _ in 0..depth {
             expected.extend([0xa1, 0]);
         }
         expected.push(7);
-        emit(&plan, &expected, &mut m);
-        drop(operation);
-        drop(plan);
-        assert_eq!(m.live_bytes(), 0);
+        prepare_run(&source, &Ok(expected.as_slice()), Fault::NONE, bound);
     }
 }
 
 #[test]
 fn excessive_nested_table_depth_is_terminal_without_publication() {
     let source = chain(128);
-    let mut operation = Preparation::new(&source);
-    let mut m = meter();
-    // The source is past the depth limit, so its shape walk is refused and
-    // no derived bound exists: the general bound applies.
-    let result = drive_faulted_observed(
-        &mut m,
-        &mut operation,
-        super::support::TURNS,
-        false,
-        |m, _, result| {
-            if let Err(error) = result
-                && error.refused()
-            {
-                assert!(
-                    ordinary_exhaustion(m, error),
-                    "unexpected refusal: {error:?}"
-                );
-            }
-        },
-    );
-    assert_eq!(result.err(), Some(BoundedError::DepthLimit));
-    exhausted(&mut m, &mut operation);
-    drop(operation);
-    assert_eq!(m.live_bytes(), 0);
+    suite(|run, policy| {
+        run.holding(
+            Preparation::new(&source),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                // The source is past the depth limit, so its shape walk is refused
+                // and no derived bound exists: the general bound applies.
+                let result =
+                    operation.drive(policy, super::support::TURNS, Retirement::Released, |_| ());
+                match result {
+                    Err(Stopped::Operation(error)) => assert_eq!(error, BoundedError::DepthLimit),
+                    Ok(()) => {
+                        return Err(Finding::Driver(
+                            "an excessively nested table was prepared or cancelled".to_owned(),
+                        ));
+                    }
+                    Err(stop) => return Err(stop.into()),
+                }
+                operation.finish(policy, super::support::TURNS, Retirement::Released)?;
+                Ok::<_, Finding>(())
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }

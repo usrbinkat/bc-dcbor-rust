@@ -1,0 +1,12 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -1791,6 +1791,8 @@
+                 None => return Err(BoundedError::PlanMismatch),
+             }
+         } else {
++            let instruction = source.instruction(frame.next);
++            frame.next = next;
+             INDEXED.admit(a)?;
+-            Some(source.instruction(frame.next))
++            Some(instruction)
+         };

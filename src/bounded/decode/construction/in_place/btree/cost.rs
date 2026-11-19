@@ -24,12 +24,12 @@ pub(super) const fn link<K, V>() -> Unit<Caller> {
 /// relocated elements and 4n+8 element slots requested, plus one staging
 /// block per growth. Each growth writes four units and prepays two releases.
 /// None when a quantity does not fit in `u64`.
-const fn arena<T, P>() -> Option<ConstructionCost> {
+const fn arena<T, P, O: crate::bounded::Origin>() -> Option<ConstructionCost> {
     let elements = cost!(unit(size_of::<T>()).checked_mul(4));
     let writes = cost!(unit(64).checked_mul(4));
     let releases = cost!(stable::release_cost::<P>().checked_mul(2));
     let each = cost!(elements.checked_add(cost!(writes.checked_add(releases))));
-    let staging = Storage::<T, P>::STAGING.block();
+    let staging = Storage::<T, P, O>::STAGING.block();
     let slots = cost!(size_of::<T>().checked_mul(4));
     let storage = held(cost!(slots.checked_add(staging)));
     let fixed = cost!(cost!(each.checked_mul(2)).checked_add(cost!(storage.checked_mul(2))));
@@ -61,16 +61,11 @@ pub(super) const fn cost<K: InPlace<A>, V: InPlace<A>, A: Allocator>() -> Option
     let own = cost!(ConstructionCost::fixed(fixed).checked_add(cost!(
         ConstructionCost::checked_per_byte(cost!(sorting.checked_add(structure)))
     )));
-    let arenas = cost!(
-        cost!(cost!(arena::<usize, A::Permit>()).checked_add(cost!(arena::<usize, A::Permit>())))
-            .checked_add(cost!(
-                cost!(arena::<Node<K, V, A::Permit>, A::Permit>()).checked_add(cost!(arena::<
-                    Entry<K, V, A>,
-                    A::Permit,
-                >(
-                )))
-            ))
-    );
+    let order = cost!(arena::<usize, A::Permit, A::Origin>());
+    let nodes = cost!(arena::<Node<K, V, A::Permit>, A::Permit, A::Origin>());
+    let entries = cost!(arena::<Entry<K, V, A>, A::Permit, A::Origin>());
+    let arenas =
+        cost!(cost!(order.checked_add(order)).checked_add(cost!(nodes.checked_add(entries))));
     let children =
         cost!(cost!(K::COST.checked_children()).checked_add(cost!(V::COST.checked_children())));
     cost!(own.checked_add(arenas)).checked_add(children)

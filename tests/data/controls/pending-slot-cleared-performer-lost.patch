@@ -1,0 +1,13 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -781,9 +781,7 @@
+         if let Some(grant) = self.grant.take() {
+             grant.forfeit(Forfeit::Cancelled, None, by);
+         }
+-        if let Some(release) = self.release.take() {
+-            release.forfeit(Forfeit::Cancelled, None, by);
+-        }
++        self.release = None;
+         self.idle();
+     }
+ }

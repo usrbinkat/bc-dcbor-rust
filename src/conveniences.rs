@@ -24,26 +24,27 @@ import_stdlib!();
 
 use crate::{CBOR, CBORCase, Error, Map, Result, Simple, tag::Tag};
 
+/// The bytes `hex` spells, refused [`Error::InvalidHex`] when it is not
+/// well-formed hexadecimal: the one hex decoding every public hex entry
+/// point uses ([`CBOR::to_byte_string_from_hex`], [`CBOR::try_from_hex`]).
+pub(crate) fn decode_hex(hex: &str) -> Result<Vec<u8>> {
+    hex::decode(hex).map_err(Error::InvalidHex)
+}
+
 /// Conveniences for byte strings.
 impl CBOR {
-    /// Creates a new CBOR value representing a byte string.
+    /// Creates a new CBOR value representing a byte string, holding a copy
+    /// of `data`: any type that can be referenced as a byte slice. An owned
+    /// `Vec<u8>` or [`crate::ByteString`] moves in without a copy through
+    /// `CBOR::from(ByteString::from(vec))`.
     ///
-    /// This method creates a CBOR byte string from any type that
-    /// can be referenced as a byte slice.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The bytes to include in the byte string, which can be any
-    ///   type that can be referenced as a byte slice (e.g., `Vec<u8>`, `&[u8]`,
-    ///   etc.)
-    ///
-    /// # Returns
-    ///
-    /// A new CBOR value representing the byte string.
+    /// A `Vec<u8>` is not decoded from a byte string by `try_into`: that
+    /// conversion is the array decoder's, a sequence of integers. The bytes
+    /// come back through [`CBOR::try_into_byte_string`].
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dcbor::prelude::*;
     ///
     /// // Create a CBOR byte string from a byte slice
@@ -54,9 +55,14 @@ impl CBOR {
     /// let encoded = cbor.to_cbor_data();
     /// assert_eq!(hex::encode(&encoded), "43010203");
     ///
-    /// // Convert back to bytes
-    /// let recovered: Vec<u8> = cbor.try_into().unwrap();
+    /// // Convert back to bytes: the byte-string accessor, not the array
+    /// // decoder.
+    /// let recovered = cbor.clone().try_into_byte_string().unwrap();
     /// assert_eq!(recovered, vec![0x01, 0x02, 0x03]);
+    /// assert!(matches!(
+    ///     Vec::<u8>::try_from(cbor),
+    ///     Err(dcbor::Error::WrongType)
+    /// ));
     /// ```
     pub fn to_byte_string(data: impl AsRef<[u8]>) -> CBOR {
         CBORCase::ByteString(data.as_ref().into()).into()
@@ -75,7 +81,9 @@ impl CBOR {
     ///
     /// # Returns
     ///
-    /// A new CBOR value representing the byte string.
+    /// The byte string, its decoded vector moved in; refused
+    /// [`Error::InvalidHex`] when `hex` is not well-formed hexadecimal (a
+    /// non-hex character, or an odd number of digits), never a panic.
     ///
     /// # Examples
     ///
@@ -83,18 +91,19 @@ impl CBOR {
     /// use dcbor::prelude::*;
     ///
     /// // Create a CBOR byte string from a hex string
-    /// let cbor = CBOR::to_byte_string_from_hex("010203");
+    /// let cbor = CBOR::to_byte_string_from_hex("010203").unwrap();
     ///
     /// // Get the diagnostic representation
     /// assert_eq!(cbor.diagnostic(), "h'010203'");
+    ///
+    /// // Malformed hex is refused.
+    /// assert!(matches!(
+    ///     CBOR::to_byte_string_from_hex("0g"),
+    ///     Err(dcbor::Error::InvalidHex(_))
+    /// ));
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if the hex string is not well-formed hexadecimal
-    /// (contains non-hex characters or an odd number of digits).
-    pub fn to_byte_string_from_hex(hex: impl AsRef<str>) -> CBOR {
-        Self::to_byte_string(hex::decode(hex.as_ref()).unwrap())
+    pub fn to_byte_string_from_hex(hex: impl AsRef<str>) -> Result<CBOR> {
+        Ok(CBORCase::ByteString(crate::ByteString::from(decode_hex(hex.as_ref())?)).into())
     }
 
     /// Extract the CBOR value as a byte string.

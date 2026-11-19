@@ -1,5 +1,6 @@
 use super::*;
-use dcbor::bounded::decode::construction::in_place::StableOption;
+use dcbor::bounded::BoundedError;
+use dcbor::bounded::decode::construction::in_place::{Building, StableOption, Transferable};
 use dcbor::bounded::decode::construction::reclamation::{MAX_DISPATCH_DEPTH, Written};
 
 /// Literal [["q\u{301}", "b"], ["c"]] through the decode matrix
@@ -45,25 +46,16 @@ fn large_optional_payload_is_initialized_at_its_published_address() {
         std::mem::size_of::<usize>()
     );
     for (wire, present) in [([0x00], true), ([0xf6], false)] {
-        let mut m = turns(None);
-        let (mut owner, input) = open(&mut m, &wire);
-        let output = support::decode::<_, StableOption<Probe, Limits>>(
-            &mut m,
-            input,
-            Options::normalizing(8),
-        )
-        .expect("stable optional literal failed");
-        assert_eq!(output.value().is_some(), present);
-        if let Some(value) = output.value().as_ref() {
-            assert_eq!(value.inline, [0x5a; 256]);
-            assert_eq!(
-                value.construction_address,
-                std::ptr::from_ref(value) as usize
-            );
-        }
-        drop(output);
-        drain(&mut owner, &mut m);
-        assert_eq!(m.live_bytes(), 0);
+        decoded::<StableOption<Probe, Limits>, _>(&wire, Options::normalizing(8), |output| {
+            assert_eq!(output.value().is_some(), present);
+            if let Some(value) = output.value().as_ref() {
+                assert_eq!(value.inline, [0x5a; 256]);
+                assert_eq!(
+                    value.construction_address,
+                    std::ptr::from_ref(value) as usize
+                );
+            }
+        });
     }
 }
 
@@ -80,22 +72,28 @@ unsafe impl<A: Allocator, const D: usize> Reclaim<A> for Declared<D> {
     type State = Written;
     const INITIAL: Written = Written::Empty;
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
-    )]
+    /// A third-party binding admits its own cleanup through the one route
+    /// ([`admit`]), as `Reclaim` documents.
     fn reclaim_step(
         mut slot: Slot<'_, Self, Written>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        admit(cleanup, 0)?;
         *slot.custody() = Written::Empty;
         Ok(Reclaimed::Done)
     }
 
     /// One call, which is `Done`.
-    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
-        1
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> Option<u64> {
+        Some(1)
+    }
+
+    /// The zero-sized value owns no permit.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, Written>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
@@ -106,24 +104,32 @@ unsafe impl<A: Allocator, const D: usize> InPlace<A> for Declared<D> {
     const COST: ConstructionCost =
         ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own construction, as `InPlace` documents"
-    )]
-    fn build_step(
-        _: &Document<'_, A::Permit>,
-        _: usize,
-        mut slot: Slot<'_, Self, Written>,
+    /// A third-party binding admits its own construction through the one
+    /// route ([`admit`]), as `InPlace` documents.
+    fn build_step<'b>(
+        ctx: dcbor::bounded::decode::construction::in_place::BindingContext<
+            'b,
+            '_,
+            '_,
+            '_,
+            Self,
+            A,
+        >,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
         const { assert!(D >= 1, "a declared depth below the true depth of 1") };
+        let assembly = ctx.assembly();
+        let mut slot = ctx.into_slot();
         let state = slot.custody();
         if *state != Written::Empty {
             return Err(BoundedError::PlanMismatch.into());
         }
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        admit(a, 0)?;
         *state = Written::Initialized;
-        Ok(Built::Done)
+        // SAFETY: the value is zero-sized, so the admitted unit recorded
+        // `Initialized` above initializes it whole; the slot is not
+        // reclaimed while it builds.
+        Ok(Building::Done(unsafe { assembly.assemble() }))
     }
 }
 
@@ -143,13 +149,7 @@ fn dispatch_depth_limit_admits_its_maximum() {
     assert_eq!(nested, 64 + <u8 as Reclaim<Limits>>::DISPATCH_DEPTH);
     assert!(nested >= MAX_DISPATCH_DEPTH);
 
-    let mut m = turns(None);
-    let (mut owner, input) = open(&mut m, &[0xf6]);
-    let output = support::decode::<_, Deepest>(&mut m, input, Options::normalizing(8))
-        .expect("the maximum dispatch depth was rejected");
-    drop(output);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    decoded::<Deepest, _>(&[0xf6], Options::normalizing(8), |_| ());
 }
 
 #[test]
@@ -179,21 +179,13 @@ fn nested_construction_and_cleanup_run_on_a_fixed_size_native_stack() {
             }
             let mut wire = [0x81; 33];
             wire[32] = 0;
-            let mut m = turns(None);
-            let (mut owner, input) = open(&mut m, &wire);
-            let output = support::decode::<_, Sixteen<Sixteen<Probe>>>(
-                &mut m,
-                input,
-                Options::normalizing(32),
-            )
-            .expect("nested construction failed");
-            let leaf = sixteen!(sixteen!(output.value()));
-            assert_eq!(leaf.inline, [0x5a; 256]);
-            assert_eq!(leaf.construction_address, std::ptr::from_ref(leaf) as usize);
-            drop(output);
-            drain(&mut owner, &mut m);
-            assert_eq!(m.live_bytes(), 0);
-            assert_eq!(DROPS.get(), 0);
+            DROPS.set(0);
+            decoded::<Sixteen<Sixteen<Probe>>, _>(&wire, Options::normalizing(32), |output| {
+                let leaf = sixteen!(sixteen!(output.value()));
+                assert_eq!(leaf.inline, [0x5a; 256]);
+                assert_eq!(leaf.construction_address, std::ptr::from_ref(leaf) as usize);
+            });
+            assert_eq!(DROPS.get(), 0, "cleanup invoked the leaf destructor");
         })
         .unwrap()
         .join()
@@ -225,33 +217,60 @@ fn maximum_real_dispatch_depth_reclaims_during_unwinding() {
             DROPS.set(0);
             let mut wire = [0x81; 63];
             wire[62] = 0;
-            let mut policy = turns(None);
-            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let (owner, input) = open(&mut policy, &wire);
-                let value =
-                    support::decode::<_, Deepest>(&mut policy, input, Options::normalizing(62))
-                        .expect("maximum real dispatch depth did not publish");
-                assert_eq!(value.bytes(), wire);
-                assert_eq!(STARTS.get(), 1);
-                // Both handles are live when unwinding starts. Their drops
-                // retire the record and drive the owner's terminal cleanup.
-                assert!(owner.outstanding() > 0);
-                policy.exhaust();
-                panic!("maximum-depth terminal cleanup");
-            }));
-            let payload = unwound.expect_err("fixture did not unwind");
-            assert_eq!(
-                payload.downcast_ref::<&str>(),
-                Some(&"maximum-depth terminal cleanup")
-            );
-            assert_eq!(policy.live_bytes(), 0);
-            assert_eq!(
-                DROPS.get(),
-                0,
-                "terminal cleanup invoked the leaf destructor"
-            );
+            // The unwind is caught inside the run, so the run's finalizer
+            // refines the terminal cleanup the unwinding retirements drove.
+            support::recorded_run(|run| unwinding::<Deepest>(run, &wire));
         })
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// [`maximum_real_dispatch_depth_reclaims_during_unwinding`]'s body: `T`
+/// decoded from `wire` in a scope `run` holds, then a panic with the
+/// published value and the scope's authority both live and the policy
+/// exhausted. The unwind passes through the holdings, which retire the
+/// value, its record queued and nothing released, then the authority, whose
+/// terminal destruction drains the queue under its terminal policy, no
+/// admission of the exhausted policy's needed, each retirement checked
+/// against its rule; the payload is caught here, after every retirement.
+/// Nothing remains live and no destructor of the leaf ran.
+fn unwinding<T: Transferable<Limits> + 'static>(
+    run: &mut support::RecordedRun,
+    wire: &[u8],
+) -> Result<(), Finding> {
+    let policy = run.policy(u64::MAX);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run.holding(
+            dcbor::bounded::decode::construction::DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                    let scope = view.value().get();
+                    view.decoded::<T, _>(policy, wire, Options::normalizing(62), |value| {
+                        assert_eq!(value.value().bytes(), wire);
+                        assert_eq!(STARTS.get(), 1);
+                        assert!(scope.outstanding() > 0, "the value holds no record");
+                        value.with_policy(policy, |_, m| m.exhaust());
+                        panic!("maximum-depth terminal cleanup");
+                    })
+                })?
+                .map_err(support::failed("the deep decode"))
+            },
+        )
+    }));
+    let payload = unwound.expect_err("fixture did not unwind");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"maximum-depth terminal cleanup")
+    );
+    run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+    assert_eq!(
+        DROPS.get(),
+        0,
+        "terminal cleanup invoked the leaf destructor"
+    );
+    Ok(())
 }

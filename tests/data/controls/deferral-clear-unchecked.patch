@@ -1,0 +1,19 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -197,14 +197,9 @@
+             // Phase 1: a listed scope holds at least the listing's release.
+             0 => abort(),
+             1 => {
+-                if deferral(&block)
+-                    .deferred
+-                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+-                    .is_ok()
+-                {
+-                    break;
+-                }
++                deferral(&block).deferred.store(0, Ordering::Release);
++                break;
+             }
+             n => {
+                 for _ in 1..n {
+                     release_reference(block, worklist);

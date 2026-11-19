@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -1402,8 +1402,6 @@
+         unsafe {
+             assert!((*header.as_ptr()).custody.get() == Holder::Handle);
+-            (*header.as_ptr()).custody.set(Holder::Queued);
+-            ((*header.as_ptr()).finish)(header, Ending::Custody(RecordStage::Queued));
+             (*header.as_ptr())
+                 .next
+                 .store(ptr::null_mut(), Ordering::Relaxed);
+         }

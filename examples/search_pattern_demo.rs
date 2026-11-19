@@ -5,21 +5,21 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a complex CBOR structure similar to what SearchPattern might
     // encounter
     let mut root_map = Map::new();
 
     // Add some basic values
-    root_map.insert("name", "SearchPattern Test");
-    root_map.insert("version", 1);
+    root_map.insert("name", "SearchPattern Test")?;
+    root_map.insert("version", 1)?;
 
     // Add nested structures
     let mut user_map = Map::new();
-    user_map.insert("id", 12345);
-    user_map.insert("email", "test@example.com");
-    user_map.insert("roles", vec!["admin", "user"]);
-    root_map.insert("user", user_map);
+    user_map.insert("id", 12345)?;
+    user_map.insert("email", "test@example.com")?;
+    user_map.insert("roles", vec!["admin", "user"])?;
+    root_map.insert("user", user_map)?;
 
     // Add an array with mixed content
     let mixed_array: Vec<CBOR> = vec![
@@ -27,7 +27,7 @@ fn main() {
         CBOR::from(42),
         CBOR::from(vec![1, 2, 3]),
     ];
-    root_map.insert("mixed", mixed_array);
+    root_map.insert("mixed", mixed_array)?;
 
     let cbor = CBOR::from(root_map);
 
@@ -143,4 +143,5 @@ fn main() {
     for (depth, count) in depths {
         println!("  Depth {}: {} elements", depth, count);
     }
+    Ok(())
 }

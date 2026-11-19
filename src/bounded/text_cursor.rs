@@ -63,21 +63,34 @@ pub struct Position {
 /// or summed), one composition, one storage relocation, or one scalar
 /// emission. All
 /// intermediate values and their reservations remain owned across refusal.
-pub type TextEncoder<'a, P> = TextContinuation<&'a str, P>;
+pub type TextEncoder<'a, P, O> = TextContinuation<&'a str, P, O>;
 
 /// Normalization progress with an explicit source attachment. Owned decoding
 /// uses `()` here and supplies a temporary source borrow to each turn.
+///
+/// The continuation is the custody of its output's one acquisition. Made
+/// with no policy, it takes its owner ([`Owner`]) at that acquisition's
+/// first entry (`ReleaseOutput`), minted by the policy that enters it and
+/// kept for the continuation's life; the acquisition's identity is minted
+/// once, at the same entry, and kept across every refused request and every
+/// change of policy until the grant. The later entry (`Allocate`) validates
+/// the performing policy against that owner before requesting anything
+/// ([`Budget::validate_owner`]). The output's release is held here
+/// ([`Retained`], its origin the family that admitted it) from
+/// `ReleaseOutput` until the grant spends it at the permit, or cleanup or a
+/// terminal error forfeits it. Its two arenas are owner custodies of their
+/// own ([`Storage`]).
 #[doc(hidden)]
-pub struct TextContinuation<S, P> {
+pub struct TextContinuation<S, P, O: Origin> {
     source: S,
-    chars: Storage<char, P>,
+    chars: Storage<char, P, O>,
     phase: Phase,
     source_at: usize,
     /// One scalar's canonical decomposition ([`text::MAX_SCALAR_PARTS`]).
     pending: [char; text::MAX_SCALAR_PARTS],
     pending_len: usize,
     pending_at: usize,
-    ordering: ordering::Ordering<P>,
+    ordering: ordering::Ordering<P, O>,
     read: usize,
     written: usize,
     starter: Option<usize>,
@@ -89,17 +102,37 @@ pub struct TextContinuation<S, P> {
     emit_at: usize,
     bytes: Vec<u8>,
     permit: Option<P>,
+    /// The owner of the output's acquisition, taken at its first entry.
+    owner: Option<Owner>,
+    /// The output's acquisition's capability, from its first entry until
+    /// its physical outcome, its cancellation or the continuation's drop.
+    acquisition: Option<Acquisition<O>>,
+    /// The output's release, held from `ReleaseOutput` until its grant.
+    output_release: Option<Retained<O>>,
 }
 
-impl<P> TextEncoder<'_, P> {
+/// A continuation dropped with its output's acquisition still bound is that
+/// acquisition's destruction: the release forfeited, then the acquisition
+/// ended, with no policy performing them ([`TextContinuation::cancel_output`]).
+/// Allocation-free and non-unwinding. A prefix of a continuation's fields
+/// never holds a bound acquisition: one binds only once every field is
+/// written (`initialization`).
+impl<S, P, O: Origin> Drop for TextContinuation<S, P, O> {
+    fn drop(&mut self) {
+        self.cancel_output(Performer::None);
+    }
+}
+
+impl<P, O: Origin> TextEncoder<'_, P, O> {
     /// One step. A terminal error enters cleanup: later steps release the
     /// retained scratch and output, then return [`Step::Finished`].
-    pub fn step<A: Allocator<Permit = P>>(
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<Step<Encoded<P>>, A> {
         let result = self.step_source(self.source, allocator);
         if matches!(&result, Err(error) if !error.refused()) {
+            self.cancel_output(allocator.performer());
             self.phase = Phase::ReclaimOrdering;
         }
         result
@@ -168,11 +201,11 @@ impl TextShape {
     /// parts and the part bytes of [`Self::worst`] are attained at once
     /// (`text::the_joint_counts_are_the_releases_own`); only the scalars
     /// trade against the parts ([`text::SCALARS_AND_PARTS_PER_BYTE`]), a sum
-    /// over scalars. A bound of a text's shape, as every one of [`TextTerms`]
+    /// over scalars. A bound of a text's shape, as every one of `TextTerms`
     /// is, rises with each count and charges each part at least what a
     /// scalar's read costs: so a scalar given up for a part never lowers it,
     /// and the most is at every part the bytes allow with every scalar those
-    /// parts leave ([`Self::jointly`]). The part bytes are not traded against
+    /// parts leave (`Self::jointly`). The part bytes are not traded against
     /// the scalars: a part byte charges no value, which a scalar's read does.
     ///
     /// The runs trade against the sorted parts: of `C` combining parts, `S`
@@ -293,7 +326,7 @@ impl TextShape {
 ///   the end;
 /// - appending: one unit per part, and one per character the arena of
 ///   decomposed characters relocates as it grows ([`storage_growth`]);
-/// - ordering ([`ordering`]): one unit per character copied into the
+/// - ordering (`ordering`): one unit per character copied into the
 ///   scratch, and one per relocated scratch character; one unit of a
 ///   character to begin, one per part examined and one per run's end to
 ///   find the runs, and one to end: `P + runs + 2`. A run of one combining
@@ -435,10 +468,12 @@ pub(crate) fn interrupted<R>(text: TextShape) -> Result<WriteWork, BoundedError<
         WriteWork::default(),
         cleanup::<R>()?,
     )?;
-    terms
-        .releasing_scratch
-        .then(terms.releasing_chars)?
-        .then(terms.cleanup)
+    WriteWork::checked_sequence(&[
+        terms.releasing_scratch,
+        terms.releasing_chars,
+        terms.cleanup,
+    ])
+    .ok_or(BoundedError::Overflow)
 }
 
 /// The [`ResourceBound`] of normalizing and encoding `texts` texts one after
@@ -466,10 +501,12 @@ pub(crate) fn normalizations<P, R>(
     if texts == 0 {
         return Ok(ResourceBound::default());
     }
+    let overflow = || BoundedError::Overflow;
     let publication = publication::<P, R>()?;
     let released = output_release::<P, R>()?;
     let summed =
         TextTerms::of::<R>(total, publication, released, WriteWork::default())?.bound::<R>()?;
+    // Every other text's fixed terms, each released before the next.
     let fixed = TextTerms::of::<R>(
         TextShape::default(),
         publication,
@@ -477,7 +514,8 @@ pub(crate) fn normalizations<P, R>(
         WriteWork::default(),
     )?
     .bound::<R>()?
-    .repeated::<R>(texts - 1)?;
+    .checked_repeated(texts - 1)
+    .ok_or_else(overflow)?;
     const ARENAS: u64 = 2;
     let scalar = widen(core::mem::size_of::<char>())?;
     // Each arena of a text of `p` parts grows at most `floor(p / 4) + 1`
@@ -486,10 +524,15 @@ pub(crate) fn normalizations<P, R>(
     // writes in its own units, stages a block of at most a quantum and
     // admits the releases of its two allocations.
     let growths = mul(add(total.parts / 4, texts)?, ARENAS)?;
-    let apart = Storage::<char, ()>::element_work(mul(mul(total.parts, 2)?, ARENAS)?)?
-        .then(Storage::<char, ()>::cleanup_work(true)?.times(mul(texts, ARENAS)?)?)?
-        .then(Storage::<char, ()>::growth_work(growths)?)?
-        .then(RELEASED.times(mul(growths, 2)?)?)?;
+    let apart = WriteWork::checked_sequence(&[
+        Storage::<char, (), ()>::element_work(mul(mul(total.parts, 2)?, ARENAS)?)?,
+        Storage::<char, (), ()>::cleanup_work(true)?
+            .checked_times(mul(texts, ARENAS)?)
+            .ok_or_else(overflow)?,
+        Storage::<char, (), ()>::growth_work(growths)?,
+        RELEASED.times(mul(growths, 2)?)?,
+    ])
+    .ok_or_else(overflow)?;
     let requested = add(
         mul(
             mul(add(mul(total.parts, 4)?, mul(texts, 4)?)?, ARENAS)?,
@@ -498,16 +541,21 @@ pub(crate) fn normalizations<P, R>(
         mul(growths, TURN.bytes)?,
     )?;
     let heads = mul(texts, widen(head_len(total.part_bytes))?)?;
-    Ok(ResourceBound {
-        values: add(add(summed.values, fixed.values)?, apart.values)?,
-        bytes: add(add(add(summed.bytes, fixed.bytes)?, apart.bytes)?, heads)?,
-        allocated: add(
-            add(add(summed.allocated, fixed.allocated)?, requested)?,
-            heads,
-        )?,
-        peak: summed.peak,
+    // The arenas growing apart, and each text's head written and requested:
+    // work and requests alone, holding nothing the summed shape does not.
+    let apart = ResourceBound {
+        values: apart.values,
+        bytes: add(apart.bytes, heads)?,
+        allocated: add(requested, heads)?,
+        peak: 0,
         retained: 0,
-    })
+    };
+    // One text at a time, each released before the next: the summed shape's
+    // peak, at least any one text's, and nothing retained.
+    summed
+        .checked_followed_by(fixed)
+        .and_then(|texts| texts.checked_followed_by(apart))
+        .ok_or_else(overflow)
 }
 
 /// The terms [`encode_bound`] sums, one per [`TextPlace`].
@@ -540,19 +588,23 @@ impl TextTerms {
         released: WriteWork,
         cleanup: WriteWork,
     ) -> Result<Self, BoundedError<R>> {
+        let overflow = || BoundedError::Overflow;
         let parts = text.parts;
         let scalar = widen(core::mem::size_of::<char>())?;
         let (chars, growing) = storage_growth::<R>(parts, scalar)?;
-        let growing = growing.then(chars.released()?)?;
+        let growing =
+            WriteWork::checked_sequence(&[growing, chars.released()?]).ok_or_else(overflow)?;
         // Derived from `Ordering::step`: a find unit per part examined, per
         // run's end and to begin and end; for each sorted run, per pass, a
         // cleared and a summed table and per part a count, a scatter and a
         // copy back: `6` part units per sorted part, `4` table units per
         // sorted run. A run of one is in order: nothing but its end.
-        let ordering = ordering::FIND
-            .times(add(add(parts, text.runs)?, 2)?)?
-            .then(ordering::MARK.times(mul(text.sorted_parts, 6)?)?)?
-            .then(ordering::TABLE.times(mul(text.sorted_runs, 4)?)?)?;
+        let ordering = WriteWork::checked_sequence(&[
+            ordering::FIND.times(add(add(parts, text.runs)?, 2)?)?,
+            ordering::MARK.times(mul(text.sorted_parts, 6)?)?,
+            ordering::TABLE.times(mul(text.sorted_runs, 4)?)?,
+        ])
+        .ok_or_else(overflow)?;
         // The payload is at most the parts' bytes, and its head at most
         // theirs: no head is shorter for a longer payload.
         let head = widen(head_len(text.part_bytes))?;
@@ -564,21 +616,28 @@ impl TextTerms {
         // releases paid for by its growths; and, cancelled after that
         // cleanup, cleanup's pass over the released arena, one step of no
         // bytes.
-        let drained = Storage::<char, ()>::element_work(parts)?
-            .then(Storage::<char, ()>::cleanup_work(parts != 0)?)?
-            .then(Storage::<char, ()>::step_work(1)?)?;
+        let drained = WriteWork::checked_sequence(&[
+            Storage::<char, (), ()>::element_work(parts)?,
+            Storage::<char, (), ()>::cleanup_work(parts != 0)?,
+            Storage::<char, (), ()>::step_work(1)?,
+        ])
+        .ok_or_else(overflow)?;
         // An arena grown to hold every part: every relocated element one
         // unit of its bytes, each growth's writes, and each allocation's
-        // release.
+        // release; its work done while its storage is held, the two
+        // concurrent, the storage released by its own place later.
         let arena = |unit: Unit<TextPlace>| -> Result<ResourceBound, BoundedError<R>> {
-            let work = unit.times(parts)?.then(growing)?;
-            Ok(ResourceBound {
-                values: work.values,
-                bytes: work.bytes,
-                allocated: chars.allocated,
-                peak: chars.peak,
-                retained: 0,
-            })
+            let work =
+                WriteWork::checked_sequence(&[unit.times(parts)?, growing]).ok_or_else(overflow)?;
+            ResourceBound::of_work(work)
+                .checked_add(ResourceBound {
+                    allocated: chars.allocated,
+                    peak: chars.peak,
+                    retained: chars.held,
+                    ..ResourceBound::default()
+                })
+                .and_then(|held| held.checked_followed_by(ResourceBound::default()))
+                .ok_or_else(overflow)
         };
         // One unit per part and one at the end.
         let ends = add(parts, 1)?;
@@ -590,13 +649,16 @@ impl TextTerms {
             releasing_scratch: drained,
             composing: COMPOSE.times(ends)?,
             measuring: MEASURE.times(ends)?,
-            output: ResourceBound {
-                values: released.values,
-                bytes: released.bytes,
-                allocated: output,
-                peak: output,
-                retained: output,
-            },
+            // The output's release admitted, then the output requested at
+            // its exact length, held and kept.
+            output: ResourceBound::of_work(released)
+                .checked_then(ResourceBound {
+                    allocated: output,
+                    peak: output,
+                    retained: output,
+                    ..ResourceBound::default()
+                })
+                .ok_or_else(overflow)?,
             header: HEADER.covering(head, 0)?,
             emitting: EMIT.times(ends)?,
             releasing_chars: drained,
@@ -647,10 +709,18 @@ impl Places for TextTerms {
         }
     }
 
-    /// The characters' arena held while the scratch grows, or while the
-    /// output is written; never both of those at once.
+    /// The characters' arena held concurrently with the alternative of the
+    /// scratch growing and the output written; never both of those at once.
+    /// Peaks alone are composed, so no work refuses a peak.
     fn peak<R>(&self) -> Result<u64, BoundedError<R>> {
-        add(self.chars.held, self.copying.peak.max(self.output.peak))
+        let peak = |peak| ResourceBound {
+            peak,
+            ..ResourceBound::default()
+        };
+        peak(self.chars.held)
+            .checked_add(peak(self.copying.peak).larger(peak(self.output.peak)))
+            .map(|held| held.peak)
+            .ok_or(BoundedError::Overflow)
     }
 }
 
@@ -661,7 +731,7 @@ fn parts<R>(source: u64) -> Result<u64, BoundedError<R>> {
     Ok(mul(source, per)? / of)
 }
 
-impl<P, A: Allocator<Permit = P>> Resumable<A> for TextEncoder<'_, P> {
+impl<P, O: Origin, A: Allocator<Permit = P, Origin = O>> Resumable<A> for TextEncoder<'_, P, O> {
     type Output = Encoded<P>;
     type Error = BoundedError<A::Refusal>;
     type Position = Position;
@@ -675,7 +745,7 @@ impl<P, A: Allocator<Permit = P>> Resumable<A> for TextEncoder<'_, P> {
     }
 }
 
-impl<S, P> TextContinuation<S, P> {
+impl<S, P, O: Origin> TextContinuation<S, P, O> {
     pub const fn new(source: S) -> Self {
         Self {
             source,
@@ -697,6 +767,9 @@ impl<S, P> TextContinuation<S, P> {
             emit_at: 0,
             bytes: Vec::new(),
             permit: None,
+            owner: None,
+            acquisition: None,
+            output_release: None,
         }
     }
 
@@ -731,8 +804,10 @@ impl<S, P> TextContinuation<S, P> {
     }
 
     /// Cancel and release one retained resource unit. Admission closes before
-    /// cleanup starts; subsequent calls cannot resume text production.
-    pub fn reclaim_step<A: Allocator<Permit = P>>(
+    /// cleanup starts; subsequent calls cannot resume text production. Bound
+    /// on [`Releasing`], not [`Allocator`]: no new allocation can be
+    /// requested through the capability cleanup is given.
+    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
@@ -762,28 +837,106 @@ impl<S, P> TextContinuation<S, P> {
             Phase::Finished => return Ok(true),
             _ => {
                 CLEANUP.admit(allocator)?;
+                self.cancel_output(allocator.performer());
                 self.phase = Phase::ReclaimOrdering;
             }
         }
         Ok(false)
     }
 
+    /// The output's release, held from `ReleaseOutput` until its grant
+    /// ([`Obligation::Release`]), forfeited into its origin, `by` the
+    /// performer, when cleanup begins, a terminal error or a drop ends the
+    /// continuation before it is granted; the acquisition then ended for
+    /// the continuation's owner, once. Nothing once its outcome ended it.
+    fn cancel_output(&mut self, by: Performer) {
+        if let Some(release) = self.output_release.take() {
+            release.forfeit(Forfeit::Cancelled, None, by);
+        }
+        if let Some(acquisition) = self.acquisition.take() {
+            acquisition.end(by);
+        }
+    }
+}
+
+impl<S, P, O: Origin> Custodial<P> for TextContinuation<S, P, O> {
+    /// The continuation's custody, observed once ([`CustodySink`]): its own
+    /// group under the owner of its output's acquisition (deferred until
+    /// that acquisition's first entry takes it), holding the output's
+    /// release between `ReleaseOutput` and its grant and the output's permit
+    /// from its grant until publication moves it into the published
+    /// encoding; inside it, its two arenas' groups, each under its own
+    /// stored owner ([`Storage::observe_custody`],
+    /// `ordering::Ordering::observe_custody`). Read from its state alone: it
+    /// allocates, admits, mints, publishes and settles nothing. Never
+    /// contended: the continuation owns no queue.
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        sink.begin(self.owner.as_ref().map(Owner::id));
+        // The bound acquisition, credit or none, from its bind to its end.
+        if let Some(acquisition) = &self.acquisition {
+            sink.bound(acquisition.id());
+        }
+        if let Some(release) = &self.output_release
+            && release.remaining() != WriteWork::default()
+        {
+            sink.held(release.observation());
+        }
+        if let Some(permit) = &self.permit {
+            sink.permit(permit, None);
+        }
+        let observed = observed_all([
+            self.chars.observe_custody(sink),
+            self.ordering.observe_custody(sink),
+        ]);
+        sink.end();
+        observed
+    }
+}
+
+impl<S, P, O: Origin> TextContinuation<S, P, O> {
+    /// The credit this continuation's custody holds: the checked fold of
+    /// its observation ([`Self::observe_custody`], [`total_held`]). `None`
+    /// when the sum does not fit. The public conservation observation of
+    /// the continuation: read beside its policies'
+    /// [`crate::bounded::Limits::credits`], it is the `held` that
+    /// [`crate::bounded::Credits::conserved_with`] checks.
+    pub fn held_credit(&mut self) -> Option<WriteWork> {
+        total_held(|sink| self.observe_custody(sink))
+    }
+
     /// The most successful calls [`Self::reclaim_step`] still takes, the one
     /// returning true included: the transition into cleanup unless it has
     /// begun, the scratch's own count while it is being released, then the
     /// characters'; one once finished. Admits nothing and changes nothing.
-    pub(crate) fn reclaim_remaining(&self) -> u64 {
-        let ordering = self.ordering.reclaim_remaining();
-        let chars = self.chars.reclaim_remaining();
+    /// `None` when the count does not fit in `u64`.
+    pub(crate) fn reclaim_remaining(&self) -> Option<u64> {
+        let ordering = self.ordering.reclaim_remaining()?;
+        let chars = self.chars.reclaim_remaining()?;
         match self.phase {
-            Phase::Finished => 1,
-            Phase::ReclaimChars => chars,
-            Phase::ReclaimOrdering => ordering.saturating_add(chars),
-            _ => ordering.saturating_add(chars).saturating_add(1),
+            Phase::Finished => Some(1),
+            Phase::ReclaimChars => Some(chars),
+            Phase::ReclaimOrdering => ordering.checked_add(chars),
+            _ => ordering.checked_add(chars)?.checked_add(1),
         }
     }
+}
 
-    pub(crate) fn step_source<A: Allocator<Permit = P>>(
+/// Whether `bytes` has room for `more` bytes in the capacity it reserved,
+/// refused [`BoundedError::PlanMismatch`] otherwise: the output's extension
+/// never reallocates, so its only allocation is the one `Allocate` admitted.
+/// The measured payload and the emitted one are read from the same settled
+/// characters, so a refusal here is a defect of that equality, reported
+/// rather than paid for with an unadmitted reallocation.
+fn fits<A: Allocator>(bytes: &Vec<u8>, more: usize, allocator: &mut A) -> BoundedResult<(), A> {
+    let spare = bytes.capacity() - bytes.len();
+    if Bound::new(Predicate::ArenaLength, spare).exceeded(allocator, more) {
+        return Err(BoundedError::PlanMismatch);
+    }
+    Ok(())
+}
+
+impl<S, P, O: Origin> TextContinuation<S, P, O> {
+    pub(crate) fn step_source<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         source: &str,
         allocator: &mut A,
@@ -901,17 +1054,82 @@ impl<S, P> TextContinuation<S, P> {
                 }
             }
             Phase::ReleaseOutput => {
-                output_released::<P>().admit(allocator)?;
+                // The continuation's owner, taken at the output acquisition's
+                // first entry and kept; the acquisition's identity, minted
+                // once and kept across a refused admission below, so a retry
+                // never mints again.
+                if self.owner.is_none() {
+                    self.owner = Some(allocator.owner().map_err(BoundedError::Refused)?);
+                }
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                let acquisition = match &self.acquisition {
+                    Some(acquisition) => acquisition.id(),
+                    None => {
+                        let minted = allocator
+                            .acquisition(owner)
+                            .map_err(BoundedError::Refused)?;
+                        let id = minted.id();
+                        self.acquisition = Some(minted);
+                        id
+                    }
+                };
+                // Held from here until the grant: this continuation is its
+                // custody across a refused request ([`Self::held_credit`]).
+                // The route validates the performing policy against the
+                // owner first.
+                let release = output_released::<P>().admit_held(
+                    allocator,
+                    Obligation::Release,
+                    owner,
+                    acquisition,
+                )?;
+                self.output_release = Some(release);
                 self.phase = Phase::Allocate;
             }
             Phase::Allocate => {
+                // A resumed entry, possibly under another policy: validated
+                // against the continuation's owner before anything is
+                // requested.
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                allocator
+                    .validate_owner(owner)
+                    .map_err(BoundedError::Refused)?;
+                let acquisition = self
+                    .acquisition
+                    .as_ref()
+                    .ok_or(BoundedError::PlanMismatch)?
+                    .id();
                 let length = add(self.payload_len, self.header_len as u64)?;
                 let size = usize::try_from(length).map_err(|_| BoundedError::Overflow)?;
                 let permit = at(TextPlace::Output, || allocator.allocate(length))
                     .map_err(BoundedError::Refused)?;
-                self.bytes
-                    .try_reserve_exact(size)
-                    .map_err(|_| BoundedError::Allocation { bytes: length })?;
+                let id = A::permit_identity(&permit);
+                let by = allocator.performer();
+                // Granted: the release is spent at the permit, which carries
+                // it and whose drop performs it on every path below.
+                self.output_release
+                    .take()
+                    .ok_or(BoundedError::PlanMismatch)?
+                    .spend(Some(id), by);
+                // The permit stays local until the reservation succeeds; a
+                // failed one is dropped inside this step ([`reserved`]). The
+                // failure is terminal (`Class::Allocation`), and the
+                // continuation holds nothing any more, so it enters cleanup
+                // here: this phase never runs again and the release is never
+                // admitted or forfeited twice.
+                let bytes = &mut self.bytes;
+                let reservation = reserved(allocator, permit, acquisition, || {
+                    bytes
+                        .try_reserve_exact(size)
+                        .map_err(|_| Forfeit::AcquisitionFailed)
+                });
+                // The acquisition ends with its physical outcome, its one
+                // obligation spent: `cancel_output` finds no release.
+                self.cancel_output(by);
+                let Ok((permit, ())) = reservation else {
+                    self.phase = Phase::ReclaimOrdering;
+                    return Err(BoundedError::Allocation { bytes: length });
+                };
                 self.permit = Some(permit);
                 self.phase = Phase::Header;
                 // Continue to actual emission; a refusal retains the newly
@@ -919,6 +1137,7 @@ impl<S, P> TextContinuation<S, P> {
                 return self.step_source(source, allocator);
             }
             Phase::Header => {
+                fits(&self.bytes, self.header_len, allocator)?;
                 HEADER.admit(allocator, self.header_len as u64)?;
                 self.bytes
                     .extend_from_slice(&self.header[..self.header_len]);
@@ -934,11 +1153,11 @@ impl<S, P> TextContinuation<S, P> {
                     return Ok(Step::Progress);
                 }
                 let mut encoded = [0; 4];
-                self.bytes.extend_from_slice(
-                    chars.as_slice()[self.emit_at]
-                        .encode_utf8(&mut encoded)
-                        .as_bytes(),
-                );
+                let scalar = chars.as_slice()[self.emit_at]
+                    .encode_utf8(&mut encoded)
+                    .as_bytes();
+                fits(&self.bytes, scalar.len(), allocator)?;
+                self.bytes.extend_from_slice(scalar);
                 self.emit_at += 1;
             }
             Phase::ReleaseChars => {
@@ -950,11 +1169,15 @@ impl<S, P> TextContinuation<S, P> {
             }
             Phase::Publish => {
                 published::<P>().admit(allocator)?;
+                // The output carries the owner its acquisition was bound
+                // under, the one this continuation stored at its first entry.
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?.id();
                 let permit = self.permit.take().ok_or(BoundedError::PlanMismatch)?;
                 self.phase = Phase::Finished;
                 return Ok(Step::Complete(Encoded {
                     bytes: core::mem::take(&mut self.bytes),
                     _permit: permit,
+                    owner,
                 }));
             }
             Phase::ReclaimOrdering | Phase::ReclaimChars => {
@@ -969,7 +1192,7 @@ impl<S, P> TextContinuation<S, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bounded::{Limits, Reservation, within};
+    use crate::bounded::{Family, Limits, Reservation, within};
     use core::ops::ControlFlow;
     use pipeline::{TextPreparation, preparation_bound};
     use unicode_normalization::UnicodeNormalization;
@@ -979,7 +1202,7 @@ mod tests {
     fn prepared(text: &str) -> (WriteWork, u64, u64, u64) {
         let bound = preparation_bound::<Reservation, ()>(TextShape::of(text)).unwrap();
         let mut limits = Limits::unlimited();
-        let mut preparation = TextPreparation::<Reservation>::new(text);
+        let mut preparation = TextPreparation::<Reservation, Family>::new(text);
         let plan = within("text preparation", bound, || {
             match preparation.step(&mut limits).unwrap() {
                 Step::Progress => ControlFlow::Continue(()),
@@ -1008,7 +1231,7 @@ mod tests {
     fn measured(text: &str) -> (WriteWork, u64, u64, u64) {
         let bound = encode_bound::<Reservation, ()>(TextShape::of(text)).unwrap();
         let mut limits = Limits::unlimited();
-        let mut encoder = TextEncoder::<Reservation>::new(text);
+        let mut encoder = TextEncoder::<Reservation, Family>::new(text);
         let encoded = within("text encoding", bound, || {
             match encoder.step(&mut limits).unwrap() {
                 Step::Progress => ControlFlow::Continue(()),
@@ -1305,6 +1528,158 @@ mod tests {
         by_length
     }
 
+    /// The longest texts of the alphabet
+    /// [`every_alphabet_text_is_encoded_within_its_bound_at_every_refusal_and_cancellation`]
+    /// encodes: every order of every shape entry ([`ALPHABET`]) up to this
+    /// many bytes, 718 texts.
+    const EXHAUSTIVE_BYTES: usize = 5;
+
+    /// `text` encoded under `m` from its first step to its publication
+    /// within `steps` calls, a refused call retried at the next, any other
+    /// error a failure named by `what`; the continuation holds no credit
+    /// once it publishes. The published encoding and the calls taken before
+    /// the one that published it.
+    fn encoded_within(
+        text: &str,
+        m: &mut Limits,
+        steps: u64,
+        what: &str,
+    ) -> (Encoded<Reservation>, u64) {
+        let mut encoder = TextEncoder::<Reservation, Family>::new(text);
+        for taken in 0..steps {
+            match encoder.step(m) {
+                Ok(Step::Complete(encoded)) => {
+                    assert_eq!(
+                        encoder.held_credit(),
+                        Some(WriteWork::default()),
+                        "{what}: credit held once published"
+                    );
+                    return (encoded, taken);
+                }
+                Ok(Step::Progress) | Err(BoundedError::Refused(_)) => {}
+                Ok(Step::Finished) => panic!("{what}: finished without an output"),
+                Err(error) => panic!("{what}: {error:?}"),
+            }
+        }
+        panic!("{what}: not published within {steps} calls");
+    }
+
+    /// Every text of the alphabet of up to [`EXHAUSTIVE_BYTES`] bytes is
+    /// encoded within the bound of its own shape ([`encode_bound`]) on every
+    /// path the policy can drive it down: unrefused; with each of its
+    /// attempts refused once, work and allocation alike, then retried; with
+    /// each of its allocation requests refused once, then retried; and
+    /// cancelled before each of its steps, then cleaned up
+    /// ([`TextContinuation::reclaim_step`]). Each run is within the bound in
+    /// work, requests and peak, and what it retains; a refused call
+    /// readmits nothing (the work used is the unrefused run's, and a
+    /// refusal costs one call); the output is the text's normalization;
+    /// nothing is held once the output or the cleanup ends, the custody
+    /// holds no credit, and the family's ledgers conserve with none held.
+    ///
+    /// Checked over the stated domain, not proved. The alphabet holds every
+    /// way a scalar enters a text's shape ([`the_alphabet_holds_every_entry_once`]),
+    /// so these texts reach every shape of their lengths, and the bound is a
+    /// function of the shape alone. What the operation does beyond the
+    /// shape (which characters compose, and the output's length) is bounded
+    /// by the parts and their bytes
+    /// ([`no_composition_is_longer_than_its_decomposition`]), not by these
+    /// texts. A physical reservation failure (`try_reserve_exact`) is not
+    /// reached: the global allocator never fails here.
+    #[test]
+    fn every_alphabet_text_is_encoded_within_its_bound_at_every_refusal_and_cancellation() {
+        for text in texts_of(EXHAUSTIVE_BYTES).into_iter().flatten() {
+            let bound = encode_bound::<Reservation, ()>(TextShape::of(&text)).unwrap();
+            let steps = bound
+                .steps::<()>()
+                .expect("a short text's steps fit in u64");
+            let expected: String = text.nfc().collect();
+            let within_bound = |m: &Limits, retained: u64, what: &str| {
+                assert!(
+                    bound.covers(m.used(), m.requested_bytes(), m.peak_bytes(), retained),
+                    "{what}: used {:?}, requested {}, peak {}, retained {retained}; {bound:?}",
+                    m.used(),
+                    m.requested_bytes(),
+                    m.peak_bytes()
+                );
+            };
+            let released = |m: &Limits, what: &str| {
+                assert_eq!(m.live_bytes(), 0, "{what}: storage outlived the run");
+                assert_eq!(
+                    m.credits().conserved_with(WriteWork::default()),
+                    Some(true),
+                    "{what}: {:?}",
+                    m.credits()
+                );
+            };
+            let published = |m: &Limits, encoded: Encoded<Reservation>, what: &str| {
+                assert!(
+                    encoded.as_ref().ends_with(expected.as_bytes()),
+                    "{what}: not its normalization"
+                );
+                within_bound(m, m.live_bytes(), what);
+                drop(encoded);
+                released(m, what);
+            };
+            let name = format!("{text:?}");
+            let mut clean = Limits::unlimited();
+            let (encoded, taken) = encoded_within(&text, &mut clean, steps, &name);
+            published(&clean, encoded, &name);
+            let used = clean.used();
+            // A refused call costs one call more than the unrefused run.
+            let refused = |mut m: Limits, what: String| {
+                let (encoded, _) = encoded_within(&text, &mut m, steps + 1, &what);
+                assert_eq!(m.refusals(), 1, "{what}: the refusal was not reached");
+                assert_eq!(m.used(), used, "{what}: a refused unit was admitted again");
+                published(&m, encoded, &what);
+            };
+            for at in 0..clean.attempts() {
+                refused(
+                    Limits::unlimited().refusing(Some(at)),
+                    format!("{name} refused at attempt {at}"),
+                );
+            }
+            for at in 0..clean.requests() {
+                refused(
+                    Limits::unlimited().refusing_request(Some(at)),
+                    format!("{name} refused at request {at}"),
+                );
+            }
+            for before in 0..=taken {
+                let what = format!("{name} cancelled before step {before}");
+                let mut m = Limits::unlimited();
+                let mut encoder = TextEncoder::<Reservation, Family>::new(&text);
+                for _ in 0..before {
+                    match encoder.step(&mut m) {
+                        Ok(Step::Progress) => {}
+                        other => panic!(
+                            "{what}: an early step did not progress: {:?}",
+                            other.map(|step| matches!(step, Step::Complete(_)))
+                        ),
+                    }
+                }
+                let mut done = false;
+                for _ in 0..steps {
+                    if encoder
+                        .reclaim_step(&mut m)
+                        .unwrap_or_else(|error| panic!("{what}: cleanup failed: {error:?}"))
+                    {
+                        done = true;
+                        break;
+                    }
+                }
+                assert!(done, "{what}: cleanup not done within {steps} calls");
+                assert_eq!(
+                    encoder.held_credit(),
+                    Some(WriteWork::default()),
+                    "{what}: credit held after cleanup"
+                );
+                within_bound(&m, 0, &what);
+                released(&m, &what);
+            }
+        }
+    }
+
     /// A bound of a text's shape.
     type Consumer = fn(TextShape) -> Result<ResourceBound, BoundedError<()>>;
 
@@ -1437,13 +1812,16 @@ mod tests {
                     long += length;
                 }
             }
-            let expected = ordering::FIND
-                .times(parts + runs.len() as u64 + 2)
-                .and_then(|work| work.then(ordering::MARK.times::<()>(6 * long)?))
-                .and_then(|work| work.then(ordering::TABLE.times::<()>(4 * sorted)?))
-                .unwrap();
+            let expected = WriteWork::checked_sequence(&[
+                ordering::FIND
+                    .times::<()>(parts + runs.len() as u64 + 2)
+                    .unwrap(),
+                ordering::MARK.times::<()>(6 * long).unwrap(),
+                ordering::TABLE.times::<()>(4 * sorted).unwrap(),
+            ])
+            .expect("a test text's ordering work fits in u64");
             let mut policy = Ledgered::new();
-            let mut encoder = TextEncoder::<Permit>::new(&text);
+            let mut encoder = TextEncoder::<Permit, ()>::new(&text);
             let bound = encode_bound::<Permit, ()>(TextShape::of(&text)).unwrap();
             let output = within("ordered text encoding", bound, || {
                 match encoder.step(&mut policy).unwrap() {
@@ -1553,7 +1931,7 @@ mod tests {
         let run = |n: usize| {
             let text = format!("q{}", "\u{316}\u{301}".repeat(n));
             let mut policy = Ledgered::new();
-            let mut encoder = TextEncoder::<Permit>::new(&text);
+            let mut encoder = TextEncoder::<Permit, ()>::new(&text);
             let bound = encode_bound::<Permit, ()>(TextShape::of(&text)).unwrap();
             let output = within("run encoding", bound, || {
                 match encoder.step(&mut policy).unwrap() {
@@ -1822,7 +2200,7 @@ mod tests {
             let shape = TextShape::of(text);
             let bound = encode_bound::<Permit, ()>(shape).unwrap();
             let mut policy = Ledgered::new();
-            let mut encoder = TextEncoder::<Permit>::new(text);
+            let mut encoder = TextEncoder::<Permit, ()>::new(text);
             let mut steps = 0;
             let outcome = within(name, bound, || {
                 if cancel.is_some_and(|cancel| cancel(steps, &encoder.position())) {
@@ -1869,7 +2247,7 @@ mod tests {
             let text = "\u{390}".repeat(2048);
             let bound = encode_bound::<Permit, ()>(TextShape::of(&text)).unwrap();
             let mut policy = Ledgered::new();
-            let mut encoder = TextEncoder::<Permit>::new(&text);
+            let mut encoder = TextEncoder::<Permit, ()>::new(&text);
             outputs.push(within("worst text encoding", bound, || {
                 match encoder.step(&mut policy).unwrap() {
                     Step::Complete(output) => ControlFlow::Break(output),
@@ -1888,7 +2266,7 @@ mod tests {
             let shape = TextShape::of(text);
             let bound = preparation_bound::<Permit, ()>(shape).unwrap();
             let mut policy = Ledgered::new();
-            let mut preparation = TextPreparation::<Permit>::new(text);
+            let mut preparation = TextPreparation::<Permit, ()>::new(text);
             plans.push(within(name, bound, || {
                 match preparation.step(&mut policy).unwrap() {
                     Step::Complete(plan) => ControlFlow::Break(plan),
@@ -1979,7 +2357,7 @@ mod tests {
             let cancel = (index % 5 == 0).then_some(index % 20 + 1);
             let bound = encode_bound::<Permit, ()>(shape).unwrap();
             let mut policy = Ledgered::new();
-            let mut encoder = TextEncoder::<Permit>::new(&text);
+            let mut encoder = TextEncoder::<Permit, ()>::new(&text);
             let mut steps = 0;
             let outcome = within(&name, bound, || {
                 if cancel == Some(steps) {

@@ -59,9 +59,12 @@ over a value's `bounded::Schema`. `bounded::encode` walks the value's shape
 extent and a widest head per map, and publishes that arena in place as the
 encoding (`Prepared::publish`): nothing is allocated or copied for the output.
 `bounded::prepare` stops at the plan; `Prepared::encode_into` writes it into a
-caller's exactly sized slice and `Prepared::encode_owned` into storage the
-caller admits separately. `bounded::encode_bound` bounds the whole of `encode`
-from the walked shape.
+caller's exactly sized slice. `Prepared::encode_owned(&mut policy)` writes it
+into storage of its own: the storage's release is admitted first, the storage
+is then requested from the writing policy at exactly the encoding's length and
+its permit published with the bytes, and only then is the write admitted.
+`encoding::owned_emit_bound` bounds `encode_owned`, and `bounded::encode_bound`
+bounds the whole of `encode` from the walked shape.
 
 With the `derive` feature, `CBORBoundedEncodable` generates the `Schema`. Named
 structs use canonical integer-key maps; absent optional fields are omitted. A
@@ -78,7 +81,8 @@ relocation, and map-header positions. Call `step` on the same preparation after 
 budget refusal. `Step::Complete` returns an independently owned plan;
 `plan.writer(destination)` emits into an exactly sized destination without
 allocation. Writer steps copy at most 64 bytes and preserve the emitted prefix
-on refusal. Preparation supports nesting up to 128 traversal frames.
+on refusal. Preparation supports nesting up to `bounded::SYMBOLIC_DEPTH` (128)
+traversal frames, the symbolic profile the decoder enforces too.
 
 Built-in schema instructions cover integers, floats, booleans, strings, byte
 strings, arrays, vectors, nullable options, references, boxes, shared pointers,
@@ -222,6 +226,13 @@ closes admission; retain the input and owner until cleanup finishes. A terminal
 decode error retains custody: further decoder steps perform cleanup before
 returning `Finished`. A budget refusal preserves the operation for resumption
 with a fresh allowance. `cancel()` selects this same explicit cleanup path.
+
+`TypedDecoder` is the one typed-construction engine. `bounded::decode::decode_typed`
+is its one-call form: a scope of its own, the input copied into it, and the
+decoder stepped to completion within `decode_typed_bound`'s steps, the value
+returned in its record with that copy. A refusal or an error cancels the
+operation in progress and steps its cleanup and the scope's shutdown under
+the caller's policy before the error returns.
 
 Custom bindings implement `in_place::InPlace<A>` and mandatory
 `reclamation::Reclaim<A>`. Their retained state implements `Custody`, projecting

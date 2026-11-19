@@ -1,0 +1,17 @@
+error[E0521]: borrowed data escapes outside of associated function
+  --> tests/ui/fail/record_after_cleanup.rs:63:17
+   |
+54 |     fn build_step<'b>(ctx: BindingContext<'b, '_, '_, '_, Self, A>, a: &mut A) -> ConstructResult<Building<'b, Self>, A> {
+   |                   --  --- `ctx` is a reference that is only valid in the associated function body
+   |                   |
+   |                   lifetime `'b` defined here
+...
+63 |         let _ = state.0.replace(record);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+   |                 |
+   |                 `ctx` escapes the associated function body here
+   |                 argument requires that `'b` must outlive `'static`
+   |
+   = note: requirement occurs because of a mutable reference to `Option<dcbor::bounded::decode::construction::in_place::Initialized<'_, Lingering>>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

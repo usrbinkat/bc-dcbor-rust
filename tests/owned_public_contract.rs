@@ -1,96 +1,122 @@
 //! The safe consumer path through the production owned pipeline: acquire,
 //! inspect, construct across threads, prepare, emit, retire and shut down.
-//! There is no test-local implementation, unsafe fallback, cfg gate on the
-//! interfaces, or ignored test.
 #![cfg(feature = "std")]
 #![forbid(unsafe_code)]
+use dcbor::ByteString;
+use dcbor::bounded::Limits;
 use dcbor::bounded::decode::Options;
-use dcbor::bounded::decode::construction::TypedDecoder;
-use dcbor::bounded::encoding::OwnedPreparation;
-use dcbor::bounded::{Limits, Step};
-use dcbor_test_support as support;
+use dcbor::bounded::decode::construction::{TypedDecoder, TypedValue};
+use dcbor_test_support::{
+    self as support, Finding, Holding, PolicyId, Retirement, pipeline::Unwitnessed,
+};
 
+/// Prepare and emit the held value while preserving the plan's custody and
+/// proving that writer observation neither charges work nor changes state.
+fn encode(
+    value: &mut Holding<'_, '_, TypedValue<'_, ByteString, String, Limits>, Unwitnessed>,
+    policy: PolicyId,
+    wire: &[u8],
+) -> Result<(), Finding> {
+    assert_eq!(value.value().value(), "ok");
+    assert_eq!(value.value().bytes(), wire);
+    value.prepare(policy, |plan| {
+        assert_eq!(plan.value().value(), "ok");
+        assert_eq!(plan.value().len(), wire.len());
+        plan.transfer(
+            dcbor::bounded::encoding::OwnedPrepared::into_writer,
+            Retirement::Published,
+            |writer| {
+                let (before, held) = writer.with_policy(policy, |writer, m| {
+                    let held = m.live_bytes();
+                    let used = m.used();
+                    let calls = m.calls().len();
+                    let before = writer.position();
+                    assert_eq!(
+                        writer.position(),
+                        before,
+                        "writer observation is not deterministic"
+                    );
+                    assert_eq!(m.live_bytes(), held, "observation changed custody");
+                    assert_eq!(m.used(), used, "observation charged work");
+                    assert_eq!(m.calls().len(), calls, "observation changed the trace");
+                    (before, held)
+                });
+                assert!(before.plan.source);
+                let prepared = before
+                    .plan
+                    .preparation
+                    .expect("published plan omitted its arenas");
+                assert!(prepared.bytes.has_current_permit);
+                assert_eq!(prepared.bytes.initialized, wire.len());
+                assert!(!before.emission.finished);
+                let mut bytes = Vec::with_capacity(wire.len());
+                assert!(writer.emit(policy, &mut bytes, wire.len(), |_, _, _| false)?);
+                assert_eq!(bytes, wire);
+                let after = writer.value().position();
+                assert!(after.emission.finished);
+                assert_eq!(after.emission.written, wire.len());
+                assert_eq!(
+                    after.plan, before.plan,
+                    "emission changed retained plan custody"
+                );
+                writer.with_policy(policy, |_, m| {
+                    assert_eq!(m.live_bytes(), held, "emission released its source or plan");
+                });
+                Ok::<_, Finding>(())
+            },
+        )
+    })?
+}
+
+/// Each decode turn executes on a fresh joined worker borrowing parent-held
+/// custody. A separate observed handle transfer proves the constructed value
+/// remains at its original address; publication outlives its decoder.
 #[test]
 fn safe_acquire_inspect_construct_encode_transfer_and_retire() {
-    let mut m = Limits::unlimited().logged().strict();
-    let mut owner = support::scope(&mut m);
-    let wire = [0x62, b'o', b'k'];
-    // Copying is explicit; acquisition retains progress and custody.
-    let input = support::copy(&owner, &mut m, &wire);
-    let document =
-        support::parse(&mut m, input, Options::quick_only(8)).expect("document inspection failed");
-    assert_eq!(document.root().encoded(), wire);
-    assert_eq!(document.bytes(), wire);
-    // The input moves out of the document without copying.
-    let input = document.into_input();
-    let mut decoder = TypedDecoder::<_, String, Limits>::new(input, Options::quick_only(8));
-    let mut output = None;
-    for _ in 0..support::typed_turns::<String>(wire.len()) {
-        // Consecutive turns run on different threads with exclusive custody.
-        (decoder, m, output) = std::thread::spawn(move || {
-            let output = match support::checked(&mut m, |m| support::contracted(m, &mut decoder)) {
-                Ok(Step::Progress) => None,
-                Ok(Step::Complete(value)) => {
-                    support::exhausted(&mut m, &mut decoder);
-                    Some(value)
-                }
-                Err(error) if support::ordinary_exhaustion(&m, &error) => None,
-                other => panic!("typed decode failed: {}", support::label(&other)),
-            };
-            (decoder, m, output)
-        })
-        .join()
-        .expect("decode turn panicked");
-        if output.is_some() {
-            break;
-        }
-    }
-    drop(decoder);
-    let output = output.expect("typed construction exceeded its bound");
-    assert_eq!(output.value(), "ok");
-    assert_eq!(output.bytes(), wire);
-    let bound = support::turns(
-        dcbor::bounded::encoding::owned_prepare_bound::<dcbor::ByteString, String, Limits, ()>(
-            support::shape(output.value()),
-        )
-        .expect("the owned preparation bound fits in u64"),
-    );
-    let plan = support::drive_within(&mut m, &mut OwnedPreparation::prepare(output), bound)
-        .expect("preparation failed");
-    assert_eq!(plan.value(), "ok");
-    assert_eq!(plan.len(), wire.len());
-    let mut writer = plan.into_writer();
-    let held = m.live_bytes();
-    let used = m.used();
-    let calls = m.calls().len();
-    let before = writer.position();
-    assert_eq!(
-        writer.position(),
-        before,
-        "writer observation is not deterministic"
-    );
-    assert_eq!(m.live_bytes(), held, "observation changed custody");
-    assert_eq!(m.used(), used, "observation charged work");
-    assert_eq!(m.calls().len(), calls, "observation changed the trace");
-    assert!(before.plan.source);
-    let prepared = before
-        .plan
-        .preparation
-        .expect("published plan omitted its arenas");
-    assert!(prepared.bytes.has_current_permit);
-    assert_eq!(prepared.bytes.initialized, wire.len());
-    assert!(!before.emission.finished);
-    let bytes = support::emit(&mut m, &mut writer, wire.len());
-    assert_eq!(bytes, wire);
-    let after = writer.position();
-    assert!(after.emission.finished);
-    assert_eq!(after.emission.written, wire.len());
-    assert_eq!(
-        after.plan, before.plan,
-        "emission changed retained plan custody"
-    );
-    assert_eq!(m.live_bytes(), held, "emission released its source or plan");
-    drop(writer);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    const WIRE: &[u8] = &[0x62, b'o', b'k'];
+    const OPTIONS: Options = Options::quick_only(8);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.scoped(policy, &Unwitnessed, |owner| {
+            owner.copied(policy, WIRE, |input| {
+                input.parse(policy, OPTIONS, |document| {
+                    assert_eq!(document.value().root().encoded(), WIRE);
+                    assert_eq!(document.value().bytes(), WIRE);
+                    document.transfer(
+                        |document| {
+                            TypedDecoder::<_, String, Limits>::new(document.into_input(), OPTIONS)
+                        },
+                        Retirement::Stopped,
+                        |decoder| {
+                            decoder.drive_threaded(
+                                policy,
+                                support::typed_turns::<String>(WIRE.len()),
+                                Retirement::Published,
+                                |_, _| {},
+                                |value| {
+                                    let address = std::ptr::from_ref(value.value().value());
+                                    value.checkpoint();
+                                    value.transfer(
+                                        core::convert::identity,
+                                        Retirement::Published,
+                                        |value| {
+                                            value.checkpoint();
+                                            assert_eq!(
+                                                std::ptr::from_ref(value.value().value()),
+                                                address,
+                                                "moving the handle moved the value"
+                                            );
+                                            encode(value, policy, WIRE)
+                                        },
+                                    )
+                                },
+                            )?
+                        },
+                    )
+                })?
+            })?
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok::<_, Finding>(())
+    });
 }

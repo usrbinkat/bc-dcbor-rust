@@ -5,6 +5,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
+# The gate tool, before anything else: the identity reads the Unicode
+# version through it (`source_identity`).
+gate_prepare || exit 2
 
 seconds=${FUZZ_SECONDS:-600}
 seed=${FUZZ_SEED:-20261019}

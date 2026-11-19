@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -779,7 +779,7 @@
+     /// terminal drain may call it.
+     pub(crate) fn settle_all(&mut self, by: Performer) {
+         if let Some(grant) = self.grant.take() {
+-            grant.forfeit(Forfeit::Cancelled, None, by);
++            grant.spend(None, by);
+         }
+         if let Some(release) = self.release.take() {
+             release.forfeit(Forfeit::Cancelled, None, by);

@@ -1,0 +1,13 @@
+--- tests/support/lifecycle.rs
++++ tests/support/lifecycle.rs
+@@ -830,6 +830,10 @@
+         defects: Vec::new(),
+     };
+     let result = body(&mut run);
++    // Planted: the body's finding returned past the finalization.
++    if let Err(finding) = &result {
++        panic!("{finding}");
++    }
+     let RecordedRun {
+         session,
+         policies,

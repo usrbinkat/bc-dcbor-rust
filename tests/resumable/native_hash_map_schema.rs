@@ -34,6 +34,64 @@ fn hash_map_deleted_buckets_encode_literal_output_after_every_refusal() {
     prepare_matrix(&map, Ok(&expected));
 }
 
+/// The hash map of `first => 1` and `second => 2`. Every key hashes alike
+/// ([`Collisions`]), so each entry takes the next bucket and the table yields
+/// them in insertion order (checked), `first` the predecessor: deterministic
+/// for both the pinned hashbrown and the forked standard library, whichever
+/// `HashMap` this module is compiled against.
+fn keyed(first: Number, second: Number) -> HashMap<Number, u64, BuildHasherDefault<Collisions>> {
+    let mut map = HashMap::with_capacity_and_hasher(2, BuildHasherDefault::<Collisions>::default());
+    assert_eq!(map.insert(first, 1), None);
+    assert_eq!(map.insert(second, 2), None);
+    assert_eq!(
+        map.keys().copied().collect::<Vec<_>>(),
+        [first, second],
+        "the table yields its keys in insertion order"
+    );
+    map
+}
+
+/// `10` then `10.0`, and `0` then `-0.0`: distinct hash map keys of one
+/// canonical encoding. A hash table's entries are enumerated by the engine's
+/// bucket traversal and merge-ordered by their prepared key bytes, so the
+/// equal pair is refused by the merge (`encoding/maps/order.rs`, `Compare`)
+/// as an invalid input (`DuplicateKey`, `Class::Invalid`), its comparison of
+/// merge candidates recorded as a merge-order collision; across every refusal and
+/// cancellation schedule too. The predecessor check (`encoding/dynamic.rs`,
+/// `key-order`) is reached by the ordered path's claimed tree
+/// (`native_schema_encoding.rs`).
+#[test]
+fn keys_colliding_after_reduction_are_refused_on_the_hash_path() {
+    for (first, second) in [
+        (Number::Integer(10), Number::Float(10.0)),
+        (Number::Integer(0), Number::Float(-0.0)),
+    ] {
+        let map = keyed(first, second);
+        let reached = key_order(&map, Err(BoundedError::DuplicateKey));
+        assert!(
+            reached.contains(MERGE_COLLISION),
+            "{first:?} then {second:?}: no merge-order collision recorded"
+        );
+        prepare_matrix(&map, Err(BoundedError::DuplicateKey));
+    }
+}
+
+/// The control: `10` then `10.5`, distinct canonical keys, encode in
+/// canonical order, the later run's merge candidate recorded strictly after
+/// the earlier's and never as a collision.
+#[test]
+fn distinct_keys_encode_and_record_their_order_on_the_hash_path() {
+    let map = keyed(Number::Integer(10), Number::Float(10.5));
+    let expected = [0xa2, 0x0a, 0x01, 0xf9, 0x49, 0x40, 0x02];
+    let reached = key_order(&map, Ok(&expected));
+    assert!(reached.contains(MERGE_AFTER), "no merge-order past recorded");
+    assert!(
+        !reached.contains(MERGE_COLLISION),
+        "distinct keys recorded a collision"
+    );
+    prepare_matrix(&map, Ok(&expected));
+}
+
 /// A source can no longer skip bucket controls: `Instruction::Entry` carries
 /// one entry and no index, and only the engine inspects a hash table's
 /// buckets. What a source can still get wrong is offering an entry where no

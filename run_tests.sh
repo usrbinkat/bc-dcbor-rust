@@ -27,6 +27,28 @@ fast | exhaustive) ;;
 esac
 section "rigor: $DCBOR_RIGOR"
 
+# The exhaustive layer's numeric sweeps (src/float.rs: every binary32
+# pattern through the reduction, and the full spread of binary32 and
+# binary64 patterns through both encoders) run once, optimized, with debug
+# assertions and overflow checks kept on, not in each unoptimized leg below,
+# which skips them; the fast layer runs their edges and a sample in every
+# leg.
+EXHAUSTIVE_SWEEPS=(
+	float::tests::every_f32_reduces_as_its_reference_and_decodes_only_if_canonical
+	float::tests::f32_and_f64_symbolic_and_bounded_agree
+)
+skips=()
+if [[ "$DCBOR_RIGOR" == exhaustive ]]; then
+	for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
+		skips+=(--skip "$sweep")
+	done
+	section "Exhaustive numeric sweeps"
+	for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
+		CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true \
+			cargo test --quiet --release --lib -- --exact "$sweep"
+	done
+fi
+
 # The evidence gates' own oracles and their planted-defect controls: the
 # record format, the model-bounds and census rows, and the gate tool
 # (outcomes, rows, Miri results and judgements, bound derivation, the reach
@@ -68,7 +90,7 @@ test_only_features() {
 	local features="$1"
 	section "no default + $features"
 	select_targets "$features"
-	cargo test --quiet "${targets[@]}" --no-default-features --features "$features"
+	cargo test --quiet "${targets[@]}" --no-default-features --features "$features" -- "${skips[@]}"
 	cargo clippy --all-targets --no-default-features --features "$features" -- -D warnings
 }
 
@@ -76,7 +98,7 @@ test_additional_features() {
 	local features="$1"
 	section "default + $features"
 	select_targets "$features"
-	cargo test --quiet "${targets[@]}" --features "$features"
+	cargo test --quiet "${targets[@]}" --features "$features" -- "${skips[@]}"
 	cargo clippy --all-targets --features "$features" -- -D warnings
 }
 
@@ -95,7 +117,7 @@ test_additional_features "derive,hashbrown"
 test_additional_features "derive,hashbrown,multithreaded,num-bigint"
 
 section "All Default Features and doctests"
-cargo test --quiet
+cargo test --quiet -- "${skips[@]}"
 cargo clippy --all-targets -- -D warnings
 
 # The step-latency ceiling is a property of this qualification host, not of
@@ -107,7 +129,7 @@ DCBOR_LATENCY_QUALIFICATION=1 cargo test --quiet --test resumable_contract laten
 # The legs above select the root package; every member's own targets, the
 # derive crate's included, are tested and linted here on the stock toolchain.
 section "Workspace: every member's targets"
-cargo test --quiet --workspace --features derive,hashbrown,multithreaded,num-bigint
+cargo test --quiet --workspace --features derive,hashbrown,multithreaded,num-bigint -- "${skips[@]}"
 cargo clippy --workspace --all-targets --features derive,hashbrown,multithreaded,num-bigint -- -D warnings
 
 cargo fmt --all -- --check

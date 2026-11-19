@@ -18,8 +18,13 @@ The output is the preparation's own plan arena, published in place: its permit
 holds at least the encoding's bytes and at most what `bounded::encode_bound`
 retains for the value's shape (its extent and a widest head per map). A caller
 needing storage of exactly the encoding's length prepares with
-`bounded::prepare` and writes with `Prepared::encode_owned`, admitting that
-output separately. Retain the owner while hashing, signing, transmitting or
+`bounded::prepare` and writes with `Prepared::encode_owned(&mut policy)`, under
+a policy that may differ from the preparation's: the output's release is
+admitted first, its storage is then requested from that policy at exactly the
+encoding's length, its permit minted by the call and published with the
+bytes, and then the write is admitted. A caller cannot supply a permit of
+another size. `encoding::owned_emit_bound` bounds it, the output's release,
+storage and retained bytes included. Retain the owner while hashing, signing, transmitting or
 persisting its bytes. Encoding failure discards the partial buffer.
 Transmission is a separate operation: a writer can fail after transmitting a
 prefix and may need application framing or a storage transaction.
@@ -79,7 +84,7 @@ public interfaces and standalone codec workloads.
 
 ## Implementing the traits
 
-`Budget`, `Allocator`, `InPlace`, `Reclaim`, `DecodeInput` and `Resumable` are
+`Budget`, `Releasing`, `Allocator`, `InPlace`, `Reclaim`, `DecodeInput` and `Resumable` are
 trusted extension points: an implementation reports its own work with
 `Budget::traverse` before doing it, makes no allocation it has not requested,
 and states its own cost.
@@ -106,8 +111,8 @@ them, and `ConstructionCost::fixed`, `checked_per_byte` and
 not fit in `u64`; a `COST` takes it through `const_cost!`, so an overflowing
 cost fails to compile where its binding is first used.
 Derived decoding bindings admit only through the public helpers built on this
-crate's charge rules (`bounded::decode::visits`,
-`bounded::decode::construction::in_place::step`) and state their costs from
+crate's charge rules (`bounded::decode::construction::in_place::step`) and
+state their costs from
 the same rules (`STEP_COST`), so a derived binding's runtime charge and its
 cost are one definition. Derived encoding admits nothing itself: it generates
 a `Schema`, announcing its optional fields' presence checks.
@@ -127,9 +132,11 @@ rule by adding the same `disallowed-methods` entry to its `clippy.toml`.
 - `Tagged { tag, value }` explicitly tags a bounded representation. There is no
   blanket conversion through the allocating `CBORTaggedEncodable` method.
 - Dates and feature-gated bignums preserve this crate's symbolic wire semantics.
-- Symbolic CBOR is accepted up to 128 nodes per nesting path. Out-of-profile
-  negative arguments are refused. Construction and destruction of that existing
-  symbolic input are caller operations.
+- Symbolic CBOR is accepted up to `bounded::SYMBOLIC_DEPTH` (128) frames per
+  nesting path, the root and each element, key, value and tagged item one frame
+  deeper; the symbolic decoder refuses deeper input (`Error::DepthLimit`).
+  Out-of-profile negative arguments are refused. Construction and destruction of
+  that existing symbolic input are caller operations.
 - The bounded decoder produces a flat borrowed document and validates canonical
   dCBOR structure. Semantic interpretation of arbitrary tags is application work.
 - `decode::decode_bound` and `decode_bound_with` bound what decoding any input of
@@ -142,6 +149,84 @@ rule by adding the same `disallowed-methods` entry to its `clippy.toml`.
 Numeric corrections can change historical hashes/signatures. Applications must
 test their actual persisted fixtures; these examples do not establish compatibility
 with an external consumer's existing records.
+
+## Typed domains above dCBOR conformance
+
+dCBOR itself requires only that text be in NFC (draft section 2.5); a
+decoder accepts every NFC text, whatever version of Unicode assigned its code
+points. The types below layer stricter rules on top. They never sit inside
+the decoder: a value the decoder accepts and a typed domain refuses is
+still valid dCBOR.
+
+### Stabilized text
+
+`StabilizedText` is NFC text that holds only code points assigned in the
+Unicode version this crate pins (`dcbor::UNICODE_VERSION`, the pinned
+`unicode-normalization`'s). A code point unassigned today may be assigned
+by a later version with a decomposition or a combining class, and NFC text
+holding it could then stop being normal; text holding none keeps the same
+normal form under every later version (UAX #15, section 12, the
+normalization process for stabilized strings). `is_assigned` answers for
+one code point.
+
+- Construction (`StabilizedText::new`, `TryFrom<String>`, `TryFrom<CBOR>`)
+  refuses text not in NFC (`Error::NonCanonicalString`), then its first
+  unassigned code point (`Error::UnassignedCodePoint`).
+- Bounded decoding (`InPlace`) checks the decoded text, which the decoder
+  has already proved NFC, in windows of at most a quantum ending on a
+  scalar, each admitted before it is inspected (one value and the window's
+  bytes), before the binding allocates anything of its own (the document is
+  already parsed and held by the caller). A refusal is
+  `DecodeError::Invalid(Error::UnassignedCodePoint)`, of class `Invalid`.
+  The text is then built and reclaimed exactly as a `String` is. Its `COST`
+  is a `String`'s plus that check: one more value per window and every
+  byte inspected once more.
+- Bounded encoding writes its text, as a `String` does.
+
+The assigned set is generated at build time (`build.rs`) from the package's
+one copy of that version's `DerivedAge.txt` (`data/unicode`), and the build
+fails unless its version equals the pinned normalization's. The version is
+part of every evidence gate's identity. Moving the pin means moving
+`data/unicode/<version>/DerivedAge.txt` and `tests/data/NormalizationTest.txt`
+with it; anything else fails to build or fails the conformance suite.
+
+### Minimal big integer
+
+`MinimalBigInt` is an integer of any size with exactly one encoding, in
+every build: a plain integer (major type 0 or 1) inside dCBOR's integer
+range, `[-2^63, 2^64 - 1]`, and a bignum (tag 2 or 3) outside it, whose byte
+string has no leading zero byte. Decoding then encoding is byte-identical,
+so one value has one identity.
+
+dCBOR places no rule on tags 2 and 3 beyond those on every byte string
+(draft 18, section 8.5, "Limiting Principles"): the decoder keeps `c2 41 01`
+and `c2 42 00 01` as two distinct tagged byte strings, and `BigInt`'s
+conversion keeps its own wire behaviour. `MinimalBigInt` refuses, as
+`Error::NonCanonicalNumeric`, a bignum whose byte string is empty or has a
+leading zero byte, and then one whose value a plain integer carries (`c2 40`,
+`c2 41 01`, `c3 41 00`); anything but an integer or a bignum is
+`Error::WrongType`.
+
+Its identity is its bytes, so it holds them: whether it is negative, and the
+argument `n` of its encoding, big-endian, with no leading zero byte (the
+value is `n`, or `-1 - n` when negative, as major type 1 and tag 3 both
+mean). `from_parts` builds one, `as_parts` reads one; `u64` and `i64`
+convert in.
+
+- Bounded encoding writes the plain integer's head inside the range, and
+  outside it the tag's head and the magnitude as a byte string.
+- Bounded decoding (`InPlace`) reads the node, and a tag's byte string,
+  checking the length and first byte in the one unit that writes the sign;
+  then builds the magnitude exactly as a byte string is built, from the
+  document's bytes or the plain integer's argument. A refusal is
+  `DecodeError::Invalid`, made before the binding allocates its own
+  magnitude or metadata; the document it reads, already parsed and held by
+  the caller, is accounted by the parse, not by this guarantee. Its `COST`
+  is a byte string's and one write of a `bool`.
+- With `num-bigint`, `BigInt` converts to and from it, and `BigUint` into
+  it, at the symbolic edge, outside any policy: the magnitude's bytes are
+  the vector num-bigint's `to_bytes_be` allocates, moved in without a
+  second copy.
 
 ## Hidden callback work and process limits
 

@@ -1,0 +1,13 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -1333,7 +1333,9 @@
+                     self.text_source = None;
+                     // Published: its output moved out, its arenas drained;
+                     // what remains is its owners, destroyed with it.
+-                    self.retire_text();
++                    // Planted: the published continuation marked for its next
++                    // initialization without being destroyed.
++                    self.text_init = 0;
+                 }
+                 Step::Finished => return Err(BoundedError::PlanMismatch),
+             }

@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place/scalars.rs
++++ src/bounded/decode/construction/in_place/scalars.rs
+@@ -12,7 +12,8 @@
+         // allocating nothing and never unwinding. done: nothing initialized
+         // owns anything, so releasing the record without `Drop` is sound.
+         // order: the unit is the same from either state, `Done` each time.
+-        // depth: a leaf, the default 1. count: one call.
++        // Planted: the remaining count's obligation goes unjustified.
++        // depth: a leaf, the default 1.
+         unsafe impl<A: Allocator> Reclaim<A> for $ty {
+             type State = Written;
+             const INITIAL: Written = Written::Empty;

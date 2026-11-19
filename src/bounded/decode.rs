@@ -23,13 +23,17 @@ use crate::bounded::boundary::boundary;
 pub mod comparison;
 pub mod construction;
 pub mod cursor;
+/// Kani harness of the decode's whole-operation bound (register item 4):
+/// compiled only by `cargo kani`.
+#[cfg(kani)]
+mod decode_proofs;
 pub mod header;
 pub(crate) mod initialization;
 pub mod storage;
 pub mod string_cursor;
 mod utf8;
 use crate::{
-    Error, ExactFrom,
+    Error,
     float::{validate_canonical_f16, validate_canonical_f32, validate_canonical_f64},
 };
 
@@ -72,7 +76,7 @@ pub struct Options {
 }
 
 impl Options {
-    /// Strict NFC validation under `max_depth`: what [`decode`] admits.
+    /// Strict NFC validation under `max_depth`: what [`decode()`] admits.
     pub const fn normalizing(max_depth: usize) -> Self {
         Self {
             max_depth,
@@ -212,14 +216,26 @@ struct Entry {
 }
 
 /// Owns the node arena and its reservations, while borrowing the original input.
+///
+/// The document outlives the decode that produced it, so it carries the
+/// identity of the owner whose acquisition granted its arena's permit: fixed
+/// when the decode publishes it, from that decode's stored owner, never
+/// changed, `None` exactly when the arena never allocated. Observational
+/// identity only: no capability, no settlement authority.
 pub struct Document<'a, P> {
     input: &'a [u8],
     entries: Owned<Entry, P>,
+    owner: Option<Identity>,
 }
 
-/// Borrow-free arena retained by an owned decoding record.
+/// Borrow-free arena retained by an owned decoding record, with the owner
+/// its permit was granted under, as [`Document`] carries it: written by the
+/// transfer's last unit. A record-held arena may be partly transferred, so
+/// its one traversal reads its prefix (`DocumentArena::observe_prefix`,
+/// `cursor/publication.rs`), never the whole arena.
 pub(crate) struct DocumentArena<P> {
     entries: Owned<Entry, P>,
+    owner: Option<Identity>,
 }
 
 impl<P> DocumentArena<P> {
@@ -244,10 +260,31 @@ impl<P> DocumentArena<P> {
         let view = core::mem::ManuallyDrop::new(Document {
             input,
             entries: unsafe { core::ptr::read(&self.entries) },
+            owner: self.owner,
         });
         f(&view)
     }
 }
+impl<P> Custodial<P> for Document<'_, P> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        <&Self as Custodial<P>>::observe_custody(&mut &*self, sink)
+    }
+}
+
+impl<P> Custodial<P> for &Document<'_, P> {
+    /// The document's custody ([`CustodySink`]): its arena's permit, if it
+    /// allocated, under the owner it was granted under, one group; nothing
+    /// otherwise. It owns no shared queue, so the observation is whole.
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        if let Some(permit) = self.entries.permit() {
+            sink.begin(self.owner);
+            sink.permit(permit, None);
+            sink.end();
+        }
+        PermitsObserved::Complete
+    }
+}
+
 impl<'a, P> Document<'a, P> {
     /// The single validated top-level value.
     pub fn root(&self) -> Node<'_, 'a> {
@@ -340,13 +377,17 @@ pub fn decode<'a, A: Allocator>(
     decode_with(input, Options::normalizing(max_depth), allocator)
 }
 
-/// [`decode`] under `options`: its nesting limit and its text policy.
+/// [`decode()`] under `options`: its nesting limit and its text policy.
 pub fn decode_with<'a, A: Allocator>(
     input: &'a [u8],
     options: Options,
     allocator: &mut A,
 ) -> Result<Document<'a, A::Permit>, DecodeError<A::Refusal>> {
     let Options { max_depth, text } = options;
+    // The call's one custody owner: both arenas' growths are acquisitions of
+    // this decode, minted once at entry (before anything is admitted) and
+    // presented by every growth in the call, each validated against it.
+    let owner = allocator.owner().map_err(BoundedError::Refused)?;
     let mut entries: Owned<Entry, A::Permit> = Owned::new();
     let mut stack: Owned<Frame, A::Permit> = Owned::new();
     let mut pos = 0usize;
@@ -364,12 +405,7 @@ pub fn decode_with<'a, A: Allocator>(
         let mut children = 0;
         let kind = match major {
             MajorType::Unsigned => Kind::Unsigned(argument),
-            MajorType::Negative => {
-                if argument > i64::MAX as u64 {
-                    return Err(Error::OutOfRange.into());
-                }
-                Kind::Negative(-1 - argument as i64)
-            }
+            MajorType::Negative => Kind::Negative(crate::decode::negative(argument)?),
             MajorType::ByteString | MajorType::Text => {
                 if Bound::new(Predicate::Payload, widen(input.len() - pos)?)
                     .exceeded(allocator, argument)
@@ -425,7 +461,7 @@ pub fn decode_with<'a, A: Allocator>(
                 3 => {
                     let n = f16::from_bits(argument as u16);
                     validate_canonical_f16(n)?;
-                    Kind::Float(n.to_f64())
+                    Kind::Float(crate::float::widened(n))
                 }
                 5 => {
                     let n = f32::from_bits(argument as u32);
@@ -460,7 +496,9 @@ pub fn decode_with<'a, A: Allocator>(
             end: pos,
             next: index + 1,
         };
-        at(DecodePlace::Arena, || entries.push(entry, allocator))?;
+        at(DecodePlace::Arena, || {
+            entries.push(entry, allocator, &owner)
+        })?;
         if children > 0 {
             let frame = Frame {
                 node: index,
@@ -469,7 +507,7 @@ pub fn decode_with<'a, A: Allocator>(
                 key: true,
                 previous_key: None,
             };
-            at(DecodePlace::Stack, || stack.push(frame, allocator))?;
+            at(DecodePlace::Stack, || stack.push(frame, allocator, &owner))?;
             continue;
         }
         let mut completed = index;
@@ -478,7 +516,14 @@ pub fn decode_with<'a, A: Allocator>(
                 if boundary!(allocator, Predicate::Payload, pos, input.len()).is_ne() {
                     return Err(Error::UnusedData(input.len() - pos).into());
                 }
-                return Ok(Document { input, entries });
+                // The arena's permit, if it allocated, was granted under the
+                // call's one owner.
+                let owner = entries.permit().map(|_| owner.id());
+                return Ok(Document {
+                    input,
+                    entries,
+                    owner,
+                });
             };
             COMPLETION.admit(allocator)?;
             if parent.map && parent.key {
@@ -511,7 +556,7 @@ pub fn decode_with<'a, A: Allocator>(
     }
 }
 
-/// The [`ResourceBound`] of [`decode`] of any input of at most `input` bytes
+/// The [`ResourceBound`] of [`decode()`] of any input of at most `input` bytes
 /// under `max_depth`, whatever its contents, malformed inputs included:
 /// every quantity is monotone in the input length, so the bound of the
 /// longest input admitted bounds every shorter one.
@@ -545,7 +590,7 @@ pub fn decode_with<'a, A: Allocator>(
 /// the input's other bytes hold: a text of `m` bytes, its head included,
 /// leaves `n - m` for them. Those shrink as `m` grows and the validation's
 /// peak only rises with `m`, so the most is at the least `m` of each of the
-/// validation's peak levels ([`next_rise`]). Refused, never saturated, when
+/// validation's peak levels (`next_rise`). Refused, never saturated, when
 /// a quantity does not fit in `u64`.
 pub fn decode_bound<R>(input: u64, max_depth: usize) -> Result<ResourceBound, BoundedError<R>> {
     decode_bound_with(input, Options::normalizing(max_depth))
@@ -588,12 +633,12 @@ struct Terms {
     /// since each has a value beside it, and the key bytes compared: a byte
     /// lies in the keys of at most one map per nesting level.
     keys: WriteWork,
-    arena: Growth,
-    /// The releases the arena's growths admit.
-    arena_released: WriteWork,
-    stack: Growth,
-    /// The releases the stack's growths admit.
-    stack_released: WriteWork,
+    /// The arena's term: its growth ([`owned_growth`]), then the releases
+    /// its growths admit, the arena held by the document once published.
+    arena: ResourceBound,
+    /// The stack's term: its growth, then its releases, the stack itself
+    /// released before `decode` returns.
+    stack: ResourceBound,
     /// Text validation ([`text::validation_bound`] or
     /// [`text::quick_validation_bound`]), which retains nothing.
     text: ResourceBound,
@@ -606,15 +651,27 @@ impl Terms {
         let depth = widen(options.max_depth)?.min(input);
         let arena = owned_growth(input, widen(core::mem::size_of::<Entry>())?)?;
         let stack = owned_growth(depth, widen(core::mem::size_of::<Frame>())?)?;
+        let (arena_released, stack_released) = (arena.released()?, stack.released()?);
+        // A growth reports its relocated bytes as one admission of no
+        // values, and its allocation's release ([`Owned::reserve`]): the
+        // arena's output kept, what the document holds once published; the
+        // stack's released before `decode` returns.
+        let arena_term = arena
+            .bound()
+            .checked_then(ResourceBound::of_work(arena_released))
+            .ok_or(BoundedError::Overflow)?;
+        let stack_term = stack
+            .bound()
+            .checked_then(ResourceBound::of_work(stack_released))
+            .and_then(|grown| grown.checked_followed_by(ResourceBound::default()))
+            .ok_or(BoundedError::Overflow)?;
         Ok(Self {
             heads: HEAD.times(add(input, 1)?)?,
             payload: PAYLOAD.units(0, input)?,
             completions: COMPLETION.times(input)?,
             keys: KEY.units(input / 2, mul(depth, input)?)?,
-            arena,
-            arena_released: arena.released()?,
-            stack,
-            stack_released: stack.released()?,
+            arena: arena_term,
+            stack: stack_term,
             text: match options.text {
                 TextPolicy::Normalize => text::validation_bound(input)?,
                 TextPolicy::QuickOnly => text::quick_validation_bound(input),
@@ -639,9 +696,17 @@ impl Terms {
     ) -> Result<u64, BoundedError<R>> {
         let entry = widen(core::mem::size_of::<Entry>())?;
         let frame = widen(core::mem::size_of::<Frame>())?;
-        let mut peak = add(arena.peak, stack.held)?.max(add(arena.held, stack.peak)?);
+        let overflow = || BoundedError::Overflow;
+        // Each growth after the other's: the stack grown beside the arena
+        // held, or the arena beside the stack, whichever grows last.
+        let (arena, stack) = (holding(arena), holding(stack));
+        let mut peak = arena
+            .checked_then(stack)
+            .zip(stack.checked_then(arena))
+            .map(|(stack_last, arena_last)| stack_last.larger(arena_last))
+            .ok_or_else(overflow)?;
         if policy == TextPolicy::QuickOnly {
-            return Ok(peak);
+            return Ok(peak.peak);
         }
         let validation = |m: u64| text::validation_bound::<R>(m).map(|bound| bound.peak);
         // The least text holds its head alone.
@@ -649,17 +714,43 @@ impl Terms {
         while m <= input {
             let level = validation(m)?;
             let rest = input - m;
-            let beside = add(
+            // The nodes and frames before the text held, then the text's
+            // validation beside them; the most over every split.
+            // Only the capacities held count here, never the growths' own
+            // peaks, which do not coexist with the text: summed as two
+            // outputs held at once, and held since.
+            let held = add(
                 owned_growth::<R>(rest, entry)?.held,
                 owned_growth::<R>(depth.min(rest), frame)?.held,
             )?;
-            peak = peak.max(add(beside, level)?);
+            let nodes = ResourceBound {
+                peak: held,
+                retained: held,
+                ..ResourceBound::default()
+            };
+            let text = ResourceBound {
+                peak: level,
+                ..ResourceBound::default()
+            };
+            peak = peak.larger(nodes.checked_then(text).ok_or_else(overflow)?);
             match next_rise(m, input, level, &validation)? {
                 Some(next) => m = next,
                 None => break,
             }
         }
-        Ok(peak)
+        Ok(peak.peak)
+    }
+}
+
+/// What a growth holds, as a bound of storage alone: its peak while it
+/// grows, and the capacity it holds once grown as its output. How
+/// [`Terms::peak_of`] composes the arena, the stack and a text's validation
+/// in time.
+fn holding(growth: Growth) -> ResourceBound {
+    ResourceBound {
+        peak: growth.peak,
+        retained: growth.held,
+        ..ResourceBound::default()
     }
 }
 
@@ -686,23 +777,8 @@ impl Places for Terms {
             DecodePlace::Payload => ResourceBound::of_work(self.payload),
             DecodePlace::Completions => ResourceBound::of_work(self.completions),
             DecodePlace::Keys => ResourceBound::of_work(self.keys),
-            // A growth reports its relocated bytes as one admission of no
-            // values, and its allocation's release ([`Owned::reserve`]); the
-            // arena is what the document holds once published.
-            DecodePlace::Arena => ResourceBound {
-                values: self.arena_released.values,
-                bytes: self.arena.copied + self.arena_released.bytes,
-                allocated: self.arena.allocated,
-                peak: self.arena.peak,
-                retained: self.arena.held,
-            },
-            DecodePlace::Stack => ResourceBound {
-                values: self.stack_released.values,
-                bytes: self.stack.copied + self.stack_released.bytes,
-                allocated: self.stack.allocated,
-                peak: self.stack.peak,
-                retained: 0,
-            },
+            DecodePlace::Arena => self.arena,
+            DecodePlace::Stack => self.stack,
             DecodePlace::Text => self.text,
         }
     }
@@ -761,9 +837,10 @@ mod terms_tests {
             assert_eq!(held, arena.held, "{count} zeros");
             let terms = Terms::of::<()>(n, Options::normalizing(1)).unwrap();
             assert!(terms.heads.values + terms.completions.values >= values - releases);
-            assert!(terms.arena_released.values + terms.stack_released.values >= releases);
+            // A growth's term charges values for its releases alone.
+            assert!(terms.arena.values + terms.stack.values >= releases);
             assert!(terms.arena.allocated >= arena.allocated);
-            assert!(terms.arena.held >= held);
+            assert!(terms.arena.retained >= held);
         }
     }
 
@@ -795,7 +872,8 @@ mod terms_tests {
             let terms =
                 Terms::of::<()>(nested.len() as u64, Options::normalizing(depth as usize)).unwrap();
             assert!(terms.stack.allocated >= deep.allocated);
-            assert!(terms.stack.copied >= deep.copied);
+            // Its bytes: what its growths relocate, and its releases.
+            assert!(terms.stack.bytes >= deep.copied);
             assert!(terms.stack.peak >= deep.peak);
         }
     }
@@ -809,7 +887,7 @@ mod terms_tests {
         let mut map = Map::new();
         let mut items = Vec::new();
         for key in &keys {
-            map.insert(key.clone(), 0u64);
+            map.insert(key.clone(), 0u64).unwrap();
             items.push(CBOR::from(key.clone()));
             items.push(CBOR::from(0u64));
         }
@@ -834,8 +912,10 @@ mod terms_tests {
         let (mut map, mut array) = (CBOR::from(0u64), CBOR::from(0u64));
         for _ in 0..levels {
             let mut next = Map::new();
-            next.insert(CBOR::from(vec![CBOR::from(0u64), map.clone()]), 0u64);
-            next.insert(CBOR::from(vec![CBOR::from(1u64), map.clone()]), 0u64);
+            next.insert(CBOR::from(vec![CBOR::from(0u64), map.clone()]), 0u64)
+                .unwrap();
+            next.insert(CBOR::from(vec![CBOR::from(1u64), map.clone()]), 0u64)
+                .unwrap();
             map = CBOR::from(next);
             array = CBOR::from(vec![
                 CBOR::from(vec![CBOR::from(0u64), array.clone()]),
@@ -1010,7 +1090,7 @@ mod terms_tests {
             DecodePlace::Keys => {
                 let mut keys = Map::new();
                 for key in 0..1000u64 {
-                    keys.insert(key, 0u64);
+                    keys.insert(key, 0u64).unwrap();
                 }
                 ("many keys", CBOR::from(keys), Options::normalizing(1))
             }
@@ -1043,13 +1123,17 @@ mod terms_tests {
         let mut key_maps = CBOR::from(0u64);
         for _ in 0..5 {
             let mut next = Map::new();
-            next.insert(CBOR::from(vec![CBOR::from(0u64), key_maps.clone()]), 0u64);
-            next.insert(CBOR::from(vec![CBOR::from(1u64), key_maps.clone()]), 0u64);
+            next.insert(CBOR::from(vec![CBOR::from(0u64), key_maps.clone()]), 0u64)
+                .unwrap();
+            next.insert(CBOR::from(vec![CBOR::from(1u64), key_maps.clone()]), 0u64)
+                .unwrap();
             key_maps = CBOR::from(next);
         }
         let mut long_keys = Map::new();
         for i in 0..11u8 {
-            long_keys.insert(ByteString::new(vec![i; 200]), 0u64);
+            long_keys
+                .insert(ByteString::new(vec![i; 200]), 0u64)
+                .unwrap();
         }
         let mut inputs: Vec<(String, Option<DecodePlace>, Vec<u8>, Options)> = DecodePlace::ALL
             .iter()
@@ -1167,11 +1251,13 @@ mod terms_tests {
         for input in [0u64, 1, 2, 100, 4096, 1 << 20] {
             let bound = decode_bound_with::<()>(input, Options::quick_only(1)).unwrap();
             let terms = Terms::of::<()>(input, Options::quick_only(1)).unwrap();
-            let releases = terms.arena.allocations + terms.stack.allocations;
-            assert_eq!(
-                terms.arena_released.values + terms.stack_released.values,
-                releases
-            );
+            // The arena of a node per byte and the stack of one frame, by
+            // the growth rule; each allocation's release one value of its
+            // growth's term.
+            let arena = owned_growth::<()>(input, entry()).unwrap();
+            let stack = owned_growth::<()>(input.min(1), frame()).unwrap();
+            let releases = arena.allocations + stack.allocations;
+            assert_eq!(terms.arena.values + terms.stack.values, releases);
             assert_eq!(
                 bound.values,
                 terms.heads.values
@@ -1194,272 +1280,364 @@ mod terms_tests {
 /// The result of constructing a typed value from a decoded document.
 pub type ConstructResult<T, A> = Result<T, DecodeError<<A as Budget>::Refusal>>;
 
-/// A typed value constructed from a decoded document ([`decode_typed`]),
-/// owned together with the permit of every heap allocation it holds. No API
-/// separates the value from its permits. Fields drop in order: the value's
-/// storage is freed before its permits are released.
-pub struct Constructed<T, P> {
-    value: T,
-    _permits: Owned<P, P>,
-}
-
-impl<T, P> Constructed<T, P> {
-    /// The constructed value, borrowed for as long as its storage is held.
-    pub const fn value(&self) -> &T {
-        &self.value
-    }
-}
-
-/// A type constructed from one node of a decoded document under the same
-/// representation its symbolic conversion (`TryFrom<CBOR>`) reads, field
-/// keys, discriminants, omission and tags included. Every unit of
-/// examination is reported to `allocator` before it is done, and every heap
-/// allocation the value holds is requested from it in its whole size before
-/// it is made, its permit pushed to `permits`, which outlive the value
-/// ([`Constructed`]). Derived types generate it from their schema
-/// (`CBORBoundedDecodable`).
-pub trait BoundedDecodable: Sized {
-    fn construct<A: Allocator>(
-        node: Node<'_, '_>,
-        permits: &mut Owned<A::Permit, A::Permit>,
-        allocator: &mut A,
-    ) -> ConstructResult<Self, A>;
-}
-
-places! {
-    /// The places synchronous typed construction ([`BoundedDecodable`],
-    /// [`decode_typed_with`]) charges, derived bindings' included.
-    pub(crate) enum TypedPlace {
-        /// Values examined.
-        Values,
-        /// Payload bytes copied into owned storage.
-        Copies,
-        /// Storage the value holds, and the permits recording it.
-        Holds,
-    }
-}
-
-/// One value examined.
-const VISIT: Unit<TypedPlace> = Unit::new(TypedPlace::Values, 1, 0);
-
-/// Values examined at once: a derived binding's fields and tags.
-const VISITS: Rate<TypedPlace> = Rate::new(TypedPlace::Values, 1, 0);
-
-/// A payload's bytes copied into owned storage at once.
-const COPY: Scan<TypedPlace> = Scan::new(TypedPlace::Copies, 0);
-
-/// Request `bytes` of storage for a value under construction from
-/// `allocator`, its release admitted first, its permit held by `permits`.
-pub fn hold<A: Allocator>(
-    bytes: u64,
-    permits: &mut Owned<A::Permit, A::Permit>,
-    allocator: &mut A,
-) -> ConstructResult<(), A> {
-    at(TypedPlace::Holds, || {
-        construction::stable::admit_release(allocator)?;
-        let permit = allocator.allocate(bytes).map_err(BoundedError::Refused)?;
-        permits.push(permit, allocator)
-    })?;
-    Ok(())
-}
-
-/// Report one value examined to `allocator`.
-pub fn visit<A: Allocator>(allocator: &mut A) -> ConstructResult<(), A> {
-    VISIT.admit(allocator)?;
-    Ok(())
-}
-
-/// Report `count` values examined to `allocator` at once, as a derived
-/// binding examines its fields and tags.
-pub fn visits<A: Allocator>(count: u64, allocator: &mut A) -> ConstructResult<(), A> {
-    VISITS.admit(allocator, count)?;
-    Ok(())
-}
-
 /// A node of an unexpected kind: the error the symbolic conversion gives.
 pub fn wrong_type<R>() -> DecodeError<R> {
     DecodeError::Invalid(Error::WrongType)
 }
 
-/// Decode `input` strictly ([`decode`]) and construct `T` from its root, on
-/// one allocator: the document's arena is released once the value is built,
-/// and the value is returned with the permits of what it holds.
-pub fn decode_typed<T: BoundedDecodable, A: Allocator>(
+/// The [`ResourceBound`] of [`decode_typed`] of an input of at most `len`
+/// bytes under `max_depth`: the one scope's own lifecycle
+/// ([`construction::scope_bound`]), the input copied into it
+/// ([`construction::copy_bound`]), and the typed decode of the copy
+/// ([`construction::typed_decode_bound`]), each with its operation's places
+/// and its own cleanup. Its [`ResourceBound::steps`] are the most steps the
+/// call takes. Refused, never saturated, when a quantity does not fit in
+/// `u64`.
+pub fn decode_typed_bound<T, A, R>(
+    len: u64,
+    max_depth: usize,
+) -> Result<ResourceBound, BoundedError<R>>
+where
+    T: construction::in_place::InPlace<A>,
+    A: Allocator,
+    A::Permit: Send,
+{
+    let scope = construction::scope_bound::<A, R>()?;
+    let copy = construction::copy_bound::<A, R>(len)?;
+    let typed = construction::typed_decode_bound::<ByteString, T, A, R>(
+        len,
+        Options::normalizing(max_depth),
+    )?;
+    scope
+        .checked_then(copy)
+        .and_then(|acquired| acquired.checked_then(typed))
+        .ok_or(BoundedError::Overflow)
+}
+
+/// Decode `input` strictly ([`decode()`]) and construct `T` from its root in
+/// one call: the retained construction (`construction::TypedDecoder`, the
+/// one typed-construction engine) driven to completion within the steps its
+/// bound allows ([`decode_typed_bound`]), as [`crate::bounded::prepare`]
+/// drives the retained preparation. A scope of its own holds the copied
+/// input, the document and the value; the value is returned in its record
+/// with the input it was decoded from, so it outlives `input`. Dropping the
+/// returned value releases its record, the input and the scope through the
+/// scope's terminal drain ([`TerminalAllocator`]).
+///
+/// Every admission and request is made to `allocator`. A refusal or an
+/// error ends the call: the operation in progress is cancelled and its
+/// cleanup stepped under `allocator`, then the scope shut down, so what was
+/// admitted is spent or forfeited before the error returns; whatever a
+/// refused cleanup unit leaves is released by the terminal drain when the
+/// scope is dropped. A run that does not complete within its steps has
+/// diverged from its plan ([`BoundedError::PlanMismatch`]).
+pub fn decode_typed<T, A>(
     input: &[u8],
     max_depth: usize,
     allocator: &mut A,
-) -> ConstructResult<Constructed<T, A::Permit>, A> {
-    decode_typed_with(input, Options::normalizing(max_depth), allocator)
+) -> ConstructResult<construction::TypedValue<'static, ByteString, T, A>, A>
+where
+    T: construction::in_place::Transferable<A> + 'static,
+    A: TerminalAllocator + 'static,
+    A::Permit: Send,
+{
+    let len = widen(input.len())?;
+    let mut steps = decode_typed_bound::<T, A, A::Refusal>(len, max_depth)?.steps()?;
+    let mut owner = construction::DecodeOwner::<'static, A>::new();
+    if let Err(error) = owner.initialize_step(allocator) {
+        shut_down(&mut owner, &mut steps, allocator);
+        return Err(error.into());
+    }
+    let mut copy = owner.copy_input(input);
+    let copied = match complete(&mut copy, |copy| copy.cancel(), &mut steps, allocator) {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(copy);
+            shut_down(&mut owner, &mut steps, allocator);
+            return Err(error);
+        }
+    };
+    drop(copy);
+    let mut decoder = construction::TypedDecoder::<'static, ByteString, T, A>::new(
+        copied,
+        Options::normalizing(max_depth),
+    );
+    let value = match complete(
+        &mut decoder,
+        |decoder| decoder.cancel(),
+        &mut steps,
+        allocator,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            drop(decoder);
+            shut_down(&mut owner, &mut steps, allocator);
+            return Err(error);
+        }
+    };
+    drop(decoder);
+    // The document's record, retired at the value's detachment, is removed
+    // and reclaimed under `allocator`; the value's record stays, holding the
+    // scope after the owner is dropped.
+    while let Some(left) = steps.checked_sub(1) {
+        steps = left;
+        if !matches!(owner.step(allocator), Ok(construction::Reclaimed::Progress)) {
+            break;
+        }
+    }
+    Ok(value)
 }
 
-/// [`decode_typed`] under `options` ([`decode_with`]).
-pub fn decode_typed_with<T: BoundedDecodable, A: Allocator>(
-    input: &[u8],
-    options: Options,
-    allocator: &mut A,
-) -> ConstructResult<Constructed<T, A::Permit>, A> {
-    let document = decode_with(input, options, allocator)?;
-    let mut permits = Owned::new();
-    let value = T::construct(document.root(), &mut permits, allocator)?;
-    drop(document);
-    Ok(Constructed {
-        value,
-        _permits: permits,
-    })
-}
-
-/// Integers by value, refused outside the target type's range, as
-/// `TryFrom<CBOR>` for each does (`int.rs`).
-macro_rules! impl_construct_integer {
-    ($($type:ty),*) => {$(
-        impl BoundedDecodable for $type {
-            fn construct<A: Allocator>(
-                node: Node<'_, '_>,
-                _: &mut Owned<A::Permit, A::Permit>,
-                allocator: &mut A,
-            ) -> ConstructResult<Self, A> {
-                visit(allocator)?;
-                let value = match node.kind() {
-                    Kind::Unsigned(n) => i128::from(n),
-                    Kind::Negative(n) => i128::from(n),
-                    _ => return Err(wrong_type()),
-                };
-                <$type>::try_from(value).map_err(|_| DecodeError::Invalid(Error::OutOfRange))
+/// `operation` stepped to its output within `steps`, each step counted. On
+/// an error, refusals included, it is cancelled (`cancel`) and its own
+/// cleanup stepped under `a` until it finishes, a unit is refused or the
+/// steps are spent, then the error returned: what a refused unit leaves is
+/// the scope's terminal drain's. Finishing without an output, or the steps
+/// spent first, is a divergence from the plan.
+fn complete<R, A>(
+    operation: &mut R,
+    cancel: fn(&mut R),
+    steps: &mut u64,
+    a: &mut A,
+) -> ConstructResult<R::Output, A>
+where
+    R: Resumable<A>,
+    A: Allocator,
+    DecodeError<A::Refusal>: From<R::Error>,
+{
+    loop {
+        *steps = steps.checked_sub(1).ok_or(BoundedError::PlanMismatch)?;
+        match operation.step(a) {
+            Ok(Step::Complete(output)) => return Ok(output),
+            Ok(Step::Progress) => {}
+            Ok(Step::Finished) => return Err(BoundedError::PlanMismatch.into()),
+            Err(error) => {
+                cancel(operation);
+                while let Some(left) = steps.checked_sub(1) {
+                    *steps = left;
+                    if !matches!(operation.step(a), Ok(Step::Progress)) {
+                        break;
+                    }
+                }
+                return Err(error.into());
             }
         }
-    )*};
+    }
 }
 
-impl_construct_integer!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
+/// The scope shut down under `a` within `steps`: its queue drained and its
+/// block released, or, an uninitialized scope's, the admissions its
+/// acquisition held forfeited. A refused unit, or the steps spent, leaves
+/// the rest to the terminal drain when the owner is dropped.
+fn shut_down<A: TerminalAllocator>(
+    owner: &mut construction::DecodeOwner<'static, A>,
+    steps: &mut u64,
+    a: &mut A,
+) {
+    while let Some(left) = steps.checked_sub(1) {
+        *steps = left;
+        if !matches!(
+            owner.shutdown_step(a),
+            Ok(construction::Reclaimed::Progress)
+        ) {
+            break;
+        }
+    }
+}
 
-/// Floats from a float or an integer exactly representable in the target,
-/// as `TryFrom<CBOR>` for each does (`float.rs`).
-macro_rules! impl_construct_float {
-    ($($type:ty),*) => {$(
-        impl BoundedDecodable for $type {
-            fn construct<A: Allocator>(
-                node: Node<'_, '_>,
-                _: &mut Owned<A::Permit, A::Permit>,
-                allocator: &mut A,
-            ) -> ConstructResult<Self, A> {
-                visit(allocator)?;
-                let value = match node.kind() {
-                    Kind::Float(n) => <$type>::exact_from_f64(n),
-                    Kind::Unsigned(n) => <$type>::exact_from_u64(n),
-                    Kind::Negative(n) => <$type>::exact_from_i128(i128::from(n)),
-                    _ => return Err(wrong_type()),
-                };
-                value.ok_or(DecodeError::Invalid(Error::OutOfRange))
+/// The one typed-construction engine's obligations carried from the
+/// synchronous engine it replaced: a sequence built from array nodes built
+/// directly, so a node can disagree with its own count, which no decoded
+/// document does (V3); the one-call decode's credit settled at every
+/// refused request; and its error custody.
+#[cfg(test)]
+mod construction_tests {
+    use super::construction::Standalone;
+    use super::construction::in_place::{
+        Built, SequenceCustody, SequenceObservation, SessionObservation,
+    };
+    use super::*;
+    use core::mem::MaybeUninit;
+
+    /// A document of one array node claiming `claimed` elements over `held`
+    /// unsigned children `1..=held`, each a leaf, over no input bytes.
+    fn array(claimed: u64, held: usize) -> Document<'static, Reservation> {
+        let leaf = |kind, next| Entry {
+            kind,
+            start: 0,
+            end: 0,
+            next,
+        };
+        let mut items = Vec::from([leaf(StoredKind::Array(claimed), held + 1)]);
+        for index in 1..=held {
+            items.push(leaf(StoredKind::Unsigned(index as u64), index + 1));
+        }
+        let capacity = items.len();
+        Document {
+            input: &[],
+            entries: Owned {
+                items,
+                capacity,
+                permit: None,
+            },
+            // No permit, so no owner it was granted under.
+            owner: None,
+        }
+    }
+
+    /// `Vec<u64>` built from `document`'s root by the retained engine to
+    /// `Done` or its first error, then cleaned up to `Done`: the build's
+    /// result, the elements committed and the element records held when it
+    /// ended, and the policy, every credit settled and nothing held.
+    fn build(document: &Document<'_, Reservation>) -> (ConstructResult<(), Limits>, usize, usize) {
+        let mut limits = Limits::unlimited();
+        let mut value = MaybeUninit::<Vec<u64>>::uninit();
+        let mut driver = Standalone::<Vec<u64>, Limits>::new(document, &mut value);
+        let mut built = Err(BoundedError::PlanMismatch.into());
+        for _ in 0..64 {
+            match driver.build_step(&mut limits) {
+                Ok(Built::Progress) => {}
+                Ok(Built::Done) => {
+                    built = Ok(());
+                    break;
+                }
+                Err(error) => {
+                    built = Err(error);
+                    break;
+                }
             }
         }
-    )*};
-}
+        let (committed, records) = match driver.observe() {
+            SessionObservation {
+                inner:
+                    SequenceObservation::Held(SequenceCustody {
+                        committed, records, ..
+                    }),
+                ..
+            } => (committed, records),
+            other => panic!("the sequence holds no metadata: {other:?}"),
+        };
+        let declared = driver.remaining().expect("the cleanup count fits in u64");
+        let mut done = false;
+        for _ in 0..declared {
+            if driver.reclaim_step(&mut limits).unwrap() == construction::Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "cleanup exceeded its declared {declared} calls");
+        assert_eq!(driver.held_credit(), Some(WriteWork::default()));
+        assert_eq!(
+            limits.credits().conserved_with(WriteWork::default()),
+            Some(true)
+        );
+        assert_eq!(limits.live_bytes(), 0);
+        (built, committed, records)
+    }
 
-impl_construct_float!(f16, f32, f64);
+    /// A node holding exactly its count builds, the control both refusals
+    /// below are measured against.
+    #[test]
+    fn a_vector_of_exactly_its_count_builds() {
+        let (built, committed, records) = build(&array(2, 2));
+        assert!(built.is_ok(), "{built:?}");
+        assert_eq!((committed, records), (2, 2));
+    }
 
-impl BoundedDecodable for bool {
-    fn construct<A: Allocator>(
-        node: Node<'_, '_>,
-        _: &mut Owned<A::Permit, A::Permit>,
-        allocator: &mut A,
-    ) -> ConstructResult<Self, A> {
-        visit(allocator)?;
-        match node.kind() {
-            Kind::Bool(value) => Ok(value),
-            _ => Err(wrong_type()),
+    /// A node holding more children than its count is refused once the
+    /// count is reached, before the child beyond it is built: no record is
+    /// pushed for it.
+    #[test]
+    fn a_child_beyond_the_count_is_refused() {
+        let (built, committed, records) = build(&array(2, 3));
+        assert!(
+            matches!(
+                built,
+                Err(DecodeError::Resource(BoundedError::PlanMismatch))
+            ),
+            "{built:?}"
+        );
+        assert_eq!((committed, records), (2, 2), "the extra child was built");
+    }
+
+    /// A node holding fewer children than its count is refused once they
+    /// end, before a record is pushed for a child that does not exist: never
+    /// published shorter than its count.
+    #[test]
+    fn fewer_children_than_the_count_are_refused() {
+        let (built, committed, records) = build(&array(2, 1));
+        assert!(
+            matches!(
+                built,
+                Err(DecodeError::Resource(BoundedError::PlanMismatch))
+            ),
+            "{built:?}"
+        );
+        assert_eq!((committed, records), (1, 1), "a missing child was started");
+    }
+
+    /// The one-call decode's credit: unrefused, the published value holds
+    /// none and the ledgers conserve; with each of its allocation requests
+    /// refused in turn, the refusal ends the call, the operation in
+    /// progress is cleaned up under the same policy, and every credit is
+    /// spent or forfeited, the refused request's release among the
+    /// forfeits, with nothing held and nothing kept.
+    #[test]
+    fn a_refused_request_ends_the_call_with_every_credit_settled() {
+        let wire = [0x63, b'a', b'b', b'c'];
+        let mut limits = Limits::unlimited();
+        let value = decode_typed::<String, _>(&wire, 8, &mut limits).unwrap();
+        assert_eq!(value.value(), "abc");
+        assert_eq!(
+            limits.credits().conserved_with(WriteWork::default()),
+            Some(true)
+        );
+        let requests = limits.requests();
+        drop(value);
+        assert_eq!(limits.live_bytes(), 0, "the value's drop kept storage");
+        assert!(requests > 0);
+        for at in 0..requests {
+            let mut limits = Limits::unlimited().refusing_request(Some(at));
+            let refused = decode_typed::<String, _>(&wire, 8, &mut limits);
+            assert!(
+                matches!(
+                    refused,
+                    Err(DecodeError::Resource(BoundedError::Refused(_)))
+                ),
+                "request {at}: {:?}",
+                refused.map(|value| value.value().clone())
+            );
+            let credits = limits.credits();
+            assert_eq!(
+                credits.conserved_with(WriteWork::default()),
+                Some(true),
+                "request {at}: {credits:?}"
+            );
+            assert_ne!(
+                credits.forfeited,
+                WriteWork::default(),
+                "request {at}: the refused request's release was not forfeited"
+            );
+            assert_eq!(limits.live_bytes(), 0, "request {at}: storage kept");
         }
     }
-}
 
-/// The one owned copy construction makes, of `len` bytes: the copy admitted,
-/// its storage requested from `allocator` with its permit held by `permits`,
-/// then reserved fallibly at exactly that length by `reserve`, which reports
-/// whether the physical allocation succeeded.
-fn reserve_copy<A: Allocator>(
-    len: usize,
-    permits: &mut Owned<A::Permit, A::Permit>,
-    allocator: &mut A,
-    reserve: impl FnOnce(usize) -> Option<()>,
-) -> ConstructResult<(), A> {
-    let length = widen(len)?;
-    COPY.admit(allocator, length)?;
-    hold(length, permits, allocator)?;
-    reserve(len).ok_or(BoundedError::Allocation { bytes: length })?;
-    Ok(())
-}
-
-/// `bytes` copied into storage requested from `allocator` and allocated
-/// fallibly at exactly their length ([`reserve_copy`]).
-pub fn copy_bytes<A: Allocator>(
-    bytes: &[u8],
-    permits: &mut Owned<A::Permit, A::Permit>,
-    allocator: &mut A,
-) -> ConstructResult<Vec<u8>, A> {
-    let mut out = Vec::new();
-    reserve_copy(bytes.len(), permits, allocator, |len| {
-        out.try_reserve_exact(len).ok()
-    })?;
-    out.extend_from_slice(bytes);
-    Ok(out)
-}
-
-/// The validated text copied into a `String` reserved like any owned copy
-/// ([`reserve_copy`]): the text is copied as a `str`, so the copy is valid
-/// UTF-8 by its type and is never checked again.
-impl BoundedDecodable for String {
-    fn construct<A: Allocator>(
-        node: Node<'_, '_>,
-        permits: &mut Owned<A::Permit, A::Permit>,
-        allocator: &mut A,
-    ) -> ConstructResult<Self, A> {
-        visit(allocator)?;
-        let Kind::Text(text) = node.kind() else {
-            return Err(wrong_type());
-        };
-        let mut out = String::new();
-        reserve_copy(text.len(), permits, allocator, |len| {
-            out.try_reserve_exact(len).ok()
-        })?;
-        out.push_str(text);
-        Ok(out)
-    }
-}
-
-impl BoundedDecodable for ByteString {
-    fn construct<A: Allocator>(
-        node: Node<'_, '_>,
-        permits: &mut Owned<A::Permit, A::Permit>,
-        allocator: &mut A,
-    ) -> ConstructResult<Self, A> {
-        visit(allocator)?;
-        let Kind::Bytes(bytes) = node.kind() else {
-            return Err(wrong_type());
-        };
-        Ok(ByteString::from(copy_bytes(bytes, permits, allocator)?))
-    }
-}
-
-/// An array of its elements, its storage requested at its whole capacity
-/// before it is allocated.
-impl<T: BoundedDecodable> BoundedDecodable for Vec<T> {
-    fn construct<A: Allocator>(
-        node: Node<'_, '_>,
-        permits: &mut Owned<A::Permit, A::Permit>,
-        allocator: &mut A,
-    ) -> ConstructResult<Self, A> {
-        visit(allocator)?;
-        let Kind::Array(count) = node.kind() else {
-            return Err(wrong_type());
-        };
-        let length = usize::try_from(count).map_err(|_| BoundedError::Overflow)?;
-        let bytes = mul(count, widen(core::mem::size_of::<T>())?)?;
-        hold(bytes, permits, allocator)?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(length)
-            .map_err(|_| BoundedError::Allocation { bytes })?;
-        for child in node.children() {
-            out.push(T::construct(child, permits, allocator)?);
-        }
-        Ok(out)
+    /// The one-call decode's error custody: an input of the wrong type is
+    /// refused as invalid, and everything the call acquired is released
+    /// under its policy before the error returns, every credit settled.
+    #[test]
+    fn an_invalid_input_releases_everything_before_its_error_returns() {
+        let mut limits = Limits::unlimited();
+        let refused = decode_typed::<Vec<u64>, _>(&[0x61, b'x'], 8, &mut limits);
+        assert!(
+            matches!(refused, Err(DecodeError::Invalid(Error::WrongType))),
+            "{:?}",
+            refused.map(|value| value.value().clone())
+        );
+        assert_eq!(
+            limits.credits().conserved_with(WriteWork::default()),
+            Some(true)
+        );
+        assert_eq!(limits.live_bytes(), 0);
     }
 }

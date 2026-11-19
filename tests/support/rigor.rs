@@ -34,31 +34,12 @@ use std::fmt::Display;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// The variable naming the layer.
-pub const VARIABLE: &str = "DCBOR_RIGOR";
+/// The layer, its variable and its one reading, defined in the record crate
+/// (`tests/record`), which the library's own unit tests also read.
+pub use dcbor_record::{RIGOR as VARIABLE, Rigor, rigor};
 
 /// The variable naming the witness sizes.
 pub const WITNESS: &str = "DCBOR_WITNESS";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rigor {
-    Fast,
-    Exhaustive,
-}
-
-/// The layer this run carries: `DCBOR_RIGOR` read once, `fast` when unset.
-pub fn rigor() -> Rigor {
-    static RIGOR: OnceLock<Rigor> = OnceLock::new();
-    *RIGOR.get_or_init(|| match std::env::var(VARIABLE) {
-        Err(std::env::VarError::NotPresent) => Rigor::Fast,
-        Ok(value) => match value.as_str() {
-            "fast" => Rigor::Fast,
-            "exhaustive" => Rigor::Exhaustive,
-            other => panic!("{VARIABLE}={other:?}: the layers are fast and exhaustive"),
-        },
-        Err(error) => panic!("{VARIABLE}: {error}"),
-    })
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Witness {

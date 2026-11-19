@@ -88,8 +88,8 @@ pub struct OrderingPosition {
     pub at: usize,
 }
 
-pub(super) struct Ordering<P> {
-    scratch: Storage<char, P>,
+pub(super) struct Ordering<P, O: Origin> {
+    scratch: Storage<char, P, O>,
     phase: OrderingPhase,
     start: usize,
     end: usize,
@@ -98,20 +98,20 @@ pub(super) struct Ordering<P> {
     counts: [u32; DIGITS],
 }
 
-impl<P> Ordering<P> {
-    pub(super) const INIT_STEPS: usize = Storage::<char, P>::INIT_STEPS + 6;
+impl<P, O: Origin> Ordering<P, O> {
+    pub(super) const INIT_STEPS: usize = Storage::<char, P, O>::INIT_STEPS + 6;
 
     /// Initialize one unit of the ordering [`Self::new`] builds in `slot`,
     /// its destination paired with its units initialized: the scratch arena,
     /// then one scalar field per unit. Every initialized field is
     /// resource-free until the complete ordering is used. Refused once
     /// initialized.
-    pub(super) fn initialize_step<A: Allocator<Permit = P>>(
+    pub(super) fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         use crate::bounded::decode::initialization::{init_field, init_part};
-        let storage_steps = Storage::<char, P>::INIT_STEPS;
+        let storage_steps = Storage::<char, P, O>::INIT_STEPS;
         let units = *slot.custody();
         if Bound::new(Predicate::Prefix, storage_steps).below(a, units) {
             init_part!(slot, scratch, 0, a, |scratch| Storage::initialize_step(
@@ -152,8 +152,9 @@ impl<P> Ordering<P> {
     /// One unit of the scratch's cleanup. Its characters are plain data: a
     /// settled scratch is discarded in one unit, whatever it holds; one
     /// cancelled while relocating or staging drains per element, which the
-    /// bound counts.
-    pub(super) fn reclaim_step<A: Allocator<Permit = P>>(
+    /// bound counts. Bound on [`Releasing`]: no new allocation can be
+    /// requested through the capability cleanup is given.
+    pub(super) fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
@@ -161,9 +162,17 @@ impl<P> Ordering<P> {
     }
 
     /// The most calls [`Self::reclaim_step`] still takes, the one reporting
-    /// the scratch released included: its storage's own count.
-    pub(super) fn reclaim_remaining(&self) -> u64 {
+    /// the scratch released included: its storage's own count, `None` when
+    /// it does not fit in `u64`.
+    pub(super) fn reclaim_remaining(&self) -> Option<u64> {
         self.scratch.reclaim_remaining()
+    }
+
+    /// The ordering's custody: its one owning component, the scratch arena,
+    /// reported as that arena's group ([`Storage::observe_custody`]). The
+    /// ordering holds nothing beside it.
+    pub(super) fn observe_custody(&self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        self.scratch.observe_custody(sink)
     }
 
     pub(super) fn state(&self) -> OrderingPosition {
@@ -188,7 +197,7 @@ impl<P> Ordering<P> {
 
     /// One admitted unit of ordering: true once every run is ordered. Each
     /// step admits its one unit before it changes anything.
-    pub(super) fn step<A: Allocator<Permit = P>>(
+    pub(super) fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         chars: &mut [char],
         allocator: &mut A,

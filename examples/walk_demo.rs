@@ -5,17 +5,17 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a complex CBOR structure
     let mut map = Map::new();
-    map.insert("name", "Alice");
-    map.insert("age", 30);
-    map.insert("hobbies", vec!["reading", "coding", "hiking"]);
+    map.insert("name", "Alice")?;
+    map.insert("age", 30)?;
+    map.insert("hobbies", vec!["reading", "coding", "hiking"])?;
 
     let mut nested_map = Map::new();
-    nested_map.insert("city", "San Francisco");
-    nested_map.insert("zip", 94102);
-    map.insert("address", nested_map);
+    nested_map.insert("city", "San Francisco")?;
+    nested_map.insert("zip", 94102)?;
+    map.insert("address", nested_map)?;
 
     let cbor = CBOR::from(map);
 
@@ -101,4 +101,5 @@ fn main() {
     println!("Strings: {}", counts.strings);
     println!("Numbers: {}", counts.numbers);
     println!("Key-value pairs: {}", counts.key_value_pairs);
+    Ok(())
 }

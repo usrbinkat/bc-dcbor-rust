@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -137,7 +137,8 @@
+     match convert_f64(value) {
+         Converted::Unsigned(i) => Numeric::Unsigned(i),
+         Converted::Negative(i) => Numeric::Negative(i),
+-        Converted::Float(_) if value.is_nan() => Numeric::Float16(CANONICAL_NAN),
++        // Planted: a NaN keeps its payload instead of the one canonical NaN.
++        Converted::Float(_) if value.is_nan() => Numeric::Float64(value.to_bits()),
+         Converted::Float(_) => {
+             let half = narrowed(value);
+             if widened(half) == value {

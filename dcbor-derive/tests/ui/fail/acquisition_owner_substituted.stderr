@@ -1,0 +1,16 @@
+error[E0061]: this method takes 1 argument but 2 arguments were supplied
+ --> tests/ui/fail/acquisition_owner_substituted.rs:7:17
+  |
+7 |     acquisition.end(Identity::new(1, 0), Performer::None);
+  |                 ^^^ ------------------- unexpected argument #1 of type `Identity`
+  |
+note: method defined here
+ --> $WORKSPACE/src/bounded.rs
+  |
+  |     pub fn end(self, by: Performer) {
+  |            ^^^
+help: remove the extra argument
+  |
+7 -     acquisition.end(Identity::new(1, 0), Performer::None);
+7 +     acquisition.end(Performer::None);
+  |

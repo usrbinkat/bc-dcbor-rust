@@ -1,13 +1,13 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
-24	24	measured	cancelled	cancelled construction: Input bytes
-1	1	measured	cancelled	cancelled construction: Input values
-61430	60064	measured	published	construction of empty strings: Build allocated
-97726	84120	measured	published	construction of empty strings: Build bytes
-61430	60064	measured	published	construction of empty strings: Build peak
-61430	60064	measured	published	construction of empty strings: Build retained
-5558	4507	measured	published	construction of empty strings: Build values
-1	1	measured	published	construction: Detach values
-1	1	measured	published	construction: Publish values
-3	3	measured	invalid	wrongly typed construction: Cleanup values
-64	64	measured	invalid	wrongly typed construction: Document bytes
-6	5	measured	invalid	wrongly typed construction: Document values
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+24	24	measured	observed	cancelled	cancelled construction: Input bytes
+1	1	measured	observed	cancelled	cancelled construction: Input values
+57406	56064	measured	observed	published	construction of empty strings: Build allocated
+93702	80120	measured	observed	published	construction of empty strings: Build bytes
+57406	56064	measured	observed	published	construction of empty strings: Build peak
+57406	56064	measured	observed	published	construction of empty strings: Build retained
+5560	4508	measured	observed	published	construction of empty strings: Build values
+1	1	measured	observed	published	construction: Detach values
+1	1	measured	observed	published	construction: Publish values
+3	3	measured	observed	invalid	wrongly typed construction: Cleanup values
+64	64	measured	observed	invalid	wrongly typed construction: Document bytes
+6	5	measured	observed	invalid	wrongly typed construction: Document values

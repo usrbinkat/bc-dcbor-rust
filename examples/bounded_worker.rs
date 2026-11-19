@@ -11,6 +11,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const MAX_INPUT: usize = 1_048_576;
     let mut limits = Limits::new(10_000_000, 128_000_000, 64_000_000);
     let mut input = Owned::new();
+    // The input buffer's custody: each of its growths is an acquisition of
+    // this owner, made once for the buffer's life.
+    let owner = limits.owner()?;
     limits.traverse(0, 4096)?;
     let mut block = [0u8; 4096];
     let mut stdin = std::io::stdin().lock();
@@ -31,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         limits.traverse(0, read as u64)?;
-        input.extend_from_slice(&block[..read], &mut limits)?;
+        input.extend_from_slice(&block[..read], &mut limits, &owner)?;
     }
     let document = decode(input.as_slice(), 128, &mut limits)?;
     let bytes = document.root().encoded();

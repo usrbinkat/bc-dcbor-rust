@@ -18,9 +18,10 @@
 //!    before it is done; storage is released when freed ([`Owned`]).
 //! 2. [`Prepared::publish`] closes the gaps in place and publishes the arena
 //!    as the encoding ([`Encoded`]), its permit with it: nothing is
-//!    allocated or copied for the output. [`Prepared::encode_into`] and
-//!    [`Prepared::encode_owned`] instead write it into storage the caller
-//!    supplies or admits separately.
+//!    allocated or copied for the output. [`Prepared::encode_into`] instead
+//!    writes it into storage the caller supplies, and
+//!    [`Prepared::encode_owned`] into storage it requests from the writing
+//!    policy at exactly the encoding's length.
 //!
 //! [`encode`] does both under one policy, and [`encode_bound`] bounds it. A
 //! budget's refusal is returned as its own type ([`BoundedError::Refused`]),
@@ -40,15 +41,15 @@
 //! covered types (`&T`, `Box`, `Arc`, `Rc`), and derived maps, newtypes,
 //! units and enums. Also covered: standalone nullable `Option<T>`, `BTreeMap`,
 //! hash maps, [`crate::Map`], [`CBOR`](crate::CBOR), [`crate::Date`],
-//! explicit [`Tagged`](encoding::Tagged) wrappers, and feature-gated
+//! explicit [`Tagged`] wrappers, and feature-gated
 //! `BigInt`/`BigUint`. Sets and deques do not implement this interface.
 //!
 //! Dynamic Rust maps are ordered by their prepared key bytes in place and
 //! reject keys whose canonical encodings collide; trees keyed by their
 //! encodings ([`crate::Map`]) are checked in one pass instead. Symbolic
-//! traversal admits at most 128 nested frames and rejects out-of-profile
-//! negative integers. Constructing an input value is outside the encoding
-//! operation's budget.
+//! traversal admits at most [`SYMBOLIC_DEPTH`] nested frames and rejects
+//! out-of-profile negative integers. Constructing an input value is outside
+//! the encoding operation's budget.
 //!
 //! [`decode::decode`] validates and decodes into a borrowed flat document,
 //! with admitted arena storage and an explicit depth limit. It never calls the
@@ -58,10 +59,11 @@
 //! # Before and after: publishing an encoded record
 //!
 //! ```
-//! use dcbor::{CBOR, bounded::{encode, Limits}};
+//! use dcbor::{CBOREncodable, bounded::{encode, Limits}};
+//! # fn main() -> dcbor::Result<()> {
 //! let fields = std::collections::BTreeMap::from([("status", "ready")]);
 //! // Before: symbolic construction and serialization allocate freely.
-//! let before = CBOR::from(fields.clone()).to_cbor_data();
+//! let before = fields.encode_cbor_data()?;
 //! // After: preparation and publication share limits; the plan's own
 //! // storage becomes the output.
 //! let mut limits = Limits::new(10_000, 100_000, 64_000);
@@ -71,15 +73,18 @@
 //! // Keep `after` alive until the transport/storage operation consumes its bytes.
 //! drop(after);
 //! assert_eq!(limits.live_bytes(), 0);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Caller-owned output
 //!
-//! Output admission can be separate from preparation. The owner below keeps
-//! its own output permit until its vector is freed and publishes bytes only
-//! after a successful write. Policy refusal, arithmetic overflow, heap
-//! failure and encoding invariant failure retain distinct [`BoundedError`]
-//! variants.
+//! The output can be written under a policy of the caller's own. Writing
+//! requests the output's storage from that policy at exactly the encoding's
+//! length, holds the permit it grants until the bytes are freed, and
+//! publishes the bytes only after a successful write. Policy refusal,
+//! arithmetic overflow, heap failure and encoding invariant failure retain
+//! distinct [`BoundedError`] variants.
 //!
 //! ```
 //! use dcbor::bounded::*;
@@ -89,6 +94,8 @@
 //!     fn drop(&mut self) { self.0.set(self.0.get() - self.1); }
 //! }
 //! struct Policy { live: Rc<Cell<u64>>, values: u64, bytes: u64, storage: u64 }
+//! // A budget that records nothing: no credit family, no identities, and
+//! // only ordinary owners.
 //! impl Budget for Policy {
 //!     type Refusal = &'static str;
 //!     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
@@ -98,9 +105,36 @@
 //!         self.bytes = b;
 //!         Ok(())
 //!     }
+//!     type Origin = ();
+//!     fn origin(&self) {}
+//!     fn admitted(&mut self, _: WriteWork) {}
+//!     fn identify(&mut self) -> Result<Identity, Self::Refusal> {
+//!         Ok(Identity::UNOBSERVED)
+//!     }
+//!     fn held(&mut self, _: WriteWork, _: Hold) {}
+//!     fn effect(&mut self, _: Effect) {}
+//!     fn owner(&mut self) -> Result<Owner, Self::Refusal> {
+//!         Ok(Owner::unobserved())
+//!     }
+//!     fn acquisition(&mut self, owner: &Owner) -> Result<Acquisition<()>, Self::Refusal> {
+//!         self.validate_owner(owner)?;
+//!         Acquisition::unobserved(owner).ok_or("recorded owner")
+//!     }
+//!     fn validate_owner(&mut self, owner: &Owner) -> Result<(), Self::Refusal> {
+//!         if owner.id() == Identity::UNOBSERVED { Ok(()) } else { Err("recorded owner") }
+//!     }
+//!     fn performer(&self) -> Performer {
+//!         Performer::None
+//!     }
+//! }
+//! impl Releasing for Policy {
+//!     type Permit = Permit;
+//!     fn permit_identity(_: &Permit) -> Identity {
+//!         Identity::UNOBSERVED
+//!     }
+//!     fn custody(_: &Permit, _: Identity, _: RecordStage) {}
 //! }
 //! impl Allocator for Policy {
-//!     type Permit = Permit;
 //!     fn allocate(&mut self, bytes: u64) -> Result<Permit, Self::Refusal> {
 //!         let next = self.live.get().checked_add(bytes).ok_or("storage")?;
 //!         if next > self.storage { return Err("storage"); }
@@ -109,10 +143,9 @@
 //!     }
 //! }
 //! let live = Rc::new(Cell::new(0));
-//! let mut policy = Policy { live: live.clone(), values: 10_000, bytes: 10_000, storage: 1024 };
+//! let mut policy = Policy { live: live.clone(), values: 10_000, bytes: 100_000, storage: 64_000 };
 //! let prepared = prepare(&24u64, &mut policy).unwrap();
-//! let output = policy.allocate(prepared.len() as u64).unwrap();
-//! let encoded = prepared.encode_owned(output, &mut policy).unwrap();
+//! let encoded = prepared.encode_owned(&mut policy).unwrap();
 //! assert_eq!(encoded.as_ref(), [0x18, 0x18]);
 //! drop((prepared, encoded));
 //! assert_eq!(live.get(), 0);
@@ -204,12 +237,19 @@ pub(crate) fn at<P: Place, T>(place: P, f: impl FnOnce() -> T) -> T {
 
 /// Admit `values` and `bytes` at `place`: the one admission route. In this
 /// crate's own test builds the admission is marked as routed, and the
-/// attribution ledger refuses any that is not.
+/// attribution ledger refuses any that is not. Once the policy admits, its
+/// disposition is reported ([`Credit::Admit`]): `held`, the part prepaid
+/// for an obligation the caller's custody now holds, at most the whole
+/// admission, and the rest consumed. A held part is given its identity
+/// before it is admitted, minted by the budget ([`Budget::identify`]), and
+/// returned in its custody ([`Retained`]); every later spend or forfeit of
+/// it names that identity ([`Retained::spend`], [`Retained::forfeit`]). A
+/// refused admission reports nothing.
 #[expect(
     clippy::disallowed_methods,
     reason = "the one admission route every charge rule's `admit` goes through"
 )]
-fn admit_at<P: Place, B: Budget>(
+fn traverse_at<P: Place, B: Budget>(
     place: P,
     budget: &mut B,
     values: u64,
@@ -219,6 +259,67 @@ fn admit_at<P: Place, B: Budget>(
     #[cfg(feature = "std")]
     let _routed = places::route();
     at(place, || budget.traverse(values, bytes)).map_err(BoundedError::Refused)
+}
+
+/// The route's admission of work consumed at once.
+fn admit_at<P: Place, B: Budget>(
+    place: P,
+    budget: &mut B,
+    values: u64,
+    bytes: u64,
+) -> BoundedResult<(), B> {
+    traverse_at(place, budget, values, bytes)?;
+    budget.admitted(WriteWork::new(values, bytes));
+    Ok(())
+}
+
+/// The route's admission of work of which `part` is held for `obligation`
+/// by `acquisition` of `owner` (the owning custody's capability, and the
+/// acquisition's identity minted once when it was bound,
+/// [`Budget::acquisition`]), in this order: the performing budget
+/// validated against the owner ([`Budget::validate_owner`]), the
+/// obligation's identity minted ([`Budget::identify`]), the work admitted,
+/// the hold observed ([`Budget::held`]); its custody, with the budget's
+/// origin, returned to the holder. A refusal at any of the first three
+/// leaves accounting unchanged (a refused validation makes the recording
+/// sticky-invalid). Identity issuance may include admissions refused after
+/// it: a family's sequence counts identities minted, not obligations held,
+/// and its exhaustion is checked and sticky; no credit is ever admitted
+/// without its identity.
+fn admit_held_at<P: Place, B: Budget>(
+    place: P,
+    budget: &mut B,
+    values: u64,
+    bytes: u64,
+    held: (Obligation, WriteWork, &Owner, Identity),
+) -> BoundedResult<Retained<B::Origin>, B> {
+    let (obligation, part, owner, acquisition) = held;
+    if less(WriteWork::new(values, bytes), part).is_none() {
+        return Err(BoundedError::PlanMismatch);
+    }
+    budget
+        .validate_owner(owner)
+        .map_err(BoundedError::Refused)?;
+    // Identified before admitting: a recording budget that cannot identify
+    // the obligation refuses with nothing admitted.
+    let id = budget.identify().map_err(BoundedError::Refused)?;
+    traverse_at(place, budget, values, bytes)?;
+    budget.held(
+        WriteWork::new(values, bytes),
+        Hold {
+            obligation,
+            work: part,
+            id,
+            acquisition,
+        },
+    );
+    Ok(Retained {
+        origin: budget.origin(),
+        sequence: id.sequence(),
+        acquisition,
+        remaining: part,
+        obligation,
+    })
 }
 
 /// The bytes one admitted unit stores into retained state, its write
@@ -235,7 +336,18 @@ pub(crate) const fn write_extent(bytes: usize) -> u64 {
     bytes as u64
 }
 
-/// The most bytes an [`Allocator::Permit`] may take, one limit on every
+/// The symbolic nesting profile: the most frames a value nests, the root
+/// and each array element, map key, map value and tagged item one frame
+/// deeper than its parent, so a scalar inside 127 arrays is 128 frames. The
+/// one limit of every symbolic traversal: the bounded encoder's shape walk
+/// and its preparation refuse a deeper value
+/// ([`BoundedError::DepthLimit`]), and so does the symbolic decoder
+/// ([`crate::Error::DepthLimit`]). A value built deeper still serializes
+/// through [`CBOR::to_cbor_data`](crate::CBOR::to_cbor_data), which applies
+/// no profile; neither the bounded encoder nor the decoder accepts it.
+pub const SYMBOLIC_DEPTH: usize = 128;
+
+/// The most bytes a [`Releasing::Permit`] may take, one limit on every
 /// path: a retained arena's whole state, its vector, tracked capacity and
 /// permit beside a staged growth, and a decode record's header, state and
 /// permit each fit a quantum only with permits this small.
@@ -296,9 +408,35 @@ impl<P: Place> Unit<P> {
         admit_at(self.place, budget, self.values, self.bytes)
     }
 
+    /// Admit this unit prepaid for `obligation`, all of it held
+    /// ([`Credit::Admit`]): the obligation's owning custody is returned
+    /// ([`Retained`]), for the caller to store at once.
+    pub(crate) fn admit_held<B: Budget>(
+        self,
+        budget: &mut B,
+        obligation: Obligation,
+        owner: &Owner,
+        acquisition: Identity,
+    ) -> BoundedResult<Retained<B::Origin>, B> {
+        admit_held_at(
+            self.place,
+            budget,
+            self.values,
+            self.bytes,
+            (obligation, self.work(), owner, acquisition),
+        )
+    }
+
+    /// The work of one of these units.
+    pub(crate) const fn work(self) -> WriteWork {
+        WriteWork::new(self.values, self.bytes)
+    }
+
     /// `count` of these units.
     pub(crate) fn times<R>(self, count: u64) -> Result<WriteWork, BoundedError<R>> {
-        WriteWork::new(self.values, self.bytes).times(count)
+        WriteWork::new(self.values, self.bytes)
+            .checked_times(count)
+            .ok_or(BoundedError::Overflow)
     }
 
     /// One of these units as a [`ResourceBound`]: what a constant cost sums.
@@ -339,10 +477,41 @@ impl<P: Place> Capped<P> {
     }
 
     pub(crate) fn admit<B: Budget>(self, budget: &mut B, bytes: u64) -> BoundedResult<(), B> {
+        self.capped(budget, bytes)?;
+        admit_at(self.place, budget, self.values, bytes)
+    }
+
+    /// Admit one unit of `bytes` prepaid for `obligation`, all of it held
+    /// ([`Credit::Admit`]): its owning custody is returned ([`Retained`]).
+    pub(crate) fn admit_held<B: Budget>(
+        self,
+        budget: &mut B,
+        bytes: u64,
+        obligation: Obligation,
+        owner: &Owner,
+        acquisition: Identity,
+    ) -> BoundedResult<Retained<B::Origin>, B> {
+        self.capped(budget, bytes)?;
+        admit_held_at(
+            self.place,
+            budget,
+            self.values,
+            bytes,
+            (obligation, self.work(bytes), owner, acquisition),
+        )
+    }
+
+    /// The one cap check of a capped unit, before either admission.
+    fn capped<B: Budget>(self, budget: &mut B, bytes: u64) -> BoundedResult<(), B> {
         if Bound::new(Predicate::Quantum, self.cap).exceeded(budget, bytes) {
             return Err(BoundedError::PlanMismatch);
         }
-        admit_at(self.place, budget, self.values, bytes)
+        Ok(())
+    }
+
+    /// The work of one unit of `bytes`.
+    pub(crate) const fn work(self, bytes: u64) -> WriteWork {
+        WriteWork::new(self.values, bytes)
     }
 
     /// The units covering `bytes` bytes, each at most the cap, and `items`
@@ -354,7 +523,9 @@ impl<P: Place> Capped<P> {
 
     /// `count` units of the full cap each.
     pub(crate) fn times<R>(self, count: u64) -> Result<WriteWork, BoundedError<R>> {
-        WriteWork::new(self.values, self.cap).times(count)
+        WriteWork::new(self.values, self.cap)
+            .checked_times(count)
+            .ok_or(BoundedError::Overflow)
     }
 }
 
@@ -413,14 +584,51 @@ impl<P: Place> Rate<P> {
         admit_at(self.place, budget, work.values, work.bytes)
     }
 
+    /// Admit one admission over `count` elements, the per-element part
+    /// prepaid for `obligation` and held ([`Credit::Admit`]), its owning
+    /// custody returned ([`Retained`]); the base consumed.
+    pub(crate) fn admit_held<B: Budget>(
+        self,
+        budget: &mut B,
+        count: u64,
+        obligation: Obligation,
+        owner: &Owner,
+        acquisition: Identity,
+    ) -> BoundedResult<Retained<B::Origin>, B> {
+        let work = self.of(count)?;
+        let held = self.held(count)?;
+        admit_held_at(
+            self.place,
+            budget,
+            work.values,
+            work.bytes,
+            (obligation, held, owner, acquisition),
+        )
+    }
+
+    /// The per-element part of one admission over `count` elements: what
+    /// [`Self::admit_held`] holds.
+    pub(crate) fn held<R>(self, count: u64) -> Result<WriteWork, BoundedError<R>> {
+        self.each.checked_times(count).ok_or(BoundedError::Overflow)
+    }
+
     /// The work of one admission over `count` elements.
     pub(crate) fn of<R>(self, count: u64) -> Result<WriteWork, BoundedError<R>> {
-        self.base.then(self.each.times(count)?)
+        self.each
+            .checked_times(count)
+            .and_then(|each| self.base.checked_then(each))
+            .ok_or(BoundedError::Overflow)
     }
 
     /// The work of `admissions` admissions over `count` elements in all.
     pub(crate) fn over<R>(self, admissions: u64, count: u64) -> Result<WriteWork, BoundedError<R>> {
-        self.base.times(admissions)?.then(self.each.times(count)?)
+        let (Some(base), Some(each)) = (
+            self.base.checked_times(admissions),
+            self.each.checked_times(count),
+        ) else {
+            return Err(BoundedError::Overflow);
+        };
+        base.checked_then(each).ok_or(BoundedError::Overflow)
     }
 }
 
@@ -439,27 +647,47 @@ pub(crate) trait Places {
     /// peak at once; a bound whose places hold storage at different times
     /// composes their peaks itself.
     fn peak<R>(&self) -> Result<u64, BoundedError<R>> {
-        let mut peak = 0u64;
-        for &place in Self::Place::ALL {
-            peak = add(peak, self.term(place).peak)?;
-        }
-        Ok(peak)
+        concurrent_peak(self)
     }
 
-    /// The bound: every place's work, requests and retained bytes summed,
-    /// and [`Self::peak`].
+    /// The bound: every place's work, requests and retained bytes summed
+    /// ([`additive`]), and [`Self::peak`], the one composition of the
+    /// bound's peak, which a bound whose places hold storage at different
+    /// times composes itself. A sum of peaks the bound never reports
+    /// refuses nothing, nor does a peak query refuse over work.
     fn bound<R>(&self) -> Result<ResourceBound, BoundedError<R>> {
-        let mut bound = ResourceBound::default();
-        for &place in Self::Place::ALL {
-            let term = self.term(place);
-            bound.values = add(bound.values, term.values)?;
-            bound.bytes = add(bound.bytes, term.bytes)?;
-            bound.allocated = add(bound.allocated, term.allocated)?;
-            bound.retained = add(bound.retained, term.retained)?;
-        }
-        bound.peak = self.peak()?;
-        Ok(bound)
+        Ok(ResourceBound {
+            peak: self.peak()?,
+            ..additive(self)?
+        })
     }
+}
+
+/// The additive quantities of every place of `terms` running concurrently:
+/// values, bytes, requests and retained bytes, each summed through
+/// [`ResourceBound::checked_add`] with every term's peak left out, so only
+/// these quantities can refuse ([`BoundedError::Overflow`]); the peak is 0.
+pub(crate) fn additive<T: Places + ?Sized, R>(terms: &T) -> Result<ResourceBound, BoundedError<R>> {
+    T::Place::ALL
+        .iter()
+        .try_fold(ResourceBound::default(), |total, &place| {
+            total.checked_add(ResourceBound {
+                peak: 0,
+                ..terms.term(place)
+            })
+        })
+        .ok_or(BoundedError::Overflow)
+}
+
+/// Every place's peak at once, the places concurrent: the peaks alone
+/// summed, refused as [`BoundedError::Overflow`] only when they do not fit.
+pub(crate) fn concurrent_peak<T: Places + ?Sized, R>(terms: &T) -> Result<u64, BoundedError<R>> {
+    T::Place::ALL
+        .iter()
+        .try_fold(0u64, |total, &place| {
+            total.checked_add(terms.term(place).peak)
+        })
+        .ok_or(BoundedError::Overflow)
 }
 
 /// The value of a construction cost computed in a constant, the one form
@@ -489,12 +717,27 @@ pub mod boundary;
 use boundary::{Bound, Predicate};
 pub mod decode;
 pub mod encoding;
+/// Kani harnesses of the arenas' growth recurrence (register item 4):
+/// compiled only by `cargo kani`.
+#[cfg(kani)]
+mod growth_proofs;
 mod policy;
+/// The Kani harnesses' one stand-in budget: compiled only by `cargo kani`.
+#[cfg(kani)]
+pub(crate) mod proof_budget;
+/// Kani proofs of the bound algebra (register item 4): compiled only by
+/// `cargo kani`.
+#[cfg(kani)]
+mod proofs;
 pub mod text;
 pub mod text_cursor;
 pub use encoding::Tagged;
+pub use policy::record::{
+    Boundary, Capacity, Incomplete, Invalidation, OBSERVED_WORDS, Observed, Session,
+};
 pub use policy::{
-    Admission, AdmissionTrace, Call, LimitRefusal, Limits, Reservation, TURN, TransferRefusal,
+    Admission, AdmissionTrace, Answer, Call, Credits, Event, Family, HistoryCounts, LimitRefusal,
+    Limits, RecordStage, Reservation, TURN, TransferRefusal, Unreadable,
 };
 
 /// Why a bounded preparation or write stopped.
@@ -566,39 +809,944 @@ pub trait Budget {
     /// may run inside cleanup and terminal steps. By default nothing is
     /// recorded.
     fn boundary(&mut self, _boundary: boundary::Boundary) {}
+
+    /// The capability a held obligation admitted through this budget keeps
+    /// to settle into this budget's credit family ([`Origin`]), whatever
+    /// budget later runs the step that settles it. A budget that records no
+    /// credit has `()`.
+    type Origin: Origin;
+
+    /// This budget's credit family's capability, obtained without any
+    /// admission, request or allocation.
+    fn origin(&self) -> Self::Origin;
+
+    /// Observe an admission of `work` through the route, all of it
+    /// consumed at once ([`Credit::Admit`]). Called by the route after a
+    /// successful [`Self::traverse`] and before the admission returns, so a
+    /// refused admission records nothing. Pure observation, as
+    /// [`Self::boundary`]: it admits nothing, refuses nothing, must not
+    /// allocate or unwind.
+    fn admitted(&mut self, work: WriteWork);
+
+    /// Mint the identity of an obligation about to be admitted held: called
+    /// by the route before it admits, so a budget that records and cannot
+    /// identify it refuses ([`Self::acquisition`]'s refusal) with nothing
+    /// admitted. [`Identity::UNOBSERVED`] for a budget that records nothing.
+    fn identify(&mut self) -> Result<Identity, Self::Refusal>;
+
+    /// Observe an admission of `work` through the route of which `hold`'s
+    /// part is held ([`Hold`], its identity from [`Self::identify`]). Called
+    /// as [`Self::admitted`] is, and held to the same contract.
+    fn held(&mut self, work: WriteWork, hold: Hold);
+
+    /// Observe a physical effect of an acquisition ([`Effect`]): the
+    /// reservation a granted permit pays for made, or failed. Called by the
+    /// acquisition right after the reservation's outcome is known, before
+    /// its grant's obligation is settled. Held to [`Self::admitted`]'s
+    /// contract.
+    fn effect(&mut self, effect: Effect);
+
+    /// Mint the identity of a custody that owns acquisitions (an operation
+    /// record, a standalone driver, a decode owner, an acquisition token, an
+    /// arena), once, when the custody is made, and observe it
+    /// ([`Event::Owner`]); [`Identity::UNOBSERVED`] for a budget that records
+    /// nothing. A budget that records refuses when it cannot identify the
+    /// owner, nothing changed. Otherwise held to [`Self::admitted`]'s
+    /// contract.
+    ///
+    /// The refusal of a recording budget that cannot identify (its session
+    /// exhausted, or an owner it did not mint) is sticky: the session is no
+    /// evidence from then on, and its recorder rejects every run of it, so
+    /// retrying it on the ordinary refusal path proves nothing.
+    fn owner(&mut self) -> Result<Owner, Self::Refusal>;
+
+    /// Mint one acquisition `owner` binds, and observe the binding
+    /// ([`Event::Bound`]): the capability ([`Acquisition`]) holding the
+    /// acquisition's identity, its owner's, and this budget's origin, the
+    /// one authority that later publishes its end ([`Acquisition::end`]).
+    /// Every obligation admitted for it, and the permit it is granted, name
+    /// its identity. Minted once per acquisition, before its first
+    /// admission, and kept by its holder across every retry and every change
+    /// of policy: the families that later admit its obligations or grant its
+    /// permit are their own, named by their identities, not by this one's.
+    /// A budget that records nothing returns [`Acquisition::unobserved`]. A
+    /// budget that records refuses, before anything is admitted, an
+    /// acquisition it cannot identify (its session exhausted) or whose owner
+    /// it never identified, so no recorded acquisition is ever unidentified.
+    /// Otherwise held to [`Self::admitted`]'s contract.
+    fn acquisition(&mut self, owner: &Owner) -> Result<Acquisition<Self::Origin>, Self::Refusal>;
+
+    /// Check, minting and admitting nothing, that this budget may perform
+    /// work for `owner`'s acquisitions: an ordinary budget for an ordinary
+    /// owner, a recording budget for an owner of its own, still usable,
+    /// session. Every other pairing is refused (for [`Limits`],
+    /// [`LimitRefusal::Unrecorded`]) and stickily invalidates each recording
+    /// session involved, the owner's included. Called on every acquisition
+    /// entry, a resumed one included, before anything is admitted, so a
+    /// policy of another session never extends an acquisition it did not
+    /// bind; [`Self::acquisition`] calls the same check before minting.
+    /// Cleanup never calls it: settlement into each obligation's origin and
+    /// every release proceed whatever the performing budget.
+    fn validate_owner(&mut self, owner: &Owner) -> Result<(), Self::Refusal>;
+
+    /// Who performs a settlement made through this budget's step
+    /// ([`Performer`]).
+    fn performer(&self) -> Performer;
 }
 
-/// A budget that also governs allocation: each allocation is requested in
-/// its whole size before it is made, a reallocation's new size while the
-/// old allocation is still held, and its [`Self::Permit`] is held for
-/// exactly the allocation's life. Dropping the permit releases it, and
-/// cannot fail.
+/// The capability a custody that owns acquisitions keeps, made by
+/// [`Budget::owner`]: its identity, and for a recording budget the session
+/// that minted it. Its fields are private; the one public constructor is
+/// [`Self::unobserved`], for a budget that records nothing, which a
+/// recording family refuses.
 ///
-/// Releasing a permit is the last unit of an allocation's life, admitted by
-/// the acquisition that requests it, before the allocation exists, as one
-/// value and at most a quantum of bytes; any cleanup path, a stepped one or a
-/// terminal one, then performs it unrefused. A permit is in the supported
-/// domain only if dropping it does constant work, allocates nothing and
-/// does not unwind: the terminal path's bound is one such drop per
-/// allocation held. A permit is at most sixteen bytes, checked at compile
-/// time wherever a retained arena or a decode record holds one. Owned
-/// decode scopes that cross threads require `Permit: Send`.
-pub trait Allocator: Budget {
+/// What is enforced: each owning custody stores its own owner (one per
+/// custody, made when the custody is made), and every acquisition entry,
+/// a resumed one included, presents it to the performing budget, which
+/// validates the pairing before admitting anything
+/// ([`Budget::validate_owner`]). Being neither `Clone` nor `Copy` stops the
+/// value being duplicated; it does not stop `&Owner` being shared, so the
+/// attribution rests on that storage and that check, not on the type alone.
+///
+/// `Send` and `Sync`: an identity and a counted reference to the session's
+/// store, whose shared state is atomics only. Dropping it decrements that
+/// count; it neither allocates nor unwinds. The last reference to a store
+/// frees it, which is not constant work; while a run is recorded its
+/// recorder holds the [`policy::record::Session`] until it finishes
+/// ([`policy::record::Session::finish`], which refuses while any owner of
+/// the session lives), so no custody's drop or terminal cleanup ever frees
+/// the store.
+///
+/// Its contract representation is [`OWNER_BYTES`]: an identity's two words
+/// and the session reference's one, whatever the target; an ordinary owner
+/// occupies the same storage.
+pub struct Owner {
+    id: Identity,
+    session: Option<policy::record::Shared>,
+}
+
+/// An owner's contract bytes ([`Owner`]): three words, the identity's two
+/// and the session reference's one, checked against its representation.
+pub const OWNER_BYTES: usize = 24;
+
+const _: () = assert!(
+    core::mem::size_of::<Owner>() <= OWNER_BYTES,
+    "an owner takes more than OWNER_BYTES bytes"
+);
+
+impl Owner {
+    /// Invalidate, stickily, the session this owner was minted in, if any:
+    /// a pairing refused by [`Budget::validate_owner`] makes it no evidence.
+    pub(crate) fn invalidate(&self) {
+        self.invalidate_with(Invalidation::ForeignOwner);
+    }
+
+    /// Invalidate this custody's recording without admission or allocation.
+    /// The session retains its first cause; ordinary custody records nothing.
+    pub(crate) fn invalidate_with(&self, cause: Invalidation) {
+        if let Some(session) = &self.session {
+            policy::record::exhaust(session, cause);
+        }
+    }
+
+    /// Whether it was minted in a recording session.
+    pub(crate) fn recorded_in_any(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// An owner of a budget that records nothing: no identity, no session.
+    pub const fn unobserved() -> Self {
+        Self {
+            id: Identity::UNOBSERVED,
+            session: None,
+        }
+    }
+
+    /// The identity it names.
+    pub fn id(&self) -> Identity {
+        self.id
+    }
+
+    /// An owner minted as `id` in `session` (`Limits::owner` only).
+    pub(crate) fn recorded(id: Identity, session: policy::record::Shared) -> Self {
+        Self {
+            id,
+            session: Some(session),
+        }
+    }
+
+    /// Whether it was minted in `session`.
+    pub(crate) fn of(&self, session: &policy::record::Shared) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|own| policy::record::same(own, session))
+    }
+}
+
+impl fmt::Debug for Owner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Owner")
+            .field("id", &self.id)
+            .field("recorded", &self.session.is_some())
+            .finish()
+    }
+}
+
+/// Who performed a settlement: a policy of the session, by its number, or
+/// no policy at all (a drop, a terminal path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Performer {
+    Policy(u64),
+    None,
+}
+
+/// The capability to settle held credit into the credit family that
+/// admitted it, and nothing else: no policy, permit or admission can be
+/// derived from it, and dropping it releases nothing. Kept by every held
+/// obligation ([`Retained`]) so its settlement reaches its origin whichever
+/// budget, or none, performs it: a later step's policy, a terminal drain,
+/// or the holder's drop.
+pub trait Origin: Send + Sync {
+    /// The family's identity within its recording session
+    /// ([`Identity::family`]); `0` for a family that records nothing.
+    fn family(&self) -> u64;
+
+    /// Record one settlement into this family: `settled`'s work of its
+    /// obligation consumed (`rule` is `None`) or forfeited under `rule`,
+    /// performed `by`. Constant work; it admits nothing, refuses nothing,
+    /// and neither allocates nor unwinds, so drops and terminal cleanup may
+    /// call it.
+    fn settle(&self, settled: Settled, rule: Option<Forfeit>, by: Performer);
+
+    /// Record the end of `acquisition`, which `owner` bound and this family
+    /// minted ([`Budget::acquisition`]), performed `by`: its holder settled
+    /// every obligation it held and keeps no capability of it. Reached only
+    /// through the acquisition's own capability ([`Acquisition::end`]), so
+    /// only the minting family publishes it. Held to [`Self::settle`]'s
+    /// contract: constant work, admitting, refusing, allocating and
+    /// unwinding nothing.
+    fn end(&self, acquisition: Identity, owner: Identity, by: Performer);
+}
+
+/// A budget that records no credit settles nothing and records no end.
+impl Origin for () {
+    fn family(&self) -> u64 {
+        0
+    }
+
+    fn settle(&self, _settled: Settled, _rule: Option<Forfeit>, _by: Performer) {}
+
+    fn end(&self, _acquisition: Identity, _owner: Identity, _by: Performer) {}
+}
+
+/// One acquisition's capability, minted by the budget that binds it
+/// ([`Budget::acquisition`]): its identity and the minting family's origin,
+/// the one authority that publishes its end. Kept by the acquisition's one
+/// holder from its bind to its end, across every refusal and every change
+/// of policy; obligations, permits, events and checkpoints name it by
+/// identity alone ([`Self::id`]), never by this capability. Neither `Copy`
+/// nor `Clone`: one acquisition, one holder.
+///
+/// The owner it was bound for is captured when it is minted and never
+/// changes: its end names that owner, and no holder can supply another.
+///
+/// Its end is explicit ([`Self::end`]), published by its holder once every
+/// obligation it held is settled. It has no `Drop` publication: a drop
+/// that could run before its obligations settle would publish an end the
+/// stream refutes, so a capability dropped without its end leaves the
+/// acquisition active, which refinement refuses at finalization.
+pub struct Acquisition<O: Origin> {
+    origin: O,
+    id: Identity,
+    owner: Identity,
+}
+
+impl Acquisition<()> {
+    /// An acquisition of a budget that records nothing, for an ordinary
+    /// `owner`: no identity, and an origin that publishes nothing, so no
+    /// unidentified end can ever be published. None for a recorded owner,
+    /// whose acquisitions only its own session mints.
+    pub fn unobserved(owner: &Owner) -> Option<Self> {
+        Self::ordinary((), owner)
+    }
+}
+
+impl<O: Origin> Acquisition<O> {
+    /// An acquisition of an ordinary family `origin` for an ordinary
+    /// `owner` (`Limits::acquisition` for a family that records nothing,
+    /// [`Acquisition::unobserved`]): no identity. None when either records:
+    /// an unobserved capability never carries a recorded origin or owner.
+    pub(crate) fn ordinary(origin: O, owner: &Owner) -> Option<Self> {
+        if owner.recorded_in_any() || origin.family() != 0 {
+            return None;
+        }
+        Some(Self {
+            origin,
+            id: Identity::UNOBSERVED,
+            owner: owner.id(),
+        })
+    }
+
+    /// An acquisition minted as `id` by the family `origin` is, for the
+    /// validated recorded `owner`, its binding published
+    /// (`Limits::acquisition` only). None unless `id` is an identity of
+    /// `origin`'s family and `owner` is recorded.
+    pub(crate) fn minted(origin: O, id: Identity, owner: &Owner) -> Option<Self> {
+        if id == Identity::UNOBSERVED
+            || id.family() == 0
+            || id.family() != origin.family()
+            || !owner.recorded_in_any()
+        {
+            return None;
+        }
+        Some(Self {
+            origin,
+            id,
+            owner: owner.id(),
+        })
+    }
+
+    /// The identity it names: a reference, never publication authority.
+    pub fn id(&self) -> Identity {
+        self.id
+    }
+
+    /// End it, `by` the performer of the step that ends it, for the owner
+    /// it was minted for: published into the minting family
+    /// ([`Origin::end`]), the capability consumed. Admits, allocates,
+    /// refuses and unwinds nothing, so terminal paths call it.
+    pub fn end(self, by: Performer) {
+        self.origin.end(self.id, self.owner, by);
+    }
+}
+
+impl<O: Origin> fmt::Debug for Acquisition<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Acquisition")
+            .field("id", &self.id)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A physical effect of an acquisition: the reservation the permit of
+/// `permit` pays for exists, or failed and the permit dropped; the
+/// acquisition is the one the permit was granted to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Reserved {
+        permit: Identity,
+        acquisition: Identity,
+    },
+    Failed {
+        permit: Identity,
+        acquisition: Identity,
+    },
+}
+
+/// The physical step a granted `permit` pays for, and its outcome: the one
+/// definition every acquisition reports its effect by, after spending its
+/// release at the permit. `reserve` performs the step. Made, the effect is
+/// [`Effect::Reserved`] and the permit is returned beside what `reserve`
+/// made, for its caller to hold for the allocation's life. Failed physically
+/// ([`Forfeit::AcquisitionFailed`]), the effect is [`Effect::Failed`] and the
+/// permit is dropped here, inside the failing step, performing the release
+/// spent at it: a failed reservation has no allocation, and a permit lives
+/// exactly as long as its allocation ([`Releasing`]), so no failed permit
+/// survives the step that failed it. Refused under any other rule, nothing
+/// physical happened: no effect is reported, and the permit is dropped alike.
+/// The caller then settles what its acquisition still holds by the returned
+/// rule and ends the acquisition. Allocation-free on its own side.
+pub(crate) fn reserved<A: Allocator, T>(
+    allocator: &mut A,
+    permit: A::Permit,
+    acquisition: Identity,
+    reserve: impl FnOnce() -> Result<T, Forfeit>,
+) -> Result<(A::Permit, T), Forfeit> {
+    let id = A::permit_identity(&permit);
+    match reserve() {
+        Ok(made) => {
+            allocator.effect(Effect::Reserved {
+                permit: id,
+                acquisition,
+            });
+            Ok((permit, made))
+        }
+        Err(rule) => {
+            if matches!(rule, Forfeit::AcquisitionFailed) {
+                allocator.effect(Effect::Failed {
+                    permit: id,
+                    acquisition,
+                });
+            }
+            drop(permit);
+            Err(rule)
+        }
+    }
+}
+
+/// One held obligation, the one custody of held credit every holder keeps:
+/// its originating family's capability, the identity its admission minted,
+/// its kind and the work it still holds. Its settlements are this type's
+/// alone: a partial spend ([`Self::consume`]), the remainder spent
+/// ([`Self::spend`]) or forfeited ([`Self::forfeit`]), each recorded into
+/// its origin. Dropped unsettled, it forfeits what it still holds
+/// ([`Forfeit::Cancelled`]) into its origin: allocation-free and
+/// non-unwinding, so no holder's drop or terminal path leaves credit held
+/// with no custody reporting it. It is never `Copy` or `Clone`: one
+/// obligation, one custody. Its identity's family is its origin's, so only
+/// the sequence is stored; the acquisition it is held for is stored whole,
+/// since another family may have bound it.
+pub struct Retained<O: Origin> {
+    origin: O,
+    sequence: u64,
+    acquisition: Identity,
+    remaining: WriteWork,
+    obligation: Obligation,
+}
+
+impl<O: Origin> Retained<O> {
+    /// The identity its admission minted.
+    pub(crate) fn id(&self) -> Identity {
+        Identity::new(self.origin.family(), self.sequence)
+    }
+
+    /// The acquisition it is held for.
+    pub(crate) fn acquisition(&self) -> Identity {
+        self.acquisition
+    }
+
+    /// What it is held for.
+    pub(crate) fn obligation(&self) -> Obligation {
+        self.obligation
+    }
+
+    /// The work it still holds: its holder's `held_credit` part.
+    pub(crate) fn remaining(&self) -> WriteWork {
+        self.remaining
+    }
+
+    /// The obligation as a custody observation: its kind, the work it still
+    /// holds at the observation point, its identity and its acquisition's.
+    /// Observation data only, never settlement authority.
+    pub(crate) fn observation(&self) -> Hold {
+        Hold {
+            obligation: self.obligation(),
+            work: self.remaining(),
+            id: self.id(),
+            acquisition: self.acquisition(),
+        }
+    }
+
+    /// Spend `part` of it, at `permit` when the spend is bound to one, `by`
+    /// the performing budget's [`Budget::performer`]: a window's inspected
+    /// controls. More than it holds is an engine defect, refused with
+    /// nothing changed. Its one caller is the bucket traversal
+    /// (`encoding::buckets`), compiled exactly where a hash table is.
+    #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
+    pub(crate) fn consume<R>(
+        &mut self,
+        part: WriteWork,
+        permit: Option<Identity>,
+        by: Performer,
+    ) -> Result<(), BoundedError<R>> {
+        let remaining = less(self.remaining, part).ok_or(BoundedError::PlanMismatch)?;
+        self.record(part, permit, None, by);
+        self.remaining = remaining;
+        Ok(())
+    }
+
+    /// Spend all it still holds, at `permit` when bound to one, `by` its
+    /// performer: a release at its permit's grant, a grant once its
+    /// reservation exists.
+    pub(crate) fn spend(mut self, permit: Option<Identity>, by: Performer) {
+        let remaining = core::mem::take(&mut self.remaining);
+        self.record(remaining, permit, None, by);
+    }
+
+    /// Forfeit all it still holds under `rule`, at `permit` when the
+    /// forfeit is a granted permit's (its reservation failed, or its scope
+    /// closed under the grant), `by` its performer.
+    pub(crate) fn forfeit(mut self, rule: Forfeit, permit: Option<Identity>, by: Performer) {
+        let remaining = core::mem::take(&mut self.remaining);
+        self.record(remaining, permit, Some(rule), by);
+    }
+
+    /// The one record of a settlement into its origin; nothing for none.
+    fn record(
+        &self,
+        work: WriteWork,
+        permit: Option<Identity>,
+        rule: Option<Forfeit>,
+        by: Performer,
+    ) {
+        if work == WriteWork::default() {
+            return;
+        }
+        self.origin.settle(
+            Settled {
+                obligation: self.obligation,
+                work,
+                id: self.id(),
+                acquisition: self.acquisition,
+                permit,
+            },
+            rule,
+            by,
+        );
+    }
+}
+
+/// Dropped unsettled: an unwinding or abandoned holder's backstop. Every
+/// explicit cleanup path settles explicitly, under its performer, before
+/// this runs.
+impl<O: Origin> Drop for Retained<O> {
+    fn drop(&mut self) {
+        let remaining = core::mem::take(&mut self.remaining);
+        self.record(remaining, None, Some(Forfeit::Cancelled), Performer::None);
+    }
+}
+
+impl<O: Origin> fmt::Debug for Retained<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Retained")
+            .field("id", &self.id())
+            .field("acquisition", &self.acquisition)
+            .field("obligation", &self.obligation)
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The one sink of a custody observation.
+///
+/// A custody observation is a properly nested sequence of groups, one per
+/// owning component: `begin(owner)` opens a group under the owner its stored
+/// ownership capability names (`None` while deferred); `held` and `permit`
+/// belong to the innermost open group; `end` closes it and restores its
+/// parent. A component that holds an independently owning component (an
+/// arena with its own Pending, a text continuation, a dynamic state) reports
+/// it as a child group inside its own. An item outside every group, an
+/// unmatched `end`, an unclosed group, or a deferred group holding an item
+/// directly (rather than through a child group) is a malformed observation.
+/// A `Contended` result invalidates the whole observation, groups already
+/// emitted included. Allocation-free on the custody's side; the collector
+/// owns any stack.
+///
+/// Every owning custody has one traversal, returning whether the observation
+/// is whole ([`PermitsObserved`]): a holder's is its [`Custodial`]
+/// implementation, a component's the one its holder calls from inside its
+/// own; each projection below reads that traversal, so no custody keeps a
+/// second enumeration of what it owns.
+pub trait CustodySink<P> {
+    fn begin(&mut self, owner: Option<Identity>);
+    /// An acquisition bound by the open group's owner and not yet ended.
+    fn bound(&mut self, acquisition: Identity);
+    fn held(&mut self, hold: Hold);
+    /// A permit the open group's component physically owns, and, for a
+    /// record block's, the record stage under which that component holds it
+    /// ([`RecordStage`]): `None` for every permit that is no record block.
+    /// [`RecordStage::Reclaimed`] is never reported at a quiescent point:
+    /// a record's cleanup completes and frees its block in one unit.
+    fn permit(&mut self, permit: &P, record: Option<RecordStage>);
+    fn end(&mut self);
+    /// Custody held jointly by several holders and by none alone, named by
+    /// `custody`, the identity of the permit it is held under: a decode
+    /// scope whose authority was dropped, kept alive by the counted
+    /// reference of every live handle, any of which may be the last. Each
+    /// holder reaching it asks first; true reports it now, as groups of its
+    /// own owners, false passes it over. A collector of everything the
+    /// observation reaches answers true once per identity, so the custody is
+    /// reported once whichever holder reaches it first; a projection of one
+    /// holder's own custody ([`held_of`], [`permits_of`], [`owners_of`],
+    /// [`bound_of`]) answers false, since shared custody is no holder's own.
+    fn shared(&mut self, custody: Identity) -> bool;
+}
+
+/// A holder of custody with permits of `P`: a value its holder keeps,
+/// steps or retires as a whole (an operation, a typed decode, a scope's
+/// authority, a record handle, a published value, plan or writer), whose
+/// custody is observed through this one contract wherever it is held. Its
+/// traversal reports every group it owns into `sink`, its components'
+/// through their own traversals, each identity once ([`CustodySink`]).
+/// Read-only and allocation-free on the custody's side: it admits, mints,
+/// publishes, settles and releases nothing. `&mut self` excludes every
+/// reader of the custody, and every borrow out of it, while it is walked.
+pub trait Custodial<P> {
+    /// This holder's custody, whole or contended ([`PermitsObserved`]).
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved;
+}
+
+/// The output of an operation that publishes nothing (a write into a
+/// caller's destination) holds no permit.
+impl<P> Custodial<P> for () {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
+    }
+}
+
+/// Whether a custody observation is whole: `Complete` when every part the
+/// custody owns was visited; `Contended` when some part (a shared scope
+/// queue another caller is stepping) could not be walked, so the visit is no
+/// observation of it. A contended observation is not an empty one: its
+/// reader discards it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermitsObserved {
+    Complete,
+    Contended,
+}
+
+/// Whether every observation of `parts` is whole: contended when any is,
+/// since a contended part is no observation of what it holds.
+pub fn observed_all(parts: impl IntoIterator<Item = PermitsObserved>) -> PermitsObserved {
+    let mut whole = PermitsObserved::Complete;
+    for part in parts {
+        if part == PermitsObserved::Contended {
+            whole = PermitsObserved::Contended;
+        }
+    }
+    whole
+}
+
+/// The held obligations of a custody observation, in the traversal's order,
+/// its groups and permits passed over. Returns the traversal's completeness.
+pub fn held_of<P>(
+    observe: impl FnOnce(&mut dyn CustodySink<P>) -> PermitsObserved,
+    visit: &mut dyn FnMut(Hold),
+) -> PermitsObserved {
+    struct Held<'v>(&'v mut dyn FnMut(Hold));
+    impl<P> CustodySink<P> for Held<'_> {
+        fn begin(&mut self, _: Option<Identity>) {}
+        fn bound(&mut self, _: Identity) {}
+        fn held(&mut self, hold: Hold) {
+            (self.0)(hold);
+        }
+        fn permit(&mut self, _: &P, _: Option<RecordStage>) {}
+        fn end(&mut self) {}
+        /// One holder's own obligations: shared custody is none of them.
+        fn shared(&mut self, _: Identity) -> bool {
+            false
+        }
+    }
+    observe(&mut Held(visit))
+}
+
+/// The permits of a custody observation, each named by `A`'s identity of it
+/// ([`Releasing::permit_identity`]), in the traversal's order. Returns the
+/// traversal's completeness: a contended visit is not an empty one.
+pub fn permits_of<A: Releasing>(
+    observe: impl FnOnce(&mut dyn CustodySink<A::Permit>) -> PermitsObserved,
+    visit: &mut dyn FnMut(Identity),
+) -> PermitsObserved {
+    struct Permits<'v, A>(
+        &'v mut dyn FnMut(Identity),
+        core::marker::PhantomData<fn() -> A>,
+    );
+    impl<A: Releasing> CustodySink<A::Permit> for Permits<'_, A> {
+        fn begin(&mut self, _: Option<Identity>) {}
+        fn bound(&mut self, _: Identity) {}
+        fn held(&mut self, _: Hold) {}
+        /// Every permit by identity, a record block's stage passed over: the
+        /// permit set is the projection, the stage the collector's to check.
+        fn permit(&mut self, permit: &A::Permit, _: Option<RecordStage>) {
+            (self.0)(A::permit_identity(permit));
+        }
+        fn end(&mut self) {}
+        /// One holder's own permits: shared custody is none of them.
+        fn shared(&mut self, _: Identity) -> bool {
+            false
+        }
+    }
+    observe(&mut Permits::<A>(visit, core::marker::PhantomData))
+}
+
+/// The owners a custody observation's groups name, each group's once its
+/// owner is made; a deferred group names none. One owner may head several
+/// groups. Returns the traversal's completeness.
+pub fn owners_of<P>(
+    observe: impl FnOnce(&mut dyn CustodySink<P>) -> PermitsObserved,
+    visit: &mut dyn FnMut(Identity),
+) -> PermitsObserved {
+    struct Owners<'v>(&'v mut dyn FnMut(Identity));
+    impl<P> CustodySink<P> for Owners<'_> {
+        fn begin(&mut self, owner: Option<Identity>) {
+            if let Some(owner) = owner {
+                (self.0)(owner);
+            }
+        }
+        fn bound(&mut self, _: Identity) {}
+        fn held(&mut self, _: Hold) {}
+        fn permit(&mut self, _: &P, _: Option<RecordStage>) {}
+        fn end(&mut self) {}
+        /// One holder's own owners: shared custody is none of them.
+        fn shared(&mut self, _: Identity) -> bool {
+            false
+        }
+    }
+    observe(&mut Owners(visit))
+}
+
+/// The acquisitions a custody observation reports bound, in the traversal's
+/// order, its groups, obligations and permits passed over: the bindings a
+/// progress position does not carry. Returns the traversal's completeness.
+pub fn bound_of<P>(
+    observe: impl FnOnce(&mut dyn CustodySink<P>) -> PermitsObserved,
+    visit: &mut dyn FnMut(Identity),
+) -> PermitsObserved {
+    struct Bound<'v>(&'v mut dyn FnMut(Identity));
+    impl<P> CustodySink<P> for Bound<'_> {
+        fn begin(&mut self, _: Option<Identity>) {}
+        fn bound(&mut self, acquisition: Identity) {
+            (self.0)(acquisition);
+        }
+        fn held(&mut self, _: Hold) {}
+        fn permit(&mut self, _: &P, _: Option<RecordStage>) {}
+        fn end(&mut self) {}
+        /// One holder's own bindings: shared custody is none of them.
+        fn shared(&mut self, _: Identity) -> bool {
+            false
+        }
+    }
+    observe(&mut Bound(visit))
+}
+
+/// The work a custody observation holds: checked addition from zero over
+/// its held obligations, allocation-free. `None` when the sum does not fit
+/// or the observation is contended, which totals nothing. The one fold every
+/// custody's `held_credit` is.
+pub fn total_held<P>(
+    observe: impl FnOnce(&mut dyn CustodySink<P>) -> PermitsObserved,
+) -> Option<WriteWork> {
+    let mut total = Some(WriteWork::default());
+    let observed = held_of(observe, &mut |held: Hold| {
+        total = total.and_then(|total| total.checked_then(held.work));
+    });
+    match observed {
+        PermitsObserved::Complete => total,
+        PermitsObserved::Contended => None,
+    }
+}
+
+/// `left - right` in both quantities, or none when either falls below zero.
+const fn less(left: WriteWork, right: WriteWork) -> Option<WriteWork> {
+    let (Some(values), Some(bytes)) = (
+        left.values.checked_sub(right.values),
+        left.bytes.checked_sub(right.bytes),
+    ) else {
+        return None;
+    };
+    Some(WriteWork::new(values, bytes))
+}
+
+/// What a prepaid admission is held for: work admitted before the event
+/// that performs it. Held credit has one source of truth, the custody of
+/// the operation that admitted it, which records it as part of its state
+/// and reports it through its `held_credit` observation; a policy records
+/// only what was admitted, consumed and forfeited ([`Credit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Obligation {
+    /// An allocation's release, admitted by its acquisition before the
+    /// allocation is requested ([`Allocator`]). Held until the allocation is
+    /// granted, when it is bound to the permit, whose drop performs it
+    /// unconditionally: [`Owned::reserve`] within its call; a retained
+    /// arena's staged growth across steps (`decode::storage`,
+    /// `Admitted::Release`); a text continuation from its `ReleaseOutput`
+    /// phase to its grant ([`text_cursor`]); a string decode from its
+    /// `Release` phase to its grant (`decode::string_cursor`);
+    /// [`Prepared::encode_owned`] within its call.
+    Release,
+    /// Work an acquisition performs when its allocation is granted, admitted
+    /// before it is requested: a retained arena's grown allocation written
+    /// into its staging block (`decode::storage`, `Admitted::Write`), and the
+    /// relocation of the initialized elements a moving reallocation performs
+    /// ([`Owned::reserve`]). Spent at the grant and forfeited under the same
+    /// rules as the release beside it.
+    Grant,
+    /// A bucket window's controls, admitted with the window
+    /// (`encoding::buckets::BucketCursor`, where hash tables are built) and
+    /// held until each is inspected.
+    BucketWindow,
+}
+
+/// The named rules under which held credit is forfeited: admitted work that
+/// is never performed. Admitted work is never refunded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forfeit {
+    /// The policy refused the request of an acquisition whose operation
+    /// keeps no custody of its admission, a synchronous call that a refusal
+    /// ends ([`Owned::reserve`], [`Prepared::encode_owned`]): a retry admits
+    /// again. A retained acquisition keeps its credit held across a refusal
+    /// instead, and its retry's grant spends it.
+    AcquisitionRefused,
+    /// The physical reservation failed after the request was granted: the
+    /// grant's work ([`Obligation::Grant`]) is never performed. The release
+    /// was spent at the grant, bound to the permit, which drops at once and
+    /// performs it. The failure is terminal ([`Class::Allocation`]).
+    AcquisitionFailed,
+    /// Cleanup began, or a terminal error ended the operation, while its
+    /// custody still held the credit: an admitted release or grant whose
+    /// allocation was not granted, or a window's controls not inspected.
+    Cancelled,
+    /// An enumeration ended with its window's credit unspent: every entry
+    /// yielded, or the count its map declared reached.
+    EnumerationComplete,
+}
+
+/// One credit event: an admission, reported through [`Budget::admitted`] or
+/// [`Budget::held`], or a settlement, recorded into the obligation's origin
+/// ([`Origin::settle`]) by its custody ([`Retained`]). A policy's ledgers are
+/// what was admitted (A), consumed (C) and forfeited (F); what is held (H)
+/// is the custody's own (`held_credit`). An operation's credit is
+/// conserved when, over every policy instance that served it, `A = C + F +
+/// H`. Consumed is work performed, or work irrevocably committed to a
+/// granted permit, whose drop performs its release unconditionally: the
+/// ledgers do not report how much work has physically executed.
+///
+/// Every held obligation carries the identity its admission minted
+/// ([`Budget::identify`]), and every spend or forfeit names it; a settlement
+/// tied to a permit (a release bound at its grant, a grant spent once the
+/// physical reservation exists or forfeited when it failed or was
+/// abandoned) names that permit's identity too, read from the permit
+/// itself ([`Releasing::permit_identity`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Credit {
+    /// An admission through the route of `work`, of which `held`, at most
+    /// all of it, was prepaid for an obligation, which the admitting
+    /// custody now holds; the rest is consumed at once. One event: there is
+    /// no window in which held credit is reported consumed.
+    Admit { work: WriteWork, held: Option<Hold> },
+    /// Held credit spent: the obligation's work performed, or bound to a
+    /// granted permit.
+    Spend(Settled),
+    /// Held credit forfeited under a named rule.
+    Forfeit(Settled, Forfeit),
+}
+
+/// The identity a policy family gives each permit it grants and each
+/// obligation admitted held through it: the family's own identity, minted
+/// once per family from one process-wide sequence when its first policy is
+/// made, and the family's monotone sequence number, so no two permits or
+/// obligations of one process share one, whichever families served them. A
+/// budget that observes no credit mints [`Self::UNOBSERVED`] for every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Identity {
+    family: u64,
+    sequence: u64,
+}
+
+impl Identity {
+    /// What a budget observing no credit mints: no identity. No family is
+    /// numbered zero.
+    pub const UNOBSERVED: Self = Self {
+        family: 0,
+        sequence: 0,
+    };
+
+    /// The identity numbered `sequence` in `family`, as a stream records it.
+    pub const fn new(family: u64, sequence: u64) -> Self {
+        Self { family, sequence }
+    }
+
+    /// The family that minted it.
+    pub const fn family(self) -> u64 {
+        self.family
+    }
+
+    /// Its number in its family.
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+/// A held obligation: the obligation it is prepaid for, its work, the
+/// identity minted for it, and the acquisition holding it. In an admission
+/// event ([`Credit::Admit`]) `work` is the work initially held; in a custody
+/// observation ([`CustodySink::held`]) it is the work still held at the
+/// observation point. Observation data only, never settlement authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub obligation: Obligation,
+    pub work: WriteWork,
+    pub id: Identity,
+    pub acquisition: Identity,
+}
+
+/// A held obligation's settlement: the obligation and its identity, the
+/// acquisition that held it, the work settled, and the permit it is
+/// settled at, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    pub obligation: Obligation,
+    pub work: WriteWork,
+    pub id: Identity,
+    pub acquisition: Identity,
+    pub permit: Option<Identity>,
+}
+
+/// A budget that holds and releases permits of [`Self::Permit`] and names
+/// them, and cannot request a new allocation: what cleanup receives
+/// (`Cleanup`, in `decode::construction::reclamation`), and the bound of
+/// every cleanup path, which may admit work, release what it holds and
+/// report permits, never acquire.
+///
+/// A permit is held for exactly the life of the allocation it was granted
+/// for; dropping it releases it, and cannot fail. Releasing a permit is the
+/// last unit of an allocation's life, admitted by the acquisition that
+/// requests it, before the allocation exists, as one value and at most a
+/// quantum of bytes; any cleanup path, a stepped one or a terminal one, then
+/// performs it unrefused. A permit is in the supported domain only if
+/// dropping it does constant work, allocates nothing and does not unwind:
+/// the terminal path's bound is one such drop per allocation held. A permit
+/// is at most sixteen bytes, checked at compile time wherever a retained
+/// arena or a decode record holds one. Owned decode scopes that cross
+/// threads require `Permit: Send`.
+pub trait Releasing: Budget {
     /// Held while the allocation it was given for exists.
     type Permit;
 
+    /// The identity of `permit`, read from the permit itself:
+    /// [`Identity::UNOBSERVED`] for a permit of a family that records
+    /// nothing. Observation only; a physical effect ([`Effect`]) and the
+    /// settlement of its release name it.
+    fn permit_identity(permit: &Self::Permit) -> Identity;
+
+    /// Observe that `permit`, a record block's, entered `stage` of its
+    /// record's lifecycle under `owner`, the owner whose acquisition granted
+    /// it ([`Event::Custody`]): published through the permit's own family,
+    /// whatever budget performs the step, and with no budget at all where
+    /// none exists (a record's retirement into its queue). Nothing for a
+    /// permit of a family that records nothing. Observation only: it admits,
+    /// allocates, refuses and unwinds nothing.
+    fn custody(permit: &Self::Permit, owner: Identity, stage: RecordStage);
+}
+
+/// A releasing budget ([`Releasing`]) that also governs allocation: each
+/// allocation is requested in its whole size before it is made, a
+/// reallocation's new size while the old allocation is still held, and its
+/// permit is held for exactly the allocation's life.
+pub trait Allocator: Releasing {
     /// Admit an allocation of `bytes` requested capacity bytes. This excludes
     /// allocator metadata and allocator rounding; it is not an RSS bound.
     fn allocate(&mut self, bytes: u64) -> Result<Self::Permit, Self::Refusal>;
 }
 
 /// A policy that can finish a decode scope after its scheduler has gone away.
+/// Credit its holder can no longer reach a policy to settle is settled by
+/// the holder's own [`Retained`] custody into its origin, not through this
+/// trait.
 ///
 /// # Safety
-/// `terminal` and dropping its result must not allocate or unwind. The returned
-/// policy's `traverse` must always succeed, do bounded allocation-free work,
-/// and never unwind. Its `allocate` must not allocate: reclamation is forbidden
-/// from requesting new storage. The policy must not borrow `permit`.
+/// An implementation keeps four obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *terminal*: `terminal` and dropping its result neither allocate nor
+///   unwind.
+/// - *traverse*: the returned policy's `traverse` always succeeds, does
+///   bounded allocation-free work, and never unwinds.
+/// - *allocate*: the returned policy's `allocate` allocates nothing:
+///   reclamation is forbidden from requesting new storage.
+/// - *borrow*: the returned policy does not borrow `permit`.
 pub unsafe trait TerminalAllocator: Allocator + Sized {
     fn terminal(permit: &Self::Permit) -> Self;
 }
@@ -617,11 +1765,59 @@ impl<B: Budget + ?Sized> Budget for &mut B {
     fn boundary(&mut self, boundary: boundary::Boundary) {
         (**self).boundary(boundary)
     }
+
+    type Origin = B::Origin;
+
+    fn origin(&self) -> Self::Origin {
+        (**self).origin()
+    }
+
+    fn admitted(&mut self, work: WriteWork) {
+        (**self).admitted(work)
+    }
+
+    fn identify(&mut self) -> Result<Identity, Self::Refusal> {
+        (**self).identify()
+    }
+
+    fn held(&mut self, work: WriteWork, hold: Hold) {
+        (**self).held(work, hold)
+    }
+
+    fn effect(&mut self, effect: Effect) {
+        (**self).effect(effect)
+    }
+
+    fn owner(&mut self) -> Result<Owner, Self::Refusal> {
+        (**self).owner()
+    }
+
+    fn acquisition(&mut self, owner: &Owner) -> Result<Acquisition<Self::Origin>, Self::Refusal> {
+        (**self).acquisition(owner)
+    }
+
+    fn validate_owner(&mut self, owner: &Owner) -> Result<(), Self::Refusal> {
+        (**self).validate_owner(owner)
+    }
+
+    fn performer(&self) -> Performer {
+        (**self).performer()
+    }
+}
+
+impl<R: Releasing + ?Sized> Releasing for &mut R {
+    type Permit = R::Permit;
+
+    fn permit_identity(permit: &Self::Permit) -> Identity {
+        R::permit_identity(permit)
+    }
+
+    fn custody(permit: &Self::Permit, owner: Identity, stage: RecordStage) {
+        R::custody(permit, owner, stage)
+    }
 }
 
 impl<A: Allocator + ?Sized> Allocator for &mut A {
-    type Permit = A::Permit;
-
     fn allocate(&mut self, bytes: u64) -> Result<Self::Permit, Self::Refusal> {
         (**self).allocate(bytes)
     }
@@ -728,6 +1924,12 @@ pub fn mul<R>(left: u64, right: u64) -> Result<u64, BoundedError<R>> {
     left.checked_mul(right).ok_or(BoundedError::Overflow)
 }
 
+/// The larger of `left` and `right`, in constants: [`Ord::max`] is not a
+/// `const fn`.
+const fn larger_of(left: u64, right: u64) -> u64 {
+    if left > right { left } else { right }
+}
+
 /// A `usize` count or length as `u64`.
 pub fn widen<R>(value: usize) -> Result<u64, BoundedError<R>> {
     u64::try_from(value).map_err(|_| BoundedError::Overflow)
@@ -745,6 +1947,26 @@ pub fn item_len<R>(argument: u64, payload: u64) -> Result<u64, BoundedError<R>> 
 /// requests the allocation ([`Owned::reserve`]).
 pub(crate) const RELEASED: Capped<Caller> = Capped::new(Caller, 1, TURN.bytes);
 
+/// The capacity an arena grows to from `capacity`: four from empty,
+/// otherwise double; `None` when doubling overflows. The one growth rule
+/// [`Owned::reserve`], the staged arena's growth (`decode/storage.rs`
+/// `allocate_grown`) and the bound over both ([`owned_growth`]) follow.
+pub(crate) const fn grown_capacity(capacity: u64) -> Option<u64> {
+    if capacity == 0 {
+        Some(4)
+    } else {
+        capacity.checked_mul(2)
+    }
+}
+
+/// [`grown_capacity`] over a `usize` capacity, refused
+/// [`BoundedError::Overflow`] when it does not fit.
+pub(crate) fn grown<R>(capacity: usize) -> Result<usize, BoundedError<R>> {
+    grown_capacity(widen(capacity)?)
+        .and_then(|grown| usize::try_from(grown).ok())
+        .ok_or(BoundedError::Overflow)
+}
+
 /// A vector whose capacity grows only through its [`Allocator`], doubling
 /// from four elements, each growth admitted in its whole new size, and its
 /// eventual release, before it is made and its permit held for as long as
@@ -752,6 +1974,12 @@ pub(crate) const RELEASED: Capped<Caller> = Capped::new(Caller, 1, TURN.bytes);
 /// new one exists. Its capacity is tracked as requested, not as the
 /// allocator rounded it, so two runs over the same input request the same
 /// allocations.
+///
+/// Fields drop in declaration order, which is the release order
+/// `Self::release` and every drop rely on: `items` first, freeing the
+/// allocation, then `permit`, releasing its reservation, so no permit is
+/// released while the storage it accounts for still exists. Reordering the
+/// fields reverses it.
 pub struct Owned<T, P> {
     items: Vec<T>,
     capacity: usize,
@@ -801,11 +2029,22 @@ impl<T, P> Owned<T, P> {
         self.items.is_empty()
     }
 
-    /// Make room for `additional` more elements.
+    /// The permit of this vector's allocation, read-only: named by its
+    /// identity ([`Releasing::permit_identity`]) where a custody reports the
+    /// permits it owns. None while it holds no allocation.
+    pub fn permit(&self) -> Option<&P> {
+        self.permit.as_ref()
+    }
+
+    /// Make room for `additional` more elements, each growth an acquisition
+    /// of `owner`, the custody that holds this vector. The owner is the
+    /// custody's, not the vector's own: storing it here would take the
+    /// vector past one write extent ([`write_extent`]).
     pub fn reserve<A: Allocator<Permit = P>>(
         &mut self,
         additional: usize,
         allocator: &mut A,
+        owner: &Owner,
     ) -> BoundedResult<(), A> {
         let needed = self
             .items
@@ -813,24 +2052,83 @@ impl<T, P> Owned<T, P> {
             .checked_add(additional)
             .ok_or(BoundedError::Overflow)?;
         while Bound::new(Predicate::ArenaLength, self.capacity).exceeded(allocator, needed) {
-            let grown = if self.capacity == 0 {
-                4
-            } else {
-                self.capacity.checked_mul(2).ok_or(BoundedError::Overflow)?
-            };
+            let grown = grown(self.capacity)?;
             let bytes = mul(widen(grown)?, widen(core::mem::size_of::<T>())?)?;
+            let initialized = widen(self.items.len())?;
             // A moving reallocation can copy every initialized element; the
             // new allocation's release is paid for before it is requested.
-            Self::MOVE.admit(allocator, widen(self.items.len())?)?;
-            RELEASED.admit(allocator, const { Self::RELEASE_BYTES })?;
-            let permit = allocator.allocate(bytes).map_err(BoundedError::Refused)?;
-            // On failure the new permit drops here, releasing what was
-            // admitted for the allocation that did not happen.
-            self.items
-                .try_reserve_exact(grown - self.items.len())
-                .map_err(|_| BoundedError::Allocation { bytes })?;
-            self.permit = Some(permit);
-            self.capacity = grown;
+            // Both are held for the grant, each in its own custody from its
+            // admission ([`Retained`]): this call keeps neither across a
+            // refusal, which ends it, so a refusal forfeits them and a
+            // retry admits them again.
+            // Each growth is one acquisition of `owner`, the custody holding
+            // this vector, bound here and held for the length of the call:
+            // nothing of it is held across a call. Every exit settles what
+            // the growth holds, then ends the acquisition, once.
+            let acquisition = allocator
+                .acquisition(owner)
+                .map_err(BoundedError::Refused)?;
+            let by = allocator.performer();
+            let grant = match Self::MOVE.admit_held(
+                allocator,
+                initialized,
+                Obligation::Grant,
+                owner,
+                acquisition.id(),
+            ) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    acquisition.end(by);
+                    return Err(error);
+                }
+            };
+            let release = match RELEASED.admit_held(
+                allocator,
+                const { Self::RELEASE_BYTES },
+                Obligation::Release,
+                owner,
+                acquisition.id(),
+            ) {
+                Ok(release) => release,
+                Err(error) => {
+                    grant.forfeit(Forfeit::AcquisitionRefused, None, by);
+                    acquisition.end(by);
+                    return Err(error);
+                }
+            };
+            let permit = match allocator.allocate(bytes) {
+                Ok(permit) => permit,
+                Err(refusal) => {
+                    grant.forfeit(Forfeit::AcquisitionRefused, None, by);
+                    release.forfeit(Forfeit::AcquisitionRefused, None, by);
+                    acquisition.end(by);
+                    return Err(BoundedError::Refused(refusal));
+                }
+            };
+            let id = A::permit_identity(&permit);
+            // Granted: the permit carries the release, which its drop
+            // performs whatever follows.
+            release.spend(Some(id), by);
+            let additional = grown - self.items.len();
+            let items = &mut self.items;
+            match reserved(allocator, permit, acquisition.id(), || {
+                items
+                    .try_reserve_exact(additional)
+                    .map_err(|_| Forfeit::AcquisitionFailed)
+            }) {
+                Ok((permit, ())) => {
+                    grant.spend(Some(id), by);
+                    acquisition.end(by);
+                    self.permit = Some(permit);
+                    self.capacity = grown;
+                }
+                Err(rule) => {
+                    // The relocation the grant paid for never happens.
+                    grant.forfeit(rule, Some(id), by);
+                    acquisition.end(by);
+                    return Err(BoundedError::Allocation { bytes });
+                }
+            }
         }
         Ok(())
     }
@@ -839,8 +2137,9 @@ impl<T, P> Owned<T, P> {
         &mut self,
         item: T,
         allocator: &mut A,
+        owner: &Owner,
     ) -> BoundedResult<(), A> {
-        self.reserve(1, allocator)?;
+        self.reserve(1, allocator, owner)?;
         self.items.push(item);
         Ok(())
     }
@@ -851,18 +2150,21 @@ impl<T, P> Owned<T, P> {
         at: usize,
         item: T,
         allocator: &mut A,
+        owner: &Owner,
     ) -> BoundedResult<(), A> {
         let len = self.items.len();
         if Bound::new(Predicate::ArenaLength, len).exceeded(allocator, at) {
             return Err(BoundedError::Overflow);
         }
         Self::MOVE.admit(allocator, widen(len - at)?)?;
-        self.reserve(1, allocator)?;
+        self.reserve(1, allocator, owner)?;
         self.items.insert(at, item);
         Ok(())
     }
 
-    /// Remove every element, keeping the allocation and its permit.
+    /// Remove every element, keeping the allocation and its permit. The
+    /// drain itself admits nothing: its caller admits each element it
+    /// handles as it handles it.
     pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         self.items.drain(..)
     }
@@ -890,8 +2192,9 @@ impl<P> Owned<u8, P> {
         &mut self,
         bytes: &[u8],
         allocator: &mut A,
+        owner: &Owner,
     ) -> BoundedResult<(), A> {
-        self.reserve(bytes.len(), allocator)?;
+        self.reserve(bytes.len(), allocator, owner)?;
         self.items.extend_from_slice(bytes);
         Ok(())
     }
@@ -934,7 +2237,7 @@ pub fn owned_growth<R>(elements: u64, element_size: u64) -> Result<Growth, Bound
     let mut growth = Growth::default();
     let mut capacity = 0u64;
     while capacity < elements {
-        let grown = if capacity == 0 { 4 } else { mul(capacity, 2)? };
+        let grown = grown_capacity(capacity).ok_or(BoundedError::Overflow)?;
         let previous = mul(capacity, element_size)?;
         let bytes = mul(grown, element_size)?;
         growth.copied = add(growth.copied, previous)?;
@@ -992,6 +2295,56 @@ impl Growth {
     pub(crate) fn released<R>(&self) -> Result<WriteWork, BoundedError<R>> {
         RELEASED.times(self.allocations)
     }
+
+    /// What `growths` hold, every one's capacity held at once and one growing
+    /// at a time, as a bound of storage alone (no work, no requests): the
+    /// alternative ([`ResourceBound::larger`]) over which one grows of the
+    /// others' capacities held concurrently ([`ResourceBound::checked_add`])
+    /// then its growth ([`ResourceBound::checked_then`]). Its peak is every
+    /// capacity held and the largest relocation in progress, never two; it
+    /// retains every capacity. Refused when a quantity does not fit.
+    pub(crate) fn one_growing<R>(growths: &[Self]) -> Result<ResourceBound, BoundedError<R>> {
+        let held = |growth: &Self| ResourceBound {
+            peak: growth.held,
+            retained: growth.held,
+            ..ResourceBound::default()
+        };
+        let mut most = ResourceBound::default();
+        for (growing, growth) in growths.iter().enumerate() {
+            let others = growths
+                .iter()
+                .enumerate()
+                .filter(|&(other, _)| other != growing)
+                .try_fold(ResourceBound::default(), |total, (_, other)| {
+                    total.checked_add(held(other))
+                });
+            let one = others
+                .and_then(|others| {
+                    others.checked_then(ResourceBound {
+                        peak: growth.peak,
+                        retained: growth.held,
+                        ..ResourceBound::default()
+                    })
+                })
+                .ok_or(BoundedError::Overflow)?;
+            most = most.larger(one);
+        }
+        Ok(most)
+    }
+
+    /// This growth as the bound of the vector it grows: its relocated bytes
+    /// reported as work of no values, its requests, its peak, and what it
+    /// holds once grown as its retained output. Its releases are composed
+    /// onto it by its holder ([`Self::released`]).
+    pub(crate) const fn bound(self) -> ResourceBound {
+        ResourceBound {
+            values: 0,
+            bytes: self.copied,
+            allocated: self.allocated,
+            peak: self.peak,
+            retained: self.held,
+        }
+    }
 }
 
 /// What a retained arena (`decode::storage::Storage`) of `element_size`-byte
@@ -1002,7 +2355,7 @@ impl Growth {
 /// the elements relocate; and its work: one admitted unit of an element's
 /// bytes per element it relocates, and each growth's writes. Each growth's
 /// two allocations, the grown arena's and its block's, admit their releases
-/// ([`Growth::released`]). A capped reservation requests no more than this.
+/// (`Growth::released`). A capped reservation requests no more than this.
 pub fn storage_growth<R>(
     elements: u64,
     element_size: u64,
@@ -1025,8 +2378,11 @@ pub fn storage_growth<R>(
             add(grown.peak, block)?
         },
     };
-    let work = WriteWork::new(relocated, grown.copied)
-        .then(decode::storage::Storage::<u8, ()>::growth_work(growths)?)?;
+    let work = WriteWork::checked_sequence(&[
+        WriteWork::new(relocated, grown.copied),
+        decode::storage::Storage::<u8, (), ()>::growth_work(growths)?,
+    ])
+    .ok_or(BoundedError::Overflow)?;
     Ok((growth, work))
 }
 
@@ -1035,6 +2391,19 @@ pub fn storage_growth<R>(
 /// [`Budget::traverse`], the sum of its allocation requests, the most bytes
 /// its permits hold at once while it runs, and the most bytes the permits of
 /// what it publishes hold once it completes.
+///
+/// Bounds compose only through six combinators, each a `const fn`
+/// returning `None` when a quantity does not fit in `u64`, so one form
+/// serves constants (`const_cost!`) and run time
+/// (`.ok_or(BoundedError::Overflow)`): sequence with the first's output held
+/// ([`Self::checked_then`]), sequence after it is released
+/// ([`Self::checked_followed_by`]), concurrent ([`Self::checked_add`]),
+/// alternative ([`Self::larger`]), repetition each released first
+/// ([`Self::checked_repeated`]) and each held
+/// ([`Self::checked_repeated_retained`]); [`Self::checked_mul`] is the
+/// concurrent one repeated. Each states its algebra per
+/// quantity. A deadline is a constraint on when an operation runs, not a
+/// resource it consumes: no field carries one, and none composes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceBound {
     /// Values reported to [`Budget::traverse`].
@@ -1079,47 +2448,114 @@ impl ResourceBound {
         }
     }
 
-    /// This operation, then `next` while this one's output is still held:
-    /// work and requests add, the peak is the larger of this operation's and
-    /// its retained output beside `next`'s peak, and both outputs are
-    /// retained.
-    pub fn then<R>(self, next: Self) -> Result<Self, BoundedError<R>> {
-        Ok(Self {
-            values: add(self.values, next.values)?,
-            bytes: add(self.bytes, next.bytes)?,
-            allocated: add(self.allocated, next.allocated)?,
-            peak: self.peak.max(add(self.retained, next.peak)?),
-            retained: add(self.retained, next.retained)?,
+    /// This operation, then `next` while this one's output is still held,
+    /// or none when a quantity does not fit in `u64`. Work and requests:
+    /// summed. Peak: `max(P_a, R_a + P_b)`, this one's peak, or its retained
+    /// output beside `next`'s peak. Retained: `R_a + R_b`, both outputs.
+    pub const fn checked_then(self, next: Self) -> Option<Self> {
+        let (Some(values), Some(bytes), Some(allocated), Some(held), Some(retained)) = (
+            self.values.checked_add(next.values),
+            self.bytes.checked_add(next.bytes),
+            self.allocated.checked_add(next.allocated),
+            self.retained.checked_add(next.peak),
+            self.retained.checked_add(next.retained),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak: larger_of(self.peak, held),
+            retained,
         })
     }
 
     /// This operation, then `next` after this one's output was consumed and
-    /// released: as [`Self::then`], but only `next`'s output is retained and
-    /// nothing of this one's is held beside `next`'s peak.
-    pub fn followed_by<R>(self, next: Self) -> Result<Self, BoundedError<R>> {
-        Ok(Self {
-            values: add(self.values, next.values)?,
-            bytes: add(self.bytes, next.bytes)?,
-            allocated: add(self.allocated, next.allocated)?,
-            peak: self.peak.max(next.peak),
+    /// released, or none when a quantity does not fit in `u64`. Work and
+    /// requests: summed. Peak: `max(P_a, P_b)`, nothing of this one's held
+    /// beside `next`'s. Retained: `R_b`, `next`'s output alone.
+    pub const fn checked_followed_by(self, next: Self) -> Option<Self> {
+        let (Some(values), Some(bytes), Some(allocated)) = (
+            self.values.checked_add(next.values),
+            self.bytes.checked_add(next.bytes),
+            self.allocated.checked_add(next.allocated),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak: larger_of(self.peak, next.peak),
             retained: next.retained,
         })
     }
 
-    /// The bound of `count` operations of this bound, each released before
-    /// the next runs.
-    pub fn repeated<R>(self, count: u64) -> Result<Self, BoundedError<R>> {
-        Ok(Self {
-            values: mul(self.values, count)?,
-            bytes: mul(self.bytes, count)?,
-            allocated: mul(self.allocated, count)?,
-            peak: if count == 0 { 0 } else { self.peak },
-            retained: if count == 0 { 0 } else { self.retained },
+    /// `count` operations of this bound, each one's output released before
+    /// the next runs, or none when a quantity does not fit in `u64`: this
+    /// bound [`Self::checked_followed_by`] itself `count` times. Work and
+    /// requests: `count` times. Peak and retained: this bound's for
+    /// `count > 0`, nothing for `count == 0`.
+    pub const fn checked_repeated(self, count: u64) -> Option<Self> {
+        let (Some(values), Some(bytes), Some(allocated)) = (
+            self.values.checked_mul(count),
+            self.bytes.checked_mul(count),
+            self.allocated.checked_mul(count),
+        ) else {
+            return None;
+        };
+        let once = count != 0;
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak: if once { self.peak } else { 0 },
+            retained: if once { self.retained } else { 0 },
         })
     }
 
-    /// This bound and `other` together, every quantity summed, or none when
-    /// one does not fit in `u64`: the one sum of bounds, which construction
+    /// `count` operations of this bound, each one's output still held while
+    /// every later one runs, or none when a quantity does not fit in `u64`:
+    /// this bound [`Self::checked_then`] itself `count` times. Work and
+    /// requests: `count` times. Peak: `(count - 1) R + P` for `count > 0`,
+    /// the earlier outputs beside the last one's peak (a peak counts what
+    /// its operation retains, `R <= P`, so the last run is the highest),
+    /// nothing for `count == 0`. Retained: `count R`.
+    pub const fn checked_repeated_retained(self, count: u64) -> Option<Self> {
+        if count == 0 {
+            return Some(Self {
+                values: 0,
+                bytes: 0,
+                allocated: 0,
+                peak: 0,
+                retained: 0,
+            });
+        }
+        let (Some(values), Some(bytes), Some(allocated), Some(earlier), Some(retained)) = (
+            self.values.checked_mul(count),
+            self.bytes.checked_mul(count),
+            self.allocated.checked_mul(count),
+            self.retained.checked_mul(count - 1),
+            self.retained.checked_mul(count),
+        ) else {
+            return None;
+        };
+        let Some(peak) = earlier.checked_add(self.peak) else {
+            return None;
+        };
+        Some(Self {
+            values,
+            bytes,
+            allocated,
+            peak,
+            retained,
+        })
+    }
+
+    /// This bound and `other` running concurrently, or none when a quantity
+    /// does not fit in `u64`: every quantity summed, peaks included, both
+    /// held at once at worst. The one sum of bounds, which construction
     /// costs compose in constants ([`decode::construction::in_place`]), where
     /// none fails to compile (`const_cost!`), and which a run-time caller
     /// refuses as [`BoundedError::Overflow`].
@@ -1142,8 +2578,10 @@ impl ResourceBound {
         })
     }
 
-    /// This bound, every quantity `count` times, or none when one does not
-    /// fit in `u64` ([`Self::checked_add`]).
+    /// `count` operations of this bound running concurrently, or none when a
+    /// quantity does not fit in `u64`: this bound [`Self::checked_add`]
+    /// itself `count` times, every quantity, peak and retained included,
+    /// `count` times.
     pub const fn checked_mul(self, count: u64) -> Option<Self> {
         let (Some(values), Some(bytes), Some(allocated), Some(peak), Some(retained)) = (
             self.values.checked_mul(count),
@@ -1163,18 +2601,16 @@ impl ResourceBound {
         })
     }
 
-    /// The larger of this bound and `other` in every quantity: a bound of
-    /// either operation, whichever runs.
+    /// The alternative of this bound and `other`, whichever operation runs:
+    /// every quantity, work, requests, peak and retained alike, the larger
+    /// of the two. Never overflows.
     pub const fn larger(self, other: Self) -> Self {
-        const fn max(left: u64, right: u64) -> u64 {
-            if left > right { left } else { right }
-        }
         Self {
-            values: max(self.values, other.values),
-            bytes: max(self.bytes, other.bytes),
-            allocated: max(self.allocated, other.allocated),
-            peak: max(self.peak, other.peak),
-            retained: max(self.retained, other.retained),
+            values: larger_of(self.values, other.values),
+            bytes: larger_of(self.bytes, other.bytes),
+            allocated: larger_of(self.allocated, other.allocated),
+            peak: larger_of(self.peak, other.peak),
+            retained: larger_of(self.retained, other.retained),
         }
     }
 
@@ -1202,20 +2638,44 @@ impl WriteWork {
         Self { values, bytes }
     }
 
-    /// This work, then `next`.
-    pub fn then<R>(self, next: Self) -> Result<Self, BoundedError<R>> {
-        Ok(Self {
-            values: add(self.values, next.values)?,
-            bytes: add(self.bytes, next.bytes)?,
-        })
+    /// This work, then `next`, or none when a quantity does not fit in
+    /// `u64`: summed, as work composes under every sequencing
+    /// ([`ResourceBound::checked_then`]).
+    pub const fn checked_then(self, next: Self) -> Option<Self> {
+        let (Some(values), Some(bytes)) = (
+            self.values.checked_add(next.values),
+            self.bytes.checked_add(next.bytes),
+        ) else {
+            return None;
+        };
+        Some(Self { values, bytes })
     }
 
-    /// This work `count` times.
-    pub fn times<R>(self, count: u64) -> Result<Self, BoundedError<R>> {
-        Ok(Self {
-            values: mul(self.values, count)?,
-            bytes: mul(self.bytes, count)?,
-        })
+    /// `parts` in sequence, [`Self::checked_then`] over them in order, or
+    /// none when a quantity does not fit in `u64`; no work for none.
+    pub const fn checked_sequence(parts: &[Self]) -> Option<Self> {
+        let mut total = Self::new(0, 0);
+        let mut at = 0;
+        while at < parts.len() {
+            total = match total.checked_then(parts[at]) {
+                Some(total) => total,
+                None => return None,
+            };
+            at += 1;
+        }
+        Some(total)
+    }
+
+    /// This work `count` times, or none when a quantity does not fit in
+    /// `u64`.
+    pub const fn checked_times(self, count: u64) -> Option<Self> {
+        let (Some(values), Some(bytes)) = (
+            self.values.checked_mul(count),
+            self.bytes.checked_mul(count),
+        ) else {
+            return None;
+        };
+        Some(Self { values, bytes })
     }
 
     /// Whether `actual` is within this bound.
@@ -1229,9 +2689,43 @@ pub use encoding::{Prepared, Schema, encode_bound};
 /// Successfully encoded bytes together with the reservation that owns their
 /// storage. No API separates the vector from its permit. Fields drop in order:
 /// the allocation is freed before its reservation is released.
+///
+/// The output outlives the operation that produced it, so it carries the
+/// identity of the owner whose acquisition granted its permit: fixed at
+/// construction from that acquisition's stored owner, never changed, and
+/// observational identity only (no capability, no settlement authority), so
+/// a custody observation of the output names the owner it was granted under
+/// wherever the output has moved ([`CustodySink`]).
 pub struct Encoded<P> {
     bytes: Vec<u8>,
     _permit: P,
+    owner: Identity,
+}
+
+impl<P> Encoded<P> {
+    /// The permit the encoding's storage holds, read: an observation naming
+    /// it ([`Releasing::permit_identity`]); never moved or released here.
+    pub fn permit(&self) -> &P {
+        &self._permit
+    }
+
+    /// The identity of the owner whose acquisition granted the permit
+    /// ([`Self`]): observational identity, read.
+    pub fn owner(&self) -> Identity {
+        self.owner
+    }
+}
+
+/// The encoding's custody ([`CustodySink`]): one group, its permit under the
+/// owner its acquisition was bound under. It owns no shared queue, so the
+/// observation is never contended.
+impl<P> Custodial<P> for Encoded<P> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        sink.begin(Some(self.owner));
+        sink.permit(&self._permit, None);
+        sink.end();
+        PermitsObserved::Complete
+    }
 }
 
 impl<P> AsRef<[u8]> for Encoded<P> {
@@ -1258,8 +2752,8 @@ pub fn prepare<T: Schema + ?Sized, A: Allocator>(
     let source: &dyn Schema = &value;
     let shape = encoding::Shape::of(source, allocator)?;
     let cap = usize::try_from(shape.appended()?).map_err(|_| BoundedError::Overflow)?;
-    let steps = encoding::prepare_bound::<A::Permit, A::Refusal>(shape)?.steps()?;
-    let mut preparation = encoding::Preparation::capped(source, cap);
+    let steps = encoding::prepare_bound::<A::Permit, A::Origin, A::Refusal>(shape)?.steps()?;
+    let mut preparation = encoding::Preparation::<A::Permit, A::Origin>::capped(source, cap);
     for _ in 0..steps {
         match preparation.step(allocator)? {
             Step::Progress => {}
@@ -1274,8 +2768,8 @@ pub fn prepare<T: Schema + ?Sized, A: Allocator>(
 /// the encoding ([`Prepared::publish`]), all under one policy: the plan's
 /// arena, its permit with it, becomes the output, so nothing is allocated
 /// or copied for it. A caller that prepares under one policy and writes
-/// under another (an admitted unit) uses [`prepare`] and
-/// [`Prepared::encode_owned`] or [`Prepared::publish`] directly.
+/// under another uses [`prepare`] and [`Prepared::encode_owned`] or
+/// [`Prepared::publish`] directly.
 pub fn encode<T: Schema + ?Sized, A: Allocator>(
     value: &T,
     allocator: &mut A,
@@ -1488,13 +2982,13 @@ pub(crate) mod places {
                 let measured = self.at(key);
                 measured.work = measured
                     .work
-                    .then::<()>(work)
+                    .checked_then(work)
                     .expect("admitted work fits in u64");
             }
             self.total.work = self
                 .total
                 .work
-                .then::<()>(work)
+                .checked_then(work)
                 .expect("admitted work fits in u64");
             self.admissions.push((keys, work));
         }
@@ -1584,7 +3078,7 @@ pub(crate) mod places {
             for (keys, admitted) in &self.admissions {
                 if counted(keys) {
                     work = work
-                        .then::<()>(*admitted)
+                        .checked_then(*admitted)
                         .expect("admitted work fits in u64");
                 }
             }
@@ -1661,18 +3155,74 @@ pub(crate) mod places {
                 ROUTED.with(Cell::get) > 0,
                 "an admission of {values} values and {bytes} bytes bypassed the attributed \
                  route at places {:?}: admit through a charge rule's `admit` (`Unit`, \
-                 `Capped`, `Scan`, `Rate`), or, in derived code, `bounded::decode::visits` \
-                 or `bounded::decode::construction::in_place::step`",
+                 `Capped`, `Scan`, `Rate`), or, in derived code, \
+                 `bounded::decode::construction::in_place::step`",
                 entered()
             );
             self.ledger().work(WriteWork::new(values, bytes));
             Ok(())
         }
+
+        /// The attribution ledger keeps no credit ledgers: its held
+        /// obligations settle into nothing.
+        type Origin = ();
+
+        fn origin(&self) {}
+
+        fn admitted(&mut self, _: WriteWork) {}
+
+        fn identify(&mut self) -> Result<Identity, Self::Refusal> {
+            Ok(Identity::UNOBSERVED)
+        }
+
+        fn held(&mut self, _: WriteWork, _: Hold) {}
+
+        fn effect(&mut self, _: Effect) {}
+
+        fn owner(&mut self) -> Result<Owner, Self::Refusal> {
+            Ok(Owner::unobserved())
+        }
+
+        /// A recorded owner's session is invalidated by the validation, so
+        /// the run is no evidence, and its acquisition is bound for no
+        /// identity: the attribution ledger cannot refuse, and its origin
+        /// publishes nothing.
+        fn acquisition(&mut self, owner: &Owner) -> Result<Acquisition<()>, Self::Refusal> {
+            self.validate_owner(owner)?;
+            Ok(Acquisition::unobserved(owner)
+                .or_else(|| Acquisition::unobserved(&Owner::unobserved()))
+                .expect("an ordinary owner binds an unobserved acquisition"))
+        }
+
+        /// An ordinary budget, which cannot refuse: an ordinary owner is its
+        /// own pairing; a recorded one is a pairing [`Limits`] refuses, so its
+        /// session is invalidated, stickily, and is no evidence, as the
+        /// contract requires, and the attribution run continues.
+        fn validate_owner(&mut self, owner: &Owner) -> Result<(), Self::Refusal> {
+            if owner.recorded_in_any() {
+                owner.invalidate();
+            }
+            Ok(())
+        }
+
+        fn performer(&self) -> Performer {
+            Performer::None
+        }
+    }
+
+    impl Releasing for Ledgered {
+        type Permit = Permit;
+
+        /// The attribution ledger records no identities.
+        fn permit_identity(_: &Permit) -> Identity {
+            Identity::UNOBSERVED
+        }
+
+        /// The attribution ledger records no record lifecycle.
+        fn custody(_: &Permit, _: Identity, _: RecordStage) {}
     }
 
     impl Allocator for Ledgered {
-        type Permit = Permit;
-
         fn allocate(&mut self, bytes: u64) -> Result<Permit, Self::Refusal> {
             if self.terminal {
                 std::process::abort();
@@ -2033,6 +3583,19 @@ pub(crate) mod places {
     }
 
     impl Ceiling {
+        /// The evidence class a ratio held to this ceiling establishes, its
+        /// one definition: an [`Ceiling::Exact`] ratio is the exact most of a
+        /// cost over every feasible input, computed, so derived; every other
+        /// ceiling holds what a witness, or a run, measured, so observed.
+        fn evidence(self) -> record::Evidence {
+            match self {
+                Ceiling::Exact => record::Evidence::Derived,
+                Ceiling::Within(_) | Ceiling::Measured | Ceiling::Joint | Ceiling::Total => {
+                    record::Evidence::Observed
+                }
+            }
+        }
+
         /// The ceiling [`fmt::Display`] wrote as `text`.
         fn parse(text: &str) -> Option<Self> {
             match text {
@@ -2085,7 +3648,8 @@ pub(crate) mod places {
     /// composition (work and requests summed, the peak the most held at
     /// once, retained what publication holds). Each ratio is recorded
     /// exactly, the bound and what its witness used as integers with the
-    /// ceiling it is held to, in `tests/data/tightness/<suite>.txt`, or
+    /// ceiling it is held to and the evidence class that ceiling supports
+    /// ([`Ceiling::evidence`]), in `tests/data/tightness/<suite>.txt`, or
     /// `<suite>.num-bigint.txt` where bignums are encoded ([`VARIANT`]), and held
     /// by a ratchet: any change of a recorded ratio fails, as does a recorded
     /// ratio no longer measured or a measured one not recorded; setting
@@ -2397,10 +3961,11 @@ pub(crate) mod places {
                     .iter()
                     .map(|(key, ratio)| {
                         format!(
-                            "{}\t{}\t{}\t{}\t{key}",
+                            "{}\t{}\t{}\t{}\t{}\t{key}",
                             ratio.bound,
                             ratio.used,
                             ratio.ceiling,
+                            ratio.ceiling.evidence(),
                             ratio.outcome.name()
                         )
                     })
@@ -2420,8 +3985,9 @@ pub(crate) mod places {
         let mut recorded = std::collections::BTreeMap::new();
         for (number, line) in read.rows {
             let at = || format!("{path}:{number}");
-            let mut fields = line.splitn(5, '\t');
-            let (Some(bound), Some(used), Some(ceiling), Some(outcome), Some(key)) = (
+            let mut fields = line.splitn(6, '\t');
+            let (Some(bound), Some(used), Some(ceiling), Some(class), Some(outcome), Some(key)) = (
+                fields.next(),
                 fields.next(),
                 fields.next(),
                 fields.next(),
@@ -2429,7 +3995,7 @@ pub(crate) mod places {
                 fields.next(),
             ) else {
                 panic!(
-                    "{}: not a bound, a use, a ceiling, an outcome and a key",
+                    "{}: not a bound, a use, a ceiling, an evidence class, an outcome and a key",
                     at()
                 );
             };
@@ -2445,6 +4011,15 @@ pub(crate) mod places {
                 ceiling: Ceiling::parse(ceiling)
                     .unwrap_or_else(|| panic!("{}: no ceiling {ceiling:?}", at())),
             };
+            let class = record::Evidence::parse(class)
+                .unwrap_or_else(|| panic!("{}: {key}: no evidence class {class:?}", at()));
+            let supports = ratio.ceiling.evidence();
+            assert!(
+                class == supports,
+                "{}: {key}: claims {class}, its ceiling {} supports {supports}",
+                at(),
+                ratio.ceiling
+            );
             ratio.outcome.admissible(key);
             assert!(
                 recorded.insert(key.to_string(), ratio).is_none(),
@@ -2479,10 +4054,13 @@ pub(crate) mod places {
     }
 
     /// The ratchet records the configuration on its record's first line and
-    /// publishes the record whole, leaving no temporary file; then refuses a
-    /// planted change of a recorded ratio, a planted unrecorded ratio and a
-    /// recorded ratio no longer measured, each named, and a record without its
-    /// configuration line; and passes the measured ratios unchanged.
+    /// each ratio's evidence class from its ceiling ([`Ceiling::evidence`]),
+    /// and publishes the record whole, leaving no temporary file; then
+    /// refuses a planted change of a recorded ratio, a planted unrecorded
+    /// ratio, a recorded ratio no longer measured, a row claiming another
+    /// class than its ceiling supports (measured as derived, exact as
+    /// observed), each named, and a record without its configuration line;
+    /// and passes the measured ratios unchanged.
     #[test]
     fn the_ratchet_records_its_configuration_and_refuses_planted_changes() {
         let directory =
@@ -2507,8 +4085,8 @@ pub(crate) mod places {
             record::render(
                 "toolchain=t std=s",
                 [
-                    "4\t2\tmeasured\tpublished\ta values",
-                    "9\t9\tmeasured\tpublished\tb bytes"
+                    "4\t2\tmeasured\tobserved\tpublished\ta values",
+                    "9\t9\tmeasured\tobserved\tpublished\tb bytes"
                 ]
             )
         );
@@ -2548,7 +4126,47 @@ pub(crate) mod places {
         );
         let dropped = refused(vec![("a values".to_string(), ratio(4, 2))]);
         assert!(dropped.contains("b bytes: recorded in"), "{dropped}");
-        std::fs::write(path, "4\t2\tmeasured\ta values\n").expect("a record without its line");
+        // A row claiming another class than its ceiling supports: a measured
+        // ratio recorded as derived, and an exact one recorded as observed.
+        let honest = recorded();
+        std::fs::write(
+            path,
+            honest.replacen("\tmeasured\tobserved\t", "\tmeasured\tderived\t", 1),
+        )
+        .expect("a misclassified record");
+        let misclassified = refused(measured.clone());
+        assert!(
+            misclassified
+                .contains("a values: claims derived, its ceiling measured supports observed"),
+            "{misclassified}"
+        );
+        let exact = vec![(
+            "a values".to_string(),
+            Ratio {
+                outcome: Outcome::Exact,
+                bound: 4,
+                used: 2,
+                ceiling: Ceiling::Exact,
+            },
+        )];
+        ratchet(path, &exact, Ratchet::Record("toolchain=t std=s".into()));
+        assert!(
+            recorded().contains("4\t2\texact\tderived\texact\ta values"),
+            "{}",
+            recorded()
+        );
+        std::fs::write(
+            path,
+            recorded().replacen("\texact\tderived\t", "\texact\tobserved\t", 1),
+        )
+        .expect("a misclassified exact record");
+        let observed = refused(exact);
+        assert!(
+            observed.contains("a values: claims observed, its ceiling exact supports derived"),
+            "{observed}"
+        );
+        std::fs::write(path, "4\t2\tmeasured\tobserved\tpublished\ta values\n")
+            .expect("a record without its line");
         let unnamed = refused(measured);
         assert!(
             unnamed.contains("not the configuration it was recorded under"),
@@ -2644,10 +4262,11 @@ pub(crate) mod places {
         });
         for options in [strict, quick] {
             monotone("retained_decode_bound", sizes(), |n| {
-                decode::cursor::retained_decode_bound::<Reservation, ()>(n, options).unwrap()
+                decode::cursor::retained_decode_bound::<Reservation, Family, ()>(n, options)
+                    .unwrap()
             });
             monotone("string_bound", sizes(), |n| {
-                decode::string_cursor::string_bound::<Reservation, ()>(n, options).unwrap()
+                decode::string_cursor::string_bound::<Reservation, Family, ()>(n, options).unwrap()
             });
             monotone("parse_bound", sizes(), |n| {
                 parse_bound::<ByteString, Limits, ()>(n, options).unwrap()
@@ -2668,6 +4287,9 @@ pub(crate) mod places {
         monotone("header_bound", sizes(), decode::header::header_bound);
         monotone("emit_bound", sizes(), |n| {
             encoding::emit_bound::<()>(n).unwrap()
+        });
+        monotone("owned_emit_bound", sizes(), |n| {
+            encoding::owned_emit_bound::<Reservation, ()>(n).unwrap()
         });
         monotone("writer_bound", sizes(), |n| {
             pipeline::writer_bound::<()>(n).unwrap()
@@ -2772,12 +4394,12 @@ pub(crate) mod places {
             monotone(&format!("prepare_bound in {count}"), 0..=256, |value| {
                 let mut shape = base;
                 set(&mut shape, value);
-                encoding::prepare_bound::<Reservation, ()>(shape).unwrap()
+                encoding::prepare_bound::<Reservation, Family, ()>(shape).unwrap()
             });
             monotone(&format!("encode_bound in {count}"), 0..=256, |value| {
                 let mut shape = base;
                 set(&mut shape, value);
-                super::encode_bound::<Reservation, ()>(shape).unwrap()
+                super::encode_bound::<Reservation, Family, ()>(shape).unwrap()
             });
         }
         #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]

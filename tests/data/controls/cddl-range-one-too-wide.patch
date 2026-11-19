@@ -1,0 +1,13 @@
+--- src/cddl.rs
++++ src/cddl.rs
+@@ -237,7 +237,9 @@
+                 if (<$type>::MIN as i128) == 0 && (<$type>::MAX as u128) == u64::MAX as u128 {
+                     "uint".to_string()
+                 } else {
+-                    format!("{}..{}", <$type>::MIN, <$type>::MAX)
++                    // Planted: every range rendered one past its maximum. Must fail
++                    // every_fixtures_cddl_admits_exactly_what_its_decoders_accept.
++                    format!("{}..{}", <$type>::MIN, <$type>::MAX as i128 + 1)
+                 }
+             }
+         })+

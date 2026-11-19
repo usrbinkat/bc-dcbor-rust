@@ -6,15 +6,11 @@
 static HEAP: support::heap::Heap = support::heap::Heap;
 use dcbor::ByteString;
 use dcbor::bounded::Limits;
-use dcbor::bounded::decode::Options;
 use dcbor::bounded::decode::construction::in_place::{
     EntryObservation, TreeCustody, TreeObservation, TreePhase,
 };
-use dcbor::bounded::decode::construction::reclamation::Admitted;
-use dcbor::bounded::decode::construction::{TypedDecoder, TypedValue};
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
-use dcbor::bounded::encoding::OwnedPreparation;
-use dcbor_test_support as support;
+use dcbor_test_support::{self as support, pipeline::Unwitnessed};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use support::legality::{Legality, initial, not_last, storage_build, storage_clean};
@@ -53,7 +49,73 @@ fn the_occupancy_witnesses_are_each_classes_edges() {
     assert_eq!(occupancy_witnesses(144), [0, 1, 11, 12, 143, 144]);
 }
 
-/// A tree of each occupancy witness ([`occupancy_witnesses`]): every class's
+/// The wide map: 256 entries whose values carry 80 bytes more each, which
+/// alone reaches the two-byte count head and the four-byte bound head
+/// ([`node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding`]).
+const WIDE: (usize, usize) = (256, 80);
+
+/// The maps the occupancy run builds under `rigor`, each `(entries, value
+/// padding)`. Fast runs cross the leaf/internal boundary: the witnesses
+/// through the first tree with an internal node, the least count of height
+/// one (a leaf has height zero): empty, one leaf, a full leaf, a root over
+/// leaves, which reach every
+/// branch of the fork's node code, which branches only on leaf against
+/// internal. Exhaustive runs retain every height boundary through
+/// `full_limit` ([`occupancy_witnesses`]) and the wide encoding witness; each
+/// deeper witness repeats the node paths at a cost growing with its entries.
+fn occupancy_maps(rigor: support::rigor::Rigor, full_limit: usize) -> Vec<(usize, usize)> {
+    use dcbor::bounded::decode::construction::in_place::{TreeOccupancy, tree_occupancy};
+    use support::rigor::Rigor;
+    let limit = match rigor {
+        Rigor::Fast => (1..=full_limit)
+            .find(|&count| tree_occupancy(count) == TreeOccupancy::Height(1))
+            .expect("the witness limit reaches a tree with an internal node"),
+        Rigor::Exhaustive => full_limit,
+    };
+    occupancy_witnesses(limit)
+        .into_iter()
+        .map(|count| (count, 0))
+        .chain((rigor == Rigor::Exhaustive).then_some(WIDE))
+        .collect()
+}
+
+#[test]
+fn expensive_occupancy_maps_require_exhaustive_rigor() {
+    use support::rigor::Rigor;
+    assert_eq!(
+        occupancy_maps(Rigor::Fast, 1728),
+        [(0, 0), (1, 0), (11, 0), (12, 0)]
+    );
+    assert_eq!(
+        occupancy_maps(Rigor::Exhaustive, 1728),
+        [
+            (0, 0),
+            (1, 0),
+            (11, 0),
+            (12, 0),
+            (143, 0),
+            (144, 0),
+            (1727, 0),
+            (1728, 0),
+            (256, 80),
+        ]
+    );
+    assert_eq!(
+        occupancy_maps(Rigor::Exhaustive, 144),
+        [
+            (0, 0),
+            (1, 0),
+            (11, 0),
+            (12, 0),
+            (143, 0),
+            (144, 0),
+            (256, 80)
+        ]
+    );
+}
+
+/// Fast runs cover empty, singleton, full leaf and first internal node.
+/// Exhaustive runs cover each occupancy witness ([`occupancy_witnesses`]): every class's
 /// edges, through the fourth level's first count at full witness sizes and
 /// the third's at minimal sizes, the reach map requiring the minimal run to
 /// execute every region the full run does (`tests/reach-map.sh`); and a wide
@@ -64,17 +126,13 @@ fn the_occupancy_witnesses_are_each_classes_edges() {
 /// four-byte head).
 #[test]
 fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
-    const WIDE: (usize, usize) = (256, 80);
-    let maps: Vec<(usize, usize)> = occupancy_witnesses(support::rigor::sized(1728, 144))
-        .into_iter()
-        .map(|count| (count, 0))
-        .chain([WIDE])
-        .collect();
+    let maps = occupancy_maps(support::rigor::rigor(), support::rigor::sized(1728, 144));
     let maps = maps.as_slice();
     // Each map reported as it runs, with the time since the first: which
     // boundary's map dominates the interpreted run is measured, not assumed.
     let mut progress = support::rigor::Progress::new("node occupancy boundaries");
     progress.stage("maps", maps.len(), maps.len());
+    let mut unmeasured = Vec::new();
     for &(count, padding) in maps {
         progress.case(format!("{count} entries, values padded by {padding} bytes"));
         let expected: BTreeMap<String, String> = (0..count)
@@ -87,7 +145,7 @@ fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
             .collect();
         let mut symbolic = dcbor::Map::new();
         for (key, value) in &expected {
-            symbolic.insert(key.clone(), value.clone());
+            symbolic.insert(key.clone(), value.clone()).unwrap();
         }
         let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
         if (count, padding) == WIDE {
@@ -98,39 +156,152 @@ fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
                 wire.len()
             );
         }
-        let mut m = Limits::unlimited().logged().strict();
-        let mut owner = support::scope(&mut m);
-        let input = support::copy(&owner, &mut m, &wire);
-        let value: TypedValue<'static, ByteString, BTreeMap<String, String>, Limits> =
-            support::drive_within(
-                &mut m,
-                &mut TypedDecoder::new(input, Options::normalizing(8)),
-                support::typed_turns::<BTreeMap<String, String>>(wire.len()),
-            )
-            .expect("tree decode");
-        assert_eq!(value.value(), &expected, "{count} entries");
-        for (key, wanted) in &expected {
-            assert_eq!(value.value().get(key), Some(wanted));
-        }
-        let shape = dcbor::bounded::encoding::Shape::of(value.value(), &mut Limits::unlimited())
-            .expect("tree shape");
-        let bound = support::turns(
-            dcbor::bounded::encoding::owned_prepare_bound::<
-                ByteString,
-                BTreeMap<String, String>,
-                Limits,
-                (),
-            >(shape)
-            .expect("owned tree preparation bound"),
+        let budget = recording_budget((count, padding));
+        let capacity = match (budget, measuring()) {
+            (Some(budget), _) => budget,
+            (None, true) => MEASURING,
+            (None, false) => panic!(
+                "no recording budget is stated for the map of {count} entries padded by \
+                 {padding}: measure it with {MEASURE}=1 and state it in recording_budget"
+            ),
+        };
+        let report = round_trip(
+            &wire,
+            capacity,
+            |value: &BTreeMap<String, String>| {
+                assert_eq!(value, &expected, "{count} entries");
+                for (key, wanted) in &expected {
+                    assert_eq!(value.get(key), Some(wanted));
+                }
+            },
         );
-        let plan = support::drive_within(&mut m, &mut OwnedPreparation::prepare(value), bound)
-            .expect("tree preparation");
-        let len = plan.len();
-        let bytes = support::emit(&mut m, &mut plan.into_writer(), len);
-        assert_eq!(bytes, wire, "{count} entries");
-        support::drain(&mut owner, &mut m);
-        assert_eq!(m.live_bytes(), 0);
+        let turns = report.boundaries.len();
+        let phases: Vec<String> = report
+            .bounds
+            .iter()
+            .map(|&(phase, bound)| {
+                let taken = report
+                    .boundaries
+                    .iter()
+                    .filter(|boundary| boundary.phase == phase)
+                    .count();
+                format!("{phase:?} {taken} of {bound} turns")
+            })
+            .collect();
+        eprintln!(
+            "[node occupancy boundaries] {count} entries padded by {padding}: {} events, {} \
+             permit records, {turns} turns, {:.2} events per turn; {}",
+            report.observed.len(),
+            permit_records(&report.observed),
+            report.observed.len() as f64 / turns as f64,
+            phases.join(", ")
+        );
+        if budget.is_none() {
+            unmeasured.push(format!(
+                "({count}, {padding}) => Some(support::measured({}, {}))",
+                report.observed.len(),
+                permit_records(&report.observed)
+            ));
+        }
     }
+    // A measurement run is never a qualification: it names every budget it
+    // measured, to be stated, and fails.
+    assert!(
+        unmeasured.is_empty(),
+        "{MEASURE}: state these measured budgets in recording_budget: {unmeasured:#?}"
+    );
+}
+
+/// The variable that has the occupancy run measure the maps whose recording
+/// budget is not yet stated ([`recording_budget`]) instead of refusing them:
+/// `1`, or unset. A measuring run records those maps at [`MEASURING`],
+/// reports what each recorded, and fails naming the budgets to state; it is
+/// never a qualification, and no gate leg inherits it.
+const MEASURE: &str = "DCBOR_MEASURE_RECORDING";
+
+/// Whether this run measures the unstated budgets ([`MEASURE`]).
+fn measuring() -> bool {
+    match std::env::var(MEASURE) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        other => panic!("{MEASURE} must be 1 or unset: {other:?}"),
+    }
+}
+
+/// The recording each occupancy map was measured to need, from its finished
+/// recording's events and permit records ([`support::measured`]): the fast
+/// layer's maps, at most 4,211 events and 119 permit records, within the
+/// default capacity; each exhaustive map's own measurement. `None` for a map
+/// whose budget is not yet stated: refused before it runs, or measured
+/// under [`MEASURE`]; never run at a guessed budget.
+fn recording_budget(map: (usize, usize)) -> Option<dcbor::bounded::Capacity> {
+    match map {
+        (0 | 1 | 11 | 12, 0) => Some(support::CAPACITY),
+        (143, 0) => Some(support::measured(67_746, 727)),
+        (144, 0) => Some(support::measured(68_379, 734)),
+        _ => None,
+    }
+}
+
+/// The recording each integer tree's whole construction was measured to
+/// need ([`support::construction_in`]), its document's parse recorded beside
+/// it in the same session: the two-level boundaries within the default
+/// capacity, the fast layer's and the minimal witnesses' sizes, seen passing
+/// there; each three-level boundary its own measurement. `None` for a tree
+/// whose budget is not yet stated: refused before it runs, or measured under
+/// [`MEASURE`]; never run at a guessed budget.
+fn construction_budget(count: usize) -> Option<dcbor::bounded::Capacity> {
+    match count {
+        143 | 144 => Some(support::CAPACITY),
+        _ => None,
+    }
+}
+
+/// The capacity a map or tree construction with no stated budget is
+/// measured at under [`MEASURE`]: large enough to finish any map of the
+/// occupancy run and any construction of the tree run.
+const MEASURING: dcbor::bounded::Capacity = support::measured(1 << 20, 1 << 14);
+
+/// The permit records a finished recording claimed: one per grant and one
+/// per split child ([`support::measured`]).
+fn permit_records(observed: &[dcbor::bounded::Observed]) -> usize {
+    use dcbor::bounded::{Answer, Call, Event};
+    observed
+        .iter()
+        .filter(|observation| {
+            matches!(
+                observation.event,
+                Event::Call(Call::Allocate(_), Answer::Granted(_)) | Event::Split { .. }
+            )
+        })
+        .count()
+}
+
+/// The map `wire` encodes, decoded from a copy in a scope of its own, read
+/// back by `check`, prepared and emitted to its own bytes through the owned
+/// pipeline, the scope drained, in one recorded run of `capacity`
+/// ([`support::measured`]): the run's report.
+fn round_trip<T>(
+    wire: &[u8],
+    capacity: dcbor::bounded::Capacity,
+    check: impl FnOnce(&T),
+) -> support::pipeline::Report
+where
+    T: dcbor::bounded::decode::construction::in_place::Transferable<Limits>
+        + dcbor::bounded::encoding::TransferableSchema
+        + 'static,
+{
+    let report = support::pipeline::Under::<Unwitnessed>::encode_checked::<T>(
+        wire,
+        &support::pipeline::Schedule {
+            capacity,
+            ..support::pipeline::Schedule::BASELINE
+        },
+        &support::classes::Classes::none(),
+        check,
+    );
+    assert!(report.complete, "the canonical round trip did not complete");
+    report
 }
 
 /// A map's declared dispatch depth is one more than the deeper of its key's
@@ -167,21 +338,15 @@ fn a_map_dispatches_one_deeper_than_its_deeper_child() {
 fn integer_keys_are_built_in_numeric_order() {
     let mut map = dcbor::Map::new();
     for n in [i64::MIN, -100i64, -2, -1, 0, 1, 24, 100, i64::MAX] {
-        map.insert(n, n);
+        map.insert(n, n).unwrap();
     }
     let wire = dcbor::CBOR::from(map).to_cbor_data();
-    let mut m = Limits::unlimited().logged().strict();
-    let mut owner = support::scope(&mut m);
-    let input = support::copy(&owner, &mut m, &wire);
-    let value: TypedValue<'static, ByteString, BTreeMap<i64, i64>, Limits> =
-        support::decode(&mut m, input, Options::normalizing(8)).expect("integer tree decode");
-    assert_eq!(
-        value.value().keys().copied().collect::<Vec<_>>(),
-        [i64::MIN, -100, -2, -1, 0, 1, 24, 100, i64::MAX]
-    );
-    drop(value);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    round_trip(&wire, support::CAPACITY, |value: &BTreeMap<i64, i64>| {
+        assert_eq!(
+            value.keys().copied().collect::<Vec<_>>(),
+            [i64::MIN, -100, -2, -1, 0, 1, 24, 100, i64::MAX]
+        );
+    });
 }
 
 #[test]
@@ -198,34 +363,21 @@ fn byte_keys_preserve_prefix_order_and_embedded_zeroes() {
     .collect();
     let mut map = dcbor::Map::new();
     for (key, value) in &expected {
-        map.insert(key.clone(), *value);
+        map.insert(key.clone(), *value).unwrap();
     }
     let wire = dcbor::CBOR::from(map).to_cbor_data();
-    let mut m = Limits::unlimited().logged().strict();
-    let mut owner = support::scope(&mut m);
-    let input = support::copy(&owner, &mut m, &wire);
-    let value: TypedValue<'static, ByteString, BTreeMap<ByteString, bool>, Limits> =
-        support::decode(&mut m, input, Options::normalizing(8)).expect("byte-key tree decode");
-    assert_eq!(value.value(), &expected);
-    let bound = support::turns(
-        dcbor::bounded::encoding::owned_prepare_bound::<
-            ByteString,
-            BTreeMap<ByteString, bool>,
-            Limits,
-            (),
-        >(support::shape(value.value()))
-        .expect("owned byte-key tree preparation bound"),
+    round_trip(
+        &wire,
+        support::CAPACITY,
+        |value: &BTreeMap<ByteString, bool>| {
+            assert_eq!(value, &expected);
+        },
     );
-    let plan = support::drive_within(&mut m, &mut OwnedPreparation::prepare(value), bound)
-        .expect("byte-key tree preparation");
-    let len = plan.len();
-    assert_eq!(support::emit(&mut m, &mut plan.into_writer(), len), wire);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
 }
 
 /// The arenas of a tree's custody, in its observation's order: the two
-/// index arenas, the nodes, the entry records.
+/// index arenas, the nodes, the entry records, each its execution
+/// observation.
 fn arenas<K, V>(custody: &TreeCustody<K, V>) -> [StoragePosition; 4] {
     [
         custody.order[0],
@@ -235,19 +387,11 @@ fn arenas<K, V>(custody: &TreeCustody<K, V>) -> [StoragePosition; 4] {
     ]
 }
 
-/// An arena that holds nothing: settled, empty, unallocated.
-const EMPTY: StoragePosition = StoragePosition {
-    stage: StorageStage::Settled,
-    initialized: 0,
-    reserved_capacity: 0,
-    physical_capacity: 0,
-    relocating_remaining: 0,
-    has_current_permit: false,
-    staged_reserved_capacity: 0,
-    staged_physical_capacity: 0,
-    has_staged_permit: false,
-    has_relocating_permit: false,
-};
+/// An arena that holds nothing: the position of a new arena, settled,
+/// empty, unallocated ([`StoragePosition::default`]).
+fn empty() -> StoragePosition {
+    StoragePosition::default()
+}
 
 /// Whether `after`'s arenas are `before`'s but for at most one of those
 /// `allowed`, moved by one unit `step` relates.
@@ -278,15 +422,12 @@ fn relocation(before: &StoragePosition, after: &StoragePosition) -> bool {
 
 /// Popping through `settle_step` leaves a growth beside a settled arena
 /// untouched. This differs from `reclaim_step`, which releases that growth
-/// before draining the arena. Every field except the element count is kept.
+/// before draining the arena. Every field of the position except the
+/// element count is kept, the growth's stage among them.
 fn popped(before: &StoragePosition, after: &StoragePosition) -> bool {
     matches!(
         before.stage,
-        StorageStage::Settled
-            | StorageStage::Staging(_)
-            | StorageStage::Staged(_)
-            | StorageStage::Ready
-            | StorageStage::Retired
+        StorageStage::Settled | StorageStage::Staged | StorageStage::Ready | StorageStage::Retired
     ) && before.initialized > 0
         && *after
             == StoragePosition {
@@ -297,8 +438,10 @@ fn popped(before: &StoragePosition, after: &StoragePosition) -> bool {
 
 /// The successor relations of a B-tree over its key's and value's, read
 /// from `btree::build` and `btree::cleanup::reclaim`. Built: the metadata
-/// block installed, its admissions only advancing; its sixteen fields
-/// initialized one per step; the header read; per entry its document index
+/// block installed (its acquisition's binding and credit the operation's
+/// custody, never this progress); its units initialized one per step (the phase, each of the
+/// four arenas' own units, the eleven plain fields); the header read; per
+/// entry its document index
 /// gathered and a scratch slot pushed, each arena growing by its own units;
 /// the merge sort's starts, comparisons and writes, the index arenas
 /// relocating as they settle; the height raised; the root planned; per node
@@ -326,8 +469,12 @@ where
         Key, Link, PlanRoot, Publish, ReclaimEntry, ReclaimKey, ReclaimValue, ReleaseArenas,
         ReleaseNodes, Scratch, Seal, Sort, SortStart, SortWrite, Store, Value,
     };
-    // The metadata's fields, each initialized in a step of its own.
-    const FIELDS: u8 = 16;
+    // The metadata's units, each initialized in a step of its own: the
+    // phase, four arenas of `ARENA` units each, and eleven plain fields
+    // (`btree::INIT`). An arena's units are its state, its holder's ticket
+    // and its pending credit's four (`Storage::INIT_STEPS`).
+    const ARENA: u8 = 6;
+    const FIELDS: u8 = 1 + 4 * ARENA + 11;
     let Legality {
         initial: first_key,
         build: grow_key,
@@ -343,10 +490,9 @@ where
         ..
     } = value;
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
-            (Unallocated(_), Initializing(0)) => true,
+            (Unallocated, Initializing(0)) => true,
             (Initializing(done), Initializing(next)) => next == done + 1 && next < FIELDS,
             (Initializing(done), Held(custody)) => {
                 done + 1 == FIELDS
@@ -356,7 +502,7 @@ where
                     && !custody.pending_node
                     && !custody.pending_permit
                     && custody.newest.is_none()
-                    && arenas(&custody) == [EMPTY; 4]
+                    && arenas(&custody) == [empty(); 4]
             }
             (Held(held), Held(next)) => {
                 let (from, to) = (arenas(&held), arenas(&next));
@@ -455,8 +601,9 @@ where
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
-            (Initializing(_), Unallocated(next)) => next == Admitted::Nothing,
+            // The unit ending an unacquired tree's custody: the credit was
+            // settled at the operation's cleanup entry.
+            (Unallocated, Unallocated) | (Initializing(_), Unallocated) => true,
             (Held(held), Held(next)) => {
                 let (from, to) = (arenas(&held), arenas(&next));
                 let shaped = next.count == held.count && next.height == held.height;
@@ -535,27 +682,25 @@ where
                     _ => false,
                 }
             }
-            (Held(held), Unallocated(next)) => {
-                held.phase == ReleaseArenas
-                    && arenas(&held) == [EMPTY; 4]
-                    && next == Admitted::Nothing
+            (Held(held), Unallocated) => {
+                held.phase == ReleaseArenas && arenas(&held) == [empty(); 4]
             }
             _ => false,
         }),
         remaining: Rc::new(|observation| match observation {
-            Unallocated(_) | Initializing(_) => Some(1),
+            Unallocated | Initializing(_) => Some(1),
             Held(_) => None,
         }),
-        // The metadata block, written field by field before anything else is
+        // The metadata block, written unit by unit before anything else is
         // acquired; past it, the arenas' and nodes' blocks are not observed
         // one by one.
         permits: Rc::new(|observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Initializing(_) => Some(vec![0]),
             Held(_) => None,
         }),
         physical: Rc::new(|observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Initializing(_) => Some(vec![0]),
             Held(_) => None,
         }),
@@ -564,14 +709,14 @@ where
 
 /// The canonical encoding of a map of `count` entries, `key` and `value` of
 /// each entry's index.
-fn map_wire<K: Into<dcbor::CBOR>, V: Into<dcbor::CBOR>>(
+fn map_wire<K: dcbor::CBOREncodable, V: dcbor::CBOREncodable>(
     count: usize,
     key: impl Fn(usize) -> K,
     value: impl Fn(usize) -> V,
 ) -> Vec<u8> {
     let mut symbolic = dcbor::Map::new();
     for n in 0..count {
-        symbolic.insert(key(n), value(n));
+        symbolic.insert(key(n), value(n)).unwrap();
     }
     dcbor::CBOR::from(symbolic).to_cbor_data()
 }
@@ -589,7 +734,10 @@ fn map_wire<K: Into<dcbor::CBOR>, V: Into<dcbor::CBOR>>(
 /// so a tree of 143 text entries holds more live allocations than the heap
 /// observer records (512). At minimal witness sizes the exhaustive layer
 /// keeps the two-level boundaries only, the reach map requiring the same
-/// regions as at full sizes.
+/// regions as at full sizes. Fast runs check the complete build and cleanup
+/// transitions; exhaustive runs additionally rebuild and cancel at every
+/// construction prefix for each small text-keyed fixture. Each height
+/// boundary records into its stated budget ([`construction_budget`]).
 #[test]
 fn tree_construction_is_complete_and_its_transitions_legal() {
     use support::legality::{buffer, written};
@@ -598,27 +746,64 @@ fn tree_construction_is_complete_and_its_transitions_legal() {
     for count in 0..=13 {
         let wire = map_wire(count, |n| format!("{n:x}"), |n| format!("v{n}"));
         let name = format!("BTreeMap<String, String> of {count} entries");
-        legal(
-            &name,
-            &observation::<BTreeMap<String, String>, _>(&name, &wire, |o| *o),
-            &tree(buffer(), buffer()),
-        );
+        let runs = match rigor() {
+            Rigor::Fast => vec![construction::<BTreeMap<String, String>>(
+                &wire,
+                None,
+                |map| {
+                    assert_eq!(map.len(), count);
+                    for n in 0..count {
+                        assert_eq!(map.get(&format!("{n:x}")), Some(&format!("v{n}")));
+                    }
+                },
+            )],
+            Rigor::Exhaustive => observation::<BTreeMap<String, String>, _>(&name, &wire, |o| *o),
+        };
+        legal(&name, &runs, &tree(buffer(), buffer()));
     }
     let boundaries: &[usize] = match rigor() {
         Rigor::Fast => &[143, 144],
         Rigor::Exhaustive => sized(&[143, 144, 1727, 1728], &[143, 144]),
     };
+    let mut unmeasured = Vec::new();
     for &count in boundaries {
         let wire = map_wire(count, |n| n as u64, |n| n as u64);
         let name = format!("BTreeMap<u64, u64> of {count} entries");
-        let built = construction::<BTreeMap<u64, u64>>(&wire, None, |map| {
+        let budget = construction_budget(count);
+        let capacity = match (budget, measuring()) {
+            (Some(budget), _) => budget,
+            (None, true) => MEASURING,
+            (None, false) => panic!(
+                "no recording budget is stated for the construction of {count} integer \
+                 entries: measure it with {MEASURE}=1 and state it in construction_budget"
+            ),
+        };
+        let built = support::construction_in::<BTreeMap<u64, u64>>(&wire, capacity, |map| {
             assert_eq!(map.len(), count, "{count} entries");
         });
+        eprintln!(
+            "[tree construction] {count} integer entries: {} events, {} permit records",
+            built.observed.len(),
+            permit_records(&built.observed)
+        );
+        if budget.is_none() {
+            unmeasured.push(format!(
+                "{count} => Some(support::measured({}, {}))",
+                built.observed.len(),
+                permit_records(&built.observed)
+            ));
+        }
         legal(&name, &[built], &tree(written(), written()));
     }
+    // A measurement run is never a qualification: it names every budget it
+    // measured, to be stated, and fails.
+    assert!(
+        unmeasured.is_empty(),
+        "{MEASURE}: state these measured budgets in construction_budget: {unmeasured:#?}"
+    );
     let mut integers = dcbor::Map::new();
     for n in [-2i64, 0, 24, 100] {
-        integers.insert(n, n);
+        integers.insert(n, n).unwrap();
     }
     let wire = dcbor::CBOR::from(integers).to_cbor_data();
     let name = "BTreeMap<i64, i64>";

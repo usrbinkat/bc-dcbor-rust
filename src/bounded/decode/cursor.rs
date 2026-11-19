@@ -53,7 +53,10 @@ pub struct Position {
     pub stack_relocated: usize,
 }
 
-pub type Decoder<'a, P> = ParserContinuation<&'a [u8], P>;
+/// A retained parse of a borrowed input, with permits of `P`, its arenas'
+/// held credit settling into origins of `O` (the policy's
+/// [`Budget::Origin`]).
+pub type Decoder<'a, P, O> = ParserContinuation<&'a [u8], P, O>;
 
 /// The [`ResourceBound`] of a retained parse ([`Decoder`], and the owned
 /// parse built on the same continuation) of any input of at most `input`
@@ -105,13 +108,15 @@ pub type Decoder<'a, P> = ParserContinuation<&'a [u8], P>;
 /// released before its node is pushed, so a text of `m` bytes is normalized
 /// beside the arena and the stack held for the `n - m` bytes before it, and
 /// the most is at the least `m` of each level of the normalization's peak
-/// ([`next_rise`]). Refused, never saturated, when a quantity does not fit
-/// in `u64`.
-pub fn retained_decode_bound<P, R>(
+/// (`next_rise`). Refused, never saturated, when a quantity does not fit
+/// in `u64`. `O` is the policy's credit origin ([`Budget::Origin`]): the
+/// normalizer the parse initializes field by field holds credit of it, so
+/// its initialization's bytes are that origin's.
+pub fn retained_decode_bound<P, O: Origin, R>(
     input: u64,
     options: Options,
 ) -> Result<ResourceBound, BoundedError<R>> {
-    RetainedTerms::of::<P, R>(input, options)?.bound()
+    RetainedTerms::of::<P, O, R>(input, options)?.bound()
 }
 
 places! {
@@ -181,7 +186,7 @@ struct RetainedTerms {
 }
 
 impl RetainedTerms {
-    fn of<P, R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
+    fn of<P, O: Origin, R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
         use core::mem::size_of;
         let n = input;
         let depth = widen(options.max_depth)?.min(n);
@@ -190,16 +195,25 @@ impl RetainedTerms {
         // A storage of at most `elements` of `size` bytes, each pushed once
         // in a unit of `push`, each relocation one unit of its bytes, each
         // growth's writes and each allocation's release.
+        // Its work runs while its storage is held: the two concurrent; the
+        // stack's storage then released before publication.
         let arena = |elements: u64, size: u64, push: Unit<RetainedPlace>, retained: bool| {
             let (growth, growing) = storage_growth::<R>(elements, size)?;
-            let work = push.times(n)?.then(growing)?.then(growth.released()?)?;
-            Ok::<_, BoundedError<R>>(ResourceBound {
-                values: work.values,
-                bytes: work.bytes,
+            let work = WriteWork::checked_sequence(&[push.times(n)?, growing, growth.released()?])
+                .ok_or(BoundedError::Overflow)?;
+            let held = ResourceBound {
                 allocated: growth.allocated,
                 peak: growth.peak,
-                retained: if retained { growth.held } else { 0 },
-            })
+                retained: growth.held,
+                ..ResourceBound::default()
+            };
+            let term = ResourceBound::of_work(work).checked_add(held);
+            if retained {
+                term
+            } else {
+                term.and_then(|term| term.checked_followed_by(ResourceBound::default()))
+            }
+            .ok_or(BoundedError::Overflow)
         };
         let work = ResourceBound::of_work;
         let normalizing = options.text == TextPolicy::Normalize;
@@ -232,7 +246,13 @@ impl RetainedTerms {
         // relocation reset belongs exclusively to cancellation cleanup.
         set(
             RetainedPlace::Publication,
-            work(Storage::<Frame, P>::step_work(1)?.then(PUBLISH.times(1)?)?),
+            work(
+                WriteWork::checked_sequence(&[
+                    Storage::<Frame, P, O>::step_work(1)?,
+                    PUBLISH.times(1)?,
+                ])
+                .ok_or(BoundedError::Overflow)?,
+            ),
         );
         // Cleanup: the arena and the stack drained and cleaned up, each
         // charged a unit per element, the most it takes: settled, each is
@@ -252,25 +272,34 @@ impl RetainedTerms {
             // charges nothing for its run: the worst text's parts are the
             // most any text of its length has.
             let interrupted = if normalizing {
-                text_cursor::interrupted::<R>(text_cursor::TextShape::worst(text.max(1))?)?
-                    .then(Storage::<char, P>::element_work(2)?)?
+                WriteWork::checked_sequence(&[
+                    text_cursor::interrupted::<R>(text_cursor::TextShape::worst(text.max(1))?)?,
+                    Storage::<char, P, O>::element_work(2)?,
+                ])
+                .ok_or(BoundedError::Overflow)?
             } else {
                 WriteWork::default()
             };
-            Storage::<Entry, P>::element_work(add(n - text, 1)?)?.then(interrupted)
+            WriteWork::checked_sequence(&[
+                Storage::<Entry, P, O>::element_work(add(n - text, 1)?)?,
+                interrupted,
+            ])
+            .ok_or(BoundedError::Overflow)
         };
-        let (all_nodes, all_text) = (shared(0)?, shared(n)?);
+        // The input all nodes or all one text, whichever drains more: the
+        // alternative of the two.
+        let drained = work(shared(0)?).larger(work(shared(n)?)).work();
         set(
             RetainedPlace::Cleanup,
             work(
-                WriteWork::new(
-                    all_nodes.values.max(all_text.values),
-                    all_nodes.bytes.max(all_text.bytes),
-                )
-                .then(Storage::<Entry, P>::cleanup_work(true)?)?
-                .then(Storage::<Frame, P>::element_work(add(depth, 1)?)?)?
-                .then(Storage::<Frame, P>::cleanup_work(true)?)?
-                .then(CLEANUP.times(3)?)?,
+                WriteWork::checked_sequence(&[
+                    drained,
+                    Storage::<Entry, P, O>::cleanup_work(true)?,
+                    Storage::<Frame, P, O>::element_work(add(depth, 1)?)?,
+                    Storage::<Frame, P, O>::cleanup_work(true)?,
+                    CLEANUP.times(3)?,
+                ])
+                .ok_or(BoundedError::Overflow)?,
             ),
         );
         if normalizing {
@@ -285,10 +314,11 @@ impl RetainedTerms {
             set(
                 RetainedPlace::NormalizerInit,
                 work(
-                    super::initialization::fields::<TextContinuation<(), P>, R>(
-                        TextContinuation::<(), P>::INIT_STEPS,
+                    super::initialization::fields::<TextContinuation<(), P, O>, R>(
+                        TextContinuation::<(), P, O>::INIT_STEPS,
                     )?
-                    .times(undecided)?,
+                    .checked_times(undecided)
+                    .ok_or(BoundedError::Overflow)?,
                 ),
             );
             set(RetainedPlace::Normalization, normalizations);
@@ -328,9 +358,23 @@ impl RetainedTerms {
         let held = |elements: u64, size: u64| {
             storage_growth::<R>(add(elements, 1)?, size).map(|(growth, _)| growth.held)
         };
-        let mut peak = add(arena_peak, held(depth, frame)?)?.max(add(held(n, entry)?, stack_peak)?);
+        let overflow = || BoundedError::Overflow;
+        let storage = |peak: u64, retained: u64| ResourceBound {
+            peak,
+            retained,
+            ..ResourceBound::default()
+        };
+        // Each growth after the other's: the stack grown beside the arena
+        // held, or the arena beside the stack, whichever grows last.
+        let arena = storage(arena_peak, held(n, entry)?);
+        let stack = storage(stack_peak, held(depth, frame)?);
+        let mut peak = arena
+            .checked_then(stack)
+            .zip(stack.checked_then(arena))
+            .map(|(stack_last, arena_last)| stack_last.larger(arena_last))
+            .ok_or_else(overflow)?;
         if !normalizing {
-            return Ok(peak);
+            return Ok(peak.peak);
         }
         // One text of `m` bytes, its head included; a text that short
         // cannot be undecided holds nothing.
@@ -345,14 +389,21 @@ impl RetainedTerms {
         while m <= n {
             let level = normalization(m)?;
             let rest = n - m;
+            // The nodes and frames before the text held, their capacities
+            // alone, then the text's normalization beside them.
             let beside = add(held(rest, entry)?, held(depth.min(rest), frame)?)?;
-            peak = peak.max(add(beside, level)?);
+            let text = storage(level, 0);
+            peak = peak.larger(
+                storage(beside, beside)
+                    .checked_then(text)
+                    .ok_or_else(overflow)?,
+            );
             match next_rise(m, n, level, &normalization)? {
                 Some(next) => m = next,
                 None => break,
             }
         }
-        Ok(peak)
+        Ok(peak.peak)
     }
 }
 
@@ -371,11 +422,11 @@ impl Places for RetainedTerms {
 }
 
 #[doc(hidden)]
-pub struct ParserContinuation<I, P> {
+pub struct ParserContinuation<I, P, O: Origin> {
     input: I,
     options: Options,
-    entries: Storage<Entry, P>,
-    stack: Storage<Frame, P>,
+    entries: Storage<Entry, P, O>,
+    stack: Storage<Frame, P, O>,
     phase: Phase,
     header: HeaderState,
     parsed: Option<Header>,
@@ -387,15 +438,15 @@ pub struct ParserContinuation<I, P> {
     completed: usize,
     child_count: usize,
     utf8: Option<Utf8>,
-    normalizer: MaybeUninit<TextContinuation<(), P>>,
+    normalizer: MaybeUninit<TextContinuation<(), P, O>>,
     normalizer_init: usize,
     normalized: Option<Encoded<P>>,
     text_compared: usize,
     comparison: Option<RangeComparison>,
 }
 
-impl<'a, P> Decoder<'a, P> {
-    pub fn step<A: Allocator<Permit = P>>(
+impl<'a, P, O: Origin> Decoder<'a, P, O> {
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> Result<Step<Document<'a, P>>, DecodeError<A::Refusal>> {
@@ -403,7 +454,7 @@ impl<'a, P> Decoder<'a, P> {
     }
 }
 
-impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for Decoder<'a, P> {
+impl<'a, P, O: Origin, A: Allocator<Permit = P, Origin = O>> Resumable<A> for Decoder<'a, P, O> {
     type Output = Document<'a, P>;
     type Error = DecodeError<A::Refusal>;
     type Position = Position;
@@ -417,7 +468,37 @@ impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for Decoder<'a, P> {
     }
 }
 
-impl<I, P> ParserContinuation<I, P> {
+/// The parser's custody, observed once ([`crate::bounded::CustodySink`]). The
+/// parser binds no acquisition of its own, so it opens no group: it reports
+/// each independently owning component it holds as a group of its own, in
+/// order: its arena and its stack, each under its own stored owner
+/// ([`Storage::observe_custody`]); an initialized normalizer and a normalized
+/// output still held for its comparison, each through its own
+/// [`crate::bounded::Custodial`] traversal. Read from its state alone: it
+/// allocates, admits, mints, publishes and settles nothing. Never contended:
+/// the parser owns no queue.
+impl<I, P, O: Origin> crate::bounded::Custodial<P> for ParserContinuation<I, P, O> {
+    fn observe_custody(
+        &mut self,
+        sink: &mut dyn crate::bounded::CustodySink<P>,
+    ) -> crate::bounded::PermitsObserved {
+        let mut observed = crate::bounded::observed_all([
+            self.entries.observe_custody(sink),
+            self.stack.observe_custody(sink),
+        ]);
+        if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
+            // SAFETY: a complete prefix is an initialized normalizer.
+            let normalizer = unsafe { self.normalizer.assume_init_mut() };
+            observed = crate::bounded::observed_all([observed, normalizer.observe_custody(sink)]);
+        }
+        if let Some(normalized) = &mut self.normalized {
+            observed = crate::bounded::observed_all([observed, normalized.observe_custody(sink)]);
+        }
+        observed
+    }
+}
+
+impl<I, P, O: Origin> ParserContinuation<I, P, O> {
     pub fn new(input: I, options: Options) -> Self {
         Self {
             input,
@@ -460,7 +541,7 @@ impl<I, P> ParserContinuation<I, P> {
         }
     }
 
-    pub(crate) fn step_input<'a, A: Allocator<Permit = P>>(
+    pub(crate) fn step_input<'a, A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         input: &'a [u8],
         allocator: &mut A,
@@ -475,14 +556,18 @@ impl<I, P> ParserContinuation<I, P> {
 
     /// Close parser admission and reclaim one resource unit. Terminal errors
     /// enter this same path, retaining partial relocation and normalization.
-    pub fn reclaim_step<A: Allocator<Permit = P>>(
+    /// Bound on [`Releasing`], not [`Allocator`]: cleanup admits work and
+    /// releases what it holds, and no new allocation can be requested
+    /// through the capability it is given, so a cleanup step's capability
+    /// (`reclamation::Cleanup`) reaches it.
+    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
         let cleanup = RetainedPlace::Cleanup;
         match self.phase {
             Phase::ReclaimNormalizer => {
-                if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
+                if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
                     // SAFETY: all resource-free metadata fields were initialized
                     // before the normalizer could acquire any resources.
                     let normalizer = unsafe { self.normalizer.assume_init_mut() };
@@ -491,7 +576,7 @@ impl<I, P> ParserContinuation<I, P> {
                     }
                 }
                 CLEANUP.admit(allocator)?;
-                self.normalizer_init = 0;
+                self.retire_normalizer();
                 // A normalized output still held is released in the same
                 // unit: its request paid for its release.
                 self.normalized = None;
@@ -529,23 +614,51 @@ impl<I, P> ParserContinuation<I, P> {
     /// returning true included: the transition into cleanup unless it has
     /// begun; an initialized normalizer's own count, or one transition; each
     /// arena's own count; one once finished. Admits nothing and changes
-    /// nothing.
-    pub(crate) fn reclaim_remaining(&self) -> u64 {
-        let normalizer = if self.normalizer_init == TextContinuation::<(), P>::INIT_STEPS {
+    /// nothing. `None` when the count does not fit in `u64`.
+    pub(crate) fn reclaim_remaining(&self) -> Option<u64> {
+        let normalizer = if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
             // SAFETY: a complete prefix is an initialized normalizer.
-            unsafe { self.normalizer.assume_init_ref() }.reclaim_remaining()
+            unsafe { self.normalizer.assume_init_ref() }.reclaim_remaining()?
         } else {
             1
         };
-        let stack = self.stack.reclaim_remaining();
-        let entries = self.entries.reclaim_remaining().saturating_add(stack);
+        let stack = self.stack.reclaim_remaining()?;
+        let entries = self.entries.reclaim_remaining()?.checked_add(stack)?;
         match self.phase {
-            Phase::Finished => 1,
-            Phase::ReclaimStack => stack,
-            Phase::ReclaimEntries => entries,
-            Phase::ReclaimNormalizer => normalizer.saturating_add(entries),
-            _ => normalizer.saturating_add(entries).saturating_add(1),
+            Phase::Finished => Some(1),
+            Phase::ReclaimStack => Some(stack),
+            Phase::ReclaimEntries => Some(entries),
+            Phase::ReclaimNormalizer => normalizer.checked_add(entries),
+            _ => normalizer.checked_add(entries)?.checked_add(1),
         }
+    }
+
+    /// The credit this parser's custody holds: the checked fold of its
+    /// observation (its [`crate::bounded::Custodial`] traversal,
+    /// [`crate::bounded::total_held`]). `None` when the sum does not fit.
+    /// The public conservation observation of the parse: read beside its
+    /// policies' [`crate::bounded::Limits::credits`], it is the `held` that
+    /// [`crate::bounded::Credits::conserved_with`] checks.
+    pub fn held_credit(&mut self) -> Option<WriteWork> {
+        crate::bounded::total_held(|sink| {
+            crate::bounded::Custodial::observe_custody(&mut *self, sink)
+        })
+    }
+
+    /// Retire a normalizer that holds nothing more (its cleanup finished, or
+    /// its output published): its remaining state, its stored owner and its
+    /// released arenas, dropped in place, constant work that allocates and
+    /// unwinds nothing, so the owner it took is not kept alive past it (a
+    /// recording session refuses to finish while any of its owners lives);
+    /// then its slot is free for the next text. Nothing for a slot holding
+    /// no complete normalizer, whose prefix owns nothing.
+    fn retire_normalizer(&mut self) {
+        if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
+            // SAFETY: a complete prefix is an initialized normalizer; the
+            // count is reset at once, so it is never read or dropped again.
+            unsafe { self.normalizer.assume_init_drop() };
+        }
+        self.normalizer_init = 0;
     }
 
     fn next_header(&mut self) {
@@ -558,7 +671,7 @@ impl<I, P> ParserContinuation<I, P> {
         self.phase = Phase::Header;
     }
 
-    fn advance<'a, A: Allocator<Permit = P>>(
+    fn advance<'a, A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         input: &'a [u8],
         allocator: &mut A,
@@ -581,11 +694,11 @@ impl<I, P> ParserContinuation<I, P> {
                 self.phase = Phase::Entry;
                 let kind = match header.major {
                     MajorType::Unsigned => Kind::Unsigned(header.argument),
+                    // The one integer-wire range rule, shared with the
+                    // symbolic and flat decoders and proved over every
+                    // argument (`decode::proofs`).
                     MajorType::Negative => {
-                        if header.argument > i64::MAX as u64 {
-                            return Err(Error::OutOfRange.into());
-                        }
-                        Kind::Negative(-1 - header.argument as i64)
+                        Kind::Negative(crate::decode::negative(header.argument)?)
                     }
                     MajorType::ByteString | MajorType::Text => {
                         let remaining = widen(input.len() - self.position)?;
@@ -638,7 +751,9 @@ impl<I, P> ParserContinuation<I, P> {
                         3 => {
                             let n = f16::from_bits(header.argument as u16);
                             validate_canonical_f16(n)?;
-                            Kind::Float(n.to_f64())
+                            // The one widening of production, checked
+                            // against its contract on each branch.
+                            Kind::Float(crate::float::widened(n))
                         }
                         5 => {
                             let n = f32::from_bits(header.argument as u32);
@@ -714,7 +829,7 @@ impl<I, P> ParserContinuation<I, P> {
                 }
             }
             Phase::Normalize => {
-                if self.normalizer_init != TextContinuation::<(), P>::INIT_STEPS {
+                if self.normalizer_init != TextContinuation::<(), P, O>::INIT_STEPS {
                     return Err(BoundedError::PlanMismatch.into());
                 }
                 let normalizer = unsafe { self.normalizer.assume_init_mut() };
@@ -727,10 +842,10 @@ impl<I, P> ParserContinuation<I, P> {
                     Step::Progress => {}
                     Step::Complete(bytes) => {
                         self.normalized = Some(bytes);
-                        // Completion has already drained the normalizer scratch
-                        // and transferred its output reservation. The old slot
-                        // may now be reused without a whole-state destructor.
-                        self.normalizer_init = 0;
+                        // Completion has already drained the normalizer
+                        // scratch and transferred its output reservation; what
+                        // remains is its stored owner, retired with the slot.
+                        self.retire_normalizer();
                         self.text_compared = 0;
                         self.phase = Phase::CheckText;
                     }
@@ -846,6 +961,11 @@ impl<I, P> ParserContinuation<I, P> {
                 }
             }
             Phase::Publish => {
+                // The document carries the owner its arena's acquisitions
+                // were bound under, the one the arena stored at its first
+                // growth: the published arena's association outlives the
+                // parser.
+                let owner = self.entries.owner_id();
                 let entries = &mut self.entries;
                 let Some(arena) = at(RetainedPlace::Arena, || entries.settle_step(allocator))?
                 else {
@@ -854,7 +974,11 @@ impl<I, P> ParserContinuation<I, P> {
                 PUBLISH.admit(allocator)?;
                 let entries = core::mem::take(arena);
                 self.phase = Phase::Finished;
-                return Ok(Step::Complete(Document { input, entries }));
+                return Ok(Step::Complete(Document {
+                    input,
+                    entries,
+                    owner,
+                }));
             }
             Phase::Compare => {
                 let comparison = self.comparison.as_mut().ok_or(BoundedError::PlanMismatch)?;
@@ -943,7 +1067,7 @@ mod attribution {
                 expected
             );
             assert_eq!(
-                RetainedTerms::of::<Permit, ()>(input.len() as u64, options)
+                RetainedTerms::of::<Permit, (), ()>(input.len() as u64, options)
                     .unwrap()
                     .term(RetainedPlace::Publication),
                 expected
@@ -1014,7 +1138,7 @@ mod attribution {
             RetainedPlace::Keys => {
                 let mut keys = Map::new();
                 for key in 0..1000u64 {
-                    keys.insert(key, 0u64);
+                    keys.insert(key, 0u64).unwrap();
                 }
                 (
                     "many keys",
@@ -1079,8 +1203,9 @@ mod attribution {
         cancel: Cancel,
     ) -> (Ledgered, Option<Document<'a, Permit>>) {
         let mut policy = Ledgered::new();
-        let mut parser = Decoder::<Permit>::new(input, options);
-        let bound = retained_decode_bound::<Permit, ()>(input.len() as u64, options)
+        // `Ledgered` records no credit: its origin is `()`.
+        let mut parser = Decoder::<Permit, ()>::new(input, options);
+        let bound = retained_decode_bound::<Permit, (), ()>(input.len() as u64, options)
             .expect("the bound of a fixture fits in u64");
         let mut rejected = false;
         let document = crate::bounded::within(name, bound, || {
@@ -1149,7 +1274,8 @@ mod attribution {
                 assert!(document.is_some(), "{name}: not published");
                 drop(document);
                 let held = policy.ledger().total().peak;
-                let terms = RetainedTerms::of::<Permit, ()>(input.len() as u64, options).unwrap();
+                let terms =
+                    RetainedTerms::of::<Permit, (), ()>(input.len() as u64, options).unwrap();
                 let bound = terms.bound::<()>().unwrap();
                 assert!(
                     held <= bound.peak,
@@ -1194,7 +1320,8 @@ mod attribution {
                     outcome,
                     name: format!("{name} {options:?}"),
                     policy,
-                    terms: RetainedTerms::of::<Permit, ()>(input.len() as u64, options).unwrap(),
+                    terms: RetainedTerms::of::<Permit, (), ()>(input.len() as u64, options)
+                        .unwrap(),
                 });
             }
         }
@@ -1215,13 +1342,17 @@ mod attribution {
         let mut key_maps = CBOR::from(0u64);
         for _ in 0..3 {
             let mut next = Map::new();
-            next.insert(CBOR::from(vec![CBOR::from(0u64), key_maps.clone()]), 0u64);
-            next.insert(CBOR::from(vec![CBOR::from(1u64), key_maps.clone()]), 0u64);
+            next.insert(CBOR::from(vec![CBOR::from(0u64), key_maps.clone()]), 0u64)
+                .unwrap();
+            next.insert(CBOR::from(vec![CBOR::from(1u64), key_maps.clone()]), 0u64)
+                .unwrap();
             key_maps = CBOR::from(next);
         }
         let mut long_keys = Map::new();
         for i in 0..11u8 {
-            long_keys.insert(ByteString::new(vec![i; 200]), 0u64);
+            long_keys
+                .insert(ByteString::new(vec![i; 200]), 0u64)
+                .unwrap();
         }
         let mut truncated = CBOR::from(vec![1u64; 40]).to_cbor_data();
         truncated.truncate(30);
@@ -1340,7 +1471,7 @@ mod attribution {
                     places::Outcome::Invalid
                 },
                 policy,
-                terms: RetainedTerms::of::<Permit, ()>(input.len() as u64, *options).unwrap(),
+                terms: RetainedTerms::of::<Permit, (), ()>(input.len() as u64, *options).unwrap(),
             });
         }
         places::check(&runs);

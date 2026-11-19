@@ -1,13 +1,13 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
-1554182	787264	joint	invalid	flat array: total allocated
-590272	590080	joint	invalid	flat array: total peak
-4099	4096	joint	published	long text: total retained
-964566	54684	joint	published	undecided text: total bytes
-65835	12007	joint	published	undecided text: total values
-1203	1200	measured	published	witness of Copies: Copies allocated
-1243	1240	measured	published	witness of Copies: Copies bytes
-1203	1200	measured	published	witness of Copies: Copies peak
-1203	1200	measured	published	witness of Copies: Copies retained
-22	21	measured	published	witness of Copies: Copies values
-1	1	measured	published	witness of Inspection: Inspection values
-1	1	measured	published	witness of Publication: Publication values
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+1554182	787264	joint	observed	invalid	flat array: total allocated
+590272	590080	joint	observed	invalid	flat array: total peak
+4099	4096	joint	observed	published	long text: total retained
+1099638	55188	joint	observed	published	undecided text: total bytes
+69319	12020	joint	observed	published	undecided text: total values
+1203	1200	measured	observed	published	witness of Copies: Copies allocated
+1243	1240	measured	observed	published	witness of Copies: Copies bytes
+1203	1200	measured	observed	published	witness of Copies: Copies peak
+1203	1200	measured	observed	published	witness of Copies: Copies retained
+22	21	measured	observed	published	witness of Copies: Copies values
+1	1	measured	observed	published	witness of Inspection: Inspection values
+1	1	measured	observed	published	witness of Publication: Publication values

@@ -1,0 +1,12 @@
+--- src/bounded/text.rs
++++ src/bounded/text.rs
+@@ -360,7 +360,8 @@
+         return Ok(true);
+     }
+     let normal = normalize(text, allocator)?;
+-    PASS.admit(allocator, bytes)?;
++    // Planted: a refused comparison pass is swallowed.
++    let _ = PASS.admit(allocator, bytes);
+     Ok(normal.as_slice() == text.as_bytes())
+ }
+

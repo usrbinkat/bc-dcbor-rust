@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -1407,7 +1407,7 @@
+             self.bytes.unreleased_copy_remaining()?,
+             self.holes.unreleased_copy_remaining()?,
+             self.cursors.unreleased_copy_remaining()?,
+-            self.windows.unreleased_remaining()?,
++            u64::from(!self.windows.is_released()),
+             self.dynamic.reclaim_remaining()?,
+             1,
+         ]

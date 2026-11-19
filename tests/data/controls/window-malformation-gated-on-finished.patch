@@ -1,0 +1,12 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -1302,7 +1302,8 @@
+         &mut self,
+         a: &mut A,
+     ) -> BoundedResult<Reclaimed, A> {
+-        let malformed = windows_malformed(&self.windows, self.cursors.len());
++        let malformed =
++            self.end == End::Running && !windows_valid(&self.windows, self.cursors.len());
+         // Cleanup entry ends the preparation's work: a cancelled one is
+         // failed, its cleanup this; a published one stays published.
+         if self.end == End::Running {

@@ -1,0 +1,15 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -832,7 +832,11 @@
+     let mut ctx = ctx;
+     ctx.descend::<A::Refusal>(T::DISPATCH_DEPTH)?;
+     let expected = ctx.assembly();
+-    Ok(verified(step(ctx, a)?, expected)?)
++    let _ = expected;
++    Ok(match step(ctx, a)? {
++        Building::Progress => Built::Progress,
++        Building::Done(_) => Built::Done,
++    })
+ }
+
+ /// What a step reported (`building`), its `Done` record verified against

@@ -305,8 +305,9 @@ pub fn plan(listed: &[Listed], bounds: &Bounds) -> Vec<Planned> {
 /// The verdict over the evidence `rows` of the `listed` models against
 /// `bounds`: every planned row present once with the outcome it must
 /// produce; no evidence row at any value but unset, one under the recorded
-/// bound, or one page under the recorded stack; the record complete. Empty
-/// when the evidence holds.
+/// bound, or one page under the recorded stack; each claiming the class its
+/// run supports (`rows::misclassified`); the record complete. Empty when
+/// the evidence holds.
 pub fn verdict(listed: &[Listed], bounds: &Bounds, rows: &[Row]) -> Vec<String> {
     let mut faults = completeness(listed, bounds);
     let evidence: Vec<&Row> = rows
@@ -320,6 +321,9 @@ pub fn verdict(listed: &[Listed], bounds: &Bounds, rows: &[Row]) -> Vec<String> 
         .collect();
     for row in &evidence {
         let named = format!("{} {} {}", row.runner, row.line, row.test);
+        if let Some(fault) = crate::rows::misclassified(row) {
+            faults.push(format!("{named}: {fault}"));
+        }
         let Some(checker) = Checker::parse(&row.runner) else {
             faults.push(format!("{named}: no checker ran it"));
             continue;
@@ -394,7 +398,7 @@ pub fn verdict(listed: &[Listed], bounds: &Bounds, rows: &[Row]) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rows::Physical;
+    use crate::rows::{Evidence, Physical};
 
     fn ran(outcome: Outcome) -> Ran {
         Ran {
@@ -547,7 +551,9 @@ mod tests {
             seconds: None,
             peak_kb: None,
             physical: Physical::NotApplicable,
+            evidence: Evidence::Unverified,
         }
+        .classified()
     }
 
     #[test]
@@ -629,6 +635,15 @@ mod tests {
             faults
                 .iter()
                 .any(|fault| fault.contains("where the plan expects pass")),
+            "{faults:#?}"
+        );
+        let mut checked = rows.clone();
+        checked[0].evidence = Evidence::Checked;
+        let faults = verdict(&listed(), &bounds(), &checked);
+        assert!(
+            faults
+                .iter()
+                .any(|fault| fault.contains("claims checked, its run supports modeled")),
             "{faults:#?}"
         );
     }

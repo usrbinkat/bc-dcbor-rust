@@ -39,6 +39,7 @@ all-features test owned_pipeline_matrix
 all-features test owned_pipeline_interleavings retiring_each_preparation_boundary_preserves_other_operations
 all-features race owned_pipeline_interleavings cross_thread_plan_retirement_races_with_shutdown_without_double_release
 all-features race owned_pipeline_interleavings suspended_entry_cursors_and_texts_transfer_between_workers
+all-features race owned_pipeline_interleavings a_derived_records_preparation_transfers_between_workers
 all-features test owned_public_contract
 all-features race owner_concurrency
 all-features test optional_admission
@@ -62,8 +63,22 @@ all-features lib bounded::tests::integers_match_the_symbolic_encoding_at_every_w
 all-features lib bounded::tests::a_tree_iterators_steps_compare_no_keys
 all-features lib bounded::decode::construction::reclamation::tests::
 all-features lib bounded::decode::construction::reclamation::owned::tests::the_defaults_hold_nothing
+# The scope deferral's intrusive worklist (reclamation/owned.rs, `defer`,
+# `process`): several references of one scope deferred in one step and
+# performed by exact subtraction, the retained release last, and a chain of
+# abandoned scopes drained through it. A release performed before the count
+# is cleared frees the block under the clear, which only Miri observes (the
+# deferral-all-releases-first control).
+all-features lib bounded::decode::construction::reclamation::owned::tests::several_handles_of_one_scope_released_in_one_step_are_all_performed
+all-features lib bounded::decode::construction::reclamation::owned::tests::a_chain_of_abandoned_scopes_completes_through_the_worklist
+all-features lib bounded::decode::construction::reclamation::owned::tests::retirement_into_abandoned_scopes_never_nests_a_drain
 all-features lib bounded::decode::construction::input::tests::
 all-features lib bounded::decode::storage::tests::the_default_arena_is_empty_and_settled
+# Every initialization prefix of an arena dropped in place: initialized
+# prefixes currently hold no owned resources, and dropping past what was
+# written reads uninitialized discriminants, which only Miri observes (the
+# storage-prefix-overdrop control).
+all-features lib bounded::decode::storage::tests::every_initialization_prefix_drops_and_releases_its_session
 all-features lib bounded::decode::header::attribution::every_place_of_a_head_is_within_its_term
 all-features lib bounded::decode::terms_tests::quick_only_text_costs_its_quick_check_alone
 all-features lib bounded::decode::terms_tests::the_stack_term_covers_nesting
@@ -73,6 +88,19 @@ all-features lib bounded::encoding::bound_tests::a_preparation_admits_a_wide_ins
 all-features lib bounded::encoding::bound_tests::retired_plan_consumes_prepaid_releases_before_admitted_completion
 all-features lib bounded::encoding::bound_tests::shape_and_preparation_reject_the_same_invalid_map_protocols
 all-features lib bounded::encoding::bound_tests::keys_holding_gapped_maps_are_compacted_before_they_are_ordered
+# Destruction in place and released prefixes: a preparation's published
+# text continuation destroyed before the next text initializes the field
+# again (encoding.rs, `retire_text`); an owned preparation's drained
+# preparation dropped in its record; and every prefix record (parse,
+# construction, plan, borrowed input) released at every cut and stepped,
+# counted, observed and refused after `Done`. A read of a destroyed
+# continuation, a dropped preparation or parser, or a released prefix's
+# fields reads freed or uninitialized memory, which only Miri observes.
+all-features lib bounded::encoding::bound_tests::every_text_continuation_is_destroyed_before_its_next_text
+all-features lib bounded::encoding::plan_record::
+all-features lib bounded::decode::construction::parse::released::
+all-features lib bounded::decode::construction::construct::released::
+all-features lib bounded::decode::construction::input::released::
 all-features lib bounded::text::tests::combining_pressure_is_refused_within_its_allowance
 all-features lib bounded::text_cursor::tests::the_joint_worst_bound_is_total
 all-features lib bounded::text_cursor::tests::every_part_sorted_in_pairs_is_the_most_any_runs_charge
@@ -95,7 +123,15 @@ all-features test encode encode_map
 all-features test encode encode_map_misordered
 all-features test encode encode_map_with_map_keys
 all-features test format format_map
-all-features test numeric_profile noncanonical_nan_payloads_encode_as_the_canonical_nan
+all-features test appendix_a every_valid_encoding_is_produced_and_accepted_by_both_paths
+# The binary16 conversion contract on half's software branch: under Miri,
+# std_detect reports every runtime feature disabled (library/std_detect
+# detect/mod.rs, os/other.rs), so half's dispatch takes its fallback, and
+# the test, every pattern, checks that branch's exact round trip and
+# widening (src/float.rs, the f16 contract the Kani reduction proofs assume).
+# The accelerated branch is the native run's on an f16c host; each run names
+# the branch it took (`DCBOR_F16_BRANCH`).
+all-features lib float::tests::every_f16_reduces_as_its_reference_and_decodes_only_if_canonical
 all-features test resumable_contract schedules::writer_refusals_preserve_literal_prefix_guards_and_plan_ownership
 all-features test resumable_contract repeated::typed_fields_survive_successive_refusals_with_output_ownership
 all-features test resumable_contract repeated::normalization_and_emission_survive_successive_refusals_without_replay
@@ -108,6 +144,13 @@ all-features test resumable_contract dynamic_maps::long_key_comparison_retains_e
 all-features test resumable_contract tests::real_capacity_exhaustion_is_distinct_from_work_and_invalid_input
 all-features test resumable_contract derive::derived_unit_and_newtype_resume_without_schema_replay
 all-features test resumable_contract derive::derived_nested_fields_resume_at_every_admission_without_reconstruction
+# The derive's generated `Variants` and `Payload` impls (an enum's and a
+# tagged record's construction), whose obligations the unsafe-impl census
+# names at their generators (tests/unsafe_census.rs, `UNSAFE_IMPLS`): every
+# enum shape and a tagged generic value built under Miri, as the field map,
+# newtype and unit above are.
+all-features test resumable_contract derive::every_enum_shape_resumes_without_discriminant_replay
+all-features test resumable_contract derive::tagged_and_generic_nested_values_resume_without_reconstruction
 all-features test resumable_contract hash_map_schema::hash_map_deleted_buckets_encode_literal_output_after_every_refusal
 all-features test resumable_contract std_hash_map_schema::hash_map_deleted_buckets_encode_literal_output_after_every_refusal
 all-features test resumable_contract schema_encoding::many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes

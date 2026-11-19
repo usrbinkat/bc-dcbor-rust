@@ -46,17 +46,29 @@ identity() {
 }
 
 # What every gate's identity begins with, whatever the gate: the snapshot,
-# the shell's configuration, the toolchain's store path (its components, the
-# forked library, miri, llvm-tools, change it without changing its version),
-# the compiler and Cargo. Two gates' evidence combines only when this part
-# of their identities is equal (`same_source`).
+# the shell's configuration, the Unicode version dCBOR normalizes and
+# stabilizes text by and the dCBOR draft revision it implements (each read
+# from the library through the gate tool, never written here, so
+# `gate_prepare` comes first), the toolchain's store path
+# (its components, the forked library, miri, llvm-tools, change it without
+# changing its version), the compiler and Cargo. Two gates' evidence
+# combines only when this part of their identities is equal (`same_source`).
 source_identity() {
 	: "${DCBOR_CONFIGURATION:?run in the configured development shell}"
-	snapshot
+	local unicode draft sysroot
+	unicode="$(gate unicode-version)" || return 1
+	draft="$(gate dcbor-draft)" || return 1
+	# Read before printing: a substitution as a printf argument would record
+	# an empty value when the command failed.
+	sysroot="$(rustc --print sysroot)" || return 1
+	[[ -n "$unicode" && -n "$draft" && -n "$sysroot" ]] || return 1
+	snapshot || return 1
 	printf 'configuration\t%s\n' "$DCBOR_CONFIGURATION"
-	printf 'toolchain\t%s\n' "$(rustc --print sysroot)"
-	rustc -vV
-	cargo -V
+	printf 'unicode\t%s\n' "$unicode"
+	printf 'dcbor-draft\t%s\n' "$draft"
+	printf 'toolchain\t%s\n' "$sysroot"
+	rustc -vV || return 1
+	cargo -V || return 1
 }
 
 # Whether the gate whose logs are `$1` ran over this source and toolchain:
@@ -93,8 +105,21 @@ same_source() {
 # against the alignment their storage guarantees.
 MIRI_STRICT="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-env-forward=DCBOR_RIGOR -Zmiri-env-forward=DCBOR_CLASS_COVERAGE -Zmiri-env-forward=DCBOR_WITNESS"
 
-# The aliasing models every Miri verdict is given under.
-MIRI_MODELS=(stacked tree)
+# The aliasing models every Miri verdict is given under, into the array
+# `MIRI_MODELS`: read from the gate tool's one list (`gate miri models`,
+# tests/gate `miri::MIRI_MODELS`), never written here, so `gate_prepare`
+# comes first. Each must have its flags (`miri_flags`): a model the gate
+# lists and this file cannot run is refused here, before any identity
+# records empty flags for it.
+miri_models() {
+	local listed model
+	listed="$(gate miri models)" || return 2
+	mapfile -t MIRI_MODELS <<<"$listed"
+	((${#MIRI_MODELS[@]} > 0)) || return 2
+	for model in "${MIRI_MODELS[@]}"; do
+		miri_flags "$model" >/dev/null || return 2
+	done
+}
 
 # The seeds a `race` suite's tests run under, one Miri process each
 # (`-Zmiri-seed`): the seed's RNG picks the thread schedule (preemption at
@@ -146,6 +171,23 @@ copy_of() {
 # tree a gate keeps is ever changed.
 apply_diff() {
 	patch -d "$2" -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$1"
+}
+
+# The one reverser of a planted diff: `revert_diff DIFF DIR` reverses DIFF in
+# the copy at DIR, exactly as `apply_diff` applied it, so a control is seen
+# green again in the same copy it was seen red in.
+revert_diff() {
+	patch -d "$2" -p0 -R --batch --fuzz=0 --no-backup-if-mismatch --quiet <"$1"
+}
+
+# The digest of every file of the copy at `$1` (`copy_of`, which carries no
+# git metadata), by path in byte order: a control's copy is recorded before
+# its diff, with it, and after it is reversed, and must read back equal.
+tree_digest() {
+	(
+		cd "$1" || exit 1
+		find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+	) | sha256sum | cut -d' ' -f1
 }
 
 # The gate tool (tests/gate): every decision about what a run produced and
@@ -216,7 +258,7 @@ miri_flags() {
 	stacked) printf '%s %s' "$MIRI_STRICT" "${MIRIFLAGS:-}" ;;
 	tree) printf '%s -Zmiri-tree-borrows %s' "$MIRI_STRICT" "${MIRIFLAGS:-}" ;;
 	*)
-		printf 'unknown Miri model: %s; the models are %s\n' "$1" "${MIRI_MODELS[*]}" >&2
+		printf 'unknown Miri model: %s; the models are those `gate miri models` lists, each with its flags here\n' "$1" >&2
 		return 2
 		;;
 	esac

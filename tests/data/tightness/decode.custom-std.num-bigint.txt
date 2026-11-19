@@ -1,26 +1,26 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
-4099	4096	measured	published	bytes (Payload): Payload bytes
-98112	98112	measured	published	flat array (Arena): Arena allocated
-49536	49392	measured	published	flat array (Arena): Arena bytes
-73728	73728	measured	published	flat array (Arena): Arena peak
-49152	49152	measured	published	flat array (Arena): Arena retained
-9	9	measured	published	flat array (Arena): Arena values
-218636	98304	joint	published	flat array (Arena): total allocated
-73920	73920	joint	published	flat array (Arena): total peak
-49152	49152	joint	published	flat array (Arena): total retained
-1003	1000	measured	published	flat array (Completions): Completions values
-9036	8973	measured	published	flat array (Heads): Heads bytes
-1004	1001	measured	published	flat array (Heads): Heads values
-1278284	786432	joint	published	large flat array: total allocated
-590016	590016	joint	published	large flat array: total peak
-393216	393216	joint	published	large flat array: total retained
-56692063	33936223	joint	published	long letters: total bytes
-6544300	4260378	joint	published	long letters: total values
-3723	2717	measured	published	many keys (Keys): Keys bytes
-1861	999	measured	published	many keys (Keys): Keys values
-2880	2880	measured	published	nested arrays (Stack): Stack allocated
-1600	1536	measured	published	nested arrays (Stack): Stack bytes
-2304	2304	measured	published	nested arrays (Stack): Stack peak
-4	4	measured	published	nested arrays (Stack): Stack values
-13664095	8284911	joint	published	normalized text (Text): total bytes
-1598953	1040535	joint	published	normalized text (Text): total values
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+4099	4096	measured	observed	published	bytes (Payload): Payload bytes
+98112	98112	measured	observed	published	flat array (Arena): Arena allocated
+49536	49392	measured	observed	published	flat array (Arena): Arena bytes
+73728	73728	measured	observed	published	flat array (Arena): Arena peak
+49152	49152	measured	observed	published	flat array (Arena): Arena retained
+9	9	measured	observed	published	flat array (Arena): Arena values
+218636	98304	joint	observed	published	flat array (Arena): total allocated
+73920	73920	joint	observed	published	flat array (Arena): total peak
+49152	49152	joint	observed	published	flat array (Arena): total retained
+1003	1000	measured	observed	published	flat array (Completions): Completions values
+9036	8973	measured	observed	published	flat array (Heads): Heads bytes
+1004	1001	measured	observed	published	flat array (Heads): Heads values
+1278284	786432	joint	observed	published	large flat array: total allocated
+590016	590016	joint	observed	published	large flat array: total peak
+393216	393216	joint	observed	published	large flat array: total retained
+56692063	33936223	joint	observed	published	long letters: total bytes
+6544300	4260378	joint	observed	published	long letters: total values
+3723	2717	measured	observed	published	many keys (Keys): Keys bytes
+1861	999	measured	observed	published	many keys (Keys): Keys values
+2880	2880	measured	observed	published	nested arrays (Stack): Stack allocated
+1600	1536	measured	observed	published	nested arrays (Stack): Stack bytes
+2304	2304	measured	observed	published	nested arrays (Stack): Stack peak
+4	4	measured	observed	published	nested arrays (Stack): Stack values
+13664095	8284911	joint	observed	published	normalized text (Text): total bytes
+1598953	1040535	joint	observed	published	normalized text (Text): total values

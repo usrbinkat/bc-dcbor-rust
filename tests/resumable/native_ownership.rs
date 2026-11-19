@@ -1,54 +1,15 @@
 use super::bindings::string_decoder;
 use super::harness::*;
 use super::support::{
-    self, Fault, allowed, checked, contracted, drive_faulted, refusal_matrix, refuse, rigor::rigor,
-    scope_checked,
+    self, Fault, Finding, Retirement, pipeline::Unwitnessed, refusal_matrix, rigor::rigor,
 };
-use dcbor::bounded::decode::{BoundedDecodable, DecodeError, decode, decode_typed};
-use dcbor::bounded::{Allocator, BoundedError, Owned, Step};
+use dcbor::bounded::decode::decode_typed;
+use dcbor::bounded::{Allocator, BoundedError, Owned};
 
-#[test]
-fn input_parser_fields_and_output_have_separate_observed_lifetimes() {
-    let text = "q\u{301}\u{1f600}".repeat(64);
-    let wire = text_wire(&text);
-    let mut pool = meter_with(1024 * 1024);
-    // Input storage is consumer-owned in the borrowed-input API.
-    let input_owner = pool.allocate(wire.len() as u64).unwrap();
-    let input_live = pool.live_bytes();
-    assert_eq!(input_live, wire.len() as u64);
-    let mut parser = pool.share();
-    let document = decode(&wire, 8, &mut parser).unwrap();
-    let parsed_live = pool.live_bytes();
-    assert!(parsed_live > input_live);
-    let mut constructor = pool.share();
-    let mut output_permits = Owned::new();
-    let value = String::construct(document.root(), &mut output_permits, &mut constructor).unwrap();
-    let constructed_live = pool.live_bytes();
-    assert!(constructed_live >= parsed_live + text.len() as u64);
-    assert_eq!(value, text);
-    drop(document);
-    assert_eq!(
-        pool.live_bytes(),
-        constructed_live - (parsed_live - input_live)
-    );
-    drop(parser);
-    drop(constructor);
-    assert_eq!(
-        pool.live_bytes(),
-        constructed_live - (parsed_live - input_live)
-    );
-    drop(wire);
-    drop(input_owner);
-    assert!(pool.live_bytes() >= text.len() as u64);
-    assert_eq!(value, text);
-    drop(value);
-    assert!(
-        pool.live_bytes() > 0,
-        "explicit permit owner is still alive"
-    );
-    drop(output_permits);
-    assert_eq!(pool.live_bytes(), 0);
-}
+// The input, the parse and the value's separate lifetimes, and a refused
+// construction's release of its completed fields, are the one typed engine's
+// (`ownership_is_accounted_at_every_phase_transition_and_cancellation`,
+// `completed_field_values_not_just_permits_survive_later_refusal`, below).
 
 /// Every admission of a string decode refused, resumed and cancelled, in a
 /// pool of fixed capacity: after each run, cancelled or published and
@@ -57,84 +18,54 @@ fn input_parser_fields_and_output_have_separate_observed_lifetimes() {
 #[test]
 fn cancellation_at_every_actual_constructor_admission_returns_capacity() {
     let wire = text_wire("q\u{301}\u{1f600}");
-    let capacity = 1024 * 1024;
+    // The pool: four quarter-mebibyte elements of one tenant.
+    const QUARTER: usize = 256 * 1024;
+    let capacity = 4 * QUARTER as u64;
     refusal_matrix("string decode in a fixed pool", rigor(), |fault: Fault| {
-        let mut pool = meter_with(capacity);
-        let mut m = pool.share();
-        refuse(&mut m, fault.refusal);
-        let mut operation = string_decoder(&wire);
-        let turns = allowed(&m, string_turns(wire.len()));
-        let value = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
-            .expect("canonical text decodes");
-        m.assert_units(TURN);
-        drop(operation);
-        drop(value);
-        assert_eq!(pool.live_bytes(), 0, "a run kept capacity");
-        let all = pool.allocate(capacity).unwrap();
-        assert!(pool.allocate(1).is_err());
-        drop(all);
-        support::RefusalRun::of(&m)
+        suite_with(capacity, support::CAPACITY, |run, pool| {
+            let decoding = run.shared_policy(pool);
+            run.holding(
+                string_decoder(&wire),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    operation.drive_faulted(
+                        decoding,
+                        string_turns(wire.len()),
+                        Retirement::Released,
+                        fault,
+                        |_, _| {},
+                        |_| (),
+                    )?;
+                    Ok::<_, Finding>(())
+                },
+            )?;
+            run.with_policy(decoding, |m| m.assert_units(TURN));
+            run.with_policy(pool, |m| {
+                assert_eq!(m.live_bytes(), 0, "a run kept capacity")
+            });
+            let calls = run.with_policy(decoding, |m| support::RefusalRun::of(m));
+            let owner = run.with_policy(pool, |m| m.owner().expect("a recorded owner"));
+            let all = run.with_policy(pool, |m| occupy::<QUARTER>(m, &owner));
+            run.holding(all, Retirement::Released, &Unwitnessed, |all| {
+                all.with_policy(pool, |_, m| refuses_more(m, &owner));
+            });
+            run.with_policy(pool, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(calls)
+        })
     });
 }
 
 #[test]
-fn partial_field_reservations_are_released_when_failed_construction_is_cancelled() {
-    let wire = [0x82, 0x63, b'a', b'b', b'c', 0x63, b'd', b'e', b'f'];
-    let mut parser = meter();
-    let document = decode(&wire, 8, &mut parser).unwrap();
-    let mut baseline = meter();
-    let mut permits = Owned::new();
-    let output = Vec::<String>::construct(document.root(), &mut permits, &mut baseline).unwrap();
-    assert_eq!(output, ["abc", "def"]);
-    drop(output);
-    drop(permits);
-    let stop = baseline
-        .calls()
-        .iter()
-        .enumerate()
-        .filter(|(_, call)| {
-            **call
-                == Call::Work {
-                    values: 0,
-                    bytes: 3,
-                }
-        })
-        .nth(1)
-        .unwrap()
-        .0;
-    let mut m = meter();
-    refuse(
-        &mut m,
-        support::pipeline::Refusal::For(stop, LimitRefusal::Work),
-    );
-    let mut permits = Owned::new();
-    let result = Vec::<String>::construct(document.root(), &mut permits, &mut m);
-    assert!(matches!(
-        result,
-        Err(DecodeError::Resource(BoundedError::Refused(
-            LimitRefusal::Work
-        )))
-    ));
-    assert_eq!(m.first_refusal(), Some((stop, LimitRefusal::Work)));
-    assert!(
-        m.live_bytes() > 0,
-        "completed field reservations were discarded"
-    );
-    drop(result);
-    drop(permits);
-    assert_eq!(m.live_bytes(), 0);
-    drop(document);
-    assert_eq!(parser.live_bytes(), 0);
-}
-
-#[test]
 fn completed_field_values_not_just_permits_survive_later_refusal() {
-    use dcbor::bounded::decode::construction::TypedDecoder;
-    use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace};
-    use dcbor::bounded::decode::construction::reclamation::{
-        Mode, PeekSlot, Reclaim, Reclaimed, Slot,
+    use dcbor::bounded::decode::construction::in_place::{
+        BindingContext, Building, Built, ConstructionCost, InPlace, build_part, reclaim_part,
+        remaining_part, reported,
     };
-    use dcbor::bounded::decode::{ConstructResult, Document, Options};
+    use dcbor::bounded::decode::construction::reclamation::{
+        Cleanup, Mode, PeekSlot, Reclaim, Reclaimed, Slot,
+    };
+    use dcbor::bounded::decode::{ConstructResult, Options};
     use std::ptr::addr_of_mut;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CREATED: AtomicUsize = AtomicUsize::new(0);
@@ -158,29 +89,45 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
         // Construction and cleanup are the single String field's.
         const COST: ConstructionCost = <String as InPlace<A>>::COST;
 
-        fn build_step(
-            document: &Document<'_, A::Permit>,
-            index: usize,
-            slot: Slot<'_, Self, Self::State>,
+        fn build_step<'b>(
+            ctx: BindingContext<'b, '_, '_, '_, Self, A>,
             allocator: &mut A,
-        ) -> ConstructResult<Built, A> {
-            let result = String::build_step(document, index, field::<A, _>(slot), allocator)?;
+        ) -> ConstructResult<Building<'b, Self>, A> {
+            let mut ctx = ctx;
+            let assembly = ctx.assembly();
+            let index = ctx.index();
+            // SAFETY: the string field's slot, projected from this record's
+            // own slot by [`field`]: a part of the record, from its node.
+            let string = match unsafe {
+                ctx.part(index, |slot| {
+                    Ok::<_, core::convert::Infallible>(field::<A, _>(slot))
+                })
+            } {
+                Ok(string) => string,
+                Err(never) => match never {},
+            };
+            let result = build_part::<String, A>(string, allocator)?;
             if result == Built::Done {
                 CREATED.fetch_add(1, Ordering::SeqCst);
             }
-            Ok(result)
+            // SAFETY: `Done` is reported only once `build_part` verified the
+            // string's record against its field's place, and the string is
+            // the record's one field, so the record is initialized whole.
+            Ok(unsafe { reported(result, assembly) })
         }
     }
     // SAFETY: only the initialized String field is reclaimed; no Tracked Drop.
     unsafe impl<A: Allocator> Reclaim<A> for Tracked {
+        // Its own level and its string field's, dispatched as a part.
+        const DISPATCH_DEPTH: usize = <String as Reclaim<A>>::DISPATCH_DEPTH + 1;
         type State = <String as Reclaim<A>>::State;
         const INITIAL: Self::State = <String as Reclaim<A>>::INITIAL;
 
         fn reclaim_step(
             slot: Slot<'_, Self, Self::State>,
-            a: &mut A,
+            cleanup: &mut Cleanup<'_, A>,
         ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
-            let result = String::reclaim_step(field::<A, _>(slot), a)?;
+            let result = reclaim_part::<String, A>(field::<A, _>(slot), cleanup)?;
             if result == Reclaimed::Done {
                 DROPPED.fetch_add(1, Ordering::SeqCst);
             }
@@ -188,8 +135,17 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
         }
 
         /// The wrapped string's own count, at the same projection.
-        fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> u64 {
-            <String as Reclaim<A>>::remaining(field::<A, _>(slot))
+        fn remaining(slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
+            remaining_part::<String, A>(field::<A, _>(slot))
+        }
+
+        /// The wrapped string's own custody, at the same projection: the
+        /// record holds nothing beside its one field.
+        fn observe_permits(
+            slot: PeekSlot<'_, Self, Self::State>,
+            sink: &mut dyn dcbor::bounded::CustodySink<A::Permit>,
+        ) -> dcbor::bounded::PermitsObserved {
+            <String as Reclaim<A>>::observe_permits(field::<A, _>(slot), sink)
         }
     }
     impl Drop for Tracked {
@@ -201,103 +157,145 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
     let wire = [0x82, 0x63, b'a', b'b', b'c', 0x63, b'd', b'e', b'f'];
     let created = CREATED.load(Ordering::SeqCst);
     let dropped = DROPPED.load(Ordering::SeqCst);
-    let mut m = meter();
-    let (mut owner, input) = support::open(&mut m, &wire);
-    m.open();
-    let mut operation =
-        TypedDecoder::<_, Vec<Tracked>, Limits>::new(input, Options::normalizing(8));
-    let turns = support::typed_turns::<Vec<Tracked>>(wire.len());
-    let mut reached = false;
-    for _ in 0..turns {
-        assert!(matches!(
-            contracted(&mut m, &mut operation).unwrap(),
-            Step::Progress
-        ));
-        if CREATED.load(Ordering::SeqCst) == created + 1 {
-            reached = true;
-            break;
-        }
-    }
-    assert!(reached, "first field never completed");
-    let held = m.live_bytes();
-    assert!(held > 0);
-    let position = operation.position();
-    support::repeated_refusal("completed tracked field", &mut m, position, 3, |m| {
-        let result = contracted(m, &mut operation).map(|_| ());
-        (operation.position(), result)
+    suite(|run, policy| {
+        run.holding(
+            dcbor::bounded::decode::construction::DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.decoder::<_, Vec<Tracked>, _, _>(
+                    policy,
+                    support::Borrowing(&wire),
+                    Options::normalizing(8),
+                    &Unwitnessed,
+                    |operation| {
+                        operation.with_policy(policy, |_, m| m.open());
+                        let turns = support::typed_turns::<Vec<Tracked>>(wire.len());
+                        let published = operation.controlled(
+                            policy,
+                            turns,
+                            Retirement::Published,
+                            true,
+                            |_, _, _| CREATED.load(Ordering::SeqCst) == created + 1,
+                            |_| (),
+                        )?;
+                        assert!(published.is_none(), "first-field boundary was skipped");
+                        let held = operation.with_policy(policy, |_, m| m.live_bytes());
+                        assert!(held > 0);
+                        let position = operation.value().position();
+                        // The completed field's boundary refused three
+                        // times: each refusal leaves the decode where it
+                        // was, its work charged once and its storage
+                        // held.
+                        operation.refused(policy, 3, Retirement::Published)?;
+                        assert_eq!(operation.value().position(), position);
+                        operation.with_policy(policy, |_, m| {
+                            assert_eq!(m.live_bytes(), held, "a refusal changed ownership");
+                        });
+                        assert_eq!(
+                            CREATED.load(Ordering::SeqCst) - created,
+                            1,
+                            "first field was not completed"
+                        );
+                        let prematurely_dropped = DROPPED.load(Ordering::SeqCst) - dropped;
+                        operation.with_policy(policy, |_, m| assert_eq!(m.live_bytes(), held));
+                        // Each later scheduler turn begins after positively observing the
+                        // refusal. Consumption and allocation ownership remain cumulative.
+                        operation
+                            .drive_faulted(
+                                policy,
+                                turns,
+                                Retirement::Published,
+                                Fault::NONE,
+                                |_, _| {},
+                                |output| {
+                                    assert_eq!(
+                                        output
+                                            .value()
+                                            .value()
+                                            .iter()
+                                            .map(|v| v.0.as_str())
+                                            .collect::<Vec<_>>(),
+                                        ["abc", "def"]
+                                    );
+                                    assert_eq!(CREATED.load(Ordering::SeqCst) - created, 2);
+                                    output.with_policy(policy, |_, m| {
+                                        m.assert_units(TURN);
+                                        assert!(m.live_bytes() > 0);
+                                    });
+                                    assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
+                                },
+                            )?
+                            .expect("the successful continuation publishes");
+                        assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
+                        assert_eq!(
+                            prematurely_dropped, 0,
+                            "completed field value was discarded while its reservation survived"
+                        );
+                        Ok::<_, Finding>(())
+                    },
+                )??;
+                owner.drain(policy)
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        assert_eq!(
+            CREATED.load(Ordering::SeqCst),
+            DROPPED.load(Ordering::SeqCst)
+        );
+        Ok(())
     });
-    assert_eq!(
-        CREATED.load(Ordering::SeqCst) - created,
-        1,
-        "first field was not completed"
-    );
-    let prematurely_dropped = DROPPED.load(Ordering::SeqCst) - dropped;
-    assert_eq!(m.live_bytes(), held);
-    // Each later scheduler turn begins after positively observing the
-    // refusal. Consumption and allocation ownership remain cumulative.
-    let output = support::drive_within(&mut m, &mut operation, turns)
-        .expect("retained construction did not complete");
-    support::exhausted(&mut m, &mut operation);
-    assert_eq!(
-        output
-            .value()
-            .iter()
-            .map(|v| v.0.as_str())
-            .collect::<Vec<_>>(),
-        ["abc", "def"]
-    );
-    assert_eq!(CREATED.load(Ordering::SeqCst) - created, 2);
-    m.assert_units(TURN);
-    drop(operation);
-    assert!(m.live_bytes() > 0);
-    assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
-    drop(output);
-    assert_eq!(DROPPED.load(Ordering::SeqCst), dropped);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
-    assert_eq!(
-        CREATED.load(Ordering::SeqCst),
-        DROPPED.load(Ordering::SeqCst)
-    );
-    assert_eq!(
-        prematurely_dropped, 0,
-        "completed field value was discarded while its reservation survived"
-    );
 }
 
 #[test]
 fn output_moved_to_another_thread_releases_only_at_the_last_owner() {
     let wire = text_wire("\u{e9}\u{1f600}");
-    let mut m = meter();
-    let output = decode_typed::<String, _>(&wire, 8, &mut m).unwrap();
-    let pool = m.share();
-    let held = pool.live_bytes();
-    assert!(held >= 6);
-    let (ready, wait_ready) = std::sync::mpsc::channel();
-    let (release, wait_release) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        assert_eq!(output.value(), "\u{e9}\u{1f600}");
-        ready.send(()).unwrap();
-        wait_release.recv().unwrap();
-        drop(output);
+    support::recorded_run(|run| {
+        let decoding = run.policy(POOL);
+        let output = run.with_policy(decoding, |m| {
+            decode_typed::<String, _>(&wire, 8, m)
+                .map_err(|error| Finding::Driver(format!("the text did not decode: {error:?}")))
+        })?;
+        let output = std::cell::RefCell::new(Some(output));
+        let held = run.with_policy(decoding, |m| m.live_bytes());
+        let worker = run.shared_policy(decoding);
+        // The input is gone before the worker receives the published handle.
+        // Its custody comes back through the join for parent-side retirement.
+        drop(wire);
+        run.workers(
+            &[worker],
+            1,
+            Retirement::LastReference,
+            |_| {
+                output
+                    .borrow_mut()
+                    .take()
+                    .expect("one output for one worker")
+            },
+            |_, _, output, m| {
+                assert!(held >= 6);
+                assert_eq!(output.value(), "\u{e9}\u{1f600}");
+                assert_eq!(m.live_bytes(), held);
+                Ok(())
+            },
+        )?;
+        assert_eq!(run.with_policy(decoding, |m| m.live_bytes()), 0);
+        Ok(())
     });
-    wait_ready.recv().unwrap();
-    drop(m);
-    drop(wire);
-    assert_eq!(pool.live_bytes(), held);
-    release.send(()).unwrap();
-    worker.join().unwrap();
-    assert_eq!(pool.live_bytes(), 0);
 }
 
 // Transfers follow merge and split in tokio/tests/sync_semaphore_owned.rs:
 // intermediate ownership is exact, zero-sized and refused transfers change
-// nothing, and the final owner releases exactly what it holds.
+// nothing, and the final owner releases exactly what it holds. The test
+// exercises the policy's own reservations, granted directly, so it runs on
+// ordinary, unrecorded pools: a recorded run admits grants only through the
+// production acquisition protocol.
 #[test]
 fn split_merge_zero_and_refused_transfers_preserve_exact_capacity() {
     use dcbor::bounded::TransferRefusal;
     let capacity = 4096;
-    let mut pool = meter_with(capacity);
+    let mut pool = Limits::new(u64::MAX, u64::MAX, capacity);
     let mut first = pool.allocate(3).unwrap();
     assert_eq!((pool.live_bytes(), pool.peak_bytes()), (3, 3));
     let mut second = first.split(1).unwrap();
@@ -317,7 +315,7 @@ fn split_merge_zero_and_refused_transfers_preserve_exact_capacity() {
     assert_eq!(first.bytes(), 3);
     assert_eq!(pool.live_bytes(), 3);
     // A reservation of other storage is returned unchanged.
-    let mut foreign_pool = meter_with(capacity);
+    let mut foreign_pool = Limits::new(u64::MAX, u64::MAX, capacity);
     let foreign = foreign_pool.allocate(5).unwrap();
     let (foreign, refusal) = first.merge(foreign).unwrap_err();
     assert_eq!(refusal, TransferRefusal::Foreign);
@@ -360,7 +358,9 @@ enum Held {
 
 fn held(
     position: &dcbor::bounded::decode::construction::TypedPosition<
-        dcbor::bounded::decode::construction::in_place::BufferObservation,
+        dcbor::bounded::decode::construction::in_place::SessionObservation<
+            dcbor::bounded::decode::construction::in_place::BufferObservation,
+        >,
     >,
 ) -> Option<Held> {
     use dcbor::bounded::decode::construction::in_place::BufferObservation;
@@ -368,10 +368,13 @@ fn held(
     match position {
         TypedPosition::Parse(parse) if parse.allocated => Some(Held::ParserScratch),
         TypedPosition::Construct(construct) => match construct.detail.phase {
-            // The byte buffer holds its metadata block: a field under
-            // construction, its payload acquired or not.
+            // The byte buffer, under its root session, holds its metadata
+            // block: a field under construction, its payload acquired or not.
             Some(ConstructPhase::Build)
-                if matches!(construct.detail.build, Some(BufferObservation::Held(_))) =>
+                if matches!(
+                    construct.detail.build,
+                    Some(observation) if matches!(observation.inner, BufferObservation::Held(_))
+                ) =>
             {
                 Some(Held::PartialField)
             }
@@ -386,126 +389,176 @@ fn held(
 fn ownership_is_accounted_at_every_phase_transition_and_cancellation() {
     use dcbor::ByteString;
     use dcbor::bounded::decode::Options;
-    use dcbor::bounded::decode::construction::{DecodeOwner, Reclaimed, TypedDecoder};
+    use dcbor::bounded::decode::construction::DecodeOwner;
     let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
     let wire = dcbor::CBOR::to_byte_string(&payload).to_cbor_data();
     let len = wire.len() as u64;
+    let turns = support::typed_turns::<ByteString>(wire.len());
     for stop in [Held::ParserScratch, Held::PartialField, Held::TypedOutput] {
         for cancel in [false, true] {
-            let mut m = meter();
-            let mut owner: DecodeOwner<'static, Limits> = support::scope(&mut m);
-            let input = support::copy(&owner, &mut m, &wire);
-            // Input retained: the copy and its record, before any decoding.
-            let input_live = m.live_bytes();
-            assert!(input_live >= len);
-            let mut operation =
-                TypedDecoder::<_, ByteString, Limits>::new(input, Options::normalizing(8));
-            let mut fired = false;
-            let mut output = None;
-            let mut previous = None;
-            for _ in 0..support::typed_turns::<ByteString>(wire.len()) {
-                let phase = held(&operation.position());
-                match phase {
-                    Some(Held::ParserScratch) => assert!(m.live_bytes() > input_live),
-                    Some(Held::PartialField) => assert!(m.live_bytes() > input_live),
-                    Some(Held::TypedOutput) => assert!(m.live_bytes() >= input_live + len),
-                    None => {}
-                }
-                // Phases are entered in order, each once.
-                if phase.is_some() && phase != previous {
-                    assert!(phase > previous, "{phase:?} after {previous:?}");
-                    previous = phase;
-                }
-                if phase == Some(stop) && !fired {
-                    let position = operation.position();
-                    let live = m.live_bytes();
-                    support::repeated_refusal("typed ownership phase", &mut m, position, 3, |m| {
-                        let result = contracted(m, &mut operation).map(|_| ());
-                        (operation.position(), result)
-                    });
-                    assert_eq!(m.live_bytes(), live, "a refusal changed ownership");
-                    fired = true;
-                    if cancel {
-                        operation.cancel();
-                        support::finish_within(
-                            &mut m,
-                            &mut operation,
-                            support::typed_turns::<ByteString>(wire.len()),
-                        );
-                        break;
-                    }
-                    continue;
-                }
-                match checked(&mut m, |m| contracted(m, &mut operation)) {
-                    Ok(Step::Progress) => {}
-                    Ok(Step::Complete(value)) => {
-                        support::exhausted(&mut m, &mut operation);
-                        output = Some(value);
-                        break;
-                    }
-                    Err(error) if support::ordinary_exhaustion(&m, &error) => {}
-                    other => panic!("unexpected ownership outcome: {}", support::label(&other)),
-                }
-            }
-            assert!(fired, "{stop:?} was never reached");
-            assert_eq!(output.is_some(), !cancel);
-            drop(operation);
-            if let Some(value) = output {
-                assert_eq!(value.value().data(), &payload[..]);
-                // Scratch released: the retired parse record is reclaimed from
-                // the queue while the published value and its input remain.
-                let retained = m.live_bytes();
-                // The retired parse record's cleanup is within the typed
-                // decode's bound.
-                let mut idle = false;
-                for _ in 0..support::typed_turns::<ByteString>(wire.len()) {
-                    match scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
-                        Ok(Reclaimed::Waiting | Reclaimed::Done) => {
-                            idle = true;
-                            break;
-                        }
-                        Ok(Reclaimed::Progress) => {}
-                        Err(error) if support::ordinary_exhaustion(&m, &error) => {}
-                        Err(error) => panic!("queued cleanup failed: {error:?}"),
-                    }
-                }
-                assert!(idle, "queued cleanup exceeded the decode's bound");
-                let output_live = m.live_bytes();
-                assert!(output_live < retained, "parser scratch was not released");
-                assert!(output_live >= input_live + payload.len() as u64);
-                assert_eq!(value.value().data(), &payload[..]);
-                drop(value);
-            }
-            support::drain(&mut owner, &mut m);
-            assert_eq!(m.live_bytes(), 0, "leaked at {stop:?}, cancel={cancel}");
+            suite(|run, policy| {
+                run.holding(
+                    DecodeOwner::<'static, Limits>::new(),
+                    Retirement::Scope,
+                    &Unwitnessed,
+                    |owner| {
+                        owner.initialize(policy)?;
+                        owner.decoder::<_, ByteString, _, _>(
+                            policy,
+                            support::Copying(&wire),
+                            Options::normalizing(8),
+                            &Unwitnessed,
+                            |operation| {
+                                // Input retained: the copy and its record,
+                                // before any decoding.
+                                let input_live =
+                                    operation.with_policy(policy, |_, m| m.live_bytes());
+                                assert!(input_live >= len);
+                                // What each phase holds, and phases entered in
+                                // order, each once: checked before every turn.
+                                let mut previous = None;
+                                let mut entered = |m: &Limits, phase: Option<Held>| {
+                                    match phase {
+                                        Some(Held::ParserScratch | Held::PartialField) => {
+                                            assert!(m.live_bytes() > input_live);
+                                        }
+                                        Some(Held::TypedOutput) => {
+                                            assert!(m.live_bytes() >= input_live + len);
+                                        }
+                                        None => {}
+                                    }
+                                    if phase.is_some() && phase != previous {
+                                        assert!(phase > previous, "{phase:?} after {previous:?}");
+                                        previous = phase;
+                                    }
+                                };
+                                let reached = operation.controlled(
+                                    policy,
+                                    turns,
+                                    Retirement::Published,
+                                    true,
+                                    |m, operation, _| {
+                                        let phase = held(&operation.position());
+                                        entered(m, phase);
+                                        phase == Some(stop)
+                                    },
+                                    |_| (),
+                                )?;
+                                assert!(reached.is_none(), "{stop:?} was never reached");
+                                let live = operation.with_policy(policy, |_, m| m.live_bytes());
+                                operation.refused(policy, 3, Retirement::Published)?;
+                                operation.with_policy(policy, |_, m| {
+                                    assert_eq!(m.live_bytes(), live, "a refusal changed ownership");
+                                });
+                                if cancel {
+                                    operation.value().cancel();
+                                    operation.finish(policy, turns, Retirement::Published)?;
+                                    return Ok(());
+                                }
+                                operation
+                                    .controlled(
+                                        policy,
+                                        turns,
+                                        Retirement::Published,
+                                        true,
+                                        |m, operation, _| {
+                                            entered(m, held(&operation.position()));
+                                            false
+                                        },
+                                        |value| {
+                                            // The decoder retired, its scratch
+                                            // queued: the value and its input
+                                            // remain.
+                                            assert_eq!(value.value().value().data(), &payload[..]);
+                                            value.with_policy(policy, |_, m| {
+                                                assert!(
+                                                    m.live_bytes()
+                                                        >= input_live + payload.len() as u64
+                                                );
+                                            });
+                                        },
+                                    )?
+                                    .expect("an uncontrolled decode publishes");
+                                Ok::<_, Finding>(())
+                            },
+                        )??;
+                        owner.drain(policy)
+                    },
+                )?;
+                run.with_policy(policy, |m| {
+                    assert_eq!(m.live_bytes(), 0, "leaked at {stop:?}, cancel={cancel}");
+                });
+                Ok(())
+            });
         }
     }
 }
 
 #[test]
 fn failed_growth_keeps_old_reservation_until_a_successful_replacement() {
-    let mut pool = meter_with(4096);
-    let mut m = pool.share();
-    let mut storage = Owned::new();
-    storage.push(7u8, &mut m).unwrap();
-    let old = pool.live_bytes();
-    let blocker = pool.allocate(4096 - old).unwrap();
-    let failure = storage.reserve(256, &mut m);
-    assert!(matches!(
-        failure,
-        Err(BoundedError::Refused(LimitRefusal::Storage))
-    ));
-    assert_eq!(storage.as_slice(), &[7]);
-    assert_eq!(pool.live_bytes(), 4096);
-    drop(blocker);
-    assert_eq!(pool.live_bytes(), old);
-    // A new operation policy, same storage owner. This tests reserve, not
-    // decode continuation, and therefore does not misrepresent a restarted
-    // parser.
-    let mut next = pool.share();
-    storage.reserve(256, &mut next).unwrap();
-    assert_eq!(storage.as_slice(), &[7]);
-    assert!(pool.live_bytes() > old);
-    drop(storage);
-    assert_eq!(pool.live_bytes(), 0);
+    use dcbor::bounded::{Custodial, CustodySink, PermitsObserved};
+    struct Growth {
+        storage: PublishedArena<u8>,
+        blocker: Option<Tenant<1023>>,
+    }
+    impl Custodial<Reservation> for Growth {
+        fn observe_custody(&mut self, sink: &mut dyn CustodySink<Reservation>) -> PermitsObserved {
+            dcbor::bounded::observed_all([
+                self.storage.observe_custody(sink),
+                self.blocker
+                    .as_mut()
+                    .map_or(PermitsObserved::Complete, |blocker| {
+                        blocker.observe_custody(sink)
+                    }),
+            ])
+        }
+    }
+    suite_with(4096, support::CAPACITY, |run, pool| {
+        let owner = run.with_policy(pool, |m| m.owner().expect("a recorded owner"));
+        let tenant = run.with_policy(pool, |m| m.owner().expect("a recorded owner"));
+        let first = run.shared_policy(pool);
+        let next = run.shared_policy(pool);
+        run.holding(
+            Growth {
+                storage: PublishedArena {
+                    storage: Owned::new(),
+                    owner: Some(owner.id()),
+                },
+                blocker: None,
+            },
+            Retirement::Released,
+            &Unwitnessed,
+            |growth| {
+                growth.with_policy(first, |growth, m| {
+                    growth.storage.storage.push(7, m, &owner).unwrap();
+                    assert_eq!(m.live_bytes(), 4);
+                });
+                growth.with_policy(pool, |growth, m| {
+                    growth.blocker = Some(occupy::<1023>(m, &tenant));
+                });
+                growth.with_policy(first, |growth, m| {
+                    assert!(matches!(
+                        growth.storage.storage.reserve(256, m, &owner),
+                        Err(BoundedError::Refused(LimitRefusal::Storage))
+                    ));
+                    assert_eq!(growth.storage.storage.as_slice(), &[7]);
+                    assert_eq!(m.live_bytes(), 4096);
+                });
+                let blocker = growth
+                    .value()
+                    .blocker
+                    .take()
+                    .expect("the pool blocker is held");
+                growth.holding(blocker, Retirement::Released, |_| ());
+                growth.with_policy(pool, |_, m| assert_eq!(m.live_bytes(), 4));
+                growth.with_policy(next, |growth, m| {
+                    growth.storage.storage.reserve(256, m, &owner).unwrap();
+                    assert_eq!(growth.storage.storage.as_slice(), &[7]);
+                    assert!(m.live_bytes() > 4);
+                });
+            },
+        );
+        run.with_policy(pool, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }

@@ -2,7 +2,10 @@
 use core::cmp::Ordering;
 
 use super::super::boundary::{Bound, Predicate, boundary, units};
-use super::super::{BoundedError, Budget, Caller, Capped, Failure, Resumable, Step, WriteWork};
+use super::super::{
+    BoundedError, Budget, Caller, Capped, Custodial, CustodySink, Failure, PermitsObserved,
+    Resumable, Step, WriteWork,
+};
 
 /// One comparison turn: one value and at most a quantum of byte pairs. The
 /// caller supplies the place.
@@ -118,12 +121,14 @@ impl<'a> KeyComparison<'a> {
     }
 }
 
-/// The [`ResourceBound`] of comparing two keys the shorter of which has
+/// The [`ResourceBound`](super::super::ResourceBound) of comparing two keys the shorter of which has
 /// `shorter` bytes ([`KeyComparison`]): one turn per quantum of byte pairs,
 /// and one for keys of no common bytes; every pair examined once; nothing
 /// allocated.
 pub fn comparison_bound(shorter: u64) -> super::super::ResourceBound {
-    const { assert!(COMPARE.values() == 1) };
+    const {
+        assert!(COMPARE.values() == 1);
+    }
     super::super::ResourceBound {
         values: shorter.div_ceil(COMPARE.cap()).max(1),
         bytes: shorter,
@@ -142,6 +147,20 @@ impl<B: Budget> Resumable<B> for KeyComparison<'_> {
 
     fn position(&mut self) -> usize {
         KeyComparison::position(self)
+    }
+}
+
+/// Both keys are borrowed; the comparison owns no permit or held admission.
+impl<P> Custodial<P> for KeyComparison<'_> {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
+    }
+}
+
+/// A comparison's published ordering carries no resources.
+impl<P> Custodial<P> for Ordering {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
@@ -195,3 +214,8 @@ pub(crate) fn compare_step<B: Budget>(
     }
     Ok((*position == shorter).then(|| left.len().cmp(&right.len())))
 }
+
+/// Kani harnesses of map-key order (register item 4): compiled only by
+/// `cargo kani`.
+#[cfg(kani)]
+mod proofs;

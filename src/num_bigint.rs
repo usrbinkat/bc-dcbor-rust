@@ -50,7 +50,8 @@ import_stdlib!();
 
 pub use num_bigint::{BigInt, BigUint, Sign};
 
-use crate::{CBOR, CBORCase, Error, Result, TAG_NEGATIVE_BIGNUM, TAG_POSITIVE_BIGNUM, Tag};
+use crate::minimal_bigint::{bignum_tag, drop_leading_zeros};
+use crate::{ByteString, CBOR, CBORCase, Error, Result, TAG_NEGATIVE_BIGNUM, TAG_POSITIVE_BIGNUM};
 
 /// Validates that a bignum magnitude byte string is in shortest canonical form.
 ///
@@ -81,68 +82,60 @@ fn validate_bignum_magnitude(bytes: &[u8], is_negative: bool) -> Result<()> {
     Ok(())
 }
 
-/// Strips leading zero bytes from a byte slice, returning the minimal
-/// representation.
-fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
-    &bytes[start..]
-}
-
-impl From<BigUint> for CBOR {
-    /// Converts a [`BigUint`] to CBOR as a tag 2 (positive bignum).
-    ///
-    /// The value is always encoded as a bignum regardless of size.
-    /// Zero is encoded as tag 2 with an empty byte string.
-    fn from(value: BigUint) -> Self {
-        let bytes = value.to_bytes_be();
-        let stripped = strip_leading_zeros(&bytes);
-        let byte_string = CBOR::to_byte_string(stripped);
-        CBOR::to_tagged_value(Tag::with_value(TAG_POSITIVE_BIGNUM), byte_string)
+/// The bignum of the argument whose big-endian bytes `to_bytes_be` returned:
+/// tag 2, or tag 3 when `negative`, around those bytes with their leading
+/// zeros drained in place, the vector then moved into the byte string,
+/// never copied. A positive zero is the empty byte string; a negative
+/// argument of zero (the value -1) is `00`, as the decoder's canonical form
+/// requires ([`validate_bignum_magnitude`]). The one definition every
+/// bignum conversion uses.
+fn bignum(negative: bool, mut bytes: Vec<u8>) -> CBOR {
+    drop_leading_zeros(&mut bytes);
+    if negative && bytes.is_empty() {
+        bytes.push(0);
     }
+    CBOR::to_tagged_value(
+        bignum_tag(negative),
+        CBORCase::ByteString(ByteString::from(bytes)),
+    )
 }
 
+/// Tag 2 around the magnitude: always a bignum, whatever its size; zero is
+/// the empty byte string. Reads the borrow: the integer is never cloned.
 impl From<&BigUint> for CBOR {
     fn from(value: &BigUint) -> Self {
-        value.clone().into()
+        bignum(false, value.to_bytes_be())
     }
 }
 
-impl From<BigInt> for CBOR {
-    /// Converts a [`BigInt`] to CBOR as a tag 2 or tag 3 bignum.
-    ///
-    /// - Non-negative values use tag 2 (positive bignum).
-    /// - Negative values use tag 3 (negative bignum), where the encoded
-    ///   magnitude is `|value| - 1` per RFC 8949.
-    fn from(value: BigInt) -> Self {
-        let (sign, magnitude) = value.into_parts();
-        match sign {
-            Sign::NoSign | Sign::Plus => {
-                // Zero or positive: use tag 2
-                CBOR::from(magnitude)
-            }
-            Sign::Minus => {
-                // Negative: use tag 3 with magnitude = |value| - 1
-                // For value = -1, magnitude = 1, so n = 0 -> encode as 0x00
-                // For value = -2, magnitude = 2, so n = 1 -> encode as 0x01
-                let n = magnitude - 1u32;
-                let bytes = n.to_bytes_be();
-                let stripped = strip_leading_zeros(&bytes);
-                // For n = 0 (value = -1), to_bytes_be() returns empty, but we
-                // need 0x00
-                let content = if stripped.is_empty() {
-                    CBOR::to_byte_string([0u8])
-                } else {
-                    CBOR::to_byte_string(stripped)
-                };
-                CBOR::to_tagged_value(Tag::with_value(TAG_NEGATIVE_BIGNUM), content)
-            }
+/// As the borrowed conversion, which reads the integer in place.
+impl From<BigUint> for CBOR {
+    fn from(value: BigUint) -> Self {
+        CBOR::from(&value)
+    }
+}
+
+/// Tag 2 for a non-negative value; tag 3 for a negative one, around the
+/// argument `|value| - 1` (RFC 8949 §3.4.3). Reads the borrow: a
+/// non-negative value's magnitude is read in place, and a negative value's
+/// argument is the one integer computed.
+impl From<&BigInt> for CBOR {
+    fn from(value: &BigInt) -> Self {
+        match value.sign() {
+            Sign::Minus => bignum(true, (value.magnitude() - 1u32).to_bytes_be()),
+            Sign::NoSign | Sign::Plus => CBOR::from(value.magnitude()),
         }
     }
 }
 
-impl From<&BigInt> for CBOR {
-    fn from(value: &BigInt) -> Self {
-        value.clone().into()
+/// As the borrowed conversion; a negative value's magnitude is consumed by
+/// the subtraction rather than read.
+impl From<BigInt> for CBOR {
+    fn from(value: BigInt) -> Self {
+        match value.into_parts() {
+            (Sign::Minus, magnitude) => bignum(true, (magnitude - 1u32).to_bytes_be()),
+            (Sign::NoSign | Sign::Plus, magnitude) => CBOR::from(&magnitude),
+        }
     }
 }
 
@@ -268,6 +261,48 @@ impl TryFrom<CBOR> for BigInt {
                 Err(Error::WrongType)
             }
             _ => Err(Error::WrongType),
+        }
+    }
+}
+
+// A `MinimalBigInt` and num-bigint's integers convert at the symbolic edge,
+// outside any policy: a magnitude's bytes are a vector `to_bytes_be`
+// allocates, moved into the result without a second copy (num-bigint keeps
+// zero and one inline, `BigDigits::Inline`, but its byte form is still a
+// vector). Every integer has exactly one minimal form, so each conversion is
+// total.
+
+impl From<&BigUint> for crate::MinimalBigInt {
+    /// The magnitude's big-endian bytes, its leading zeros dropped: the
+    /// argument `n` of a non-negative value is the value.
+    fn from(value: &BigUint) -> Self {
+        crate::MinimalBigInt::from_vec(false, value.to_bytes_be())
+    }
+}
+
+impl From<&BigInt> for crate::MinimalBigInt {
+    /// A non-negative value as [`BigUint`]'s; a negative value `v` as the
+    /// argument `n = -1 - v`, its bytes without leading zeros.
+    fn from(value: &BigInt) -> Self {
+        match value.sign() {
+            Sign::Minus => {
+                let n = value.magnitude() - 1u32;
+                crate::MinimalBigInt::from_vec(true, n.to_bytes_be())
+            }
+            Sign::NoSign | Sign::Plus => Self::from(value.magnitude()),
+        }
+    }
+}
+
+impl From<&crate::MinimalBigInt> for BigInt {
+    /// `n` when non-negative, `-1 - n` when negative.
+    fn from(value: &crate::MinimalBigInt) -> Self {
+        let (negative, magnitude) = value.as_parts();
+        let n = BigUint::from_bytes_be(magnitude);
+        if negative {
+            BigInt::from_biguint(Sign::Minus, n + 1u32)
+        } else {
+            BigInt::from_biguint(Sign::Plus, n)
         }
     }
 }

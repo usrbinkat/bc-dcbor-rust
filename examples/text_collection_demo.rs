@@ -2,12 +2,12 @@ use std::cell::RefCell;
 
 use dcbor::{prelude::*, walk::WalkElement};
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a simple map with text keys and values
     let mut map = Map::new();
-    map.insert("name", "Alice"); // Both text - should be easy to collect
-    map.insert("age", 30); // Text key, number value
-    map.insert("nested", vec![1, 2]); // Text key, array value
+    map.insert("name", "Alice")?; // Both text - should be easy to collect
+    map.insert("age", 30)?; // Text key, number value
+    map.insert("nested", vec![1, 2])?; // Text key, array value
     let cbor = CBOR::from(map);
 
     println!("CBOR: {}", cbor.diagnostic_flat());
@@ -46,4 +46,5 @@ fn main() {
 
     println!("\nCollected texts: {:?}", *texts.borrow());
     println!("Total texts found: {}", texts.borrow().len());
+    Ok(())
 }

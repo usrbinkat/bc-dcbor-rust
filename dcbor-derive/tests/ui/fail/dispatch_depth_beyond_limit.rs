@@ -4,14 +4,14 @@
 mod policy;
 
 use dcbor::bounded::decode::construction::in_place::{
-    Built, ConstructionCost, InPlace, step, unit,
+    BindingContext, Building, Built, ConstructionCost, InPlace, reported, step, unit,
 };
 use dcbor::bounded::decode::construction::reclamation::{
-    MAX_DISPATCH_DEPTH, PeekSlot, Reclaim, Reclaimed, Slot, Written,
+    Cleanup, MAX_DISPATCH_DEPTH, PeekSlot, Reclaim, Reclaimed, Slot, Written,
 };
 use dcbor::bounded::decode::construction::{Borrowed, OwnedInitialized, TypedDecoder};
-use dcbor::bounded::decode::{ConstructResult, Document, Options};
-use dcbor::bounded::{Allocator, BoundedResult};
+use dcbor::bounded::decode::{ConstructResult, Options};
+use dcbor::bounded::{Allocator, BoundedResult, CustodySink, PermitsObserved};
 
 struct AtLimit;
 
@@ -20,29 +20,36 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
     type State = Written;
     const INITIAL: Written = Written::Empty;
 
-    fn reclaim_step(mut slot: Slot<'_, Self, Written>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        step(a)?;
+    fn reclaim_step(mut slot: Slot<'_, Self, Written>, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
+        step(cleanup)?;
         *slot.custody() = Written::Empty;
         Ok(Reclaimed::Done)
     }
 
-    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
-        1
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> Option<u64> {
+        Some(1)
+    }
+
+    fn observe_permits(
+        _: PeekSlot<'_, Self, Written>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
 unsafe impl<A: Allocator> InPlace<A> for AtLimit {
     const COST: ConstructionCost = ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
 
-    fn build_step(
-        _: &Document<'_, A::Permit>,
-        _: usize,
-        mut slot: Slot<'_, Self, Written>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
         step(a)?;
-        *slot.custody() = Written::Initialized;
-        Ok(Built::Done)
+        let assembly = ctx.assembly();
+        *ctx.into_slot().custody() = Written::Initialized;
+        // SAFETY: a unit owns nothing and reads no node: the admitted unit initializes it whole.
+        Ok(unsafe { reported(Built::Done, assembly) })
     }
 }
 

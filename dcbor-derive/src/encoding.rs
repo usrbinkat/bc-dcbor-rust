@@ -71,7 +71,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
             0 => __i::Head(__m::Simple, __a::Shortest(22)),
             _ => __i::End,
         }),
-        Shape::Newtype(_) => quote!(match index {
+        Shape::Newtype => quote!(match index {
             0 => __i::Child(&self.0),
             _ => __i::End,
         }),
@@ -123,9 +123,11 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
         }
     };
     quote! {
-        // SAFETY: generated instructions return only fields of self and
-        // scalar heads. Each field carries the recursive transfer contract;
-        // generated schemas create no entry cursors or external references.
+        // SAFETY: references: generated instructions return only fields of
+        // self and scalar heads. cursors: generated schemas create no entry
+        // cursors; a field's cursors are its own type's. recursion: every
+        // field type is bound `TransferableSchema` and `Self: Sync` (the
+        // `transfer` where clause).
         unsafe impl #transfer_ig dcbor::bounded::encoding::TransferableSchema
             for #name #transfer_tg #transfer_wc {}
         impl #ig dcbor::bounded::encoding::Schema for #name #tg #wc {

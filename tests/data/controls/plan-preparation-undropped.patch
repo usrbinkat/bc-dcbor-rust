@@ -1,0 +1,13 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -3428,7 +3428,9 @@
+                     // SAFETY: the preparation is initialized and held in this
+                     // phase; the phase moves past it below, and no later
+                     // step, count, observation or detail reads it.
+-                    unsafe { preparation.assume_init_drop() };
++                    // Planted: the drained preparation left in the record,
++                    // its arenas' and its own owners never dropped.
++                    let _ = &preparation;
+                     *phase = PlanPhase::ReclaimSource;
+                 }
+             }

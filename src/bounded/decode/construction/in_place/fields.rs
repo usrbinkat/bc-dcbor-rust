@@ -1,28 +1,39 @@
 //! Retained required-field map construction for generated structs.
 use super::*;
 use crate::bounded::boundary::{Predicate, boundary, position};
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody};
-use crate::bounded::decode::construction::stable::{self, Installed, Stack};
+use crate::bounded::decode::construction::reclamation::Custody;
+use crate::bounded::decode::construction::stable::{self, Installed, Stack, Ticket};
 use crate::sync::{Atomics, Representation};
 
 /// Compiler-generated field projections, indexed by ascending integer wire key.
 ///
 /// Each callback receives a [`Slot`] of the record's root place and one
-/// field's state, which names the field it belongs to: a caller holding one
-/// has nothing to promise.
+/// field's state, which names the field it belongs to, construction within a
+/// [`Context`] of that slot projected from the record's: a caller holding
+/// one has nothing to promise. Each field is a part of the record, stepped
+/// through the engine's part entries ([`build_part`], [`build_part_present`],
+/// [`build_part_absent`], [`reclaim_part`], [`remaining_part`]).
 ///
 /// # Safety
-/// Keys must be unique and strictly increasing. Every payload field must occur
-/// exactly once; COUNT must equal the payload field count. Non-payload enum tags
-/// are initialized separately by the enum engine. Projections must use the actual
-/// aligned struct layout. [`Self::start`] must return, for each field index
-/// below COUNT, a [`Self::Field`] naming that field and holding its type's
-/// [`Reclaim::INITIAL`] state, and must neither allocate nor unwind. Each
-/// field callback must delegate to the field its state names, with that
-/// field's InPlace/Reclaim implementation, the state it carries, and the
-/// field's place projected from the record's ([`Slot::child`]) by one
-/// expression shared by construction, cleanup and the count; each is sound
-/// for every call, in any order, as its field's own methods are.
+/// An implementation keeps six obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation). Non-payload enum tags are initialized
+/// separately by the enum engine.
+///
+/// - *keys*: keys are unique and strictly increasing.
+/// - *count*: every payload field occurs exactly once; COUNT equals the
+///   payload field count.
+/// - *layout*: projections use the actual aligned struct layout.
+/// - *start*: [`Self::start`] returns, for each field index below COUNT, a
+///   [`Self::Field`] naming that field and holding its type's
+///   [`Reclaim::INITIAL`] state, and neither allocates nor unwinds.
+/// - *delegation*: each field callback delegates to the field its state
+///   names, with that field's InPlace/Reclaim implementation, the state it
+///   carries, and the field's place projected from the record's
+///   ([`Slot::child`]) by one expression shared by construction, cleanup and
+///   the count.
+/// - *order*: each callback is sound for every call, in any order, as its
+///   field's own methods are.
 pub unsafe trait Fields<A: Allocator>: Sized {
     const COUNT: usize;
     const TAG: Option<u64> = None;
@@ -37,22 +48,37 @@ pub unsafe trait Fields<A: Allocator>: Sized {
     /// The initial state of the field of dense index `field`, or `None` for
     /// an index past the last field.
     fn start(field: usize) -> Option<Self::Field>;
-    /// Initializes only the field the slot's state names, which is omitted,
-    /// and retains its cleanup state.
-    fn missing_field(slot: Slot<'_, Self, Self::Field>, a: &mut A) -> ConstructResult<Built, A>;
-    /// One unit of construction of the field the slot's state names.
-    fn build_field(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::Field>,
+    /// Initializes only the field the context's state names, which is
+    /// omitted, and retains its cleanup state; the context's node is the
+    /// record's.
+    fn missing_field(
+        ctx: Context<'_, '_, '_, '_, Self, Self::Field, A>,
         a: &mut A,
     ) -> ConstructResult<Built, A>;
-    /// One unit of cleanup of the field the slot's state names.
-    fn reclaim_field(slot: Slot<'_, Self, Self::Field>, a: &mut A) -> BoundedResult<Reclaimed, A>;
+    /// One unit of construction of the field the context's state names,
+    /// from the context's node, the field's value.
+    fn build_field(
+        ctx: Context<'_, '_, '_, '_, Self, Self::Field, A>,
+        a: &mut A,
+    ) -> ConstructResult<Built, A>;
+    /// One unit of cleanup of the field the slot's state names, under the
+    /// record's cleanup capability ([`Cleanup`]).
+    fn reclaim_field(
+        slot: Slot<'_, Self, Self::Field>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A>;
     /// The calls [`Self::reclaim_field`] still takes from the slot's state:
     /// the [`Reclaim::remaining`] of the field it names, at that field's
-    /// place, with its own state.
-    fn remaining_field(slot: PeekSlot<'_, Self, Self::Field>) -> u64;
+    /// place, with its own state; `None` when it does not fit in `u64`.
+    fn remaining_field(slot: PeekSlot<'_, Self, Self::Field>) -> Option<u64>;
+    /// The permits the field the slot's state names owns, reported inside
+    /// the caller's open group: its [`Reclaim::observe_permits`]
+    /// ([`observe_part`]), at that field's place, with its own state,
+    /// projected as for [`Self::remaining_field`].
+    fn observe_field(
+        slot: PeekSlot<'_, Self, Self::Field>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved;
 }
 
 /// Where a field map's construction or cleanup is: the tag and map
@@ -97,24 +123,32 @@ const fn contract<F, P>() -> stable::Contract<Meta<F, P>, Meta<F, P>, P> {
 }
 
 /// The construction state of a field map whose fields' states are `F`, with
-/// permits of `P`: its metadata, once installed; what that installation has
-/// admitted; its phase; and the fields completed, in key order. Only the field
-/// engine reads or changes it; outside code can only start one.
+/// permits of `P`: its metadata, once installed; the ticket of that
+/// installation's acquisition while it is pending ([`Ticket`]), whose credit
+/// is the operation's; its phase; and the fields completed, in key order.
+/// Only the field engine reads or changes it; outside code can only start
+/// one.
 pub struct State<F, P> {
     meta: Option<Installed<Meta<F, P>, P>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
     // Control belongs to the continuation, including before installation and
     // after release. Keeping it here also avoids an aligned word in Meta's
-    // single-quantum initialization; it shares padding with `admitted`.
+    // single-quantum initialization.
     phase: Phase,
-    position: usize,
+    /// The fields completed, at most the schema's field count, which the
+    /// field indices already hold as `u32` ([`field_index`] refuses a count
+    /// past it): a `u32` too. So the state is 24 bytes, two words, the
+    /// count and the phase, and a derived enum's metadata, which holds one
+    /// variant's field state beside its own phase, index and permit, stays
+    /// within one quantum (`enumeration::Meta`).
+    position: u32,
 }
 
 impl<F, P> State<F, P> {
     /// Nothing installed, nothing completed.
     pub const INITIAL: Self = Self {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
         phase: Phase::Inspect,
         position: 0,
     };
@@ -126,20 +160,21 @@ impl<F, P> State<F, P> {
 // nested record's proof is one obligation per level.
 unsafe impl<F: Send, P: Send> Send for State<F, P> {}
 
-/// What a field map's construction holds: no metadata block, with the
-/// admissions held toward it; or the block, holding the field records.
+/// What a field map's construction holds: no metadata block, or the block,
+/// holding the field records. Progress alone: an acquisition bound for the
+/// block or the next record is the root pending's custody, reported by its
+/// observation (`CustodySink::bound`), never by this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FieldsObservation<F> {
-    Unallocated(Admitted),
+    Unallocated,
     Held(FieldsCustody<F>),
 }
 
 /// A field map's custody once its metadata is held, `F` a field's
 /// observation: the phase; the fields completed, in key order; the document
-/// positions searched and the key range; the field records held and the
-/// admissions held toward the next; and the newest record's field, the one
-/// under construction or cleanup whenever one is, whole. Every record
-/// before the newest holds a complete field.
+/// positions searched and the key range; the field records held; and the
+/// newest record's field, the one under construction or cleanup whenever
+/// one is, whole. Every record before the newest holds a complete field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldsCustody<F> {
     pub phase: Phase,
@@ -149,7 +184,6 @@ pub struct FieldsCustody<F> {
     pub low: u32,
     pub high: u32,
     pub records: usize,
-    pub admitted: Admitted,
     pub newest: Option<F>,
 }
 
@@ -158,18 +192,17 @@ impl<F: Custody, P> Custody for State<F, P> {
 
     fn observe(&mut self) -> Self::Observation {
         let Some(installed) = self.meta.as_mut() else {
-            return FieldsObservation::Unallocated(self.admitted);
+            return FieldsObservation::Unallocated;
         };
         let meta = installed.get();
         FieldsObservation::Held(FieldsCustody {
             phase: self.phase,
-            completed: self.position,
+            completed: self.position as usize,
             next: meta.next,
             end: meta.end,
             low: meta.low,
             high: meta.high,
             records: meta.children.len(),
-            admitted: meta.children.admitted(),
             newest: meta.children.top().map(|child| child.state.observe()),
         })
     }
@@ -248,16 +281,58 @@ pub const fn entries(count: usize) -> Option<ConstructionCost> {
     })
 }
 
-/// One unit of construction of the record in `slot`. Without metadata the
-/// state is `INITIAL` (every cleanup that releases the metadata restores it),
-/// so construction begins; any phase past construction is refused.
-pub fn build<T: Fields<A>, A: Allocator>(
-    document: &Document<'_, A::Permit>,
+/// The newest field record's context, projected from the record's: the
+/// record's own place and the state the record holds for its newest field,
+/// in this record's metadata. Refused when no metadata or record is held.
+///
+/// # Safety
+/// The newest record holds the state of the field being built or written,
+/// started for it by [`Fields::start`]: the record's place and that state
+/// are the field's slot as its callbacks project it.
+unsafe fn newest<'b, 'c, 'x, 'a, T: Fields<A>, A: Allocator>(
+    ctx: &'x mut Context<'b, 'c, '_, 'a, T, State<T::Field, A::Permit>, A>,
     index: usize,
-    mut slot: Slot<'_, T, State<T::Field, A::Permit>>,
+) -> BoundedResult<Context<'b, 'c, 'x, 'a, T, T::Field, A>, A> {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        ctx.part(index, |slot| {
+            let (place, state) = slot.into_parts();
+            let meta = state.meta.as_mut().ok_or(BoundedError::PlanMismatch)?.get();
+            let child = meta.children.top().ok_or(BoundedError::PlanMismatch)?;
+            Ok(Slot::new(place, &mut child.state))
+        })
+    }
+}
+
+/// One unit of construction of the record in the context's slot, from the
+/// context's node. Without metadata the state is `INITIAL` (every cleanup
+/// that releases the metadata restores it), so construction begins; any
+/// phase past construction is refused.
+///
+/// Each field is a part of the record. Its node is recomputed from
+/// `meta.next`, the record's one record of which entry it is at: set past
+/// the tag and map heads, moved by `Search` only past an unknown key, and
+/// past a field's value only in `Advance`, after the field reports `Done`; a
+/// refused or erroring field leaves it, the phase and the field's record
+/// unchanged. A field is built (`Build`, [`Fields::build_field`]) exactly
+/// when `Allocate` found its key in the map (`low` reached by `Search`), and
+/// written absent (`Missing`, [`Fields::missing_field`]) exactly when it did
+/// not (`position < low`). No field is built once cleanup began: cleanup's
+/// first unit moves the phase to `Reclaim` ([`reclaim`]), which this
+/// function's last arm refuses, nothing changed. A record reclaimed to its
+/// end is `INITIAL` again, which a build would restart: only its owner's
+/// phase (a parent's cleanup phase, or the root's released session) keeps it
+/// from being built again.
+pub fn build<'b, T: Fields<A>, A: Allocator>(
+    ctx: Context<'b, '_, '_, '_, T, State<T::Field, A::Permit>, A>,
     a: &mut A,
-) -> ConstructResult<Built, A> {
-    let (place, state) = slot.parts();
+) -> ConstructResult<Building<'b, T>, A> {
+    let mut ctx = ctx;
+    let assembly = ctx.assembly();
+    let index = ctx.index();
+    let nodes = ctx.nodes();
+    let (mut slot, pending) = ctx.acquiring();
+    let state = slot.custody();
     let Some(installed) = state.meta.as_mut() else {
         if state.phase != Phase::Inspect || state.position != 0 {
             return Err(BoundedError::PlanMismatch.into());
@@ -268,7 +343,8 @@ pub fn build<T: Fields<A>, A: Allocator>(
             stable::install::<Meta<T::Field, A::Permit>, Meta<T::Field, A::Permit>, A>(
                 const { contract::<T::Field, A::Permit>() },
                 &mut state.meta,
-                &mut state.admitted,
+                pending,
+                &mut state.ticket,
                 || Meta {
                     next: index,
                     end: 0,
@@ -280,14 +356,14 @@ pub fn build<T: Fields<A>, A: Allocator>(
                 a,
             )?
         };
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     };
     let meta = installed.get();
     match state.phase {
         Phase::Inspect => {
             STEP.admit(a)?;
             if let Some(expected) = T::TAG {
-                let node = node_at(document, meta.next).ok_or_else(wrong_type)?;
+                let node = nodes.node(meta.next).ok_or_else(wrong_type)?;
                 match node.kind() {
                     Kind::Tagged(found) if found == expected => {
                         meta.next = meta.next.checked_add(1).ok_or(BoundedError::Overflow)?;
@@ -309,9 +385,9 @@ pub fn build<T: Fields<A>, A: Allocator>(
             STEP.admit(a)?;
             if T::POSITIONAL {
                 state.phase = Phase::Find;
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             }
-            let node = node_at(document, meta.next).ok_or_else(wrong_type)?;
+            let node = nodes.node(meta.next).ok_or_else(wrong_type)?;
             if !matches!(node.kind(), Kind::Map(_)) {
                 return Err(wrong_type());
             }
@@ -322,25 +398,37 @@ pub fn build<T: Fields<A>, A: Allocator>(
         Phase::Find => {
             STEP.admit(a)?;
             if T::POSITIONAL {
-                if state.position == T::COUNT {
+                if state.position as usize == T::COUNT {
                     state.phase = Phase::Complete;
-                    return Ok(Built::Done);
+                    // SAFETY: as for the keyed record below.
+                    return Ok(Building::Done(unsafe { assembly.assemble() }));
                 }
                 // The element is located in this admitted unit, so the build
                 // of the field never inspects the document before admission.
-                node_at(document, meta.next).ok_or_else(wrong_type)?;
-                meta.low = field_index(state.position)?;
+                nodes.node(meta.next).ok_or_else(wrong_type)?;
+                meta.low = state.position;
                 state.phase = Phase::Allocate;
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             }
             if meta.next == meta.end {
-                if state.position != T::COUNT {
+                if state.position as usize != T::COUNT {
                     meta.low = field_index(T::COUNT)?;
                     state.phase = Phase::Allocate;
-                    return Ok(Built::Progress);
+                    return Ok(Building::Progress);
                 }
                 state.phase = Phase::Complete;
-                return Ok(Built::Done);
+                // SAFETY: `position` counts the fields completed in key
+                // order, and it reaches `COUNT` only through `Advance` or
+                // `AdvanceMissing`. Each of those follows a `Done` whose
+                // record, confined by its brand to the step that minted it,
+                // the engine's part entry verified against the field place
+                // this record projected for that field (`build_field` and
+                // `missing_field` delegate to `build_part`,
+                // `build_part_present` or `build_part_absent`).
+                // So every payload field is initialized, `Fields` lists each
+                // exactly once, and the slot is not reclaimed: cleanup moves
+                // the phase to `Reclaim`, which this function refuses.
+                return Ok(Building::Done(unsafe { assembly.assemble() }));
             }
             meta.low = 0;
             meta.high = field_index(T::COUNT)?;
@@ -348,7 +436,7 @@ pub fn build<T: Fields<A>, A: Allocator>(
         }
         Phase::Search => {
             STEP.admit(a)?;
-            let node = node_at(document, meta.next).ok_or_else(wrong_type)?;
+            let node = nodes.node(meta.next).ok_or_else(wrong_type)?;
             if let Kind::Unsigned(key) = node.kind()
                 && boundary!(a, Predicate::Field, meta.low, meta.high).is_lt()
             {
@@ -357,23 +445,28 @@ pub fn build<T: Fields<A>, A: Allocator>(
                     core::cmp::Ordering::Less => meta.high = mid,
                     core::cmp::Ordering::Greater => meta.low = mid + 1,
                     core::cmp::Ordering::Equal => {
-                        if boundary!(a, Predicate::Field, mid as usize, state.position).is_lt() {
+                        if boundary!(a, Predicate::Field, mid as usize, state.position as usize)
+                            .is_lt()
+                        {
                             return Err(BoundedError::PlanMismatch.into());
                         }
                         meta.low = mid;
                         state.phase = Phase::Allocate;
                     }
                 }
-                return Ok(Built::Progress);
+                return Ok(Building::Progress);
             }
-            let value = node_at(document, super::super::next_index(node)).ok_or_else(wrong_type)?;
+            let value = nodes
+                .node(super::super::next_index(node))
+                .ok_or_else(wrong_type)?;
             meta.next = super::super::next_index(value);
             state.phase = Phase::Find;
         }
         Phase::Allocate => {
             let low = meta.low as usize;
-            let missing = boundary!(a, Predicate::Field, state.position, low).is_lt();
-            let field = if missing { state.position } else { low };
+            let completed = state.position as usize;
+            let missing = boundary!(a, Predicate::Field, completed, low).is_lt();
+            let field = if missing { completed } else { low };
             boundary!(a, Predicate::Field => position(field, T::COUNT));
             if missing && !T::optional(field) {
                 STEP.admit(a)?;
@@ -384,7 +477,7 @@ pub fn build<T: Fields<A>, A: Allocator>(
             // Custody is registered, holding the field's initial state, before
             // any field constructor runs.
             let start = T::start(field).ok_or(BoundedError::PlanMismatch)?;
-            meta.children.push(start, a)?;
+            meta.children.push(start, pending, a)?;
             state.phase = if missing {
                 Phase::Missing
             } else {
@@ -392,12 +485,11 @@ pub fn build<T: Fields<A>, A: Allocator>(
             };
         }
         Phase::Missing => {
-            let child = meta.children.top().ok_or(BoundedError::PlanMismatch)?;
-            // SAFETY: the record's root place, and the state of the field
-            // its record names, started for that field by `T::start`.
-            let field = unsafe { Slot::new(place, &mut child.state) };
+            // SAFETY: Allocate pushed the omitted field's record, started for
+            // it by `T::start`, and it is the newest.
+            let field = unsafe { newest::<T, A>(&mut ctx, index) }?;
             if T::missing_field(field, a)? == Built::Done {
-                state.phase = Phase::AdvanceMissing;
+                ctx.slot().custody().phase = Phase::AdvanceMissing;
             }
         }
         Phase::AdvanceMissing => {
@@ -406,7 +498,7 @@ pub fn build<T: Fields<A>, A: Allocator>(
                 .position
                 .checked_add(1)
                 .ok_or(BoundedError::Overflow)?;
-            state.phase = if state.position == T::COUNT {
+            state.phase = if state.position as usize == T::COUNT {
                 Phase::Find
             } else {
                 Phase::Allocate
@@ -414,28 +506,29 @@ pub fn build<T: Fields<A>, A: Allocator>(
         }
         Phase::Build => {
             // Find or Search located this node in an admitted unit.
-            let key = node_at(document, meta.next).ok_or(BoundedError::PlanMismatch)?;
-            // Allocate pushed the active child; its exact projection and
-            // state remain unchanged throughout suspension and cleanup.
-            let child = meta.children.top().ok_or(BoundedError::PlanMismatch)?;
-            let index = if T::POSITIONAL {
+            let key = nodes.node(meta.next).ok_or(BoundedError::PlanMismatch)?;
+            let value = if T::POSITIONAL {
                 meta.next
             } else {
                 super::super::next_index(key)
             };
-            // SAFETY: as in `Missing`.
-            let field = unsafe { Slot::new(place, &mut child.state) };
-            if T::build_field(document, index, field, a)? == Built::Done {
-                state.phase = Phase::Advance;
+            // SAFETY: Allocate pushed the active field's record, started for
+            // it by `T::start`, and it is the newest; its exact projection
+            // and state remain unchanged throughout suspension and cleanup.
+            let field = unsafe { newest::<T, A>(&mut ctx, value) }?;
+            if T::build_field(field, a)? == Built::Done {
+                ctx.slot().custody().phase = Phase::Advance;
             }
         }
         Phase::Advance => {
             STEP.admit(a)?;
-            let key = node_at(document, meta.next).ok_or_else(wrong_type)?;
+            let key = nodes.node(meta.next).ok_or_else(wrong_type)?;
             let value = if T::POSITIONAL {
                 key
             } else {
-                node_at(document, super::super::next_index(key)).ok_or_else(wrong_type)?
+                nodes
+                    .node(super::super::next_index(key))
+                    .ok_or_else(wrong_type)?
             };
             meta.next = super::super::next_index(value);
             state.position = state
@@ -446,7 +539,24 @@ pub fn build<T: Fields<A>, A: Allocator>(
         }
         _ => return Err(BoundedError::PlanMismatch.into()),
     }
-    Ok(Built::Progress)
+    Ok(Building::Progress)
+}
+
+/// One unit of construction of an enum's selected variant payload, `T` the
+/// variant's field record, in the context the enum projected for that
+/// payload ([`super::enumeration::Variants::build_variant`]): the record's
+/// step ([`build`]), its `Done` record, confined by its brand to this step,
+/// verified against the payload place this context holds and consumed here
+/// (`verified`). The check runs here, inside the crate: the generated
+/// callback that calls this serves every variant of its enum, so its
+/// signature cannot carry a variant's record. The enum advances its phase
+/// only on the `Built::Done` this returns.
+pub fn build_payload<T: Fields<A>, A: Allocator>(
+    ctx: Context<'_, '_, '_, '_, T, State<T::Field, A::Permit>, A>,
+    a: &mut A,
+) -> ConstructResult<Built, A> {
+    let expected = ctx.assembly();
+    Ok(super::verified::<T, A::Refusal>(build(ctx, a)?, expected)?)
 }
 
 /// One unit of cleanup of the record in `slot`. The slot's custody excludes
@@ -454,11 +564,14 @@ pub fn build<T: Fields<A>, A: Allocator>(
 /// a later step reports `Done` and a later build begins anew.
 pub fn reclaim<T: Fields<A>, A: Allocator>(
     mut slot: Slot<'_, T, State<T::Field, A::Permit>>,
-    a: &mut A,
+    a: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         STEP.admit(a)?;
+        // The metadata's acquisition, if pending, had its credit settled at
+        // the operation's cleanup entry: the ticket is forgotten.
+        state.ticket = None;
         return Ok(Reclaimed::Done);
     };
     let meta = installed.get();
@@ -485,6 +598,10 @@ pub fn reclaim<T: Fields<A>, A: Allocator>(
         }
         _ => {
             STEP.admit(a)?;
+            // A field record's acquisition, if pending, had its credit
+            // settled at the operation's cleanup entry: the ticket is
+            // forgotten.
+            meta.children.abandon();
             state.phase = Phase::Reclaim;
         }
     }
@@ -493,25 +610,51 @@ pub fn reclaim<T: Fields<A>, A: Allocator>(
 
 /// The calls [`reclaim`] still takes from the slot's state: no metadata, one;
 /// in `Reclaim`, every field record's own calls, then the metadata's release;
-/// before it, one more to enter `Reclaim`.
+/// before it, one more to enter `Reclaim`. `None` when the count does not
+/// fit in `u64`.
 pub fn remaining<T: Fields<A>, A: Allocator>(
     mut slot: PeekSlot<'_, T, State<T::Field, A::Permit>>,
-) -> u64 {
+) -> Option<u64> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
-        return 1;
+        return Some(1);
     };
-    let mut drain = 0u64;
+    let mut drain = Some(0u64);
     installed.get().children.for_each(|child| {
         // SAFETY: each record's state names its own field, which the
         // callback projects from the root.
-        drain = drain.saturating_add(T::remaining_field(unsafe { Slot::new(place, child) }));
+        let field = T::remaining_field(unsafe { Slot::new(place, child) });
+        drain = drain.and_then(|drain| drain.checked_add(field?));
     });
-    let reclaiming = drain.saturating_add(1);
+    let reclaiming = drain?.checked_add(1)?;
     match state.phase {
-        Phase::Reclaim => reclaiming,
-        _ => reclaiming.saturating_add(1),
+        Phase::Reclaim => Some(reclaiming),
+        _ => reclaiming.checked_add(1),
     }
+}
+
+/// The permits the record in `slot` owns, reported inside the caller's open
+/// group: its metadata block's, then, newest first, each field record's
+/// block and the field's own ([`Fields::observe_field`]); none without
+/// metadata.
+pub fn observe_permits<T: Fields<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, T, State<T::Field, A::Permit>>,
+    sink: &mut dyn CustodySink<A::Permit>,
+) -> PermitsObserved {
+    let (place, state) = slot.parts();
+    let Some(installed) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    sink.permit(installed.permit(), None);
+    let mut whole = PermitsObserved::Complete;
+    installed.get().children.for_each_record(|permit, child| {
+        sink.permit(permit, None);
+        // SAFETY: each record's state names its own field, which the
+        // callback projects from the root.
+        let field = T::observe_field(unsafe { Slot::new(place, child) }, sink);
+        whole = observed_all([whole, field]);
+    });
+    whole
 }
 
 #[cfg(test)]

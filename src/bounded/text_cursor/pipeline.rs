@@ -1,12 +1,41 @@
 //! Separately retained preparation and allocation-free destination emission.
 use super::*;
 
+/// A prepared text: its normalized characters, the arena of them taken from
+/// the preparation with its permit, and the identity of the owner that arena's
+/// acquisitions were bound under, immutable for its life (observational
+/// identity only, never settlement authority); `None` exactly when the arena
+/// never allocated.
 pub struct PreparedText<P> {
     chars: Owned<char, P>,
+    owner: Option<Identity>,
     count: usize,
     header: [u8; MAX_HEAD_LEN],
     header_len: usize,
     length: u64,
+}
+
+/// Its custody, observed ([`CustodySink`]): its characters' permit under the
+/// owner its arena's acquisitions were bound under, one group, when the arena
+/// allocated. Never contended. The traversal reads the plan only, so it is
+/// defined on a shared borrow: a plan lent to its [`TextWriter`] is observed
+/// by its owner through the borrow the writer shares.
+impl<P> Custodial<P> for &PreparedText<P> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        if let Some(permit) = self.chars.permit() {
+            sink.begin(self.owner);
+            sink.permit(permit, None);
+            sink.end();
+        }
+        PermitsObserved::Complete
+    }
+}
+
+/// An owned plan's custody: its shared borrow's traversal.
+impl<P> Custodial<P> for PreparedText<P> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        <&Self as Custodial<P>>::observe_custody(&mut &*self, sink)
+    }
 }
 
 impl<P> PreparedText<P> {
@@ -31,13 +60,13 @@ impl<P> PreparedText<P> {
 /// Normalization up to, and not including, output allocation. A terminal
 /// error of the normalizer is followed by its cleanup, one admitted unit per
 /// step, then [`Step::Finished`].
-pub struct TextPreparation<'a, P> {
-    cursor: TextEncoder<'a, P>,
+pub struct TextPreparation<'a, P, O: Origin> {
+    cursor: TextEncoder<'a, P, O>,
     failed: bool,
     finished: bool,
 }
 
-impl<'a, P> TextPreparation<'a, P> {
+impl<'a, P, O: Origin> TextPreparation<'a, P, O> {
     pub fn new(source: &'a str) -> Self {
         Self {
             cursor: TextEncoder::new(source),
@@ -50,7 +79,14 @@ impl<'a, P> TextPreparation<'a, P> {
         self.cursor.position()
     }
 
-    pub fn step<A: Allocator<Permit = P>>(
+    /// The credit this preparation's custody holds: its normalizer's
+    /// ([`TextContinuation::held_credit`], the checked fold of the same
+    /// traversal). `None` when the sum does not fit.
+    pub fn held_credit(&mut self) -> Option<WriteWork> {
+        self.cursor.held_credit()
+    }
+
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<Step<PreparedText<P>>, A> {
@@ -83,12 +119,16 @@ impl<'a, P> TextPreparation<'a, P> {
         // publishes the characters, never an output.
         if self.cursor.phase == Phase::ReleaseOutput {
             let length = add(self.cursor.payload_len, self.cursor.header_len as u64)?;
+            // Read before the take: the arena keeps its stored owner after
+            // its allocation moves into the plan.
+            let owner = self.cursor.chars.owner_id();
             let Some(chars) = self.cursor.chars.take_step(allocator)? else {
                 return Ok(Step::Progress);
             };
             self.finished = true;
             self.cursor.phase = Phase::Finished;
             return Ok(Step::Complete(PreparedText {
+                owner: chars.permit().and(owner),
                 chars,
                 count: self.cursor.written,
                 header: self.cursor.header,
@@ -97,6 +137,13 @@ impl<'a, P> TextPreparation<'a, P> {
             }));
         }
         Ok(Step::Progress)
+    }
+}
+
+/// Preparation retains its normalizer's custody and never allocates output.
+impl<P, O: Origin> Custodial<P> for TextPreparation<'_, P, O> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        self.cursor.observe_custody(sink)
     }
 }
 
@@ -147,7 +194,9 @@ impl WriterTerms {
     /// A text of `len` encoded bytes has at most `len` scalars beside its
     /// head, and its head and scalars are its bytes, each written once.
     fn of<R>(len: u64) -> Result<Self, BoundedError<R>> {
-        const { assert!(HEAD.values() == 1 && SCALAR.values() == 1) };
+        const {
+            assert!(HEAD.values() == 1 && SCALAR.values() == 1);
+        }
         Ok(Self {
             emitting: WriteWork::new(add(len, 1)?, len),
             completion: DONE.times(1)?,
@@ -174,7 +223,9 @@ pub fn writer_bound<R>(len: u64) -> Result<ResourceBound, BoundedError<R>> {
     WriterTerms::of::<R>(len)?.bound()
 }
 
-impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for TextPreparation<'a, P> {
+impl<'a, P, O: Origin, A: Allocator<Permit = P, Origin = O>> Resumable<A>
+    for TextPreparation<'a, P, O>
+{
     type Output = PreparedText<P>;
     type Error = BoundedError<A::Refusal>;
     type Position = Position;
@@ -266,6 +317,16 @@ impl<P> TextWriter<'_, '_, P> {
             return Ok(Step::Complete(()));
         }
         Ok(Step::Progress)
+    }
+}
+
+/// A text write's custody: none. It admits each unit as it writes it; the
+/// plan it borrows is its owner's to report, through the shared borrow
+/// ([`PreparedText`]'s traversal), and the destination is the caller's
+/// memory.
+impl<P> Custodial<P> for TextWriter<'_, '_, P> {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 

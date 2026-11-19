@@ -1,0 +1,12 @@
+--- src/float/proofs.rs
++++ src/float/proofs.rs
+@@ -115,7 +115,8 @@
+ /// harness (`src/decode/proofs.rs`).
+ pub(crate) fn from_f64_contract(value: f64) -> f16 {
+     match reference::binary16_bits(value) {
+-        Some(bits) => f16::from_bits(bits),
++        // Planted: a held value converts one unit in the last place off.
++        Some(bits) => f16::from_bits(bits ^ 1),
+         None => f16::from_bits(kani::any()),
+     }
+ }

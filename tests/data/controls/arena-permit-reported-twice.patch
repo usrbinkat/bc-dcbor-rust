@@ -1,0 +1,11 @@
+--- src/bounded/decode/cursor/publication.rs
++++ src/bounded/decode/cursor/publication.rs
+@@ -203,6 +203,8 @@
+         if let Some(permit) = permit {
+             sink.begin(owner);
+             sink.permit(permit);
++            // Planted: the permit reported twice, as by its parser and its record.
++            sink.permit(permit);
+             sink.end();
+         }
+         PermitsObserved::Complete

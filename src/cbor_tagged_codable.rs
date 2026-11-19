@@ -33,7 +33,9 @@ use crate::{CBORTaggedDecodable, CBORTaggedEncodable};
 ///
 /// // Implement encoding to tagged CBOR
 /// impl CBORTaggedEncodable for Date {
-///     fn untagged_cbor(&self) -> CBOR { self.0.into() }
+///     fn untagged_cbor(&self) -> dcbor::Result<CBOR> {
+///         Ok(self.0.into())
+///     }
 /// }
 ///
 /// // Implement decoding from tagged CBOR
@@ -56,7 +58,7 @@ use crate::{CBORTaggedDecodable, CBORTaggedEncodable};
 /// // The CBORTaggedCodable trait is automatically implemented
 /// // Create a date and demonstrate round-trip conversion
 /// let original = Date(1609459200.0);
-/// let cbor = original.tagged_cbor();
+/// let cbor = original.tagged_cbor().unwrap();
 /// let roundtrip: Date = cbor.try_into().unwrap();
 /// assert_eq!(original, roundtrip);
 /// ```

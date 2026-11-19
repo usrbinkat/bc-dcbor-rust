@@ -1,0 +1,11 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -1322,7 +1322,7 @@
+
+     fn origin(&self) -> Family {
+         Family {
+-            counters: self.counters.clone(),
++            counters: Arc::new(Counters::default()),
+         }
+     }
+

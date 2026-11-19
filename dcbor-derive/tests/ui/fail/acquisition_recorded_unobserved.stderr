@@ -1,0 +1,7 @@
+error[E0599]: no associated function or constant named `unobserved` found for struct `dcbor::bounded::Acquisition<Family>` in the current scope
+ --> tests/ui/fail/acquisition_recorded_unobserved.rs:8:28
+  |
+8 |     Acquisition::<Family>::unobserved(owner)
+  |                            ^^^^^^^^^^ associated function or constant not found in `dcbor::bounded::Acquisition<Family>`
+  |
+  = note: the associated function or constant was found for `dcbor::bounded::Acquisition<()>`

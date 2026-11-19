@@ -1,0 +1,12 @@
+--- dcbor-derive/src/cddl.rs
++++ dcbor-derive/src/cddl.rs
+@@ -18,7 +18,8 @@
+         quote!(<#ty as dcbor::cddl::Cddl>::cddl(rules))
+     };
+     quote! {
+-        dcbor::cddl::Member { key: #key, optional: #optional, value: #value }
++        // Planted: a field optional in the decoders rendered required.
++        dcbor::cddl::Member { key: #key, optional: false, value: #value }
+     }
+ }
+

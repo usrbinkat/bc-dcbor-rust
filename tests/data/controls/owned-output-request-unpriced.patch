@@ -1,0 +1,13 @@
+--- src/bounded/encoding/writer.rs
++++ src/bounded/encoding/writer.rs
+@@ -409,7 +409,9 @@
+         let output = encoded_released::<P>()
+             .bound()
+             .checked_then(ResourceBound {
+-                allocated: len,
++                // Planted: the output's storage request is not priced. Must fail
++                // "the owned write requests no more than its bound".
++                allocated: 0,
+                 peak: len,
+                 retained: len,
+                 ..ResourceBound::default()

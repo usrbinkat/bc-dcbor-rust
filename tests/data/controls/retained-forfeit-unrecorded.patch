@@ -1,0 +1,14 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -1115,8 +1115,9 @@
+     /// forfeit is a granted permit's (its reservation failed, or its scope
+     /// closed under the grant), `by` its performer.
+     pub(crate) fn forfeit(mut self, rule: Forfeit, permit: Option<Identity>, by: Performer) {
+-        let remaining = core::mem::take(&mut self.remaining);
+-        self.record(remaining, permit, Some(rule), by);
++        // Planted: a forfeit settles nothing into its origin. Must fail
++        // "legal transitions conserve: A = C + F + H".
++        let _ = (core::mem::take(&mut self.remaining), permit, rule, by);
+     }
+
+     /// The one record of a settlement into its origin; nothing for none.

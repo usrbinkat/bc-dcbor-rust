@@ -1,7 +1,7 @@
 //! Tag validation with independently retained payload initialization.
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Reduction, Uniform};
-use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::bounded::decode::construction::reclamation::{Custody, Reduction, Uniform};
+use crate::bounded::decode::construction::stable::{self, Installed, Ticket};
 use crate::sync::{Atomics, Representation};
 
 /// Generated aligned projections for a tagged schema's untagged payload.
@@ -10,31 +10,43 @@ use crate::sync::{Atomics, Representation};
 /// untagged payload's state: a caller holding one has nothing to promise.
 ///
 /// # Safety
-/// [`Self::UNTAGGED`] must be the payload construction's initial state. The
-/// callbacks must retain the destination and payload state and obey InPlace
-/// and Reclaim respectively, sound for every call in any order. They must not
-/// inspect or initialize the outer tag.
+/// An implementation keeps four obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation):
+///
+/// - *initial*: [`Self::UNTAGGED`] is the payload construction's initial
+///   state.
+/// - *projection*: the callbacks retain the destination and the payload
+///   state and obey InPlace and Reclaim respectively.
+/// - *tag*: the callbacks do not inspect or initialize the outer tag.
+/// - *order*: each callback is sound for every call, in any order.
 pub unsafe trait Payload<A: Allocator>: Sized {
     const TAG: u64;
     /// The construction state of the untagged payload, and its custody.
     type Untagged: Custody;
     /// The untagged payload's state before anything is built.
     const UNTAGGED: Self::Untagged;
-    /// One unit of construction of the untagged payload.
+    /// One unit of construction of the untagged payload, from the tag's
+    /// child node, in the tagged value's own document ([`build`]).
     fn build_payload(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, Self::Untagged>,
+        ctx: Context<'_, '_, '_, '_, Self, Self::Untagged, A>,
         a: &mut A,
     ) -> ConstructResult<Built, A>;
     /// One unit of cleanup of the untagged payload.
     fn reclaim_payload(
         slot: Slot<'_, Self, Self::Untagged>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A>;
     /// The calls [`Self::reclaim_payload`] still takes from the slot's state:
-    /// the untagged payload's [`Reclaim::remaining`].
-    fn remaining_payload(slot: PeekSlot<'_, Self, Self::Untagged>) -> u64;
+    /// the untagged payload's [`Reclaim::remaining`], `None` when it does not
+    /// fit in `u64`.
+    fn remaining_payload(slot: PeekSlot<'_, Self, Self::Untagged>) -> Option<u64>;
+    /// The permits the untagged payload's state owns, reported inside the
+    /// caller's open group: its [`Reclaim::observe_permits`].
+    fn observe_payload(
+        slot: PeekSlot<'_, Self, Self::Untagged>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved;
 }
 
 /// Where a tagged value's construction or cleanup is: the tag inspection,
@@ -45,11 +57,18 @@ pub enum Phase {
     Inspect,
     Build,
     Complete,
+    /// The payload's cleanup under way: entered by the first cleanup unit
+    /// the payload completes without finishing, so no build reaches a
+    /// payload being cleaned up.
+    Reclaim,
     Release,
 }
+/// The tagged value's metadata: the untagged payload's state and the phase.
+/// No node index: which node the value is built from is its session's record
+/// (the engine's), and the payload's node is that node's child, recomputed
+/// from the context at every step, never a second stored copy.
 struct Meta<U> {
     child: U,
-    index: usize,
     phase: Phase,
 }
 
@@ -65,39 +84,36 @@ const fn contract<U, P>() -> stable::Contract<Meta<U>, Meta<U>, P> {
 }
 
 /// The construction state of a tagged value whose untagged payload's state
-/// is `U`, with permits of `P`: its metadata, once installed, and what that
-/// installation has admitted. Only the tagged engine reads or changes it.
+/// is `U`, with permits of `P`: its metadata, once installed, and the ticket
+/// of that installation's acquisition while it is pending ([`Ticket`]), whose
+/// credit is the operation's. Only the tagged engine reads or changes it.
 pub struct State<U, P> {
     meta: Option<Installed<Meta<U>, P>>,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
 }
 
 impl<U, P> State<U, P> {
     /// Nothing installed.
     pub const INITIAL: Self = Self {
         meta: None,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
     };
 }
 
 // SAFETY: the state exclusively owns its metadata block, which holds the
-// untagged payload's state (a `U`), its permit and a plain index, as the
-// auto traits would derive through `Installed`; stated once here so a nested
-// tagged value's proof is one obligation per level.
+// untagged payload's state (a `U`) and its permit, as the auto traits would
+// derive through `Installed`; stated once here so a nested tagged value's
+// proof is one obligation per level.
 unsafe impl<U: Send, P: Send> Send for State<U, P> {}
 
-/// What a tagged value's construction holds: no metadata block, with the
-/// admissions held toward it; or the block, at a document index and phase,
-/// holding the untagged payload's construction state, whose whole
-/// observation it carries.
+/// What a tagged value's construction holds: no metadata block; or the
+/// block, at a phase, holding the untagged payload's construction state,
+/// whose whole observation it carries. Progress alone: an acquisition bound
+/// for the block is the root pending's custody (`CustodySink::bound`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaggedObservation<U> {
-    Unallocated(Admitted),
-    Held {
-        index: usize,
-        phase: Phase,
-        child: U,
-    },
+    Unallocated,
+    Held { phase: Phase, child: U },
 }
 
 /// The cleanup classes of a tagged value ([`Reduction`]), `C` its untagged
@@ -116,19 +132,20 @@ pub enum TaggedClass<C> {
 }
 
 // Cleanup reads the metadata's presence and the phase, grouped as above,
-// stepping the payload in `Build` and `Complete` alike; the document index
-// never changes a cleanup unit. The payload's own relation is a simulation
-// of its cleanup, and the value leaves `Live` exactly when the payload's
-// cleanup reports done.
+// stepping the payload in `Build` and `Complete` alike. The payload's own
+// relation is a simulation of its cleanup, and the value leaves `Live`
+// exactly when the payload's cleanup reports done.
 impl<U: Reduction, P> Reduction for State<U, P> {
     type Class = TaggedClass<U::Class>;
 
     fn class(observation: &Self::Observation) -> Self::Class {
         match observation {
-            TaggedObservation::Unallocated(_) => TaggedClass::Unallocated,
+            TaggedObservation::Unallocated => TaggedClass::Unallocated,
             TaggedObservation::Held { phase, child, .. } => match phase {
                 Phase::Inspect => TaggedClass::Inspect,
-                Phase::Build | Phase::Complete => TaggedClass::Live(U::class(child)),
+                Phase::Build | Phase::Complete | Phase::Reclaim => {
+                    TaggedClass::Live(U::class(child))
+                }
                 Phase::Release => TaggedClass::Release,
             },
         }
@@ -147,11 +164,10 @@ impl<U: Custody, P> Custody for State<U, P> {
 
     fn observe(&mut self) -> Self::Observation {
         let Some(installed) = self.meta.as_mut() else {
-            return TaggedObservation::Unallocated(self.admitted);
+            return TaggedObservation::Unallocated;
         };
         let meta = installed.get();
         TaggedObservation::Held {
-            index: meta.index,
             phase: meta.phase,
             child: meta.child.observe(),
         }
@@ -172,39 +188,44 @@ pub const fn cost<U, P>(payload: ConstructionCost) -> Option<ConstructionCost> {
     ConstructionCost::fixed(cost!(inspected.checked_add(released))).checked_add(payload)
 }
 
-/// One unit of construction of the tagged value in `slot`. Without metadata
-/// the state is `INITIAL`, so construction begins; a completed or released
-/// value is refused.
-pub fn build<T: Payload<A>, A: Allocator>(
-    document: &Document<'_, A::Permit>,
-    index: usize,
-    mut slot: Slot<'_, T, State<T::Untagged, A::Permit>>,
+/// One unit of construction of the tagged value in the context's slot, from
+/// the context's node: the derived binding's `build_step`, the context its
+/// session's. Without metadata the state is `INITIAL`, so construction
+/// begins; a completed or released value is refused. `Done` carries the
+/// value's record, minted once its untagged payload is done (`Complete`).
+pub fn build<'b, T: Payload<A>, A: Allocator>(
+    ctx: Context<'b, '_, '_, '_, T, State<T::Untagged, A::Permit>, A>,
     a: &mut A,
-) -> ConstructResult<Built, A> {
-    let (place, state) = slot.parts();
+) -> ConstructResult<Building<'b, T>, A> {
+    let mut ctx = ctx;
+    let index = ctx.index();
+    let node = ctx.node();
+    let assembly = ctx.assembly();
+    let (mut slot, pending) = ctx.acquiring();
+    let state = slot.custody();
     let Some(installed) = state.meta.as_mut() else {
         // SAFETY: the header is the whole metadata, every field written.
         unsafe {
             stable::install::<Meta<T::Untagged>, Meta<T::Untagged>, A>(
                 const { contract::<T::Untagged, A::Permit>() },
                 &mut state.meta,
-                &mut state.admitted,
+                pending,
+                &mut state.ticket,
                 || Meta {
                     child: T::UNTAGGED,
-                    index,
                     phase: Phase::Inspect,
                 },
                 |meta| meta,
                 a,
             )?
         };
-        return Ok(Built::Progress);
+        return Ok(Building::Progress);
     };
     let meta = installed.get();
     match meta.phase {
         Phase::Inspect => {
             STEP.admit(a)?;
-            match node_at(document, meta.index).map(|node| node.kind()) {
+            match node.map(|node| node.kind()) {
                 Some(Kind::Tagged(found)) if found == T::TAG => {}
                 Some(Kind::Tagged(found)) => {
                     return Err(crate::bounded::decode::DecodeError::Invalid(
@@ -216,19 +237,47 @@ pub fn build<T: Payload<A>, A: Allocator>(
                 }
                 _ => return Err(wrong_type()),
             }
-            meta.index = meta.index.checked_add(1).ok_or(BoundedError::Overflow)?;
             meta.phase = Phase::Build;
-            Ok(Built::Progress)
+            Ok(Building::Progress)
         }
         Phase::Build => {
-            // SAFETY: the tagged value's place and its untagged payload's
-            // state, which only the payload callback uses.
-            let payload = unsafe { Slot::new(place, &mut meta.child) };
-            let result = T::build_payload(document, meta.index, payload, a)?;
-            if result == Built::Done {
-                meta.phase = Phase::Complete;
+            // The payload is the tag's child: the node after the context's,
+            // recomputed here; the value keeps no index of its own. It is
+            // built only in `Build`, which a refused or erroring payload
+            // step leaves unchanged and only the payload's `Done` ends;
+            // cleanup moves the value out of it with the payload's first
+            // completed unit ([`reclaim`]), and every other phase is refused
+            // below.
+            let child = index.checked_add(1).ok_or(BoundedError::Overflow)?;
+            // SAFETY: the tagged value's own place and its untagged payload's
+            // state, held in the metadata this value's state owns, which
+            // only the payload callback uses. The payload is built within
+            // the tagged value's session, so it is a part, not a child
+            // binding with a session of its own.
+            let payload = unsafe {
+                ctx.part(child, |slot| {
+                    let (place, state) = slot.into_parts();
+                    let meta = state.meta.as_mut().ok_or(BoundedError::PlanMismatch)?.get();
+                    Ok::<_, BoundedError<A::Refusal>>(Slot::new(place, &mut meta.child))
+                })
+            }?;
+            if T::build_payload(payload, a)? == Built::Progress {
+                return Ok(Building::Progress);
             }
-            Ok(result)
+            // The payload's `Done`: a newtype's field record verified and
+            // consumed by its part entry in this step, or a unit payload's
+            // own admitted write. `Complete` records it, set here alone.
+            let mut slot = ctx.slot();
+            let installed = slot
+                .custody()
+                .meta
+                .as_mut()
+                .ok_or(BoundedError::PlanMismatch)?;
+            installed.get().phase = Phase::Complete;
+            // SAFETY: the tag was inspected and the untagged payload, the
+            // whole value at this place, is done in this step, `Complete`
+            // recording it.
+            Ok(Building::Done(unsafe { assembly.assemble() }))
         }
         _ => Err(BoundedError::PlanMismatch.into()),
     }
@@ -238,11 +287,14 @@ pub fn build<T: Payload<A>, A: Allocator>(
 /// leaves the state `INITIAL`.
 pub fn reclaim<T: Payload<A>, A: Allocator>(
     mut slot: Slot<'_, T, State<T::Untagged, A::Permit>>,
-    a: &mut A,
+    a: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
         STEP.admit(a)?;
+        // The metadata's acquisition, if pending, had its credit settled at
+        // the operation's cleanup entry: the ticket is forgotten.
+        state.ticket = None;
         return Ok(Reclaimed::Done);
     };
     let meta = installed.get();
@@ -251,18 +303,23 @@ pub fn reclaim<T: Payload<A>, A: Allocator>(
             STEP.admit(a)?;
             meta.phase = Phase::Release;
         }
-        Phase::Build | Phase::Complete => {
+        Phase::Build | Phase::Complete | Phase::Reclaim => {
             // SAFETY: the payload state tracks all partial initialization of
             // the payload at this place.
             let payload = unsafe { Slot::new(place, &mut meta.child) };
-            if T::reclaim_payload(payload, a)? == Reclaimed::Done {
-                meta.phase = Phase::Release;
-            }
+            // A refused unit returned above, the phase unchanged; one the
+            // payload completed moves the value into cleanup, so no build
+            // reaches the payload again.
+            meta.phase = match T::reclaim_payload(payload, a)? {
+                Reclaimed::Done => Phase::Release,
+                _ => Phase::Reclaim,
+            };
         }
         Phase::Release => {
             // SAFETY: the payload owns no resources now. The metadata's
             // release was paid for by its installation.
             unsafe { stable::uninstall(&mut state.meta) };
+            state.ticket = None;
             return Ok(Reclaimed::Done);
         }
     }
@@ -275,20 +332,40 @@ pub fn reclaim<T: Payload<A>, A: Allocator>(
 /// one.
 pub fn remaining<T: Payload<A>, A: Allocator>(
     mut slot: PeekSlot<'_, T, State<T::Untagged, A::Permit>>,
-) -> u64 {
+) -> Option<u64> {
     let (place, state) = slot.parts();
     let Some(installed) = state.meta.as_mut() else {
-        return 1;
+        return Some(1);
     };
     let meta = installed.get();
     match meta.phase {
-        Phase::Inspect => 2,
-        Phase::Build | Phase::Complete => {
+        Phase::Inspect => Some(2),
+        Phase::Build | Phase::Complete | Phase::Reclaim => {
             // SAFETY: the payload state tracks the payload at `place`.
-            T::remaining_payload(unsafe { Slot::new(place, &mut meta.child) }).saturating_add(1)
+            T::remaining_payload(unsafe { Slot::new(place, &mut meta.child) })?.checked_add(1)
         }
-        Phase::Release => 1,
+        Phase::Release => Some(1),
     }
+}
+
+/// The permits the tagged value in `slot` owns, reported inside the caller's
+/// open group: its metadata block's, then its untagged payload's while the
+/// payload is live ([`Payload::observe_payload`]); none without metadata.
+pub fn observe_permits<T: Payload<A>, A: Allocator>(
+    mut slot: PeekSlot<'_, T, State<T::Untagged, A::Permit>>,
+    sink: &mut dyn CustodySink<A::Permit>,
+) -> PermitsObserved {
+    let (place, state) = slot.parts();
+    let Some(installed) = state.meta.as_mut() else {
+        return PermitsObserved::Complete;
+    };
+    sink.permit(installed.permit(), None);
+    let meta = installed.get();
+    if !matches!(meta.phase, Phase::Build | Phase::Complete | Phase::Reclaim) {
+        return PermitsObserved::Complete;
+    }
+    // SAFETY: the payload state tracks the payload at `place`.
+    T::observe_payload(unsafe { Slot::new(place, &mut meta.child) }, sink)
 }
 
 #[cfg(test)]

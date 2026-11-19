@@ -78,6 +78,19 @@ pub enum Error {
     #[error("a CBOR string was not encoded in Unicode Canonical Normalization Form C")]
     NonCanonicalString,
 
+    /// A stabilized text ([`crate::StabilizedText`]) holds a code point the
+    /// pinned Unicode version does not assign. The parameter is the code
+    /// point.
+    ///
+    /// dCBOR itself requires only NFC (Section 2.5 of the dCBOR
+    /// specification); a stabilized text additionally refuses code points
+    /// unassigned in the Unicode version whose data this crate pins
+    /// ([`crate::UNICODE_VERSION`]), whose normalization a later version
+    /// could change (UAX #15, section 12, normalization process for
+    /// stabilized strings).
+    #[error("code point U+{0:04X} is not assigned in the pinned Unicode version")]
+    UnassignedCodePoint(u32),
+
     /// The decoded CBOR item didn't consume all input data.
     /// The parameter contains the number of unused bytes.
     ///
@@ -85,6 +98,18 @@ pub enum Error {
     /// but the input contains additional data after a valid CBOR item.
     #[error("the decoded CBOR had {0} extra bytes at the end")]
     UnusedData(usize),
+
+    /// The encoded CBOR nests deeper than the symbolic profile admits,
+    /// [`crate::bounded::SYMBOLIC_DEPTH`] frames: the root and each array
+    /// element, map key, map value and tagged item one frame deeper than its
+    /// parent. Refused before the frame past the limit is read, so decoding
+    /// never recurses deeper than the profile, whatever the input. A
+    /// symbolic value built deeper can be serialized by
+    /// [`crate::CBOR::to_cbor_data`], which applies no profile, but is
+    /// refused by both the bounded encoder
+    /// ([`crate::bounded::BoundedError::DepthLimit`]) and this decoder.
+    #[error("the CBOR value nests deeper than the symbolic profile allows")]
+    DepthLimit,
 
     /// The keys in a decoded CBOR map were not in canonical lexicographic order
     /// of their encoding.
@@ -95,12 +120,20 @@ pub enum Error {
     #[error("the decoded CBOR map has keys that are not in canonical order")]
     MisorderedMapKey,
 
-    /// A decoded CBOR map contains duplicate keys, which is invalid.
+    /// A CBOR map has a duplicate key, decoded or being built, which is
+    /// invalid.
     ///
-    /// Per Section 2.2 of the dCBOR specification, CBOR maps must not contain
-    /// duplicate keys, and decoders must reject encoded maps with duplicate
-    /// keys.
-    #[error("the decoded CBOR map has a duplicate key")]
+    /// Per Sections 2.4 and 2.5 of the dCBOR specification, CBOR maps must
+    /// not contain duplicate keys: decoders reject encoded maps with
+    /// duplicate keys, and keys are compared after numeric reduction, so a
+    /// map built with keys `10` and `10.0`, or `-0.0` and `0`, is refused
+    /// here rather than silently keeping one entry. A set's elements are its
+    /// keys: a set built with two elements of one canonical encoding is
+    /// refused the same way. Decoding into a host map or hash set refuses
+    /// it too when two distinct CBOR keys or elements convert to one
+    /// destination value (a key type equal under a coarser rule than
+    /// dCBOR's), rather than one silently replacing or absorbing the other.
+    #[error("the CBOR map has a duplicate key")]
     DuplicateMapKey,
 
     /// A requested key was not found in a CBOR map during data extraction.
@@ -130,6 +163,12 @@ pub enum Error {
     /// tag found.
     #[error("expected CBOR tag {0}, but got {1}")]
     WrongTag(Tag, Tag),
+
+    /// A tagged encoding was asked of a type whose `CBORTagged::cbor_tags`
+    /// lists no tag: there is no preferred tag to encode with
+    /// ([`crate::CBORTaggedEncodable::tagged_cbor`]).
+    #[error("the type declares no CBOR tag to encode with")]
+    NoTag,
 
     /// A tag registered in a [`crate::TagsStore`] has no name: a store maps
     /// tag values and names to each other, so every tag it registers is
@@ -165,6 +204,12 @@ pub enum Error {
     #[error("invalid UTF‑8 string: {0}")]
     InvalidUtf8(#[from] Utf8Error),
 
+    /// A hexadecimal string that is not well formed: a character that is not
+    /// a hex digit, or an odd number of digits. The parameter is the
+    /// decoder's account of where.
+    #[error("invalid hexadecimal string: {0}")]
+    InvalidHex(hex::FromHexError),
+
     /// Invalid ISO 8601 date format.
     #[error("invalid ISO 8601 date string: {0}")]
     InvalidDate(String),
@@ -191,6 +236,16 @@ impl From<String> for Error {
     /// Converts a `String` into a `CBORError::Custom` variant.
     fn from(error: String) -> Self {
         Error::msg(error)
+    }
+}
+
+/// A conversion that cannot fail fails as no error: a decoder generic over
+/// its elements' `TryFrom<CBOR>` (a host map's, a sequence's) then takes
+/// `CBOR` itself, whose reflexive conversion's error is `Infallible`, with
+/// no separate implementation.
+impl From<core::convert::Infallible> for Error {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
     }
 }
 

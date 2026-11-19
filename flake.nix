@@ -11,6 +11,15 @@
       url = "github:usrbinkat/rust/feat/bounded-collection-access";
       flake = false;
     };
+    # Kani, the model checker the proof harnesses run under (`cargo kani`,
+    # tests/gate/src/proofs.rs): the flake of model-checking/kani#5098, open
+    # upstream, pinned by revision. Its `kani` is the published release bundle
+    # fetched by hash, linked to its own rust-overlay toolchain.
+    kani = {
+      url = "github:lalvesl/kani/c0eb2af3ac4279ef51512d9a16a2d1b0d78c7186";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -18,6 +27,7 @@
       nixpkgs,
       rust-overlay,
       rust-fork,
+      kani,
       ...
     }:
     let
@@ -131,8 +141,11 @@
           llvmTools = "${toolchain}/lib/rustlib/${target}/bin";
           cargoLlvmCov =
             (pkgs.cargo-llvm-cov.override { rustPlatform = nightlyRustPlatform; }).overrideAttrs
-              (old: {
-                env = pkgs.lib.recursiveUpdate old.env {
+              (_old: {
+                # Replace the package's LLVM environment without evaluating
+                # its rustc.llvmPackages lookup: rust-overlay supplies these
+                # tools as a sysroot component instead of that passthru.
+                env = {
                   LLVM_COV = "${llvmTools}/llvm-cov";
                   LLVM_PROFDATA = "${llvmTools}/llvm-profdata";
                 };
@@ -164,6 +177,20 @@
                 exit 2
                 ;;
               esac
+              # Cargo looks up an external subcommand (cargo-clippy,
+              # cargo-miri, cargo-fmt) in its home's bin before PATH unless
+              # that directory is already on PATH (cargo's
+              # search_directories, rust-lang/cargo#11020); a rustup proxy
+              # there runs another toolchain's clippy against this shell's
+              # sysroot. Listed last, the toolchain's own come first. The
+              # home is cargo's: CARGO_HOME, relative to the working
+              # directory, else ~/.cargo.
+              home="''${CARGO_HOME:-$HOME/.cargo}"
+              case "$home" in
+              /*) ;;
+              *) home="$PWD/$home" ;;
+              esac
+              export PATH="$PATH:$home/bin"
               if [ "''${1:-}" = miri ]; then
                 shift
                 exec ${toolchainCargo} miri "$@"
@@ -179,12 +206,14 @@
             '';
           };
           # What maintaining the project runs besides the toolchain: the
+          # proof harnesses (Kani, on its own pinned toolchain), the
           # mutation campaign, the reach map's coverage (cargo-llvm-cov), the
           # Miri gate's per-test memory and duration (GNU time), the fuzz
           # campaign (fuzz/qualify.sh, fuzz/smoke.sh), and the check of the
           # gate scripts, which launch the gate tool (tests/gate), built by
           # the toolchain itself.
           maintenance = [
+            kani.packages.${system}.kani
             cargoMutants
             cargoLlvmCov
             pkgs.cargo-fuzz

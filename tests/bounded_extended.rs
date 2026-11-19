@@ -4,7 +4,7 @@
 #[cfg(feature = "custom-std-collections")]
 use dcbor::HashMap;
 use dcbor::{
-    CBOR, CBORCase, Date,
+    CBOR, CBORCase, CBOREncodable, Date,
     bounded::{
         decode::{DecodeError, Kind, decode},
         encoding::Shape,
@@ -25,7 +25,7 @@ fn policy() -> Limits {
 fn literal<T: Schema + ?Sized>(value: &T, expected: &[u8]) {
     let source: &dyn Schema = &value;
     let shape = Shape::of(source, &mut Limits::unlimited()).expect("the source is walkable");
-    let retained = encode_bound::<Reservation, ()>(shape)
+    let retained = encode_bound::<Reservation, Family, ()>(shape)
         .expect("the bound fits in u64")
         .retained;
     let mut limits = policy();
@@ -113,8 +113,8 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     literal(&map, &expected);
     #[cfg(any(feature = "hashbrown", feature = "custom-std-collections"))]
     literal(&HashMap::from([("b", 2u64), ("aa", 1)]), &expected);
-    literal(&dcbor::Map::from(map.clone()), &expected);
-    literal(&CBOR::from(map), &expected);
+    literal(&dcbor::Map::try_from_pairs(map.clone()).unwrap(), &expected);
+    literal(&map.encode_cbor().unwrap(), &expected);
     let collision = BTreeMap::from([("\u{e9}", 1u8), ("e\u{301}", 2)]);
     let mut limits = policy();
     assert!(matches!(
@@ -125,7 +125,7 @@ fn maps_sort_encoded_keys_and_refuse_canonical_collisions() {
     // Exercise both heap-building and extraction on multiple map sizes.
     for n in 0..80 {
         let map: BTreeMap<_, _> = (0..n).map(|k| (format!("key-{k}"), k)).collect();
-        literal(&map, &CBOR::from(map.clone()).to_cbor_data());
+        literal(&map, &map.encode_cbor_data().unwrap());
     }
 }
 
@@ -175,9 +175,17 @@ fn sparse_hash_map_iteration_is_admitted() {
         "an empty map ends at its head"
     );
     let mut limits = Limits::unlimited();
-    let mut cursor = encoding::buckets::BucketCursor::new();
+    let owner = limits.owner().expect("an ordinary owner");
+    let (mut position, mut window, mut acquisition) =
+        (encoding::buckets::BucketPosition::new(), None, None);
+    let mut cursor =
+        encoding::buckets::BucketCursor::new(&mut position, &mut window, &mut acquisition);
     assert!(matches!(
-        cursor.step(&empty as &dyn encoding::buckets::Buckets, &mut limits),
+        cursor.step(
+            &empty as &dyn encoding::buckets::Buckets,
+            &owner,
+            &mut limits
+        ),
         Ok(encoding::buckets::BucketStep::Complete)
     ));
     assert_eq!(

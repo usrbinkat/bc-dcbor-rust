@@ -102,6 +102,19 @@ fn vector_children_survive_every_admission_physical_failure_and_stop() {
     );
 }
 
+/// The empty vector through the whole pipeline (parse, transfer,
+/// construction, cleanup), across every admission, physical failure and
+/// stop: a sequence with no child to construct.
+#[test]
+fn an_empty_vector_survives_every_admission_physical_failure_and_stop() {
+    pipeline::<Vec<String>>(
+        "empty vector",
+        &[0x80],
+        Expected::Complete,
+        classes::reduced::<Vec<String>>(),
+    );
+}
+
 /// The claims the sequences' stop classes rest on, each checked on every
 /// state its construction reaches, from nothing built to complete, each
 /// cancelled there and cleaned up: every complete scalar, text and tagged
@@ -126,14 +139,13 @@ fn sequences_and_their_elements_declare_sound_reductions() {
 #[should_panic(expected = "is not of its declared complete class")]
 fn a_planted_complete_class_is_rejected() {
     use dcbor::bounded::decode::construction::Reduction;
-    use dcbor::bounded::decode::construction::in_place::BufferClass;
+    use dcbor::bounded::decode::construction::in_place::{BufferClass, Session, StageClass};
+    type Root = Session<<String as dcbor::bounded::decode::construction::Reclaim<Limits>>::State>;
     dcbor_test_support::complete_class::<String, _>(
         "a text under a planted complete class",
         &[0x63, b'q', 0xcc, 0x81],
-        |observation| {
-            <<String as dcbor::bounded::decode::construction::Reclaim<Limits>>::State as Reduction>::class(observation)
-        },
-        BufferClass::Written { payload: false },
+        <Root as Reduction>::class,
+        (StageClass::Bound, BufferClass::Written { payload: false }),
     );
 }
 
@@ -145,27 +157,31 @@ fn a_planted_complete_class_is_rejected() {
 #[should_panic(expected = "the class merges states of different custody")]
 fn a_sequence_class_dropping_its_committed_count_is_rejected() {
     use dcbor::bounded::decode::construction::Reduction;
-    use dcbor::bounded::decode::construction::in_place::SequenceClass;
+    use dcbor::bounded::decode::construction::in_place::{SequenceClass, stage_class};
     type State = <Vec<String> as dcbor::bounded::decode::construction::Reclaim<Limits>>::State;
+    // The root session's class kept; the sequence's planted.
     dcbor_test_support::simulation::<Vec<String>, _>(
         "a vector under a planted class",
         &TWO_TEXTS,
-        |observation| match <State as Reduction>::class(observation) {
-            SequenceClass::Written {
-                payload, newest, ..
-            } => SequenceClass::Written {
-                payload,
-                committed: 0,
-                newest,
-            },
-            SequenceClass::Reclaim {
-                payload, newest, ..
-            } => SequenceClass::Reclaim {
-                payload,
-                committed: 0,
-                newest,
-            },
-            other => other,
+        |observation| {
+            let sequence = match <State as Reduction>::class(&observation.inner) {
+                SequenceClass::Written {
+                    payload, newest, ..
+                } => SequenceClass::Written {
+                    payload,
+                    committed: 0,
+                    newest,
+                },
+                SequenceClass::Reclaim {
+                    payload, newest, ..
+                } => SequenceClass::Reclaim {
+                    payload,
+                    committed: 0,
+                    newest,
+                },
+                other => other,
+            };
+            (stage_class(observation.stage), sequence)
         },
     );
 }
@@ -177,8 +193,8 @@ fn tree_nodes_and_partial_children_survive_every_pipeline_boundary() {
     // Canonical CBOR orders these text keys by encoded length. Rust orders
     // them lexicographically, so construction must reorder document indices.
     let mut map = dcbor::Map::new();
-    map.insert("z", "short");
-    map.insert("aa", "q\u{301}");
+    map.insert("z", "short").unwrap();
+    map.insert("aa", "q\u{301}").unwrap();
     pipeline::<BTreeMap<String, String>>(
         "reordered tree",
         &dcbor::CBOR::from(map).to_cbor_data(),
@@ -193,7 +209,7 @@ fn tree_nodes_and_partial_children_survive_every_pipeline_boundary() {
     );
     let mut internal = dcbor::Map::new();
     for n in 0..12u64 {
-        internal.insert(n, n);
+        internal.insert(n, n).unwrap();
     }
     pipeline::<BTreeMap<u64, u64>>(
         "internal node",
@@ -226,9 +242,9 @@ fn tree_key_comparison_resumes_across_multiple_byte_quanta() {
     // of canonical CBOR order. The third key exercises the prefix-length tie.
     let prefix = "a".repeat(65);
     let mut map = dcbor::Map::new();
-    map.insert(prefix.clone(), 0u64);
-    map.insert(format!("{prefix}z"), 1u64);
-    map.insert(format!("{prefix}aa"), 2u64);
+    map.insert(prefix.clone(), 0u64).unwrap();
+    map.insert(format!("{prefix}z"), 1u64).unwrap();
+    map.insert(format!("{prefix}aa"), 2u64).unwrap();
     pipeline::<BTreeMap<String, u64>>(
         "long shared prefixes",
         &dcbor::CBOR::from(map).to_cbor_data(),
@@ -242,11 +258,11 @@ fn tree_key_comparison_resumes_across_multiple_byte_quanta() {
 fn nested_tree_values_retain_custody_at_every_pipeline_boundary() {
     use std::collections::BTreeMap;
     let mut child = dcbor::Map::new();
-    child.insert("z", "last");
-    child.insert("aa", "first");
+    child.insert("z", "last").unwrap();
+    child.insert("aa", "first").unwrap();
     let mut map = dcbor::Map::new();
-    map.insert(0u64, child);
-    map.insert(1u64, dcbor::Map::new());
+    map.insert(0u64, child).unwrap();
+    map.insert(1u64, dcbor::Map::new()).unwrap();
     pipeline::<BTreeMap<u64, BTreeMap<String, String>>>(
         "nested trees",
         &dcbor::CBOR::from(map).to_cbor_data(),
@@ -283,6 +299,65 @@ fn stable_optional_acquisitions_survive_every_admission_physical_failure_and_sto
         Expected::Complete,
         classes::reduced::<StableOption<String, Limits>>(),
     );
+}
+
+/// A stabilized text through the whole pipeline, its stops classed by its
+/// declared reduction (its text's): U+1FA8A TROMBONE, assigned in the
+/// pinned version, decodes and encodes back; U+0378, which dCBOR accepts as
+/// text, is refused as invalid by the stabilized text's check and its
+/// decode cleaned up; a decomposed text is refused by dCBOR's own NFC check
+/// before the binding sees it. The reduction's claims are certified on the
+/// same inputs.
+#[test]
+fn a_stabilized_text_survives_every_boundary_and_refuses_what_it_does_not_assign() {
+    use dcbor::StabilizedText;
+    let assigned = dcbor::CBOR::from("\u{1fa8a}").to_cbor_data();
+    let unassigned = dcbor::CBOR::from("\u{378}").to_cbor_data();
+    let decomposed = [0x63, b'e', 0xcc, 0x81];
+    dcbor_test_support::uniform::<StabilizedText>("an assigned code point", &assigned);
+    dcbor_test_support::certified::<StabilizedText>("an unassigned code point", &unassigned);
+    for (name, wire, expected) in [
+        (
+            "an assigned code point",
+            assigned.as_slice(),
+            Expected::Complete,
+        ),
+        (
+            "an unassigned code point",
+            unassigned.as_slice(),
+            Expected::Invalid,
+        ),
+        (
+            "a decomposed text",
+            decomposed.as_slice(),
+            Expected::Invalid,
+        ),
+    ] {
+        pipeline::<StabilizedText>(name, wire, expected, classes::reduced::<StabilizedText>());
+    }
+}
+
+/// A minimal big integer through the whole pipeline, its stops classed by
+/// its declared reduction (its magnitude's): 2^64, a bignum, and 1, a plain
+/// integer, decode and encode back; `c2 41 01`, which dCBOR accepts as a
+/// tagged byte string, is refused as invalid and its decode cleaned up. The
+/// reduction's claims are certified on the same inputs.
+#[test]
+fn a_minimal_big_integer_survives_every_boundary_and_refuses_a_non_minimal_encoding() {
+    use dcbor::MinimalBigInt;
+    let big = [0xc2, 0x49, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
+    let plain = [0x01];
+    let tagged = [0xc2, 0x41, 0x01];
+    dcbor_test_support::uniform::<MinimalBigInt>("2^64", &big);
+    dcbor_test_support::uniform::<MinimalBigInt>("one", &plain);
+    dcbor_test_support::certified::<MinimalBigInt>("one as a bignum", &tagged);
+    for (name, wire, expected) in [
+        ("2^64", big.as_slice(), Expected::Complete),
+        ("one", plain.as_slice(), Expected::Complete),
+        ("one as a bignum", tagged.as_slice(), Expected::Invalid),
+    ] {
+        pipeline::<MinimalBigInt>(name, wire, expected, classes::reduced::<MinimalBigInt>());
+    }
 }
 
 #[test]

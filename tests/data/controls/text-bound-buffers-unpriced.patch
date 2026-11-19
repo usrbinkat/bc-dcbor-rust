@@ -1,0 +1,15 @@
+--- src/bounded/text.rs
++++ src/bounded/text.rs
+@@ -570,7 +570,11 @@
+             ordering: work(&[COUNTING.over(releases, parts)?, HANDED.times(parts)?])?,
+             // A value per emitted character, and the normal form's bytes.
+             emitting: WriteWork::new(mul(parts, EMITTED.values())?, emitted_bytes),
+-            buffers: accounted.checked_add(held).ok_or_else(overflow)?,
++            // Planted: the normalization's buffers are not priced.
++            buffers: {
++                let _ = (accounted, held);
++                ResourceBound::default()
++            },
+         })
+     }
+ }

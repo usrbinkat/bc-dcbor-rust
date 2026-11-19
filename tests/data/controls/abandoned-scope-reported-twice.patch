@@ -1,0 +1,14 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -733,9 +733,8 @@
+                 block.value.dispatch.assume_init(),
+             )
+         };
+-        if !sink.shared(permit) {
+-            return PermitsObserved::Complete;
+-        }
++        // Planted: every holder reports the shared custody, ungated.
++        let _ = permit;
+         sink.begin(dispatch.owner);
+         let custody = scope_custody(&self.scope, sink);
+         sink.end();

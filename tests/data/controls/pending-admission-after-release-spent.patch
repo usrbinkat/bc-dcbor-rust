@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -202,7 +202,6 @@
+             // grant paid for never happens.
+             drop(permit);
+             pending.settle_grant(ticket, id, Some(rule), by)?;
+-            finished(pending, holder, ticket)?;
+             Err(if failed {
+                 BoundedError::Allocation { bytes }
+             } else {

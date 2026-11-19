@@ -1,24 +1,24 @@
 use dcbor::{prelude::*, walk::WalkElement};
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a more complex structure with tagged values
     let mut person_map = Map::new();
-    person_map.insert("name", "Alice");
-    person_map.insert("age", 30);
+    person_map.insert("name", "Alice")?;
+    person_map.insert("age", 30)?;
 
     // Create a tagged UUID (tag 37 for UUID)
     let uuid_tagged = CBOR::from(CBORCase::Tagged(
         Tag::from(37u64),
         CBOR::from("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
     ));
-    person_map.insert("id", uuid_tagged);
+    person_map.insert("id", uuid_tagged)?;
 
     // Create a tagged timestamp (tag 0 for date/time string)
     let timestamp_tagged = CBOR::from(CBORCase::Tagged(
         Tag::from(0u64),
         CBOR::from("2023-10-27T14:30:15.123Z"),
     ));
-    person_map.insert("created", timestamp_tagged);
+    person_map.insert("created", timestamp_tagged)?;
 
     let cbor = CBOR::from(person_map);
 
@@ -67,4 +67,5 @@ fn main() {
     println!("✅ Less noise in the output");
     println!("✅ Content is still traversed recursively if it has nested structure");
     println!("✅ Consistent with map key-value pair handling");
+    Ok(())
 }

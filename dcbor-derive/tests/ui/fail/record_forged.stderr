@@ -1,0 +1,17 @@
+error[E0451]: fields `place`, `bound` and `marker` of struct `dcbor::bounded::decode::construction::in_place::Initialized` are private
+  --> tests/ui/fail/record_forged.rs:9:9
+   |
+ 8 |     Initialized {
+   |     ----------- in this type
+ 9 |         place: 0,
+   |         ^^^^^ private field
+10 |         bound: true,
+   |         ^^^^^ private field
+11 |         marker: PhantomData,
+   |         ^^^^^^ private field
+
+error: type `in_place::Brand<'_>` is private
+  --> tests/ui/fail/record_forged.rs:11:17
+   |
+11 |         marker: PhantomData,
+   |                 ^^^^^^^^^^^ private type

@@ -1,10 +1,10 @@
 use dcbor::{prelude::*, walk::WalkElement};
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a tagged value with nested content
     let mut inner_map = Map::new();
-    inner_map.insert("name", "Alice");
-    inner_map.insert("age", 30);
+    inner_map.insert("name", "Alice")?;
+    inner_map.insert("age", 30)?;
 
     let tagged_cbor = CBOR::from(CBORCase::Tagged(
         Tag::from(100u64),
@@ -54,4 +54,5 @@ fn main() {
         }
         (count + 1, false)
     });
+    Ok(())
 }

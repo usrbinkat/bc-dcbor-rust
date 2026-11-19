@@ -1,8 +1,8 @@
 use super::bindings::{decoder, text_encoder};
 use super::harness::*;
-use super::support::{self, contracted, drive_within, expect_progress};
+use super::support::{self, Fault, Finding, Retirement, pipeline::Unwitnessed, recorded_run};
 use dcbor::bounded::decode::{DecodeError, Kind, decode, decode_typed};
-use dcbor::bounded::{Allocator, BoundedError, WriteWork, encode};
+use dcbor::bounded::{BoundedError, WriteWork, encode};
 
 const ARRAY: &[u8] = &[
     0x83, 0x63, b'a', b'b', b'c', 0x63, b'1', b'2', b'3', 0x65, b'h', b'e', b'l', b'l', b'o',
@@ -10,104 +10,137 @@ const ARRAY: &[u8] = &[
 
 #[test]
 fn boundary_schedules_preserve_literal_child_order_and_exact_consumption() {
-    let mut m = meter();
-    let doc = decode(ARRAY, 8, &mut m).unwrap();
-    assert_eq!(doc.root().kind(), Kind::Array(3));
-    let children: Vec<_> = doc.root().children().map(|n| n.kind()).collect();
-    assert_eq!(
-        children,
-        [Kind::Text("abc"), Kind::Text("123"), Kind::Text("hello")]
+    synchronous_case(
+        |m| decode(ARRAY, 8, m),
+        |result, m| {
+            let doc = result.unwrap();
+            assert_eq!(doc.root().kind(), Kind::Array(3));
+            let children: Vec<_> = doc.root().children().map(|n| n.kind()).collect();
+            assert_eq!(
+                children,
+                [Kind::Text("abc"), Kind::Text("123"), Kind::Text("hello")]
+            );
+            assert_eq!(doc.root().encoded(), ARRAY);
+            assert!(m.live_bytes() > 0);
+        },
     );
-    assert_eq!(doc.root().encoded(), ARRAY);
-    assert!(m.live_bytes() > 0);
-    drop(doc);
-    assert_eq!(m.live_bytes(), 0);
     for end in 0..ARRAY.len() {
-        assert!(matches!(
-            decode(&ARRAY[..end], 8, &mut meter()),
-            Err(DecodeError::Invalid(_))
-        ));
+        synchronous_case(
+            |m| decode(&ARRAY[..end], 8, m),
+            |result, _| {
+                assert!(matches!(result, Err(DecodeError::Invalid(_))));
+            },
+        );
     }
     let mut trailing = ARRAY.to_vec();
     trailing.push(0);
-    assert!(matches!(
-        decode(&trailing, 8, &mut meter()),
-        Err(DecodeError::Invalid(_))
-    ));
+    synchronous_case(
+        |m| decode(&trailing, 8, m),
+        |result, _| {
+            assert!(matches!(result, Err(DecodeError::Invalid(_))));
+        },
+    );
 }
 
 #[test]
 fn every_actual_admission_refusal_is_observed_and_stops_execution() {
-    let mut baseline = meter();
-    drop(decode(ARRAY, 8, &mut baseline).unwrap());
+    let baseline = synchronous_case(
+        |m| decode(ARRAY, 8, m),
+        |result, m| {
+            assert_eq!(result.unwrap().root().encoded(), ARRAY);
+            m.calls()
+        },
+    );
     // Synchronous decode stops at the first refusal; identical allowance
     // makes the exact attempted prefix its contract, with no resumption.
-    support::synchronous_matrix("literal array decode", baseline.attempts(), |index| {
-        let call = &baseline.calls()[index];
-        let reason = match call {
+    support::synchronous_matrix("literal array decode", baseline.len(), |index| {
+        let reason = match baseline[index] {
             Call::Work { .. } => LimitRefusal::Work,
             Call::Allocate(_) => LimitRefusal::Storage,
         };
-        let mut m = meter();
-        support::refuse(&mut m, support::pipeline::Refusal::For(index, reason));
-        let result = decode(ARRAY, 8, &mut m);
-        assert!(
-            matches!(result, Err(DecodeError::Resource(BoundedError::Refused(r))) if r == reason)
-        );
-        assert_eq!(m.first_refusal(), Some((index, reason)));
-        assert_eq!(m.calls(), &baseline.calls()[..=index]);
-        drop(result);
-        assert_eq!(m.live_bytes(), 0);
-        m.reached()
+        synchronous_case(
+            |m| {
+                support::refuse(m, support::pipeline::Refusal::For(index, reason));
+                decode(ARRAY, 8, m)
+            },
+            |result, m| {
+                assert!(
+                    matches!(result, Err(DecodeError::Resource(BoundedError::Refused(r))) if r == reason)
+                );
+                assert_eq!(m.first_refusal(), Some((index, reason)));
+                assert_eq!(m.calls(), &baseline[..=index]);
+                m.reached()
+            },
+        )
     });
 }
 
 #[test]
 fn decoder_continuation_retains_completed_arena_on_work_refusal() {
-    let mut m = meter();
-    let pool = m.share();
-    let mut operation = decoder(ARRAY);
-    let mut reached = false;
-    for _ in 0..decode_turns(ARRAY.len()) {
-        if operation.position().completed_children == 1 {
-            reached = true;
-            break;
-        }
-        expect_progress(contracted(&mut m, &mut operation));
-    }
-    assert!(reached);
-    let position = operation.position();
-    let held = pool.live_bytes();
-    assert!(held > 0);
-    support::repeated_refusal(
-        "decoder retains first completed child",
-        &mut m,
-        position,
-        3,
-        |m| {
-            let result = contracted(m, &mut operation).map(|_| ());
-            (operation.position(), result)
-        },
-    );
-    assert_eq!(operation.position(), position);
-    assert_eq!(pool.live_bytes(), held);
-    let document = drive_within(&mut m, &mut operation, decode_turns(ARRAY.len()))
-        .expect("resumed decode failed");
-    assert_eq!(document.root().encoded(), ARRAY);
-    drop(operation);
-    drop(document);
-    assert_eq!(pool.live_bytes(), 0);
+    suite(|run, policy| {
+        run.holding(
+            decoder(ARRAY),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                let reached = operation.controlled(
+                    policy,
+                    decode_turns(ARRAY.len()),
+                    Retirement::Released,
+                    true,
+                    |_, operation, _| operation.position().completed_children == 1,
+                    |_| (),
+                )?;
+                assert!(reached.is_none(), "the first child never completed");
+                let position = operation.value().position();
+                let held = operation.with_policy(policy, |_, m| m.live_bytes());
+                assert!(held > 0);
+                operation.refused(policy, 3, Retirement::Released)?;
+                assert_eq!(operation.value().position(), position);
+                operation.with_policy(policy, |_, m| assert_eq!(m.live_bytes(), held));
+                operation.drive(
+                    policy,
+                    decode_turns(ARRAY.len()),
+                    Retirement::Released,
+                    |document| {
+                        assert_eq!(document.value().root().encoded(), ARRAY);
+                    },
+                )?;
+                Ok::<_, Finding>(())
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
 fn decoder_payload_operations_fit_three_value_sixty_four_byte_quantum() {
     let wire = text_wire(&"x".repeat(65536));
-    let mut m = meter();
-    let doc = drive_within(&mut m, &mut decoder(&wire), decode_turns(wire.len())).unwrap();
-    assert_eq!(doc.root().encoded(), wire);
-    m.assert_units(TURN);
-    drop(doc);
-    assert_eq!(m.live_bytes(), 0);
+    // A 64 KiB text decoded in units of a quantum: 131,121 observations and
+    // 2 permit records, measured.
+    suite_with(POOL, support::measured(131_121, 2), |run, policy| {
+        run.holding(
+            decoder(&wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                operation.drive(
+                    policy,
+                    decode_turns(wire.len()),
+                    Retirement::Released,
+                    |doc| {
+                        doc.with_policy(policy, |doc, m| {
+                            assert_eq!(doc.root().encoded(), wire);
+                            m.assert_units(TURN);
+                        });
+                    },
+                )
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
@@ -119,13 +152,16 @@ fn canonical_key_comparison_and_arena_growth_have_bounded_units() {
     wire.push(0);
     wire.extend(text_wire(&b));
     wire.push(1);
-    let mut m = meter();
-    let doc = drive_within(&mut m, &mut decoder(&wire), decode_turns(wire.len())).unwrap();
-    assert_eq!(doc.root().kind(), Kind::Map(2));
-    assert_eq!(doc.root().encoded(), wire);
-    m.assert_units(TURN);
-    drop(doc);
-    assert_eq!(m.live_bytes(), 0);
+    retained_case(
+        decoder(&wire),
+        decode_turns(wire.len()),
+        Fault::NONE,
+        |doc, m| {
+            assert_eq!(doc.root().kind(), Kind::Map(2));
+            assert_eq!(doc.root().encoded(), wire);
+            m.assert_units(TURN);
+        },
+    );
 }
 
 #[test]
@@ -142,39 +178,50 @@ fn text_semantics_use_literal_composition_reordering_and_hangul_oracles() {
         ("\u{1111}\u{1171}\u{11b6}", &[0x63, 0xed, 0x93, 0x9b]),
     ];
     for &(source, expected) in fixtures {
-        let mut baseline = meter();
-        let encoded = encode(&source, &mut baseline).unwrap();
-        assert_eq!(encoded.as_ref(), expected);
+        let baseline = synchronous_case(
+            |m| encode(&source, m),
+            |result, m| {
+                let encoded = result.unwrap();
+                assert_eq!(encoded.as_ref(), expected);
+                m.calls()
+            },
+        );
         let canonical = std::str::from_utf8(&expected[1..]).unwrap();
-        let mut m = meter();
-        let doc = decode(expected, 8, &mut m).unwrap();
-        assert_eq!(doc.root().kind(), Kind::Text(canonical));
-        drop(doc);
-        assert_eq!(m.live_bytes(), 0);
+        synchronous_case(
+            |m| decode(expected, 8, m),
+            |result, _| {
+                let doc = result.unwrap();
+                assert_eq!(doc.root().kind(), Kind::Text(canonical));
+            },
+        );
         if source != canonical {
-            assert!(decode(&text_wire(source), 8, &mut meter()).is_err());
+            let wire = text_wire(source);
+            synchronous_case(
+                |m| decode(&wire, 8, m),
+                |result, _| assert!(result.is_err()),
+            );
         }
         support::synchronous_matrix(
             &format!("literal text encode of {source:?}"),
-            baseline.attempts(),
+            baseline.len(),
             |index| {
-                let call = &baseline.calls()[index];
-                let reason = match call {
+                let reason = match baseline[index] {
                     Call::Work { .. } => LimitRefusal::Work,
                     Call::Allocate(_) => LimitRefusal::Storage,
                 };
-                let mut m = meter();
-                support::refuse(&mut m, support::pipeline::Refusal::For(index, reason));
-                assert!(
-                    matches!(encode(&source, &mut m), Err(BoundedError::Refused(r)) if r == reason)
-                );
-                assert_eq!(m.first_refusal(), Some((index, reason)));
-                assert_eq!(m.live_bytes(), 0);
-                m.reached()
+                synchronous_case(
+                    |m| {
+                        support::refuse(m, support::pipeline::Refusal::For(index, reason));
+                        encode(&source, m)
+                    },
+                    |result, m| {
+                        assert!(matches!(result, Err(BoundedError::Refused(r)) if r == reason));
+                        assert_eq!(m.first_refusal(), Some((index, reason)));
+                        m.reached()
+                    },
+                )
             },
         );
-        drop(encoded);
-        assert_eq!(baseline.live_bytes(), 0);
     }
 }
 
@@ -182,101 +229,169 @@ fn text_semantics_use_literal_composition_reordering_and_hangul_oracles() {
 fn long_normalization_has_bounded_preparation_and_emission_units() {
     let input = format!("q{}", "\u{301}\u{316}".repeat(4096));
     let normal = format!("q{}{}", "\u{316}".repeat(4096), "\u{301}".repeat(4096));
-    let mut m = meter();
-    let output = drive_within(&mut m, &mut text_encoder(&input), normalize_turns(&input)).unwrap();
-    assert_eq!(output.as_ref(), text_wire(&normal));
-    m.assert_units(TURN);
-    drop(output);
-    assert_eq!(m.live_bytes(), 0);
+    // A combining run of 8,193 scalars normalized and encoded: 279,242
+    // observations and 53 permit records, measured.
+    let recording = support::measured(279_242, 53);
+    suite_with(POOL, recording, |run, policy| {
+        run.holding(
+            text_encoder(&input),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                operation.drive(
+                    policy,
+                    normalize_turns(&input),
+                    Retirement::Released,
+                    |output| {
+                        output.with_policy(policy, |output, m| {
+                            assert_eq!(output.as_ref(), text_wire(&normal));
+                            m.assert_units(TURN);
+                        });
+                    },
+                )
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
 fn typed_output_owns_capacity_after_parser_scratch_release() {
     let text = "\u{1f600}\u{e9}".repeat(1024);
     let wire = text_wire(&text);
-    let mut m = meter();
-    let value = decode_typed::<String, _>(&wire, 8, &mut m).unwrap();
-    assert_eq!(value.value(), &text);
-    assert!(m.live_bytes() >= text.len() as u64);
-    assert!(m.peak_bytes() >= m.live_bytes());
-    let pool = m.share();
-    drop(m);
-    drop(wire);
-    assert_eq!(value.value(), &text);
-    assert!(pool.live_bytes() >= text.len() as u64);
-    drop(value);
-    assert_eq!(pool.live_bytes(), 0);
+    recorded_run(|run| {
+        let decoding = run.policy(POOL);
+        let value = run
+            .with_policy(decoding, |m| decode_typed::<String, _>(&wire, 8, m))
+            .map_err(failed("typed output decode"))?;
+        run.holding(value, Retirement::LastReference, &Unwitnessed, |value| {
+            value.with_policy(decoding, |value, m| {
+                assert_eq!(value.value(), &text);
+                assert!(m.live_bytes() >= text.len() as u64);
+                assert!(m.peak_bytes() >= m.live_bytes());
+            });
+            // The decoding policy takes no further part and the input is gone:
+            // the value alone holds what remains.
+            drop(wire);
+            assert_eq!(value.value().value(), &text);
+            assert!(value.with_policy(decoding, |_, m| m.live_bytes()) >= text.len() as u64);
+        });
+        assert_eq!(run.with_policy(decoding, |m| m.live_bytes()), 0);
+        Ok(())
+    });
 }
 
 #[test]
 fn typed_field_copies_have_bounded_units() {
     use dcbor::bounded::decode::Options;
-    use dcbor::bounded::decode::construction::TypedDecoder;
+    use dcbor::bounded::decode::construction::DecodeOwner;
     let text = "\u{1f600}\u{e9}".repeat(1024);
     let wire = text_wire(&text);
-    let mut m = meter();
-    let (mut owner, input) = support::open(&mut m, &wire);
-    let mut decoder = TypedDecoder::<_, String, Limits>::new(input, Options::normalizing(8));
-    let value = drive_within(&mut m, &mut decoder, typed_turns::<String>(wire.len()))
-        .expect("bounded field copy failed");
-    support::exhausted(&mut m, &mut decoder);
-    assert_eq!(value.value(), &text);
-    m.assert_units(TURN);
-    drop(value);
-    drop(decoder);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    suite(|run, policy| {
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner
+                    .decoded::<String, _>(policy, &wire, Options::normalizing(8), |value| {
+                        value.with_policy(policy, |value, m| {
+                            assert_eq!(value.value(), &text);
+                            m.assert_units(TURN);
+                        });
+                    })?
+                    .map_err(failed("typed field decode"))?;
+                owner.drain(policy)
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]
 fn shared_pool_thousand_real_decodes_restore_exact_capacity() {
-    let capacity = 32 * 1024 * 1024;
-    let mut pool = meter_with(capacity);
-    let barrier = std::sync::Barrier::new(8);
-    std::thread::scope(|scope| {
-        for _ in 0..8 {
-            let shared = pool.share();
-            let barrier = &barrier;
-            scope.spawn(move || {
-                barrier.wait();
-                for _ in 0..125 {
-                    let mut m = shared.share();
-                    let result = decode_typed::<Vec<String>, _>(ARRAY, 8, &mut m).unwrap();
-                    assert_eq!(result.value(), &["abc", "123", "hello"]);
-                    drop(result);
+    use support::rigor::{Rigor, rigor};
+    // The pool: four elements of eight mebibytes of one tenant.
+    const EIGHTH: usize = 8 * 1024 * 1024;
+    // Eight workers start together at a barrier, each holding every value it
+    // decodes until all have joined. Two decodes per worker reach both of a
+    // worker's classes, its first decode and one after a value it holds; the
+    // exhaustive layer's 125 per worker, a thousand decodes, stress the same
+    // classes. A thousand decodes of a three-text array, then the pool
+    // occupied whole: 466,017 observations and 21,001 permit records,
+    // measured; sixteen fit the default recording.
+    let (per_worker, recording) = match rigor() {
+        Rigor::Fast => (2, support::CAPACITY),
+        Rigor::Exhaustive => (125, support::measured(466_017, 21_001)),
+    };
+    suite_with(4 * EIGHTH as u64, recording, |run, policy| {
+        let barrier = std::sync::Barrier::new(8);
+        let workers: Vec<_> = (0..8).map(|_| run.shared_policy(policy)).collect();
+        run.workers(
+            &workers,
+            per_worker,
+            Retirement::LastReference,
+            |_| support::CustodyBatch::with_capacity(per_worker),
+            |_, fixture, held, m| {
+                if fixture == 0 {
+                    barrier.wait();
                 }
-            });
-        }
+                let result = decode_typed::<Vec<String>, _>(ARRAY, 8, m)
+                    .map_err(failed("worker typed decode"))?;
+                let value = held.retain(result);
+                assert_eq!(value.value(), &["abc", "123", "hello"]);
+                Ok(())
+            },
+        )?;
+        run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
+        let owner = run.with_policy(policy, |pool| pool.owner().expect("a recorded owner"));
+        let all = run.with_policy(policy, |pool| occupy::<EIGHTH>(pool, &owner));
+        run.holding(all, Retirement::Released, &Unwitnessed, |all| {
+            all.with_policy(policy, |_, pool| refuses_more(pool, &owner));
+        });
+        drop(owner);
+        run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
+        Ok(())
     });
-    assert_eq!(pool.live_bytes(), 0);
-    let all = pool.allocate(capacity).unwrap();
-    assert!(pool.allocate(1).is_err());
-    drop(all);
-    assert_eq!(pool.live_bytes(), 0);
 }
 
 #[test]
 fn real_capacity_exhaustion_is_distinct_from_work_and_invalid_input() {
-    let mut pool = meter_with(4096);
-    let held = pool.allocate(4096).unwrap();
-    let mut m = pool.share();
-    assert!(matches!(
-        decode(ARRAY, 8, &mut m),
-        Err(DecodeError::Resource(BoundedError::Refused(
-            LimitRefusal::Storage
-        )))
-    ));
-    assert_eq!(pool.live_bytes(), 4096);
-    drop(held);
-    assert_eq!(pool.live_bytes(), 0);
-    let mut m = pool.share();
-    m.set_limit(WriteWork::new(0, u64::MAX));
-    assert!(matches!(
-        decode(ARRAY, 8, &mut m),
-        Err(DecodeError::Resource(BoundedError::Refused(
-            LimitRefusal::Work
-        )))
-    ));
-    assert_eq!(m.used().values, 0);
-    assert_eq!(pool.live_bytes(), 0);
+    suite_with(4096, support::CAPACITY, |run, policy| {
+        // Another tenant holding the pool's whole 4096 bytes.
+        let owner = run.with_policy(policy, |pool| pool.owner().expect("a recorded owner"));
+        let held = run.with_policy(policy, |pool| occupy::<1024>(pool, &owner));
+        let decoding = run.shared_policy(policy);
+        run.holding(held, Retirement::Released, &Unwitnessed, |held| {
+            let result = held.with_policy(decoding, |_, m| decode(ARRAY, 8, m));
+            match result {
+                Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Storage))) => {}
+                Ok(document) => held.holding(document, Retirement::Released, |_| {
+                    panic!("a full pool published a document");
+                }),
+                Err(error) => panic!("a full pool returned {error:?}"),
+            }
+            held.with_policy(policy, |_, pool| assert_eq!(pool.live_bytes(), 4096));
+        });
+        drop(owner);
+        run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
+        let decoding = run.shared_policy(policy);
+        let result = run.with_policy(decoding, |m| {
+            m.set_limit(WriteWork::new(0, u64::MAX));
+            decode(ARRAY, 8, m)
+        });
+        match result {
+            Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Work))) => {}
+            Ok(document) => run.holding(document, Retirement::Released, &Unwitnessed, |_| {
+                panic!("zero work allowance published a document");
+            }),
+            Err(error) => panic!("zero work allowance returned {error:?}"),
+        }
+        run.with_policy(decoding, |m| assert_eq!(m.used().values, 0));
+        run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
+        Ok(())
+    });
 }

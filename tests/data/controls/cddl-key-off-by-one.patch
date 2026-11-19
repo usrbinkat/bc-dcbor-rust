@@ -1,0 +1,12 @@
+--- dcbor-derive/src/cddl.rs
++++ dcbor-derive/src/cddl.rs
+@@ -18,7 +18,8 @@
+         quote!(<#ty as dcbor::cddl::Cddl>::cddl(rules))
+     };
+     quote! {
+-        dcbor::cddl::Member { key: #key, optional: #optional, value: #value }
++        // Planted: every field's key rendered one past its own.
++        dcbor::cddl::Member { key: #key + 1, optional: #optional, value: #value }
+     }
+ }
+

@@ -1,9 +1,9 @@
 //! Before/after adapter for a hypothetical record publisher. The writer belongs
 //! to the application; the encoded bytes retain their permit during write_all.
-use dcbor::{CBOR, CBORBoundedEncodable, CBOREncodable, bounded::*};
+use dcbor::{CBORBoundedEncodable, CBOREncodable, bounded::*};
 use std::io::Write;
 
-#[derive(Clone, CBOREncodable, CBORBoundedEncodable)]
+#[derive(CBOREncodable, CBORBoundedEncodable)]
 struct Record {
     #[cbor(n = 0)]
     sequence: u64,
@@ -13,13 +13,18 @@ struct Record {
     note: Option<String>,
 }
 
-fn before(record: &Record, writer: &mut impl Write) -> std::io::Result<()> {
-    let bytes = CBOR::from(record.clone()).to_cbor_data();
-    writer.write_all(&bytes)
+/// The symbolic encoding: unbounded, its refusal (a field that does not
+/// encode) returned before the writer sees a byte.
+fn before(record: &Record, writer: &mut impl Write) -> Result<(), PublishError> {
+    let bytes = record.encode_cbor_data().map_err(PublishError::Symbolic)?;
+    writer.write_all(&bytes).map_err(PublishError::Transport)
 }
 
 #[derive(Debug)]
 enum PublishError {
+    /// This record's fields always encode, so no path reads the error; it is
+    /// reported through `Debug` should one be added that does not.
+    Symbolic(#[expect(dead_code, reason = "reported through Debug only")] dcbor::Error),
     Encoding(BoundedError<LimitRefusal>),
     Transport(std::io::Error),
 }

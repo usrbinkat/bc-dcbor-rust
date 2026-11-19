@@ -10,12 +10,45 @@
 //! recording leaves the previous record intact.
 //!
 //! Each consumer owns its rows' columns and their parse; this crate owns
-//! the header, the configuration it names and the publication, defined
-//! once. It is a leaf: it depends on no crate of the workspace, so neither
-//! test instrumentation nor gate tooling reaches a build through it.
+//! the header, the configuration it names, the publication, the vocabulary
+//! of evidence classes rows carry ([`Evidence`]) and the verification layer
+//! a run carries ([`Rigor`]), each defined once. It is a leaf: it depends on
+//! no crate of the workspace, so neither test instrumentation nor gate
+//! tooling reaches a build through it, and the library's own unit tests and
+//! the test support crate read the layer through the same definition.
 
 use std::io::Write;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The variable naming the verification layer a run carries.
+pub const RIGOR: &str = "DCBOR_RIGOR";
+
+/// The verification layer a run carries. Both layers apply the same
+/// oracles; they differ in what they select, and each test states the claim
+/// of each (`tests/support/rigor.rs` for the matrices' schedules; a test
+/// over a numeric domain for its patterns). `fast` is the default every
+/// developer run carries; the gates run `exhaustive`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rigor {
+    Fast,
+    Exhaustive,
+}
+
+/// The layer this run carries: [`RIGOR`] read once, `fast` when unset; any
+/// other value is an error naming the two.
+pub fn rigor() -> Rigor {
+    static LAYER: OnceLock<Rigor> = OnceLock::new();
+    *LAYER.get_or_init(|| match std::env::var(RIGOR) {
+        Err(std::env::VarError::NotPresent) => Rigor::Fast,
+        Ok(value) => match value.as_str() {
+            "fast" => Rigor::Fast,
+            "exhaustive" => Rigor::Exhaustive,
+            other => panic!("{RIGOR}={other:?}: the layers are fast and exhaustive"),
+        },
+        Err(error) => panic!("{RIGOR}: {error}"),
+    })
+}
 
 /// The variable the development shells export naming the configuration a
 /// run is under.
@@ -37,6 +70,68 @@ pub fn recording_configuration() -> String {
     configuration().unwrap_or_else(|| {
         panic!("recording requires {CONFIGURATION}, which the flake's shells export")
     })
+}
+
+/// What a recorded row establishes: the one vocabulary of evidence classes,
+/// kept apart from the tool that produced the row and the scope it covers.
+/// Every gate's results row (`tests/gate`, `rows`) and every tightness ratio
+/// (`src/bounded.rs`, `places`) carries one; each writer derives it from what
+/// its run was, by one definition per record, and each reader refuses a row
+/// claiming another class than its run supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Evidence {
+    /// Checked against the specification's own published data.
+    Normative,
+    /// Discharged by a proof tool over a stated domain. No proof runner
+    /// exists yet, so no writer derives this class and every row claiming it
+    /// is refused.
+    Proved,
+    /// A test run on its inputs passed, natively or under Miri's checks for
+    /// undefined behavior.
+    Checked,
+    /// Sampled: seeded schedules, or measured quantities.
+    Observed,
+    /// Computed from other evidence or measurement, not itself a check.
+    Derived,
+    /// Every interleaving of a model explored within a recorded bound.
+    Modeled,
+    /// The run never started.
+    Unverified,
+}
+
+impl Evidence {
+    pub const ALL: [Self; 7] = [
+        Self::Normative,
+        Self::Proved,
+        Self::Checked,
+        Self::Observed,
+        Self::Derived,
+        Self::Modeled,
+        Self::Unverified,
+    ];
+
+    /// The class's name, as records write it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normative => "normative",
+            Self::Proved => "proved",
+            Self::Checked => "checked",
+            Self::Observed => "observed",
+            Self::Derived => "derived",
+            Self::Modeled => "modeled",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.name() == text)
+    }
+}
+
+impl std::fmt::Display for Evidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// A record of `rows` under `configuration`: the header, then each row and
@@ -139,6 +234,16 @@ mod tests {
             "temporary evidence was not removed"
         );
         std::fs::remove_dir_all(&directory).expect("the temporary directory removed");
+    }
+
+    /// Every evidence class reads back its name; another name is none.
+    #[test]
+    fn every_evidence_class_reads_back_its_name() {
+        for class in Evidence::ALL {
+            assert_eq!(Evidence::parse(class.name()), Some(class));
+            assert_eq!(class.to_string(), class.name());
+        }
+        assert_eq!(Evidence::parse("verified"), None);
     }
 
     /// A file whose first line is not a configuration line is no record.

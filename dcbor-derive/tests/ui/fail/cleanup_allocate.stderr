@@ -1,0 +1,14 @@
+error[E0599]: the method `allocate` exists for mutable reference `&mut dcbor::bounded::decode::construction::reclamation::Cleanup<'_, Limits>`, but its trait bounds were not satisfied
+  --> tests/ui/fail/cleanup_allocate.rs:21:31
+   |
+21 |         let _permit = cleanup.allocate(8);
+   |                               ^^^^^^^^ method cannot be called due to unsatisfied trait bounds
+   |
+  ::: $WORKSPACE/src/bounded/decode/construction/reclamation.rs
+   |
+   | pub struct Cleanup<'a, A: Allocator> {
+   | ------------------------------------ doesn't satisfy `_: Allocator`
+   |
+   = note: the following trait bounds were not satisfied:
+           `dcbor::bounded::decode::construction::reclamation::Cleanup<'_, Limits>: dcbor::bounded::Allocator`
+           which is required by `&mut dcbor::bounded::decode::construction::reclamation::Cleanup<'_, Limits>: dcbor::bounded::Allocator`

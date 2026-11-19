@@ -1,7 +1,7 @@
 import_stdlib!();
 mod bounded;
 
-use crate::{CBOR, Error};
+use crate::{CBOR, CBORCase, Error};
 
 /// Represents a CBOR byte string (major type 2).
 ///
@@ -49,31 +49,27 @@ use crate::{CBOR, Error};
 pub struct ByteString(Vec<u8>);
 
 impl ByteString {
-    /// Creates a new `ByteString` from any type that can be converted into a
-    /// byte vector.
-    ///
-    /// This constructor accepts any type that implements `Into<Vec<u8>>`, which
-    /// includes common types like `Vec<u8>`, arrays `[u8; N]`, slices
-    /// `&[u8]`, and string slices `&str` (via the `From<&str>`
-    /// implementation).
+    /// Creates a new `ByteString` holding a copy of `data`: any type that
+    /// can be referenced as a byte slice (`AsRef<[u8]>`): a vector, an array,
+    /// a slice. The bytes are always copied, an owned vector's included; to
+    /// move an owned `Vec<u8>` in without copying, use
+    /// `ByteString::from(vec)` (`From<Vec<u8>>`).
     ///
     /// # Examples
     ///
     /// ```
     /// use dcbor::prelude::*;
     ///
-    /// // From a vector
-    /// let bytes1 = ByteString::new(vec![1, 2, 3, 4]);
+    /// // From a byte array or slice: copied.
+    /// let bytes1 = ByteString::new([5, 6, 7, 8]);
+    /// let bytes2 = ByteString::new(&[9, 10, 11, 12][..]);
     ///
-    /// // From a byte array
-    /// let bytes2 = ByteString::new([5, 6, 7, 8]);
-    ///
-    /// // From a byte slice
-    /// let bytes3 = ByteString::new(&[9, 10, 11, 12][..]);
-    ///
-    /// // From a hex string (using an implementation elsewhere)
-    /// let hex = "deadbeef";
-    /// let bytes4 = ByteString::new(hex::decode(hex).unwrap());
+    /// // An owned vector moved in, not copied.
+    /// let owned = vec![1, 2, 3, 4];
+    /// let address = owned.as_ptr();
+    /// let bytes3 = ByteString::from(owned);
+    /// assert_eq!(bytes3.data().as_ptr(), address);
+    /// # let _ = (bytes1, bytes2);
     /// ```
     pub fn new(data: impl AsRef<[u8]>) -> Self {
         Self(data.as_ref().to_vec())
@@ -352,9 +348,10 @@ impl From<&str> for ByteString {
 /// assert_eq!(cbor.to_cbor_data(), vec![0x44, 0x01, 0x02, 0x03, 0x04]);
 /// //           0x44: byte string (major type 2) of length 4
 /// ```
+/// The byte string moved into the value, its bytes never copied.
 impl From<ByteString> for CBOR {
     fn from(value: ByteString) -> Self {
-        CBOR::to_byte_string(value)
+        CBORCase::ByteString(value).into()
     }
 }
 

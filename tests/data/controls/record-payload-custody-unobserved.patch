@@ -1,0 +1,14 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -1568,7 +1568,10 @@
+         unsafe {
+             sink.begin(Some((*block.as_ptr()).value.owner.assume_init()));
+             sink.permit(block.as_ref().permit());
+-            let observed = T::observe_permits(destination::<T, A>(block).into_observe(), sink);
++            // Planted: a record's payload custody is not observed. Must fail
++            // several_handles_of_one_scope_released_in_one_step_are_all_performed,
++            // "the holder's custody does not report its three held records".
++            let observed = PermitsObserved::Complete;
+             sink.end();
+             observed
+         }

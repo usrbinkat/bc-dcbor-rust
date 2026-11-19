@@ -1,0 +1,12 @@
+--- src/float/reference.rs
++++ src/float/reference.rs
+@@ -215,7 +215,8 @@
+     let sign = ((x.to_bits() >> 63) as u16) << 15;
+     match decompose(x) {
+         Value::Nan => None,
+-        Value::Zero => Some(sign),
++        // Planted: the zeros, which binary16 holds, are not named.
++        Value::Zero => None,
+         Value::Infinite { negative } => Some(BINARY16.infinite(negative) as u16),
+         Value::Finite(value) => BINARY16.exact(value).map(|bits| bits as u16),
+     }

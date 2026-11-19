@@ -143,6 +143,11 @@ macro_rules! impl_encode_varint {
 
 impl_encode_varint!(u8, u16, u32, u64, usize);
 
+/// Kani harnesses of header minimality (register item 4): compiled only by
+/// `cargo kani`.
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

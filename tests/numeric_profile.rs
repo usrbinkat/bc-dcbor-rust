@@ -31,51 +31,13 @@ fn encoded(value: &(impl Schema + ?Sized)) -> Vec<u8> {
         .to_vec()
 }
 
-/// Draft-12 section 7.1: literals are the authority, not another serializer.
-/// Integers unrepresentable in f64 are tested separately as integers.
+/// Numeric vectors beyond the draft's Appendix A, whose two tables
+/// `tests/appendix_a.rs` checks from the draft's own text: each value in
+/// every source precision that holds it exactly. Integers unrepresentable in
+/// f64 are tested separately as integers.
 #[test]
-fn published_numeric_vectors_in_every_exact_source_precision() {
+fn numeric_vectors_beyond_appendix_a_in_every_exact_source_precision() {
     let fixtures: &[(f64, &str)] = &[
-        (0.0, "00"),
-        (1.0, "01"),
-        (23.0, "17"),
-        (24.0, "1818"),
-        (255.0, "18ff"),
-        (65535.0, "19ffff"),
-        (65536.0, "1a00010000"),
-        (4294967295.0, "1affffffff"),
-        (4294967296.0, "1b0000000100000000"),
-        (-1.0, "20"),
-        (-2.0, "21"),
-        (-127.0, "387e"),
-        (-128.0, "387f"),
-        (-32768.0, "397fff"),
-        (-2147483648.0, "3a7fffffff"),
-        (-9223372036854775808.0, "3b7fffffffffffffff"),
-        (1.5, "f93e00"),
-        (2345678.25, "fa4a0f2b39"),
-        (1.2, "fb3ff3333333333333"),
-        (42.0, "182a"),
-        (2345678.0, "1a0023cace"),
-        (-2345678.0, "3a0023cacd"),
-        (-0.0, "00"),
-        (5.960464477539063e-8, "f90001"),
-        (1.401298464324817e-45, "fa00000001"),
-        (5e-324, "fb0000000000000001"),
-        (2.2250738585072014e-308, "fb0010000000000000"),
-        (6.103515625e-5, "f90400"),
-        (65504.0, "19ffe0"),
-        (33554430.0, "1a01fffffe"),
-        (-9223372036854774784.0, "3b7ffffffffffffbff"),
-        (18446744073709550000.0, "1bfffffffffffff800"),
-        (18446744073709552000.0, "fa5f800000"),
-        (-18446742974197924000.0, "fadf7fffff"),
-        (3.4028234663852886e38, "fa7f7fffff"),
-        (3.402823466385289e38, "fb47efffffe0000001"),
-        (f64::MAX, "fb7fefffffffffffff"),
-        (f64::INFINITY, "f97c00"),
-        (f64::NEG_INFINITY, "f9fc00"),
-        (f64::NAN, "f97e00"),
         (-33554432.0, "3a01ffffff"),
         (-18446744073709551616.0, "fadf800000"),
         // Whole doubles below the dCBOR integer range are not reduced: each
@@ -93,23 +55,18 @@ fn published_numeric_vectors_in_every_exact_source_precision() {
             "symbolic f64 {value}"
         );
         let decoded = f64::try_from(CBOR::try_from_data(&expected).unwrap()).unwrap();
-        assert!(decoded == value || (decoded.is_nan() && value.is_nan()));
+        assert_eq!(decoded, value, "decoded {value}");
         let single = value as f32;
-        if single as f64 == value || value.is_nan() {
+        if single as f64 == value {
             assert_eq!(encoded(&single), expected, "bounded f32 {value}");
             assert_eq!(CBOR::from(single).to_cbor_data(), expected);
         }
         let half = f16::from_f64(value);
-        if half.to_f64() == value || value.is_nan() {
+        if half.to_f64() == value {
             assert_eq!(encoded(&half), expected, "bounded f16 {value}");
             assert_eq!(CBOR::from(half).to_cbor_data(), expected);
         }
     }
-    assert_eq!(
-        encoded(&u64::MAX),
-        hex::decode("1bffffffffffffffff").unwrap()
-    );
-    assert_eq!(CBOR::from(u64::MAX).to_cbor_data(), encoded(&u64::MAX));
     // An integer with more precision than any float holds stays an integer.
     let precise = -9223372036854775807i64;
     let expected = hex::decode("3b7ffffffffffffffe").unwrap();
@@ -121,53 +78,22 @@ fn published_numeric_vectors_in_every_exact_source_precision() {
     );
 }
 
-/// Noncanonical NaN payload examples at each source precision encode as the
-/// canonical half-precision NaN on both paths.
+/// Invalid vectors beyond the draft's Appendix A (whose invalid table
+/// `tests/appendix_a.rs` checks), each rejected with its exact class: a
+/// float not in its narrowest canonical form is `NonCanonicalNumeric`
+/// (`float::validate_canonical_*`); a negative integer below the dCBOR range
+/// is `OutOfRange` (`decode_cbor_internal`).
 #[test]
-fn noncanonical_nan_payloads_encode_as_the_canonical_nan() {
-    let canonical = hex::decode("f97e00").unwrap();
-    let double = f64::from_bits(0x7ff9_1000_0000_0001);
-    let single = f32::from_bits(0xffc0_0001);
-    let half = f16::from_bits(0x7e01);
-    assert!(double.is_nan() && single.is_nan() && half.is_nan());
-    assert_eq!(encoded(&double), canonical, "bounded f64 NaN payload");
-    assert_eq!(encoded(&single), canonical, "bounded f32 NaN payload");
-    assert_eq!(encoded(&half), canonical, "bounded f16 NaN payload");
-    assert_eq!(CBOR::from(double).to_cbor_data(), canonical);
-    assert_eq!(CBOR::from(single).to_cbor_data(), canonical);
-    assert_eq!(CBOR::from(half).to_cbor_data(), canonical);
-}
-
-/// Each invalid vector is rejected with its exact class: a float or head
-/// not in its narrowest canonical form is `NonCanonicalNumeric`
-/// (`decode::parse_header_varint`, `float::validate_canonical_*`); a negative
-/// integer below the dCBOR range is `OutOfRange` (`decode_cbor_internal`).
-#[test]
-fn published_invalid_numeric_vectors_are_rejected() {
+fn invalid_numeric_vectors_beyond_appendix_a_are_rejected() {
     use dcbor::Error;
     use std::mem::discriminant;
     let noncanonical = Error::NonCanonicalNumeric;
     let range = Error::OutOfRange;
     for (hex, expected) in [
-        // 10.0 at half precision: must be the integer 10.
-        ("f94a00", &noncanonical),
-        // 1.5 at double precision: fits a half.
-        ("fb3ff8000000000000", &noncanonical),
         // 2^32 at single precision: must be an integer.
         ("fa4f800000", &noncanonical),
-        // -2^63 - 1, -2^64 + 1 and -2^64: 65-bit negatives (draft 7.2).
-        ("3b8000000000000000", &range),
+        // -2^64 + 1: a 65-bit negative between the appendix's two.
         ("3bfffffffffffffffe", &range),
-        ("3bffffffffffffffff", &range),
-        // Infinities wider than a half.
-        ("fb7ff0000000000000", &noncanonical),
-        ("fa7f800000", &noncanonical),
-        ("fbfff0000000000000", &noncanonical),
-        ("faff800000", &noncanonical),
-        // NaNs other than the canonical f97e00.
-        ("fb7ff9100000000001", &noncanonical),
-        ("faffc00001", &noncanonical),
-        ("f97e01", &noncanonical),
     ] {
         match CBOR::try_from_hex(hex) {
             Ok(value) => panic!("accepted {hex} as {value:?}"),
@@ -239,18 +165,47 @@ fn double_precision_exponent_boundaries_preserve_values() {
     }
 }
 
+/// Numerically equal keys are one canonical key (dCBOR §2.5): an `f32` and
+/// its `f64` widening, `-0.0` and `0`, each reduced to one encoding. A second
+/// insertion of the key is refused and leaves the first value; replacing it
+/// is explicit and returns the value replaced; both maps encode and decode as
+/// one entry.
 #[test]
 fn equal_numeric_map_keys_have_one_canonical_identity() {
-    for (single, expected) in [
-        (-33554432.0f32, "a13a01ffffff02"),
-        (4294967296.0f32, "a11b000000010000000002"),
-        (-0.0f32, "a10002"),
+    for (single, kept, replaced) in [
+        (-33554432.0f32, "a13a01ffffff01", "a13a01ffffff02"),
+        (
+            4294967296.0f32,
+            "a11b000000010000000001",
+            "a11b000000010000000002",
+        ),
+        (-0.0f32, "a10001", "a10002"),
     ] {
         let mut map = dcbor::Map::new();
-        map.insert(single, 1u64);
-        map.insert(f64::from(single), 2u64);
+        map.insert(single, 1u64).unwrap();
+        assert!(
+            matches!(
+                map.insert(f64::from(single), 2u64),
+                Err(dcbor::Error::DuplicateMapKey)
+            ),
+            "{single} as f64 is the same canonical key"
+        );
+        // `-0.0` reduces to the integer `0`: that key is the same one.
+        if single == 0.0 {
+            assert!(
+                matches!(map.insert(0u64, 3u64), Err(dcbor::Error::DuplicateMapKey)),
+                "-0.0 and 0 are one canonical key"
+            );
+        }
+        let bytes = CBOR::from(map.clone()).to_cbor_data();
+        assert_eq!(bytes, hex::decode(kept).unwrap());
+        assert!(CBOR::try_from_data(bytes).is_ok());
+        assert_eq!(
+            map.insert_or_replace(f64::from(single), 2u64).unwrap(),
+            Some(CBOR::from(1u64))
+        );
         let bytes = CBOR::from(map).to_cbor_data();
-        assert_eq!(bytes, hex::decode(expected).unwrap());
+        assert_eq!(bytes, hex::decode(replaced).unwrap());
         assert!(CBOR::try_from_data(bytes).is_ok());
     }
 }

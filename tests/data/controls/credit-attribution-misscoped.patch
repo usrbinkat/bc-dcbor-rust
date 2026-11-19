@@ -1,0 +1,16 @@
+--- tests/resumable/native_heap.rs
++++ tests/resumable/native_heap.rs
+@@ -1207,1 +1207,3 @@
++        let mut between = between;
++        let mut captured = false;
+         let mut last = None;
+@@ -1217,1 +1219,8 @@
+-                    |m, encoder| last = Some((m.credits(), encoder.held_credit())),
++                    |m, encoder| {
++                        // Planted: begin the delta after credit is already held.
++                        if !captured && encoder.held_credit().is_some_and(|held| held != WriteWork::default()) {
++                            between = m.credits();
++                            captured = true;
++                        }
++                        last = Some((m.credits(), encoder.held_credit()));
++                    },

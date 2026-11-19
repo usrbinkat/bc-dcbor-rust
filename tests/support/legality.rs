@@ -13,16 +13,28 @@
 //! phase, counts and arenas, and their newest record whole. An observation
 //! that does not determine something reports `None` for it: a container
 //! holding more than one record determines neither its remaining cleanup
-//! nor its claims, since its older records' custody is only counted, which
-//! is why containers declare no reduction.
+//! nor its claims here, since its older records' custody is only counted.
+//!
+//! Which bindings declare a reduction (`Reduction`) is a separate matter:
+//! every scalar and unit (`Written`), the byte buffer (`String`,
+//! `ByteString`), stabilized text, the minimal big integer, both options,
+//! the tagged value, and the sequence (`Vec`, arrays) over elements of a
+//! uniform complete class (`Uniform`), whose older, complete records then
+//! all clean up alike, so their count is their custody
+//! (`in_place/vector.rs`, `SequenceClass`; certified in
+//! `owned_pipeline_matrix.rs`). The derived field map and enum, whose
+//! fields differ in type, and the B-tree declare none.
 //!
 //! Every match ends in rejection: a transition is legal only by an arm that
 //! names it. These limits are stated rather than hidden. A build relation
 //! cannot tell a child's completing build step from its others, since no
 //! measure of remaining build exists, so a parent checks those steps through
-//! its child's relation alone. Transitions only a refusal reaches (an
-//! acquisition's admissions advancing without its block) are legal here,
-//! though [`crate::construction`] builds unrefused and never reaches them.
+//! its child's relation alone. An acquisition's binding and its admitted
+//! credit are the operation's custody (`stable::Pending`, reported by its
+//! custody observation, `CustodySink::bound` and `held`), not the binding's
+//! progress: a step that binds an acquisition and is then refused leaves the
+//! observation unchanged, which [`crate::legal`] requires of every refused
+//! step, so no relation here names a binding and none reads credit.
 //! A generated field or payload state, whose initial states the schema
 //! chooses per field or variant, is related only by [`opaque`]: a progress
 //! step changes its observation, and nothing else is claimed of it.
@@ -34,11 +46,12 @@ use dcbor::bounded::decode::construction::in_place::tagged::{
     Phase as TaggedPhase, TaggedObservation,
 };
 use dcbor::bounded::decode::construction::in_place::{
-    BufferCustody, BufferObservation, BufferPhase, ElementObservation, OptionalObservation,
-    OptionalPhase, SequenceCustody, SequenceObservation, SequencePhase,
-    StableOptionDecision as Decision, StableOptionObservation, StableOptionPhase,
+    BufferCustody, BufferObservation, BufferPhase, ElementObservation, MinimalObservation,
+    OptionalObservation, OptionalPhase, SequenceCustody, SequenceObservation, SequencePhase,
+    SessionObservation, StabilizedObservation, StableOptionDecision as Decision,
+    StableOptionObservation, StableOptionPhase, Stage,
 };
-use dcbor::bounded::decode::construction::reclamation::{Admitted, Written};
+use dcbor::bounded::decode::construction::reclamation::Written;
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
 use std::rc::Rc;
 
@@ -112,18 +125,90 @@ pub struct Legality<O> {
     pub physical: Claims<O>,
 }
 
-/// The byte buffer of `String` and `ByteString`. Built: the metadata block
-/// installed, its write and release admitted first (a refused or failed
-/// allocation keeps them, so admissions only advance); the empty header
-/// written; the payload's reservation and release admitted; the payload's
-/// permit granted and its buffer reserved; then copies, each of at least one
-/// byte, the last completing (an empty source completes copying nothing).
-/// A payload permit granted whose buffer reservation then fails physically
+/// A binding's relations at the root, under its root session
+/// (`in_place::Session`): what the owned root and the standalone driver
+/// build and clean up. Built: an unbound session binds its node in one unit,
+/// the binding unchanged; a bound one steps its binding by the binding's own
+/// relation, the node and entry kept, its last step completing the session.
+/// Cleaned: an unbound session is released in one unit, the binding
+/// unchanged; a bound one begins cleanup in one unit, the binding unchanged;
+/// a cleaning one steps its binding by the binding's own relation, the
+/// binding's last unit releasing the session. Remaining: one unbound or
+/// released; the begin unit and the binding's own while bound; the binding's
+/// own while cleaning. The session holds nothing, so the claims are the
+/// binding's. Children are parts, related by their parents' relations, so
+/// this wraps the root alone.
+pub fn root<O: Copy + PartialEq + 'static>(
+    binding: &Legality<O>,
+) -> Legality<SessionObservation<O>> {
+    let (initial, build, clean, remaining, permits, physical) = (
+        binding.initial,
+        Rc::clone(&binding.build),
+        Rc::clone(&binding.clean),
+        Rc::clone(&binding.remaining),
+        Rc::clone(&binding.permits),
+        Rc::clone(&binding.physical),
+    );
+    let units = Rc::clone(&remaining);
+    Legality {
+        initial: initial.map(|inner| SessionObservation {
+            stage: Stage::Unbound,
+            inner,
+        }),
+        build: Rc::new(move |before, after| match (before.stage, after.stage) {
+            (Stage::Unbound, Stage::Building { .. }) => before.inner == after.inner,
+            (
+                Stage::Building { node, entry },
+                Stage::Building {
+                    node: next,
+                    entry: entered,
+                }
+                | Stage::Built {
+                    node: next,
+                    entry: entered,
+                },
+            ) => node == next && entry == entered && build(&before.inner, &after.inner),
+            _ => false,
+        }),
+        clean: Rc::new(move |before, after| match (before.stage, after.stage) {
+            (Stage::Unbound, Stage::Released)
+            | (Stage::Building { .. } | Stage::Built { .. }, Stage::Cleaning) => {
+                before.inner == after.inner
+            }
+            (Stage::Cleaning, Stage::Cleaning) => {
+                clean(&before.inner, &after.inner) && not_last(&units, &before.inner, true)
+            }
+            (Stage::Cleaning, Stage::Released) => {
+                clean(&before.inner, &after.inner) && not_last(&units, &before.inner, false)
+            }
+            _ => false,
+        }),
+        remaining: Rc::new(move |state| match state.stage {
+            Stage::Unbound | Stage::Released => Some(1),
+            Stage::Building { .. } | Stage::Built { .. } => remaining(&state.inner)?.checked_add(1),
+            Stage::Cleaning => remaining(&state.inner),
+        }),
+        permits: Rc::new(move |state| permits(&state.inner)),
+        physical: Rc::new(move |state| physical(&state.inner)),
+    }
+}
+
+/// The byte buffer of `String` and `ByteString` (`in_place/text.rs`). Its
+/// acquisitions' bindings and credit are the operation's custody
+/// (`stable::Pending`), never its progress. Built: the metadata block
+/// installed in one step, its acquisition bound, granted and ended within it
+/// (a refusal after the bind leaves the progress unchanged, which its retry
+/// continues). The empty header written; the payload's reservation step; the
+/// payload's release admitted; the payload's permit granted and its buffer
+/// reserved, the acquisition ended; then copies, each of at least one byte,
+/// the last completing (an empty source completes copying nothing). A
+/// payload permit granted whose buffer reservation then fails physically
 /// leaves `AllocatePayload` holding the permit: a failed step, not progress,
-/// so no build transition admits it. Cleaned: no block completes at once,
-/// changing nothing; the empty or written buffer is freed, its payload
-/// permit and copy count kept; the freed buffer's permit and block are
-/// released, completing.
+/// so no build transition admits it. Cleaned: no block completes at once
+/// (the credit settled at the operation's cleanup entry) and no other state
+/// reset; the empty or written buffer is freed, its payload permit and copy
+/// count kept; the freed buffer's permit and block are released,
+/// completing.
 pub fn buffer() -> Legality<BufferObservation> {
     use BufferObservation::{Held, Unallocated};
     use BufferPhase::{
@@ -131,10 +216,9 @@ pub fn buffer() -> Legality<BufferObservation> {
     };
     let at = |phase, held: BufferCustody| BufferCustody { phase, ..held };
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
-            (Unallocated(_), after) => {
+            (Unallocated, after) => {
                 after
                     == Held(BufferCustody {
                         phase: Empty,
@@ -145,6 +229,7 @@ pub fn buffer() -> Legality<BufferObservation> {
             (Held(held), Held(next)) => match held.phase {
                 Empty => next == at(Initialized, held),
                 Initialized => next == at(ReleasePayload, held),
+                // The payload's release admitted.
                 ReleasePayload => next == at(AllocatePayload, held),
                 AllocatePayload => {
                     !held.payload
@@ -169,16 +254,14 @@ pub fn buffer() -> Legality<BufferObservation> {
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
+            (Unallocated, Unallocated) => true,
             (Held(held), Held(next)) => held.phase != BufferFreed && next == at(BufferFreed, held),
-            (Held(held), Unallocated(next)) => {
-                held.phase == BufferFreed && next == Admitted::Nothing
-            }
+            (Held(held), Unallocated) => held.phase == BufferFreed,
             _ => false,
         }),
         remaining: Rc::new(|observation| {
             Some(match observation {
-                Unallocated(_) => 1,
+                Unallocated => 1,
                 Held(held) if held.phase == BufferFreed => 1,
                 Held(_) => 2,
             })
@@ -186,7 +269,7 @@ pub fn buffer() -> Legality<BufferObservation> {
         // The metadata block, then the payload's permit once granted.
         permits: Rc::new(|observation| {
             Some(match observation {
-                Unallocated(_) => Vec::new(),
+                Unallocated => Vec::new(),
                 Held(held) if held.payload => vec![0, 1],
                 Held(_) => vec![0],
             })
@@ -195,11 +278,85 @@ pub fn buffer() -> Legality<BufferObservation> {
         // until it is freed.
         physical: Rc::new(|observation| {
             Some(match observation {
-                Unallocated(_) => Vec::new(),
+                Unallocated => Vec::new(),
                 Held(held) if matches!(held.phase, Copy | Complete) => vec![0, 1],
                 Held(_) => vec![0],
             })
         }),
+    }
+}
+
+/// A `StabilizedText`: its check, then its text, a byte buffer ([`buffer`]).
+/// Built: each window checked advances the bytes checked, the text's state
+/// still initial; then the text's own build steps, the bytes checked fixed.
+/// Cleaned: the text's own units, the bytes checked fixed. Its remaining
+/// cleanup and its claims are the text's: the check holds nothing. The
+/// observation does not carry the text's length, so a text step taken before
+/// every byte is checked is not refused here; the binding's charge witness
+/// (`a_stabilized_text_checks_every_byte_once_before_building`) holds that.
+pub fn stabilized() -> Legality<StabilizedObservation> {
+    let Legality {
+        initial: first,
+        build: grow,
+        clean: shrink,
+        remaining: rest,
+        permits: claims,
+        physical: allocations,
+    } = buffer();
+    let text = first.expect("a byte buffer names its initial observation");
+    Legality {
+        initial: Some(StabilizedObservation { checked: 0, text }),
+        build: Rc::new(move |before, after| {
+            if before.text == text && after.text == text {
+                after.checked > before.checked
+            } else {
+                after.checked == before.checked && grow(&before.text, &after.text)
+            }
+        }),
+        clean: Rc::new(move |before, after| {
+            after.checked == before.checked && shrink(&before.text, &after.text)
+        }),
+        remaining: Rc::new(move |observation| rest(&observation.text)),
+        permits: Rc::new(move |observation| claims(&observation.text)),
+        physical: Rc::new(move |observation| allocations(&observation.text)),
+    }
+}
+
+/// A `MinimalBigInt`: its sign, then its magnitude, a byte buffer
+/// ([`buffer`]). Built: the sign written, from empty to initialized, the
+/// magnitude still initial; then the magnitude's own build steps, the sign
+/// fixed. Cleaned: the magnitude's own units, the sign fixed (it holds
+/// nothing). Its remaining cleanup and its claims are the magnitude's.
+pub fn minimal_bigint() -> Legality<MinimalObservation> {
+    let Legality {
+        initial: first,
+        build: grow,
+        clean: shrink,
+        remaining: rest,
+        permits: claims,
+        physical: allocations,
+    } = buffer();
+    let magnitude = first.expect("a byte buffer names its initial observation");
+    Legality {
+        initial: Some(MinimalObservation {
+            sign: Written::Empty,
+            magnitude,
+        }),
+        build: Rc::new(move |before, after| match (before.sign, after.sign) {
+            (Written::Empty, Written::Initialized) => {
+                before.magnitude == magnitude && after.magnitude == magnitude
+            }
+            (Written::Initialized, Written::Initialized) => {
+                grow(&before.magnitude, &after.magnitude)
+            }
+            _ => false,
+        }),
+        clean: Rc::new(move |before, after| {
+            after.sign == before.sign && shrink(&before.magnitude, &after.magnitude)
+        }),
+        remaining: Rc::new(move |observation| rest(&observation.magnitude)),
+        permits: Rc::new(move |observation| claims(&observation.magnitude)),
+        physical: Rc::new(move |observation| allocations(&observation.magnitude)),
     }
 }
 
@@ -217,19 +374,22 @@ pub fn written() -> Legality<Written> {
 }
 
 /// A native `Option` over `child`. Built: a present field marked before
-/// anything else; the metadata installed, its admissions only advancing,
-/// with the payload's state initial; null written as absent, or `Some`
-/// written with its placeholder; the payload's own build steps, the last
-/// completing the option. Cleaned: no metadata completes at once, the
-/// marker and admissions reset; empty or absent reaches `Release`; the
-/// payload's own cleanup units, the last reaching `Release`; the metadata's
-/// release completes, the marker reset with it. Every completing unit leaves
-/// the initial state, so a later build starts from it.
+/// anything else; the metadata installed in one step, its acquisition bound,
+/// granted and ended within it (a refusal after the bind leaves the progress
+/// unchanged, nothing installed), with the payload's state initial; null
+/// written as absent, or `Some` written with its placeholder; the payload's
+/// own build steps, the last completing the option. Cleaned: no metadata
+/// completes at once, the marker reset (the credit settled at the
+/// operation's cleanup entry); empty or absent reaches
+/// `Release`; the payload's own cleanup units, the last reaching `Release`;
+/// the metadata's release completes, the marker reset with it. Every
+/// completing unit leaves the initial state, so a later build starts from
+/// it.
 pub fn optional<S: Copy + PartialEq + 'static>(
     child: Legality<S>,
 ) -> Legality<OptionalObservation<S>> {
     use OptionalObservation::{Held, Unallocated};
-    use OptionalPhase::{Absent, Child, Complete, Empty, Release};
+    use OptionalPhase::{Absent, Child, Complete, Empty, Reclaim, Release};
     let Legality {
         initial: first,
         build: grow,
@@ -239,29 +399,11 @@ pub fn optional<S: Copy + PartialEq + 'static>(
         physical: allocations,
     } = child;
     let units = Rc::clone(&rest);
+    let unallocated = Unallocated { present: false };
     Legality {
-        initial: Some(Unallocated {
-            present: false,
-            admitted: Admitted::Nothing,
-        }),
+        initial: Some(unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (
-                Unallocated {
-                    present: false,
-                    admitted,
-                },
-                Unallocated {
-                    present: true,
-                    admitted: next,
-                },
-            ) => next == admitted,
-            (
-                Unallocated { present, admitted },
-                Unallocated {
-                    present: marked,
-                    admitted: next,
-                },
-            ) => marked == present && next > admitted,
+            (Unallocated { present: false }, Unallocated { present: true }) => true,
             (
                 Unallocated { present, .. },
                 Held {
@@ -292,13 +434,7 @@ pub fn optional<S: Copy + PartialEq + 'static>(
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated { .. }, after) => {
-                after
-                    == Unallocated {
-                        present: false,
-                        admitted: Admitted::Nothing,
-                    }
-            }
+            (Unallocated { .. }, after) => after == unallocated,
             (
                 Held {
                     present,
@@ -314,31 +450,26 @@ pub fn optional<S: Copy + PartialEq + 'static>(
                 marked == present
                     && match (phase, next) {
                         (Empty | Absent, Release) => reclaimed == child,
-                        // The payload's unit that is not its last keeps the
-                        // phase; its last moves the option to `Release`.
-                        (Child, Child) | (Complete, Complete) => {
+                        // The payload's unit that is not its last moves the
+                        // option to, or keeps it in, `Reclaim`; its last
+                        // moves the option to `Release`.
+                        (Child | Complete | Reclaim, Reclaim) => {
                             not_last(&units, &child, true) && shrink(&child, &reclaimed)
                         }
-                        (Child | Complete, Release) => {
+                        (Child | Complete | Reclaim, Release) => {
                             not_last(&units, &child, false) && shrink(&child, &reclaimed)
                         }
                         _ => false,
                     }
             }
-            (Held { phase: Release, .. }, after) => {
-                after
-                    == Unallocated {
-                        present: false,
-                        admitted: Admitted::Nothing,
-                    }
-            }
+            (Held { phase: Release, .. }, after) => after == unallocated,
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
             Unallocated { .. } => Some(1),
             Held { phase, child, .. } => match phase {
                 Empty | Absent => Some(2),
-                Child | Complete => rest(child).map(|units| units + 1),
+                Child | Complete | Reclaim => rest(child)?.checked_add(1),
                 Release => Some(1),
             },
         }),
@@ -356,19 +487,21 @@ pub fn optional<S: Copy + PartialEq + 'static>(
 }
 
 /// A `StableOption` over `child`. Built: the null decision taken, or
-/// presence; null written; the payload block installed for a present value,
-/// its admissions only advancing, with the payload's state initial; the
-/// payload's own build steps, the last reaching `Publish`; publication
-/// writes the option. Cleaned: no block completes at once, the decision and
-/// admissions reset; the payload's own cleanup units, in `Build` and
-/// `Publish` alike, the last reaching `Clean`; the block's release
-/// completes, the decision reset with it. Every completing unit leaves the
-/// initial state, so a later build starts from it.
+/// presence; null written; the payload block installed for a present value
+/// in one step, its acquisition bound, granted and ended within it (a
+/// refusal after the bind leaves the progress unchanged), with the payload's
+/// state initial; the payload's own build steps, the last reaching
+/// `Publish`; publication writes the option. Cleaned: no block completes at
+/// once, the decision reset (the credit settled at the operation's cleanup
+/// entry); the payload's own cleanup units, in
+/// `Build` and `Publish` alike, the last reaching `Clean`; the block's
+/// release completes, the decision reset with it. Every completing unit
+/// leaves the initial state, so a later build starts from it.
 pub fn stable_option<S: Copy + PartialEq + 'static>(
     child: Legality<S>,
 ) -> Legality<StableOptionObservation<S>> {
     use StableOptionObservation::{Held, Unallocated};
-    use StableOptionPhase::{Build, Clean, Publish};
+    use StableOptionPhase::{Build, Clean, Publish, Reclaim};
     let Legality {
         initial: first,
         build: grow,
@@ -378,24 +511,17 @@ pub fn stable_option<S: Copy + PartialEq + 'static>(
         physical: allocations,
     } = child;
     let units = Rc::clone(&rest);
+    let unallocated = Unallocated {
+        decision: Decision::Undecided,
+    };
     Legality {
-        initial: Some(Unallocated {
-            decision: Decision::Undecided,
-            admitted: Admitted::Nothing,
-        }),
+        initial: Some(unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (
-                Unallocated { decision, admitted },
-                Unallocated {
-                    decision: next,
-                    admitted: held,
-                },
-            ) => match (decision, next) {
+            (Unallocated { decision }, Unallocated { decision: next }) => matches!(
+                (decision, next),
                 (Decision::Undecided, Decision::Present | Decision::Null)
-                | (Decision::Null, Decision::Written) => held == admitted,
-                (Decision::Present, Decision::Present) => held > admitted,
-                _ => false,
-            },
+                    | (Decision::Null, Decision::Written)
+            ),
             (
                 Unallocated {
                     decision: Decision::Present,
@@ -428,13 +554,7 @@ pub fn stable_option<S: Copy + PartialEq + 'static>(
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated { .. }, after) => {
-                after
-                    == Unallocated {
-                        decision: Decision::Undecided,
-                        admitted: Admitted::Nothing,
-                    }
-            }
+            (Unallocated { .. }, after) => after == unallocated,
             (
                 Held {
                     decision,
@@ -449,30 +569,25 @@ pub fn stable_option<S: Copy + PartialEq + 'static>(
             ) => {
                 next == decision
                     && match (phase, reached) {
-                        // The payload's unit that is not its last keeps the
-                        // phase; its last moves the option to `Clean`.
-                        (Build, Build) | (Publish, Publish) => {
+                        // The payload's unit that is not its last moves the
+                        // option to, or keeps it in, `Reclaim`; its last
+                        // moves the option to `Clean`.
+                        (Build | Publish | Reclaim, Reclaim) => {
                             not_last(&units, &child, true) && shrink(&child, &reclaimed)
                         }
-                        (Build | Publish, Clean) => {
+                        (Build | Publish | Reclaim, Clean) => {
                             not_last(&units, &child, false) && shrink(&child, &reclaimed)
                         }
                         _ => false,
                     }
             }
-            (Held { phase: Clean, .. }, after) => {
-                after
-                    == Unallocated {
-                        decision: Decision::Undecided,
-                        admitted: Admitted::Nothing,
-                    }
-            }
+            (Held { phase: Clean, .. }, after) => after == unallocated,
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
             Unallocated { .. } => Some(1),
             Held { phase, child, .. } => match phase {
-                Build | Publish => rest(child).map(|units| units + 1),
+                Build | Publish | Reclaim => rest(child)?.checked_add(1),
                 Clean => Some(1),
             },
         }),
@@ -490,15 +605,18 @@ pub fn stable_option<S: Copy + PartialEq + 'static>(
 }
 
 /// A tagged value over its untagged payload `child`. Built: the metadata
-/// installed at the value's document index, its admissions only advancing,
-/// with the payload's state initial; the tag inspected, moving to the
-/// payload's index; the payload's own build steps, the last completing.
-/// Cleaned: no metadata completes at once, changing nothing; an uninspected
-/// tag reaches `Release`; the payload's own cleanup units, the last reaching
-/// `Release`; the metadata's release completes.
+/// installed in one step, its acquisition bound, granted and ended within
+/// it (a refusal after the bind leaves the progress unchanged), with the
+/// payload's state initial; the tag inspected; the payload's own build
+/// steps, the last completing. The payload's node is the tag's content,
+/// recomputed from the value's context at every step, so the observation
+/// carries no index. Cleaned: no metadata completes at once (the credit
+/// settled at the operation's cleanup entry); an
+/// uninspected tag reaches `Release`; the payload's own cleanup units, the
+/// last reaching `Release`; the metadata's release completes.
 pub fn tagged<U: Copy + PartialEq + 'static>(child: Legality<U>) -> Legality<TaggedObservation<U>> {
     use TaggedObservation::{Held, Unallocated};
-    use TaggedPhase::{Build, Complete, Inspect, Release};
+    use TaggedPhase::{Build, Complete, Inspect, Reclaim, Release};
     let Legality {
         initial: first,
         build: grow,
@@ -509,11 +627,10 @@ pub fn tagged<U: Copy + PartialEq + 'static>(child: Legality<U>) -> Legality<Tag
     } = child;
     let units = Rc::clone(&rest);
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
             (
-                Unallocated(_),
+                Unallocated,
                 Held {
                     phase: Inspect,
                     child,
@@ -521,69 +638,58 @@ pub fn tagged<U: Copy + PartialEq + 'static>(child: Legality<U>) -> Legality<Tag
                 },
             ) => initial(&first, &child),
             (
+                Held { phase, child },
                 Held {
-                    index,
-                    phase,
-                    child,
-                },
-                Held {
-                    index: next,
                     phase: reached,
                     child: grown,
                 },
             ) => match (phase, reached) {
-                (Inspect, Build) => index.checked_add(1) == Some(next) && grown == child,
-                (Build, Build | Complete) => next == index && grow(&child, &grown),
+                (Inspect, Build) => grown == child,
+                (Build, Build | Complete) => grow(&child, &grown),
                 _ => false,
             },
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
+            // The credit was settled at the operation's cleanup entry.
+            (Unallocated, Unallocated) => true,
             (
+                Held { phase, child },
                 Held {
-                    index,
-                    phase,
-                    child,
-                },
-                Held {
-                    index: next,
                     phase: reached,
                     child: reclaimed,
                 },
-            ) => {
-                next == index
-                    && match (phase, reached) {
-                        (Inspect, Release) => reclaimed == child,
-                        // The payload's unit that is not its last keeps the
-                        // phase; its last moves the value to `Release`.
-                        (Build, Build) | (Complete, Complete) => {
-                            not_last(&units, &child, true) && shrink(&child, &reclaimed)
-                        }
-                        (Build | Complete, Release) => {
-                            not_last(&units, &child, false) && shrink(&child, &reclaimed)
-                        }
-                        _ => false,
-                    }
-            }
-            (Held { phase: Release, .. }, Unallocated(next)) => next == Admitted::Nothing,
+            ) => match (phase, reached) {
+                (Inspect, Release) => reclaimed == child,
+                // The payload's unit that is not its last moves the value
+                // to, or keeps it in, `Reclaim`; its last moves the value to
+                // `Release`.
+                (Build | Complete | Reclaim, Reclaim) => {
+                    not_last(&units, &child, true) && shrink(&child, &reclaimed)
+                }
+                (Build | Complete | Reclaim, Release) => {
+                    not_last(&units, &child, false) && shrink(&child, &reclaimed)
+                }
+                _ => false,
+            },
+            (Held { phase: Release, .. }, Unallocated) => true,
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(1),
+            Unallocated => Some(1),
             Held { phase, child, .. } => match phase {
                 Inspect => Some(2),
-                Build | Complete => rest(child).map(|units| units + 1),
+                Build | Complete | Reclaim => rest(child)?.checked_add(1),
                 Release => Some(1),
             },
         }),
         // The metadata block, then the untagged payload's allocations.
         permits: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held { child, .. } => after_own(1, &claims, child),
         }),
         physical: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held { child, .. } => after_own(1, &allocations, child),
         }),
     }
@@ -606,68 +712,107 @@ pub fn opaque<O: PartialEq + 'static>() -> Legality<O> {
     }
 }
 
-/// Whether two arena positions hold the same elements, capacities, moves
-/// remaining and permit: an arena whose stage alone changed.
-fn same_arena(before: &StoragePosition, after: &StoragePosition) -> bool {
-    after.initialized == before.initialized
-        && after.reserved_capacity == before.reserved_capacity
-        && after.physical_capacity == before.physical_capacity
-        && after.relocating_remaining == before.relocating_remaining
-        && after.has_current_permit == before.has_current_permit
+/// Whether `after` is exactly `before` with `change` applied to its counts:
+/// the whole position compared, so every field `change` leaves alone must
+/// be equal. The stage is taken from `after`, which the caller's match on
+/// both stages has already fixed.
+fn becomes(
+    before: &StoragePosition,
+    after: &StoragePosition,
+    change: impl FnOnce(&mut StoragePosition),
+) -> bool {
+    let mut expected = *before;
+    change(&mut expected);
+    expected.stage = after.stage;
+    expected == *after
 }
 
 /// One unit of an arena's growth, relocation or settled use
 /// (`Storage::reserve_step`, `settle_step`, `Spare::push`), from `before`
-/// to `after`: a free slot of a settled arena filled; admissions toward the
-/// staging block only advancing, the block then staged; admissions toward
-/// the grown allocation only advancing, the grown allocation then ready;
-/// the relocation published, every element still in the old allocation, or
-/// an empty arena settled on the grown one at once; one element relocated,
-/// the last ending the relocation; the relocated arena settled, its block
-/// vacated; the vacated block released. A grown allocation holds more than
-/// every element and is reserved physically for at least its capacity.
+/// to `after`, over its execution observation ([`StoragePosition`]), each
+/// transition naming every field it changes and every other held equal
+/// ([`becomes`]):
+///
+/// - a free slot of a settled arena filled: one more element, within the
+///   reserved capacity;
+/// - the staging block staged (`Settled` to `Staged`), or the vacated block
+///   released (`Retired` to `Settled`), or the relocated arena settled in
+///   place, its block vacated (`Relocated` to `Retired`): nothing physical
+///   the snapshot counts changes;
+/// - the grown allocation requested into the staged block (`Staged` to
+///   `Ready`): its capacity, more than every element and reserved
+///   physically for at least itself, and its permit;
+/// - the relocation published (`Ready` to `Relocating`): the grown
+///   allocation becomes the arena's, empty, every element still in the old
+///   allocation, whose permit is now the relocating one;
+/// - an empty arena settled on the grown allocation at once (`Ready` to
+///   `Retired`), the old allocation released;
+/// - one element relocated, the last ending the relocation and releasing
+///   the old allocation's permit.
+///
+/// The admissions a growth holds toward its block or grown allocation are
+/// its acquisition custody, which no position shows: a unit that only
+/// admits leaves the position unchanged, and is no transition here; its
+/// acquisition advance is the custody's to verify.
 pub fn storage_build(before: &StoragePosition, after: &StoragePosition) -> bool {
-    use StorageStage::{Ready, Relocated, Relocating, Retired, Settled, Staged, Staging};
-    let grown = after.reserved_capacity > before.initialized
-        && after.physical_capacity >= after.reserved_capacity
-        && after.has_current_permit
-        && after.reserved_capacity > before.reserved_capacity;
+    use StorageStage::{Ready, Relocated, Relocating, Retired, Settled, Staged};
+    let (from, to) = (before, after);
     match (before.stage, after.stage) {
         (Settled, Settled) => {
-            after.initialized == before.initialized + 1
-                && after.initialized <= after.reserved_capacity
-                && after.reserved_capacity == before.reserved_capacity
-                && after.physical_capacity == before.physical_capacity
-                && after.has_current_permit == before.has_current_permit
-                && after.relocating_remaining == 0
+            to.initialized <= from.reserved_capacity
+                && becomes(before, after, |p| p.initialized += 1)
         }
-        (Settled, Staging(next)) => next != Admitted::Nothing && same_arena(before, after),
-        (Staging(admitted), Staging(next)) => next > admitted && same_arena(before, after),
-        (Settled | Staging(_), Staged(Admitted::Nothing)) => same_arena(before, after),
-        (Staged(admitted), Staged(next)) => next > admitted && same_arena(before, after),
-        (Staged(_), Ready) | (Relocated, Retired) | (Retired, Settled) => same_arena(before, after),
+        (Settled, Staged) | (Relocated, Retired) | (Retired, Settled) => {
+            becomes(before, after, |_| {})
+        }
+        (Staged, Ready) => {
+            to.staged_reserved_capacity > from.initialized
+                && to.staged_physical_capacity >= to.staged_reserved_capacity
+                && becomes(before, after, |p| {
+                    p.staged_reserved_capacity = to.staged_reserved_capacity;
+                    p.staged_physical_capacity = to.staged_physical_capacity;
+                    p.has_staged_permit = true;
+                })
+        }
         (Ready, Relocating) => {
-            before.initialized > 0
-                && after.initialized == 0
-                && after.relocating_remaining == before.initialized
-                && grown
+            from.initialized > 0
+                && becomes(before, after, |p| {
+                    p.initialized = 0;
+                    p.relocating_remaining = from.initialized;
+                    p.reserved_capacity = from.staged_reserved_capacity;
+                    p.physical_capacity = from.staged_physical_capacity;
+                    p.has_current_permit = from.has_staged_permit;
+                    p.has_relocating_permit = from.has_current_permit;
+                    p.staged_reserved_capacity = 0;
+                    p.staged_physical_capacity = 0;
+                    p.has_staged_permit = false;
+                })
         }
-        (Ready, Retired) => before.initialized == 0 && after.initialized == 0 && grown,
+        (Ready, Retired) => {
+            from.initialized == 0
+                && becomes(before, after, |p| {
+                    p.reserved_capacity = from.staged_reserved_capacity;
+                    p.physical_capacity = from.staged_physical_capacity;
+                    p.has_current_permit = from.has_staged_permit;
+                    p.staged_reserved_capacity = 0;
+                    p.staged_physical_capacity = 0;
+                    p.has_staged_permit = false;
+                })
+        }
         (Relocating, Relocating) => {
-            after.initialized == before.initialized + 1
-                && after.relocating_remaining + 1 == before.relocating_remaining
-                && after.relocating_remaining > 0
-                && after.reserved_capacity == before.reserved_capacity
-                && after.physical_capacity == before.physical_capacity
-                && after.has_current_permit == before.has_current_permit
+            from.relocating_remaining > 1
+                && becomes(before, after, |p| {
+                    p.initialized += 1;
+                    p.relocating_remaining -= 1;
+                })
         }
         (Relocating, Relocated) => {
-            after.initialized == before.initialized + 1
-                && before.relocating_remaining == 1
-                && after.relocating_remaining == 0
-                && after.reserved_capacity == before.reserved_capacity
-                && after.physical_capacity == before.physical_capacity
-                && after.has_current_permit == before.has_current_permit
+            from.relocating_remaining == 1
+                && becomes(before, after, |p| {
+                    p.initialized += 1;
+                    p.relocating_remaining = 0;
+                    p.has_relocating_permit = false;
+                })
         }
         _ => false,
     }
@@ -675,75 +820,90 @@ pub fn storage_build(before: &StoragePosition, after: &StoragePosition) -> bool 
 
 /// One unit of an arena's cleanup (`Storage::reclaim_step`,
 /// `reclaim_copy_step`, or a newest element popped from a settled arena),
-/// from `before` to `after`: a settled element drained, or plain data
-/// cleared at once; an empty settled arena's allocation and permit released;
-/// a growth's admissions forfeited with the settled unit that follows; a
-/// staged, ready or retired growth released; one element drained from an
-/// interrupted relocation, from the grown allocation first, the last
-/// ending it; one element drained from the relocated arena, and, empty,
-/// the relocated arena released whole.
+/// from `before` to `after`, over its execution observation
+/// ([`StoragePosition`]), each transition naming every field it changes and
+/// every other held equal ([`becomes`]):
+///
+/// - a settled element drained, or plain data cleared at once;
+/// - an empty settled arena's allocation and permit released, which
+///   `Owned::release` does exactly when the arena holds a tracked capacity
+///   or a permit, leaving `Owned::new()`;
+/// - a staged or ready growth's block released, the staged fields cleared;
+///   a retired growth's vacated block released, nothing the snapshot
+///   counts changing;
+/// - one element drained from an interrupted relocation, from the grown
+///   allocation while it holds any, otherwise from the old one, the old
+///   allocation released as its last element goes;
+/// - one element drained from the relocated arena, and, empty, the
+///   relocated arena released whole.
+///
+/// A growth's held admissions settled at the cleanup's entry are its
+/// acquisition custody's settlement, which no position shows.
 pub fn storage_clean(before: &StoragePosition, after: &StoragePosition) -> bool {
-    use StorageStage::{Ready, Relocated, Relocating, Retired, Settled, Staged, Staging};
-    let emptied = after.initialized == 0
-        && after.reserved_capacity == 0
-        && after.physical_capacity == 0
-        && !after.has_current_permit
-        && after.relocating_remaining == 0;
-    let settled_unit = || {
-        let drained = after.initialized + 1 == before.initialized
-            && after.reserved_capacity == before.reserved_capacity
-            && after.physical_capacity == before.physical_capacity
-            && after.has_current_permit == before.has_current_permit;
-        let cleared = before.initialized > 0
-            && after.initialized == 0
-            && after.reserved_capacity == before.reserved_capacity
-            && after.physical_capacity == before.physical_capacity
-            && after.has_current_permit == before.has_current_permit;
-        // `Owned::release` releases exactly when the arena `holds()`: a
-        // tracked capacity or a permit; it leaves `Owned::new()`.
-        let released = before.initialized == 0
-            && (before.reserved_capacity != 0 || before.has_current_permit)
-            && emptied;
-        drained || cleared || released
+    use StorageStage::{Ready, Relocated, Relocating, Retired, Settled, Staged};
+    let from = before;
+    let released = |p: &mut StoragePosition| {
+        p.reserved_capacity = 0;
+        p.physical_capacity = 0;
+        p.has_current_permit = false;
     };
     match (before.stage, after.stage) {
-        (Settled, Settled) => settled_unit(),
-        (Staging(_), Settled) => settled_unit() || same_arena(before, after),
-        (Staged(_) | Ready | Retired, Settled) => same_arena(before, after),
-        (Relocating, Relocating | Relocated) => {
-            let from_grown = after.initialized + 1 == before.initialized
-                && after.relocating_remaining == before.relocating_remaining;
-            let from_old = before.initialized == 0
-                && after.initialized == 0
-                && after.relocating_remaining + 1 == before.relocating_remaining;
-            (from_grown || from_old)
-                && (after.stage == Relocated) == (after.relocating_remaining == 0)
-                && after.reserved_capacity == before.reserved_capacity
-                && after.has_current_permit == before.has_current_permit
+        (Settled, Settled) => {
+            let drained = from.initialized > 0 && becomes(before, after, |p| p.initialized -= 1);
+            let cleared = from.initialized > 1 && becomes(before, after, |p| p.initialized = 0);
+            let emptied = from.initialized == 0
+                && (from.reserved_capacity != 0 || from.has_current_permit)
+                && becomes(before, after, released);
+            drained || cleared || emptied
+        }
+        (Staged | Ready, Settled) => becomes(before, after, |p| {
+            p.staged_reserved_capacity = 0;
+            p.staged_physical_capacity = 0;
+            p.has_staged_permit = false;
+        }),
+        (Retired, Settled) => becomes(before, after, |_| {}),
+        (Relocating, Relocating) => {
+            let from_grown = from.initialized > 0 && becomes(before, after, |p| p.initialized -= 1);
+            let from_old = from.initialized == 0
+                && from.relocating_remaining > 1
+                && becomes(before, after, |p| p.relocating_remaining -= 1);
+            from_grown || from_old
+        }
+        (Relocating, Relocated) => {
+            from.initialized == 0
+                && from.relocating_remaining == 1
+                && becomes(before, after, |p| {
+                    p.relocating_remaining = 0;
+                    p.has_relocating_permit = false;
+                })
         }
         (Relocated, Relocated) => {
-            after.initialized + 1 == before.initialized
-                && after.reserved_capacity == before.reserved_capacity
-                && after.has_current_permit == before.has_current_permit
+            from.initialized > 0 && becomes(before, after, |p| p.initialized -= 1)
         }
-        (Relocated, Settled) => before.initialized == 0 && emptied,
+        (Relocated, Settled) => from.initialized == 0 && becomes(before, after, released),
         _ => false,
     }
 }
 
 /// A sequence over its element `child`: a `Vec`'s, or, `inline`, a fixed
 /// array's, whose elements are its own slots and which holds no payload.
-/// Built: the metadata installed, its admissions only advancing; the array
+/// Every acquisition's binding and credit are the operation's custody,
+/// never the sequence's progress. Built: the metadata installed in one step,
+/// its acquisition bound, granted and ended within it (a refusal after the
+/// bind leaves the progress unchanged, nothing installed); the array
 /// inspected and the container initialized, past the array's head; for a
-/// vector, the payload's reservation and release admitted, then its permit
-/// granted and its buffer reserved; per element, its record pushed with the
-/// element's initial state, the element's own build steps, its commit past
-/// its subtree; completion once every record is committed. Cleaned: an
-/// uninspected sequence is freed at once; otherwise its cleanup begins; the
-/// newest element's own units, the last freeing its record and leaving the
-/// prefix if it was committed, an older committed record becoming the
-/// newest; the empty container released; the payload's permit and the
-/// metadata released.
+/// vector, the payload's reservation step, its release admitted, then its
+/// permit granted and its buffer reserved, the acquisition ended; per
+/// element, its record pushed in one step with the element's initial state
+/// (a refusal after the bind leaves the progress unchanged in `Next`), the
+/// element's own build steps, its commit past its subtree; completion once
+/// every record is committed. Cleaned: no metadata completes at once (the
+/// credit settled at the operation's cleanup entry); an uninspected sequence
+/// is freed at once; otherwise its cleanup begins; the newest
+/// element's own units, the last freeing its record and leaving the prefix
+/// if it was committed, an older committed record becoming the newest; the
+/// empty container released; the payload's permit and the metadata
+/// released.
 pub fn sequence<E: Copy + PartialEq + 'static>(
     child: Legality<E>,
     inline: bool,
@@ -767,16 +927,14 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
     // for a vector, the payload.
     let base = if inline { 1 } else { 2 };
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
-            (Unallocated(_), Held(held)) => {
+            (Unallocated, Held(held)) => {
                 held == SequenceCustody {
                     phase: Initializing,
                     position: 0,
                     committed: 0,
                     records: 0,
-                    admitted: Admitted::Nothing,
                     payload: false,
                     newest: None,
                 }
@@ -793,9 +951,10 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
                                 ..held
                             }
                 }
-                (Initialized, ReleasePayload) | (ReleasePayload, AllocatePayload) => {
-                    !inline && next == at(next.phase, held)
-                }
+                (Initialized, ReleasePayload) => !inline && next == at(ReleasePayload, held),
+                // The payload's release admitted.
+                (ReleasePayload, AllocatePayload) => !inline && next == at(AllocatePayload, held),
+                // The payload granted, its acquisition ended.
                 (AllocatePayload, Next) => {
                     !inline
                         && !held.payload
@@ -807,14 +966,7 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
                             }
                 }
                 (Next, Complete) => held.records == held.committed && next == at(Complete, held),
-                (Next, Next) => {
-                    next.admitted > held.admitted
-                        && next
-                            == SequenceCustody {
-                                admitted: next.admitted,
-                                ..held
-                            }
-                }
+                // The record granted, its acquisition ended.
                 (Next, Child) => match next.newest {
                     Some(ElementObservation {
                         committed: false,
@@ -822,13 +974,11 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
                     }) => {
                         held.records == held.committed
                             && next.records == held.records + 1
-                            && next.admitted == Admitted::Nothing
                             && initial(&first, &element)
                             && next
                                 == SequenceCustody {
                                     phase: Child,
                                     records: next.records,
-                                    admitted: Admitted::Nothing,
                                     newest: next.newest,
                                     ..held
                                 }
@@ -886,9 +1036,11 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
+            // The credit was settled at the operation's cleanup entry.
+            (Unallocated, Unallocated) => true,
             (Held(held), Held(next)) => match (held.phase, next.phase) {
                 (Empty, BufferFreed) => next == at(BufferFreed, held),
+                // Cleanup begins.
                 (
                     Initialized | ReleasePayload | AllocatePayload | Next | Child | Commit
                     | Complete,
@@ -933,13 +1085,11 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
                 }
                 _ => false,
             },
-            (Held(held), Unallocated(next)) => {
-                matches!(held.phase, Initializing | BufferFreed) && next == Admitted::Nothing
-            }
+            (Held(held), Unallocated) => matches!(held.phase, Initializing | BufferFreed),
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(1),
+            Unallocated => Some(1),
             Held(held) => {
                 // The transition into cleanup, before the records' units.
                 let begin = usize::from(!matches!(held.phase, Reclaim | Empty | BufferFreed));
@@ -958,7 +1108,7 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
         // The metadata block; the payload's permit once granted; then, with
         // one record, its block and the element's own.
         permits: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held(held) => {
                 let own = if held.payload { 2 } else { 1 };
                 match (held.records, held.newest) {
@@ -980,7 +1130,7 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
         // the container is released; then, with one record, its block and
         // the element's own allocations.
         physical: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held(held) => {
                 let buffer = held.payload && held.phase != BufferFreed;
                 let own: Vec<usize> = if buffer { vec![0, 1] } else { vec![0] };
@@ -1003,16 +1153,22 @@ pub fn sequence<E: Copy + PartialEq + 'static>(
 }
 
 /// A derived struct's field map over its generated field state `child`.
-/// Built: the metadata installed at the value's document index, its
-/// admissions only advancing; the tag inspected, moving past it when one is
+/// Every acquisition's binding and credit are the operation's custody, never
+/// the map's progress. Built: the metadata installed at the value's document
+/// index in one step, its acquisition bound, granted and ended within it (a
+/// refusal after the bind leaves the progress unchanged, nothing installed);
+/// the tag inspected, moving past it when one is
 /// declared; the map inspected, moving into it and fixing its end, or, for
 /// positional fields, nothing; then per entry a find, which completes, finds
 /// a field, or begins a binary search, which narrows, lands on a field, or
-/// skips an unknown key; a field's record pushed with its state; the field
-/// built, or its absence written; the advance past it, one more field
-/// completed. Cleaned: cleanup begins; the newest field's own units, the
-/// last freeing its record, an older complete field becoming the newest;
-/// with no record left, the metadata released.
+/// skips an unknown key; a field's record pushed in one step with its state
+/// (a refusal after the bind leaves the progress unchanged in `Allocate`);
+/// the field built, or its absence written; the advance past it, one more
+/// field completed. Cleaned: no metadata completes at once (the credit
+/// settled at the operation's cleanup entry); otherwise cleanup begins; the
+/// newest
+/// field's own units, the last freeing its record, an older complete field
+/// becoming the newest; with no record left, the metadata released.
 pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<FieldsObservation<F>> {
     use FieldsObservation::{Held, Unallocated};
     use FieldsPhase::{
@@ -1030,10 +1186,9 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
     let units = Rc::clone(&rest);
     let at = |phase, held: FieldsCustody<F>| FieldsCustody { phase, ..held };
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
-            (Unallocated(_), Held(held)) => {
+            (Unallocated, Held(held)) => {
                 held == FieldsCustody {
                     phase: Inspect,
                     completed: 0,
@@ -1042,7 +1197,6 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
                     low: 0,
                     high: 0,
                     records: 0,
-                    admitted: Admitted::Nothing,
                     newest: None,
                 }
             }
@@ -1117,14 +1271,7 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
                                 ..held
                             }
                 }
-                (Allocate, Allocate) => {
-                    next.admitted > held.admitted
-                        && next
-                            == FieldsCustody {
-                                admitted: next.admitted,
-                                ..held
-                            }
-                }
+                // The record granted, its acquisition ended.
                 (Allocate, Build | Missing) => match next.newest {
                     Some(field) => {
                         held.records == held.completed
@@ -1134,7 +1281,6 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
                                 == FieldsCustody {
                                     phase: next.phase,
                                     records: next.records,
-                                    admitted: Admitted::Nothing,
                                     newest: next.newest,
                                     ..held
                                 }
@@ -1177,7 +1323,8 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
+            // The credit was settled at the operation's cleanup entry.
+            (Unallocated, Unallocated) => true,
             (Held(held), Held(next)) => match (held.phase, next.phase) {
                 (Reclaim, Reclaim) => match held.newest {
                     // The newest field's unit that is not its last.
@@ -1207,16 +1354,15 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
                     }
                     _ => false,
                 },
+                // Cleanup begins.
                 (_, Reclaim) => next == at(Reclaim, held),
                 _ => false,
             },
-            (Held(held), Unallocated(next)) => {
-                held.phase == Reclaim && held.records == 0 && next == Admitted::Nothing
-            }
+            (Held(held), Unallocated) => held.phase == Reclaim && held.records == 0,
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(1),
+            Unallocated => Some(1),
             Held(held) => {
                 let begin = usize::from(held.phase != Reclaim);
                 match (held.records, held.newest) {
@@ -1229,7 +1375,7 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
         // The metadata block, then, with one record, its block and the
         // field's own.
         permits: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held(held) => match (held.records, held.newest) {
                 (0, _) => Some(vec![0]),
                 (1, Some(field)) => after_own(2, &claims, &field),
@@ -1237,7 +1383,7 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
             },
         }),
         physical: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held(held) => match (held.records, held.newest) {
                 (0, _) => Some(vec![0]),
                 (1, Some(field)) => after_own(2, &allocations, &field),
@@ -1248,20 +1394,25 @@ pub fn fields<F: Copy + PartialEq + 'static>(child: Legality<F>) -> Legality<Fie
 }
 
 /// A derived enum over its generated payload state `child`. Built: the
-/// metadata installed at the value's document index, its admissions only
-/// advancing; the tag inspected, moving past it when one is declared; the
-/// shape read, a bare discriminant at once, or an array's length, moving
-/// into it; the array's discriminant read, moving past it; the selection
-/// passing each variant whose descriptor differs, or selecting one with the
-/// payload's initial state; the payload's own build steps, the last moving
-/// to the commit; the native tag committed, completing. Cleaned: an
-/// unselected enum reaches `Release`; the payload's own units, the last
-/// reaching `Release`; the metadata released.
+/// metadata installed at the value's document index in one step, its
+/// acquisition bound, granted and ended within it (a refusal after the bind
+/// leaves the progress unchanged, nothing installed); the tag inspected,
+/// moving past it when one is declared; the shape read, a bare discriminant
+/// at once, or an array's length, moving into it; the array's discriminant
+/// read, moving past it; the selection passing each variant whose
+/// descriptor differs, or selecting one with the payload's initial state;
+/// the payload's own build steps, the last moving to the commit; the native
+/// tag committed, completing. Cleaned: no metadata completes at once (the
+/// credit settled at the operation's cleanup entry);
+/// an unselected enum reaches `Release`; the payload's own units, the first
+/// that is not its last moving the selected phase to `Reclaim` (so no build
+/// reaches a payload being cleaned up), the others keeping `Reclaim`, the
+/// last reaching `Release`; the metadata released.
 pub fn enumeration<V: Copy + PartialEq + 'static>(
     child: Legality<V>,
 ) -> Legality<EnumObservation<V>> {
     use EnumObservation::{Held, Unallocated};
-    use EnumPhase::{Build, Commit, Complete, Discriminant, Release, Select, Shape, Tag};
+    use EnumPhase::{Build, Commit, Complete, Discriminant, Reclaim, Release, Select, Shape, Tag};
     let Legality {
         initial: first,
         build: grow,
@@ -1272,10 +1423,9 @@ pub fn enumeration<V: Copy + PartialEq + 'static>(
     } = child;
     let units = Rc::clone(&rest);
     Legality {
-        initial: Some(Unallocated(Admitted::Nothing)),
+        initial: Some(Unallocated),
         build: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next > admitted,
-            (Unallocated(_), Held { variant, phase, .. }) => variant == 0 && phase == Tag,
+            (Unallocated, Held { variant, phase, .. }) => variant == 0 && phase == Tag,
             (
                 Held {
                     index,
@@ -1323,7 +1473,8 @@ pub fn enumeration<V: Copy + PartialEq + 'static>(
             _ => false,
         }),
         clean: Rc::new(move |before, after| match (*before, *after) {
-            (Unallocated(admitted), Unallocated(next)) => next == admitted,
+            // The credit was settled at the operation's cleanup entry.
+            (Unallocated, Unallocated) => true,
             (
                 Held {
                     index,
@@ -1340,46 +1491,47 @@ pub fn enumeration<V: Copy + PartialEq + 'static>(
                     && passed == variant
                     && match (phase, reached) {
                         (Tag | Shape | Discriminant { .. } | Select { .. }, Release) => true,
-                        // The payload's unit that is not its last keeps the
-                        // phase; its last moves the enum to `Release`.
-                        (Build(payload), Build(reclaimed))
-                        | (Commit(payload), Commit(reclaimed))
-                        | (Complete(payload), Complete(reclaimed)) => {
-                            not_last(&units, &payload, true) && shrink(&payload, &reclaimed)
-                        }
-                        (Build(payload) | Commit(payload) | Complete(payload), Release) => {
-                            not_last(&units, &payload, false)
-                        }
+                        // The payload's unit that is not its last moves the
+                        // enum to, or keeps it in, `Reclaim`; its last moves
+                        // the enum to `Release`.
+                        (
+                            Build(payload) | Commit(payload) | Complete(payload) | Reclaim(payload),
+                            Reclaim(reclaimed),
+                        ) => not_last(&units, &payload, true) && shrink(&payload, &reclaimed),
+                        (
+                            Build(payload) | Commit(payload) | Complete(payload) | Reclaim(payload),
+                            Release,
+                        ) => not_last(&units, &payload, false),
                         _ => false,
                     }
             }
-            (Held { phase: Release, .. }, Unallocated(next)) => next == Admitted::Nothing,
+            (Held { phase: Release, .. }, Unallocated) => true,
             _ => false,
         }),
         remaining: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(1),
+            Unallocated => Some(1),
             Held { phase, .. } => match phase {
                 Tag | Shape | Discriminant { .. } | Select { .. } => Some(2),
-                Build(payload) | Commit(payload) | Complete(payload) => {
-                    rest(payload).map(|units| units + 1)
+                Build(payload) | Commit(payload) | Complete(payload) | Reclaim(payload) => {
+                    rest(payload)?.checked_add(1)
                 }
                 Release => Some(1),
             },
         }),
         // The metadata block, then the selected payload's allocations.
         permits: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held { phase, .. } => match phase {
-                Build(payload) | Commit(payload) | Complete(payload) => {
+                Build(payload) | Commit(payload) | Complete(payload) | Reclaim(payload) => {
                     after_own(1, &claims, payload)
                 }
                 _ => Some(vec![0]),
             },
         }),
         physical: Rc::new(move |observation| match observation {
-            Unallocated(_) => Some(Vec::new()),
+            Unallocated => Some(Vec::new()),
             Held { phase, .. } => match phase {
-                Build(payload) | Commit(payload) | Complete(payload) => {
+                Build(payload) | Commit(payload) | Complete(payload) | Reclaim(payload) => {
                     after_own(1, &allocations, payload)
                 }
                 _ => Some(vec![0]),

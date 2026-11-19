@@ -1,0 +1,15 @@
+--- tests/cddl/src/lib.rs
++++ tests/cddl/src/lib.rs
+@@ -154,10 +154,8 @@
+         ("an empty array", CBOR::from(Vec::<CBOR>::new())),
+         ("an array", CBOR::from(vec![CBOR::from(0u64)])),
+         ("an empty map", CBOR::from(Map::new())),
+-        (
+-            "tag 2 around a byte string",
+-            CBOR::to_tagged_value(2, CBOR::to_byte_string([1u8])),
+-        ),
++        // Planted: the foreign-tag class dropped from the domain. Must fail
++        // the_domain_holds_every_kind_of_mutation_a_control_targets.
+         ("tag 1 around 0", CBOR::to_tagged_value(1, CBOR::from(0u64))),
+     ]
+ }

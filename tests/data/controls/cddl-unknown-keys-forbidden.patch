@@ -1,0 +1,12 @@
+--- src/cddl.rs
++++ src/cddl.rs
+@@ -182,7 +182,8 @@
+             format!("{occurrence}{}: {}", member.key, member.value)
+         })
+         .collect();
+-    entries.push("* any => any".to_string());
++    // Planted: a derived map closed to the keys no field names.
++    entries.shrink_to_fit();
+     format!("{{ {} }}", entries.join(", "))
+ }
+

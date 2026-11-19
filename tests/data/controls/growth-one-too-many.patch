@@ -1,0 +1,12 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -1971,7 +1971,8 @@
+ pub fn owned_growth<R>(elements: u64, element_size: u64) -> Result<Growth, BoundedError<R>> {
+     let mut growth = Growth::default();
+     let mut capacity = 0u64;
+-    while capacity < elements {
++    // Planted: a full arena counted as needing one more growth.
++    while capacity <= elements {
+         let grown = grown_capacity(capacity).ok_or(BoundedError::Overflow)?;
+         let previous = mul(capacity, element_size)?;
+         let bytes = mul(grown, element_size)?;

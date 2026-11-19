@@ -1,0 +1,20 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -132,6 +132,17 @@
+
+ impl<T> Copy for Assembly<'_, T> {}
+
++// Planted: a record duplicated, so one record can be presented twice.
++impl<T> Clone for Initialized<'_, T> {
++    fn clone(&self) -> Self {
++        Self {
++            place: self.place,
++            bound: self.bound,
++            marker: core::marker::PhantomData,
++        }
++    }
++}
++
+ // Written out rather than derived: a derive would bound `T`, the value's
+ // type, which a record only names.
+ impl<T> core::fmt::Debug for Initialized<'_, T> {

@@ -1,0 +1,13 @@
+--- src/float/reference.rs
++++ src/float/reference.rs
+@@ -226,7 +226,9 @@
+     match decompose(x) {
+         Value::Nan => Numeric::Float16(SPECIFIED_NAN),
+         Value::Zero => Numeric::Unsigned(0),
+-        Value::Infinite { negative } => Numeric::Float16(BINARY16.infinite(negative) as u16),
++        // Planted: an infinity's sign dropped. Must fail
++        // the_reference_has_its_fixed_reductions, at "-inf".
++        Value::Infinite { .. } => Numeric::Float16(BINARY16.infinite(false) as u16),
+         Value::Finite(value) => integer(value)
+             .or_else(|| {
+                 BINARY16

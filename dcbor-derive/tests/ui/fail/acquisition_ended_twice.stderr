@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `acquisition`
+ --> tests/ui/fail/acquisition_ended_twice.rs:7:5
+  |
+5 | fn ended_twice(acquisition: Acquisition<Family>) {
+  |                ----------- move occurs because `acquisition` has type `dcbor::bounded::Acquisition<Family>`, which does not implement the `Copy` trait
+6 |     acquisition.end(Performer::None);
+  |                 -------------------- `acquisition` moved due to this method call
+7 |     acquisition.end(Performer::None);
+  |     ^^^^^^^^^^^ value used here after move
+  |
+note: `dcbor::bounded::Acquisition::<O>::end` takes ownership of the receiver `self`, which moves `acquisition`
+ --> $WORKSPACE/src/bounded.rs
+  |
+  |     pub fn end(self, by: Performer) {
+  |                ^^^^

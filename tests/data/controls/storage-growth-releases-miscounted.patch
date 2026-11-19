@@ -1,0 +1,12 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -2104,7 +2104,8 @@
+     let relocated = owned_growth(elements, 1)?.copied;
+     let growth = Growth {
+         copied: grown.copied,
+-        allocations: mul(growths, 2)?,
++        // Planted: one release too few, the last growth's staging block's.
++        allocations: mul(growths, 2)?.saturating_sub(1),
+         allocated: add(grown.allocated, mul(growths, block)?)?,
+         held: grown.held,
+         peak: if growths == 0 {

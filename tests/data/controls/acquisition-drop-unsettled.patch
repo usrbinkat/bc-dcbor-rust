@@ -1,0 +1,13 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -882,7 +882,9 @@
+     /// scope reference deferred into `worklist`, the step's; the one
+     /// implementation of cancelling.
+     pub(crate) fn cancel_into(&mut self, by: Performer, worklist: &mut Worklist<A>) {
+-        self.pending.settle_all(by);
++        // Planted: the token's pending credit, both its retained slots,
++        // forgotten whole: neither settled nor dropped.
++        core::mem::forget(core::mem::replace(&mut self.pending, Pending::deferred()));
+         self.holder = None;
+         self.release_granted();
+         if let Some(scope) = self.scope.take() {

@@ -1,0 +1,12 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -229,7 +229,8 @@
+                 (work, consumed, none)
+             }
+             Credit::Spend(spent) => (none, spent.work, none),
+-            Credit::Forfeit(forfeited, _) => (none, none, forfeited.work),
++            // Planted: a forfeit added to C instead of F.
++            Credit::Forfeit(forfeited, _) => (none, forfeited.work, none),
+         };
+         let fitted = [
+             Self::add(&self.admitted, admitted),

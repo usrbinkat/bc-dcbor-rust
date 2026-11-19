@@ -95,7 +95,12 @@ impl Generator {
                 for _ in 0..self.below(6) {
                     let key = self.value(0);
                     let value = self.value(depth - 1);
-                    map.insert(key, value);
+                    // Generated keys can repeat: a repeated key keeps the
+                    // latest value, replaced explicitly. Symbolic keys and
+                    // values encode infallibly, so the replacement cannot
+                    // refuse.
+                    map.insert_or_replace(key, value)
+                        .expect("a symbolic key and value always encode");
                 }
                 CBOR::from(map)
             }
@@ -347,42 +352,61 @@ fn a_refusal_is_returned_as_the_budget_gave_it() {
     );
 }
 
-/// A value prepared under one policy is written under another into storage
-/// owned with the caller's permit: the writing budget is told of the
-/// initialization and the write, never of an allocation; a refused write
-/// publishes nothing and drops the permit.
+/// A value prepared under one policy is written under another, which admits
+/// the output's release, grants its storage, exactly the encoding's length,
+/// once, and admits its initialization and its write. The permit lives with
+/// the bytes and is released with them. A refused write publishes nothing
+/// and holds nothing; a refused storage request has admitted only the
+/// release, forfeited, and holds nothing.
 #[test]
-fn an_owned_encoding_is_written_under_its_own_budget() {
+fn an_owned_encoding_is_written_under_its_own_policy() {
+    // The release of the published record, an `Encoded` of a reservation:
+    // one value and its bytes.
+    let release = WriteWork::new(1, core::mem::size_of::<Encoded<Reservation>>() as u64);
     let mut preparing = Limits::unlimited();
     let prepared = prepare(&24u64, &mut preparing).unwrap();
-    let mut storage = Limits::unlimited();
-    let permit = storage.allocate(prepared.len() as u64).unwrap();
     let mut writing = Limits::unlimited();
-    let encoded = prepared.encode_owned(permit, &mut writing).unwrap();
+    let encoded = prepared.encode_owned(&mut writing).unwrap();
     assert_eq!(encoded.as_ref(), [0x18, 0x18]);
     assert_eq!(
-        writing.used().bytes,
-        4,
-        "the initialization of both bytes, then their one segment"
+        writing.used(),
+        WriteWork::new(release.values + 2, release.bytes + 4),
+        "the release, the initialization of both bytes, then their one segment and the \
+         completion"
     );
-    assert_eq!(writing.used().values, 2, "the segment and the completion");
     assert_eq!(
-        writing.requested_bytes(),
-        0,
-        "the writing budget allocates nothing"
+        (writing.requests(), writing.requested_bytes()),
+        (1, 2),
+        "the output's storage, requested once at exactly its length"
     );
-    assert_eq!(storage.live_bytes(), 2, "the permit lives with the bytes");
+    assert_eq!(writing.live_bytes(), 2, "the permit lives with the bytes");
     drop(encoded);
-    assert_eq!(storage.live_bytes(), 0, "and is released with them");
+    assert_eq!(writing.live_bytes(), 0, "and is released with them");
 
-    let permit = storage.allocate(prepared.len() as u64).unwrap();
+    // One value admits the release, none the initialization; the write's
+    // first segment is refused.
+    let mut refusing = limited(1);
     assert_eq!(
         prepared
-            .encode_owned(permit, &mut limited(0))
+            .encode_owned(&mut refusing)
             .map(|encoded| encoded.as_ref().to_vec()),
         Err(BoundedError::Refused(LimitRefusal::Work))
     );
-    assert_eq!(storage.live_bytes(), 0, "a refused write drops its permit");
+    assert_eq!(refusing.requests(), 1, "the storage was granted first");
+    assert_eq!(refusing.live_bytes(), 0, "a refused write releases it");
+
+    let mut no_storage = Limits::new(u64::MAX, u64::MAX, 1);
+    assert_eq!(
+        prepared
+            .encode_owned(&mut no_storage)
+            .map(|encoded| encoded.as_ref().to_vec()),
+        Err(BoundedError::Refused(LimitRefusal::Storage))
+    );
+    assert_eq!(
+        (no_storage.used(), no_storage.live_bytes()),
+        (release, 0),
+        "a refused request has admitted only its release, and holds nothing"
+    );
 }
 
 /// The growth bound is exactly what an `Owned` reports and holds: element
@@ -392,13 +416,15 @@ fn an_owned_encoding_is_written_under_its_own_budget() {
 fn owned_growth_is_exact() {
     fn measured<T: Default>(elements: usize, one_at_a_time: bool) -> Growth {
         let mut limits = Limits::unlimited();
+        // The vector's custody, made once: every growth its acquisition.
+        let owner = limits.owner().expect("an ordinary policy's owner");
         let mut owned = Owned::<T, Reservation>::new();
         if one_at_a_time {
             for _ in 0..elements {
-                owned.push(T::default(), &mut limits).unwrap();
+                owned.push(T::default(), &mut limits, &owner).unwrap();
             }
         } else {
-            owned.reserve(elements, &mut limits).unwrap();
+            owned.reserve(elements, &mut limits, &owner).unwrap();
         }
         let growth = Growth {
             allocations: limits.requests() as u64,
@@ -436,18 +462,565 @@ fn owned_growth_is_exact() {
     assert_eq!(owned_growth::<()>(u64::MAX, 2), Err(BoundedError::Overflow));
 }
 
+/// The growth rule: four from empty, otherwise double, none past `u64`; its
+/// `usize` form refused [`BoundedError::Overflow`] where the rule gives none.
+#[test]
+fn the_growth_rule_is_four_from_empty_then_double() {
+    assert_eq!(grown_capacity(0), Some(4));
+    assert_eq!(grown_capacity(4), Some(8));
+    assert_eq!(grown_capacity(1 << 62), Some(1 << 63));
+    assert_eq!(grown_capacity((1 << 63) + 1), None);
+    assert_eq!(grown::<()>(0), Ok(4));
+    assert_eq!(grown::<()>(4), Ok(8));
+    assert_eq!(grown::<()>(usize::MAX), Err(BoundedError::Overflow));
+}
+
+/// An `Owned` pushed one element at a time grows through exactly the
+/// capacities the growth rule steps through, the sequence [`owned_growth`]
+/// counts: each distinct capacity it takes, in order, is the rule's next,
+/// and there are as many as `owned_growth` counts allocations, the last the
+/// one it holds.
+#[test]
+fn an_owned_grows_through_the_rules_capacities() {
+    const ELEMENTS: u64 = 1000;
+    let mut limits = Limits::unlimited();
+    let owner = limits.owner().expect("an ordinary policy's owner");
+    let mut owned = Owned::<u8, Reservation>::new();
+    let mut observed = Vec::new();
+    for element in 0..=ELEMENTS {
+        owned.push(element as u8, &mut limits, &owner).unwrap();
+        if observed.last() != Some(&owned.capacity) {
+            observed.push(owned.capacity);
+        }
+    }
+    let mut expected = Vec::new();
+    let mut capacity = 0u64;
+    while capacity < ELEMENTS + 1 {
+        capacity = grown_capacity(capacity).unwrap();
+        expected.push(usize::try_from(capacity).unwrap());
+    }
+    assert_eq!(observed, expected);
+    let growth = owned_growth::<()>(ELEMENTS + 1, 1).unwrap();
+    assert_eq!(growth.allocations, expected.len() as u64);
+    assert_eq!(growth.held, capacity);
+    drop(owned);
+    assert_eq!(limits.live_bytes(), 0);
+}
+
+/// An `Owned` released through [`Owned::release`] drops its elements before
+/// it releases its permit: each element records its drop, and the permit
+/// refuses to drop before one has. This observes element order only, not the
+/// buffer's deallocation; a plain drop's physical order, the buffer freed
+/// before the permit, is witnessed by the heap observer
+/// (`tests/resumable/native_heap.rs`,
+/// `a_dropped_owned_frees_its_buffer_before_releasing_its_permit`), which
+/// cannot reach this crate-private path. Reordering the fields so the permit drops first fails this test.
+#[test]
+fn a_released_owned_drops_its_elements_before_its_permit() {
+    use core::cell::Cell;
+    struct Marker<'f>(&'f Cell<bool>);
+    impl Drop for Marker<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    struct Permit<'f>(&'f Cell<bool>);
+    impl Drop for Permit<'_> {
+        fn drop(&mut self) {
+            assert!(
+                self.0.get(),
+                "the permit was released before any element was dropped"
+            );
+        }
+    }
+    fn owned(freed: &Cell<bool>) -> Owned<Marker<'_>, Permit<'_>> {
+        Owned {
+            items: Vec::from([Marker(freed), Marker(freed)]),
+            capacity: 2,
+            permit: Some(Permit(freed)),
+        }
+    }
+    let dropped = Cell::new(false);
+    let mut released = owned(&dropped);
+    assert!(released.release(), "it held an allocation");
+    assert!(dropped.get(), "release dropped the elements");
+    assert!(!released.holds(), "and holds nothing after");
+}
+
 #[test]
 fn work_composition_is_checked() {
-    let most = WriteWork::new(u64::MAX, 0);
+    for most in [WriteWork::new(u64::MAX, 0), WriteWork::new(0, u64::MAX)] {
+        assert_eq!(most.checked_then(WriteWork::new(1, 1)), None);
+        assert_eq!(most.checked_times(2), None);
+        assert_eq!(most.checked_times(1), Some(most));
+        assert_eq!(most.checked_times(0), Some(WriteWork::default()));
+    }
     assert_eq!(
-        most.then::<()>(WriteWork::new(1, 0)),
-        Err(BoundedError::Overflow)
+        WriteWork::new(1, 2).checked_then(WriteWork::new(3, 4)),
+        Some(WriteWork::new(4, 6))
     );
-    assert_eq!(most.times::<()>(2), Err(BoundedError::Overflow));
     assert_eq!(
         prepare(&[0u8; 0], &mut Limits::unlimited()).map(|p| p.len()),
         Ok(1)
     );
+}
+
+/// A [`Places`] bound composes its additive quantities and its peak apart:
+/// a bound whose places hold storage at different times reports the peak
+/// its own composition gives, and neither a sum of peaks it never reports
+/// nor work it does not compose into the peak refuses it.
+mod places_composition {
+    use super::*;
+
+    places! {
+        enum Two { First, Second }
+    }
+
+    /// Every quantity of every place summed, the peaks with them: the fold
+    /// the planted controls use, refusing wherever any sum does not fit.
+    fn summed<T: Places>(terms: &T) -> Result<ResourceBound, BoundedError<()>> {
+        T::Place::ALL
+            .iter()
+            .try_fold(ResourceBound::default(), |total, &place| {
+                total.checked_add(terms.term(place))
+            })
+            .ok_or(BoundedError::Overflow)
+    }
+
+    /// Two places of one term each, held one after the other: the peak is
+    /// the larger of theirs, an override of the default.
+    struct Sequential(ResourceBound);
+
+    impl Places for Sequential {
+        type Place = Two;
+
+        fn term(&self, _: Two) -> ResourceBound {
+            self.0
+        }
+
+        fn peak<R>(&self) -> Result<u64, BoundedError<R>> {
+            Ok(Two::ALL
+                .iter()
+                .map(|&place| self.term(place).peak)
+                .max()
+                .unwrap_or(0))
+        }
+    }
+
+    /// Two places of one term each, held at once: every default of
+    /// [`Places`] inherited, only the terms given.
+    struct Concurrent(ResourceBound);
+
+    impl Places for Concurrent {
+        type Place = Two;
+
+        fn term(&self, _: Two) -> ResourceBound {
+            self.0
+        }
+    }
+
+    /// A term of `values` values, one byte, and a peak of `peak`.
+    fn term(values: u64, peak: u64) -> ResourceBound {
+        ResourceBound {
+            values,
+            bytes: 1,
+            allocated: 0,
+            peak,
+            retained: 0,
+        }
+    }
+
+    /// The witness: two sequential places, each peaking at `u64::MAX`, are
+    /// one bound of that peak and their work summed; work that does not fit
+    /// still refuses it.
+    #[test]
+    fn a_sequential_peak_at_u64_max_is_a_bound() {
+        assert_eq!(
+            Sequential(term(1, u64::MAX)).bound::<()>(),
+            Ok(ResourceBound {
+                values: 2,
+                bytes: 2,
+                allocated: 0,
+                peak: u64::MAX,
+                retained: 0,
+            })
+        );
+        assert_eq!(
+            Sequential(term(u64::MAX, u64::MAX)).bound::<()>(),
+            Err(BoundedError::Overflow)
+        );
+    }
+
+    /// The default peak, inherited: peaks that do not fit refuse it, and
+    /// work that does not fit does not, its peaks fitting; the bound then
+    /// refuses over the work.
+    #[test]
+    fn the_default_peak_refuses_only_peaks_that_do_not_fit() {
+        assert_eq!(
+            Concurrent(term(1, u64::MAX)).peak::<()>(),
+            Err(BoundedError::Overflow)
+        );
+        let work = Concurrent(term(u64::MAX, 3));
+        assert_eq!(work.peak::<()>(), Ok(6));
+        assert_eq!(work.bound::<()>(), Err(BoundedError::Overflow));
+    }
+
+    /// The planted controls, each the old form as a local fold: the bound
+    /// that summed every quantity, peaks included, before taking its own
+    /// peak refuses the sequential witness; and the default peak taken from
+    /// that sum refuses work that overflows beside peaks that fit.
+    #[test]
+    fn folds_summing_what_they_do_not_report_refuse_valid_bounds() {
+        let witness = Sequential(term(1, u64::MAX));
+        let old_bound = summed(&witness).and_then(|all| {
+            Ok(ResourceBound {
+                peak: witness.peak()?,
+                ..all
+            })
+        });
+        assert_eq!(old_bound, Err(BoundedError::Overflow));
+        assert!(witness.bound::<()>().is_ok());
+        let work = Concurrent(term(u64::MAX, 3));
+        assert_eq!(
+            summed(&work).map(|all| all.peak),
+            Err(BoundedError::Overflow)
+        );
+        assert_eq!(work.peak::<()>(), Ok(6));
+    }
+}
+
+/// The composition algebra of [`ResourceBound`], witnessed by an executable
+/// model until 29.58 item 4's proofs exist. A bound is realized as an event
+/// trace: acquire its peak, release all but what it retains, admit its work,
+/// request its allocated bytes, ending holding what it retains. Each
+/// combinator composes traces by its meaning, and a simulator reads the
+/// peak, retained, work and allocated quantities off a trace: every
+/// combinator's result must equal the most its traces reach, for every pair
+/// of bounds whose quantities each range over `0..=3`, and every count in
+/// `0..=3` for the repetitions.
+mod composition {
+    use super::*;
+
+    /// One event of a run.
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        /// Bytes taken and held.
+        Acquire(u64),
+        /// Held bytes given back.
+        Release(u64),
+        /// Work admitted.
+        Work(u64, u64),
+        /// An allocation requested.
+        Request(u64),
+    }
+
+    /// One run of an operation, as the events it makes.
+    type Trace = Vec<Event>;
+
+    /// What a trace reaches: its work, its requests, the most it holds at
+    /// once, and what it holds at its end.
+    fn simulate(trace: &[Event]) -> ResourceBound {
+        let (mut held, mut most) = (0u64, 0u64);
+        let mut reached = ResourceBound::default();
+        for event in trace {
+            match *event {
+                Event::Acquire(bytes) => {
+                    held += bytes;
+                    most = most.max(held);
+                }
+                Event::Release(bytes) => held -= bytes,
+                Event::Work(values, bytes) => {
+                    reached.values += values;
+                    reached.bytes += bytes;
+                }
+                Event::Request(bytes) => reached.allocated += bytes,
+            }
+        }
+        reached.peak = most;
+        reached.retained = held;
+        reached
+    }
+
+    /// The most of each quantity over `traces`: the oracle's own maximum,
+    /// never a combinator under test.
+    fn most_of(traces: &[Trace]) -> ResourceBound {
+        let mut most = ResourceBound::default();
+        for trace in traces {
+            let reached = simulate(trace);
+            most.values = most.values.max(reached.values);
+            most.bytes = most.bytes.max(reached.bytes);
+            most.allocated = most.allocated.max(reached.allocated);
+            most.peak = most.peak.max(reached.peak);
+            most.retained = most.retained.max(reached.retained);
+        }
+        most
+    }
+
+    /// The holding part of `bound`'s run: its peak acquired, then all but
+    /// what it retains released.
+    fn holding(bound: ResourceBound) -> Trace {
+        vec![
+            Event::Acquire(bound.peak),
+            Event::Release(bound.peak - bound.retained),
+        ]
+    }
+
+    /// The counted part of `bound`'s run: its work and its requests.
+    fn counted(bound: ResourceBound) -> Trace {
+        vec![
+            Event::Work(bound.values, bound.bytes),
+            Event::Request(bound.allocated),
+        ]
+    }
+
+    /// `bound` realized as one run.
+    fn run(bound: ResourceBound) -> Trace {
+        let mut trace = holding(bound);
+        trace.extend(counted(bound));
+        trace
+    }
+
+    /// `first`'s run, then `next`'s, `first`'s output held.
+    fn then(first: &Trace, next: &Trace) -> Trace {
+        first.iter().chain(next).copied().collect()
+    }
+
+    /// `first`'s run, its output released, then `next`'s.
+    fn followed_by(first: &Trace, retained: u64, next: &Trace) -> Trace {
+        let mut trace = first.clone();
+        trace.push(Event::Release(retained));
+        trace.extend(next);
+        trace
+    }
+
+    /// Every interleaving of the two runs' holding events, each followed by
+    /// both runs' counted events, which no order changes.
+    fn concurrent(a: ResourceBound, b: ResourceBound) -> Vec<Trace> {
+        fn interleavings(left: &[Event], right: &[Event]) -> Vec<Trace> {
+            match (left.split_first(), right.split_first()) {
+                (None, _) => vec![right.to_vec()],
+                (_, None) => vec![left.to_vec()],
+                (Some((l, left_rest)), Some((r, right_rest))) => {
+                    let mut all = Vec::new();
+                    for mut rest in interleavings(left_rest, right) {
+                        rest.insert(0, *l);
+                        all.push(rest);
+                    }
+                    for mut rest in interleavings(left, right_rest) {
+                        rest.insert(0, *r);
+                        all.push(rest);
+                    }
+                    all
+                }
+            }
+        }
+        interleavings(&holding(a), &holding(b))
+            .into_iter()
+            .map(|mut trace| {
+                trace.extend(counted(a));
+                trace.extend(counted(b));
+                trace
+            })
+            .collect()
+    }
+
+    /// `count` runs of `bound`, each one's output released before the next
+    /// (`retained`) or kept.
+    fn repeated(bound: ResourceBound, count: u64, released: bool) -> Trace {
+        let mut trace = Trace::new();
+        for at in 0..count {
+            if released && at > 0 {
+                trace.push(Event::Release(bound.retained));
+            }
+            trace.extend(run(bound));
+        }
+        trace
+    }
+
+    /// Every bound whose quantities each range over `0..=3`, what it retains
+    /// within its peak (a peak counts what its operation retains).
+    fn bounds() -> Vec<ResourceBound> {
+        let mut all = Vec::new();
+        for values in 0..=3 {
+            for bytes in 0..=3 {
+                for allocated in 0..=3 {
+                    for peak in 0..=3 {
+                        for retained in 0..=peak {
+                            all.push(ResourceBound {
+                                values,
+                                bytes,
+                                allocated,
+                                peak,
+                                retained,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    /// Every combinator of two bounds equals the most its traces reach, for
+    /// every pair of bounds.
+    #[test]
+    fn every_pairwise_combinator_is_the_most_its_traces_reach() {
+        let all = bounds();
+        for &a in &all {
+            let ra = run(a);
+            for &b in &all {
+                let rb = run(b);
+                let pair = format!("{a:?} with {b:?}");
+                assert_eq!(
+                    a.checked_then(b),
+                    Some(most_of(&[then(&ra, &rb)])),
+                    "then, {pair}"
+                );
+                assert_eq!(
+                    a.checked_followed_by(b),
+                    Some(most_of(&[followed_by(&ra, a.retained, &rb)])),
+                    "followed_by, {pair}"
+                );
+                assert_eq!(
+                    a.checked_add(b),
+                    Some(most_of(&concurrent(a, b))),
+                    "concurrent, {pair}"
+                );
+                assert_eq!(
+                    a.larger(b),
+                    most_of(&[ra.clone(), rb]),
+                    "alternative, {pair}"
+                );
+            }
+        }
+    }
+
+    /// Both repetitions equal the most their traces reach, for every bound
+    /// and every count in `0..=3`; the concurrent repetition is `count`
+    /// concurrent copies.
+    #[test]
+    fn every_repetition_is_the_most_its_traces_reach() {
+        for bound in bounds() {
+            for count in 0..=3u64 {
+                let at = format!("{bound:?} {count} times");
+                assert_eq!(
+                    bound.checked_repeated(count),
+                    Some(most_of(&[repeated(bound, count, true)])),
+                    "repeated, {at}"
+                );
+                assert_eq!(
+                    bound.checked_repeated_retained(count),
+                    Some(most_of(&[repeated(bound, count, false)])),
+                    "repeated_retained, {at}"
+                );
+                let mut copies = ResourceBound::default();
+                for _ in 0..count {
+                    copies = copies.checked_add(bound).expect("small bounds fit");
+                }
+                assert_eq!(bound.checked_mul(count), Some(copies), "copies, {at}");
+            }
+        }
+    }
+
+    /// The planted control: `then` with the peak `max(P_a, P_b)`, forgetting
+    /// that the first's output is held beside the second's peak, disagrees
+    /// with the simulator for some pair, so the oracle tells it apart.
+    #[test]
+    fn a_then_forgetting_the_held_output_is_refused_by_the_simulator() {
+        fn wrong_then(a: ResourceBound, b: ResourceBound) -> ResourceBound {
+            ResourceBound {
+                values: a.values + b.values,
+                bytes: a.bytes + b.bytes,
+                allocated: a.allocated + b.allocated,
+                peak: a.peak.max(b.peak),
+                retained: a.retained + b.retained,
+            }
+        }
+        let all = bounds();
+        let refused = all.iter().any(|&a| {
+            all.iter()
+                .any(|&b| wrong_then(a, b) != most_of(&[then(&run(a), &run(b))]))
+        });
+        assert!(
+            refused,
+            "the simulator accepted a then without the held output"
+        );
+    }
+
+    /// Each combinator refuses, never wraps, wherever its algebra adds or
+    /// multiplies a quantity at `u64::MAX`; where it only takes a maximum or
+    /// keeps a quantity, `u64::MAX` composes.
+    #[test]
+    fn every_combinator_refuses_a_quantity_beyond_u64() {
+        const MAX: u64 = u64::MAX;
+        let one = ResourceBound {
+            values: 1,
+            bytes: 1,
+            allocated: 1,
+            peak: 1,
+            retained: 1,
+        };
+        let only = |set: fn(&mut ResourceBound)| {
+            let mut bound = ResourceBound::default();
+            set(&mut bound);
+            bound
+        };
+        let work: [fn(&mut ResourceBound); 3] =
+            [|b| b.values = MAX, |b| b.bytes = MAX, |b| b.allocated = MAX];
+        for set in work {
+            let most = only(set);
+            assert_eq!(most.checked_then(one), None, "then {most:?}");
+            assert_eq!(most.checked_followed_by(one), None, "followed_by {most:?}");
+            assert_eq!(most.checked_add(one), None, "concurrent {most:?}");
+            assert_eq!(most.checked_repeated(2), None, "repeated {most:?}");
+            assert_eq!(most.checked_repeated_retained(2), None, "retained {most:?}");
+            assert_eq!(most.checked_mul(2), None, "copies {most:?}");
+            let mut either = one;
+            set(&mut either);
+            assert_eq!(most.larger(one), either, "alternative {most:?}");
+        }
+        // A whole retained output: held beside the next one's peak and kept
+        // with its output by `then`, kept by every repetition that holds it.
+        let held = ResourceBound {
+            peak: MAX,
+            retained: MAX,
+            ..ResourceBound::default()
+        };
+        assert_eq!(held.checked_then(one), None, "then, the held output");
+        assert_eq!(held.checked_add(one), None, "concurrent, the held output");
+        assert_eq!(held.checked_repeated_retained(2), None, "retained twice");
+        assert_eq!(held.checked_mul(2), None, "two concurrent copies");
+        // Only the larger peak, or the last output, is taken: never summed.
+        assert_eq!(
+            held.checked_followed_by(one),
+            Some(ResourceBound {
+                peak: MAX,
+                retained: 1,
+                ..one
+            })
+        );
+        assert_eq!(held.checked_repeated(2), Some(held));
+        // `(n - 1) R + P` past `u64::MAX` through the peak alone.
+        let peaked = ResourceBound {
+            peak: MAX,
+            retained: 1,
+            ..ResourceBound::default()
+        };
+        assert_eq!(peaked.checked_repeated_retained(1), Some(peaked));
+        assert_eq!(peaked.checked_repeated_retained(2), None, "R + P past u64");
+        assert_eq!(
+            peaked.checked_repeated_retained(0),
+            Some(ResourceBound::default())
+        );
+        assert_eq!(
+            held.larger(one),
+            ResourceBound {
+                peak: MAX,
+                retained: MAX,
+                ..one
+            }
+        );
+    }
 }
 
 /// A bignum's encoding is the symbolic conversion's (`num_bigint.rs`), for
@@ -505,7 +1078,7 @@ fn a_maps_iteration_order_is_its_encoded_key_order() {
         CBOR::from(100_000u64),
         CBOR::from(false),
     ] {
-        map.insert(key, 0u64);
+        map.insert(key, 0u64).unwrap();
     }
     let iterated: Vec<Vec<u8>> = map.iter().map(|(key, _)| key.to_cbor_data()).collect();
     let mut sorted = iterated.clone();
@@ -524,8 +1097,14 @@ fn a_trees_entries_take_canonical_key_order_not_tree_order() {
     let mut tree = BTreeMap::new();
     tree.insert(String::from("aa"), 1u64);
     tree.insert(String::from("z"), 2u64);
+    // Distinct `String`s can collide: text encodes in NFC, so "\u{e9}" and
+    // "e\u{301}" are one key. These two keys are ASCII, which NFC leaves
+    // unchanged, and differ, so their encodings differ and the encoding
+    // cannot refuse.
+    let symbolic = crate::CBOREncodable::encode_cbor(&tree)
+        .expect("distinct ASCII keys are distinct CBOR keys");
     assert_eq!(
-        check(&tree, &CBOR::from(tree.clone()).to_cbor_data()),
+        check(&tree, &symbolic.to_cbor_data()),
         [0xa2, 0x61, b'z', 0x02, 0x62, b'a', b'a', 0x01]
     );
 }
@@ -725,11 +1304,12 @@ mod charge_rules {
     #[test]
     fn an_insertion_admits_the_move_of_every_element_after_it() {
         let mut limits = Limits::unlimited();
+        let owner = limits.owner().expect("an ordinary policy's owner");
         let mut owned = Owned::<u64, Reservation>::new();
-        owned.push(1, &mut limits).unwrap();
-        owned.push(3, &mut limits).unwrap();
+        owned.push(1, &mut limits, &owner).unwrap();
+        owned.push(3, &mut limits, &owner).unwrap();
         let before = limits.used();
-        owned.insert(1, 2, &mut limits).unwrap();
+        owned.insert(1, 2, &mut limits, &owner).unwrap();
         assert_eq!(owned.as_slice(), [1, 2, 3]);
         assert_eq!(
             limits.used(),
@@ -737,7 +1317,10 @@ mod charge_rules {
             "one shifted element of eight bytes, no growth"
         );
         let attempts = limits.attempts();
-        assert_eq!(owned.insert(5, 9, &mut limits), Err(BoundedError::Overflow));
+        assert_eq!(
+            owned.insert(5, 9, &mut limits, &owner),
+            Err(BoundedError::Overflow)
+        );
         assert_eq!(limits.attempts(), attempts);
         assert_eq!(owned.as_slice(), [1, 2, 3]);
     }

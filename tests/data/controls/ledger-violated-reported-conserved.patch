@@ -1,0 +1,13 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -560,7 +560,9 @@
+             .consumed
+             .checked_then(self.forfeited)?
+             .checked_then(held)?;
+-        Some(!self.violated && accounted == self.admitted)
++        // Planted: the violation is ignored. Must fail "a violated ledger is
++        // never reported conserved".
++        Some(accounted == self.admitted)
+     }
+ }
+

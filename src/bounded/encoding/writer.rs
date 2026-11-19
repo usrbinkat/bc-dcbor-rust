@@ -26,11 +26,24 @@ places! {
         /// A caller-owned output's initialization before it is written
         /// ([`Prepared::encode_owned`]).
         Initialization,
+        /// A caller-owned output's storage, requested in its whole length
+        /// and held by the encoding it publishes ([`Prepared::encode_owned`]).
+        Output,
     }
 }
 
 /// An output's bytes initialized before it is written.
 const INITIALIZED: Scan<EmitPlace> = Scan::new(EmitPlace::Initialization, 0);
+
+/// Releasing an owned output ([`Prepared::encode_owned`]): one value and
+/// the bytes dropping its published record ([`Encoded`]) rewrites, of a
+/// permit within [`PERMIT_BYTES`]. Admitted by the acquisition before the
+/// storage is requested, and forfeited, never refunded, when the request is
+/// refused or the allocation fails.
+const fn encoded_released<P>() -> Unit<EmitPlace> {
+    permit_bytes::<P>();
+    Unit::written::<Encoded<P>>(EmitPlace::Output)
+}
 
 /// Emitting one segment: one value and at most a quantum of the plan's
 /// bytes.
@@ -147,9 +160,15 @@ impl<P> Prepared<P> {
         self.holes.release();
         self.bytes.items.truncate(self.len);
         let permit = self.bytes.permit.take().ok_or(BoundedError::PlanMismatch)?;
+        // The encoding carries the owner its bytes arena's acquisitions were
+        // bound under, which the plan carried from its preparation: the
+        // bytes, and that arena's permit, move into the encoding. A plan
+        // holding a permit always names one.
+        let owner = self.owner().ok_or(BoundedError::PlanMismatch)?;
         Ok(Encoded {
             bytes: core::mem::take(&mut self.bytes.items),
             _permit: permit,
+            owner,
         })
     }
 
@@ -178,27 +197,100 @@ impl<P> Prepared<P> {
         Err(BoundedError::PlanMismatch)
     }
 
-    /// Write the encoding into storage this call allocates fallibly at
-    /// exactly [`Self::len`] bytes, owned with `permit`, the reservation the
-    /// caller admitted for that storage: its initialization admitted before
-    /// it is touched, then the write ([`Self::encode_into`]). The bytes are
-    /// published only once complete; on every error the storage is freed
-    /// and `permit` dropped after it. The budget may differ from the
-    /// preparation's allocator: a caller admits the output, its
-    /// initialization and [`Self::write_work`] as one unit and writes on it.
-    pub fn encode_owned<Q, B: Budget>(&self, permit: Q, b: &mut B) -> BoundedResult<Encoded<Q>, B> {
+    /// Write the encoding into storage of exactly [`Self::len`] bytes that
+    /// this call requests from `a` and then allocates fallibly: the permit
+    /// `a` grants is minted here for exactly that length and published with
+    /// the bytes ([`Encoded`]), so no caller can pair the storage with a
+    /// permit of another size. The storage's release is admitted before it
+    /// is requested, as every acquisition's is ([`Allocator`]): held for the
+    /// grant ([`Obligation::Release`]), forfeited if the request is refused
+    /// ([`Forfeit::AcquisitionRefused`]), and spent at the grant, bound to the
+    /// permit, whose drop performs it on every path after. The physical
+    /// reservation's outcome is reported as the permit's effect
+    /// ([`Effect`]). Then the output's initialization is admitted on `a`
+    /// before it is touched, and the write ([`Self::encode_into`]). The bytes
+    /// are published only once complete; on every error the storage is freed
+    /// and its permit released after it. One policy both grants the storage
+    /// and admits the work: a refusal of either is that policy's
+    /// ([`BoundedError::Refused`]). The policy may differ from the
+    /// preparation's. Its bound is [`owned_emit_bound`].
+    ///
+    /// The call is the custody of its one acquisition, made and ended within
+    /// it and keeping nothing across a refusal: its owner and its acquisition
+    /// are minted for it ([`Budget::owner`], [`Budget::acquisition`]), so a
+    /// recording policy that cannot identify them refuses before anything is
+    /// admitted, and a retry is a new acquisition.
+    ///
+    /// The storage is the call's own; a caller cannot supply a permit:
+    ///
+    /// ```compile_fail,E0061
+    /// use dcbor::bounded::{Allocator, Limits, prepare};
+    /// let mut limits = Limits::unlimited();
+    /// let prepared = prepare(&24u64, &mut limits).unwrap();
+    /// let undersized = limits.allocate(1).unwrap();
+    /// let _ = prepared.encode_owned(undersized, &mut limits);
+    /// ```
+    pub fn encode_owned<A: Allocator>(&self, a: &mut A) -> BoundedResult<Encoded<A::Permit>, A> {
         let len = widen(self.len)?;
+        // This call is the custody of its one acquisition: its owner and
+        // acquisition minted here, each refused before anything is admitted
+        // when a recording policy cannot identify it.
+        let owner = a.owner().map_err(BoundedError::Refused)?;
+        let acquisition = a.acquisition(&owner).map_err(BoundedError::Refused)?;
+        // The release is held for the grant within this call, which keeps no
+        // custody of it across a refusal: a refusal ends the call and
+        // forfeits it into its origin, and a retry is a new acquisition.
+        // Every exit settles the release, then ends the acquisition, once:
+        // it ends with its physical outcome, before the write that follows.
+        let release = match const { encoded_released::<A::Permit>() }.admit_held(
+            a,
+            Obligation::Release,
+            &owner,
+            acquisition.id(),
+        ) {
+            Ok(release) => release,
+            Err(error) => {
+                acquisition.end(a.performer());
+                return Err(error);
+            }
+        };
+        let permit = match at(EmitPlace::Output, || a.allocate(len)) {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                release.forfeit(Forfeit::AcquisitionRefused, None, a.performer());
+                acquisition.end(a.performer());
+                return Err(BoundedError::Refused(refusal));
+            }
+        };
+        let id = A::permit_identity(&permit);
+        // Granted: the release is spent at the permit, which carries it and
+        // whose drop performs it on every path below.
+        release.spend(Some(id), a.performer());
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.len)
-            .map_err(|_| BoundedError::Allocation { bytes: len })?;
-        INITIALIZED.admit(b, len)?;
-        bytes.resize(self.len, 0);
-        self.encode_into(&mut bytes, b)?;
-        Ok(Encoded {
+        let reservation = reserved(a, permit, acquisition.id(), || {
+            bytes
+                .try_reserve_exact(self.len)
+                .map_err(|_| Forfeit::AcquisitionFailed)
+        });
+        acquisition.end(a.performer());
+        let Ok((permit, ())) = reservation else {
+            return Err(BoundedError::Allocation { bytes: len });
+        };
+        // The storage and its permit held together from the reservation on,
+        // in the encoding that publishes them, whose fields drop the bytes
+        // before the permit: every exit below frees the storage, then
+        // releases its permit. The encoding carries this call's owner, under
+        // which its one acquisition was bound; the acquisition ended at its
+        // outcome above.
+        let mut encoded = Encoded {
             bytes,
             _permit: permit,
-        })
+            owner: owner.id(),
+        };
+        INITIALIZED.admit(a, len)?;
+        encoded.bytes.resize(self.len, 0);
+        self.encode_into(&mut encoded.bytes, a)?;
+        Ok(encoded)
     }
 }
 
@@ -280,12 +372,26 @@ pub fn emit_bound<R>(len: u64) -> Result<ResourceBound, BoundedError<R>> {
     EmitTerms::of::<R>(len)?.bound()
 }
 
+/// The [`ResourceBound`] of [`Prepared::encode_owned`] of a completed plan
+/// of `len` bytes under a policy granting permits of `P`: [`emit_bound`]'s
+/// terms, and the output's: its release admitted, one value and the bytes
+/// its published record ([`Encoded`]) rewrites when it drops, then its
+/// storage of `len` bytes requested once, held while it is written, and
+/// retained by the encoding it publishes. Refused, never saturated, when a
+/// quantity does not fit in `u64`.
+pub fn owned_emit_bound<P, R>(len: u64) -> Result<ResourceBound, BoundedError<R>> {
+    EmitTerms::owned::<P, R>(len)?.bound()
+}
+
 /// The terms [`emit_bound`] sums, one per [`EmitPlace`].
 struct EmitTerms {
     bytes: WriteWork,
     boundaries: WriteWork,
     completion: WriteWork,
     initialization: WriteWork,
+    /// The owned output's storage: none for a borrowed write or a
+    /// publication in place, which allocate nothing ([`Self::owned`]).
+    output: ResourceBound,
 }
 
 impl EmitTerms {
@@ -298,6 +404,30 @@ impl EmitTerms {
             completion: COMPLETE.times(1)?,
             // A caller-owned output's every byte, initialized once.
             initialization: INITIALIZED.units(1, len)?,
+            output: ResourceBound::default(),
+        })
+    }
+
+    /// The terms of [`Prepared::encode_owned`] of a plan of `len` bytes
+    /// under a policy granting permits of `P`: [`Self::of`], and its
+    /// output: the storage's release admitted ([`encoded_released`]), then
+    /// `len` bytes requested once, held while they are written and retained
+    /// by the encoding ([`owned_emit_bound`]).
+    fn owned<P, R>(len: u64) -> Result<Self, BoundedError<R>> {
+        // The release admitted, then the storage requested, held while it
+        // is written and kept by the encoding.
+        let output = encoded_released::<P>()
+            .bound()
+            .checked_then(ResourceBound {
+                allocated: len,
+                peak: len,
+                retained: len,
+                ..ResourceBound::default()
+            })
+            .ok_or(BoundedError::Overflow)?;
+        Ok(Self {
+            output,
+            ..Self::of(len)?
         })
     }
 }
@@ -311,6 +441,7 @@ impl Places for EmitTerms {
             EmitPlace::Boundaries => ResourceBound::of_work(self.boundaries),
             EmitPlace::Completion => ResourceBound::of_work(self.completion),
             EmitPlace::Initialization => ResourceBound::of_work(self.initialization),
+            EmitPlace::Output => self.output,
         }
     }
 }
@@ -360,7 +491,7 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> OwnedWriter<'s, I, T, A
             emission: self.at,
             plan: PlanDetail {
                 phase: Some(record.phase),
-                preparation: Some(record.preparation.position()),
+                preparation: record.preparation().map(Preparation::position),
                 source: record.source.is_some(),
             },
         }
@@ -383,20 +514,41 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> OwnedWriter<'s, I, T, A
         })
     }
 
-    /// Operation-local cleanup of the plan and its source value.
+    /// Operation-local cleanup of the plan and its source value, the cleanup
+    /// capability minted here over `a`.
     pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {
         let at = slot
             .as_ref()
             .map_or(EmitPosition::default(), |writer| writer.at);
-        reclamation::reclaim_within(
-            slot,
-            a,
-            |writer| writer.record,
-            |record| Self { record, at },
-            OwnedInitialized::reclaim_step,
-        )
+        reclamation::with_cleanup(a, |cleanup| {
+            reclamation::reclaim_within(
+                slot,
+                cleanup,
+                |writer| writer.record,
+                |record| Self { record, at },
+                OwnedInitialized::reclaim_under,
+            )
+        })
     }
 }
+
+/// The writer's custody: the plan record it emits from, under the owner of
+/// the acquisition that allocated it (its record's [`Custodial`] traversal).
+/// Emission position is no custody: completing the emission releases
+/// nothing, so the record stays reported until it is reclaimed or retired.
+/// `&mut self` excludes every borrowed chunk meanwhile. Read-only.
+impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Custodial<A::Permit>
+    for OwnedWriter<'_, I, T, A>
+{
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        self.record.observe_custody(sink)
+    }
+}
+
+/// Kani harnesses of the emission's whole-operation bound (register item 4):
+/// compiled only by `cargo kani`.
+#[cfg(kani)]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
@@ -449,7 +601,9 @@ mod tests {
     /// `source`'s plan, prepared under an unlimited policy.
     fn planned(source: &dyn Schema) -> Prepared<crate::bounded::Reservation> {
         let shape = Shape::of(source, &mut Limits::unlimited()).expect("a fixture has a shape");
-        let bound = prepare_bound::<crate::bounded::Reservation, ()>(shape)
+        // The preparation runs under `Limits`, whose held credit settles
+        // into its `Family`: the bound is of that origin's custody.
+        let bound = prepare_bound::<crate::bounded::Reservation, crate::bounded::Family, ()>(shape)
             .expect("the bound of a fixture fits in u64");
         let mut limits = Limits::unlimited();
         let mut preparation = Preparation::new(source);
@@ -462,18 +616,19 @@ mod tests {
         })
     }
 
-    /// `plan` emitted by `emission` under `budget`: its length and the bytes
-    /// emitted.
-    fn emit<B: Budget>(
+    /// `plan` emitted by `emission` under `budget`: its length, the bytes
+    /// emitted, and the encoding an owned emission publishes, its storage
+    /// and permit still held, which only that emission allocates.
+    fn emit<A: Allocator>(
         plan: Prepared<crate::bounded::Reservation>,
         emission: Emission,
-        budget: &mut B,
-    ) -> (u64, Vec<u8>)
+        budget: &mut A,
+    ) -> (u64, Vec<u8>, Option<Encoded<A::Permit>>)
     where
-        B::Refusal: fmt::Debug,
+        A::Refusal: fmt::Debug,
     {
         let len = plan.len() as u64;
-        let bytes = match emission {
+        let (bytes, held) = match emission {
             Emission::Written => {
                 let bound = emit_bound::<()>(len).expect("the bound of a plan fits in u64");
                 let mut bytes = vec![0; plan.len()];
@@ -483,24 +638,37 @@ mod tests {
                     Ok(Step::Complete(())) => ControlFlow::Break(()),
                     other => panic!("emission failed: {other:?}"),
                 });
-                bytes
+                (bytes, None)
             }
-            Emission::Owned => match plan.encode_owned((), budget) {
-                Ok(encoded) => encoded.as_ref().to_vec(),
+            Emission::Owned => match plan.encode_owned(budget) {
+                Ok(encoded) => (encoded.as_ref().to_vec(), Some(encoded)),
                 Err(error) => panic!("emission failed: {error:?}"),
             },
             Emission::Published => match plan.publish(budget) {
-                Ok(encoded) => encoded.as_ref().to_vec(),
+                Ok(encoded) => (encoded.as_ref().to_vec(), None),
                 Err(error) => panic!("emission failed: {error:?}"),
             },
         };
-        (len, bytes)
+        (len, bytes, held)
+    }
+
+    /// The terms `emission` of a plan of `len` bytes under a policy granting
+    /// permits of `P` is checked against: only an owned emission's include
+    /// its output, its release and its storage.
+    fn terms<P>(len: u64, emission: Emission) -> EmitTerms {
+        match emission {
+            Emission::Owned => EmitTerms::owned::<P, ()>(len),
+            Emission::Written | Emission::Published => EmitTerms::of::<()>(len),
+        }
+        .expect("the terms of a plan fit in u64")
     }
 
     /// Long payloads, many gaps, unordered maps at the root and nested are
-    /// each emitted by every emission within the bound, the same bytes by
-    /// each, every byte reported exactly once by the segments and nothing
-    /// requested.
+    /// each emitted by every emission within its terms, the same bytes by
+    /// each, every byte reported exactly once by the segments, and nothing
+    /// requested but an owned emission's output, its release admitted
+    /// first, requested once at exactly the encoding's length, held with the
+    /// encoding and released with it.
     #[test]
     fn the_emission_bound_covers_every_plan_shape() {
         let text = "x".repeat(70_000);
@@ -511,19 +679,28 @@ mod tests {
             let mut emitted = Vec::new();
             for emission in EMISSIONS {
                 let mut budget = Limits::unlimited();
-                let (len, bytes) = emit(planned(source), emission, &mut budget);
+                let (len, bytes, held) = emit(planned(source), emission, &mut budget);
                 let used = budget.used();
-                let bound = emit_bound::<()>(len).unwrap();
+                let bound = terms::<crate::bounded::Reservation>(len, emission)
+                    .bound::<()>()
+                    .unwrap();
+                let public = match emission {
+                    Emission::Owned => owned_emit_bound::<crate::bounded::Reservation, ()>(len),
+                    Emission::Written | Emission::Published => emit_bound::<()>(len),
+                };
+                assert_eq!(public, Ok(bound), "{emission:?}: its public bound");
                 assert!(
                     bound.work().covers(&used),
                     "{emission:?}: {used:?} exceeds {bound:?}"
                 );
-                // Beside the plan's bytes: a caller's own output's bytes
-                // initialized. Publication's release of the gap records was
+                // Beside the plan's bytes: a caller's own output, its bytes
+                // initialized, its release admitted and its storage
+                // requested. Publication's release of the gap records was
                 // paid for by their growth.
-                let beside = match emission {
-                    Emission::Owned => len,
-                    Emission::Published | Emission::Written => 0,
+                let released = encoded_released::<crate::bounded::Reservation>().bytes();
+                let (beside, output, requests) = match emission {
+                    Emission::Owned => (len + released, len, 1),
+                    Emission::Published | Emission::Written => (0, 0, 0),
                 };
                 assert_eq!(
                     used.bytes,
@@ -531,10 +708,17 @@ mod tests {
                     "{emission:?}: every byte is reported once"
                 );
                 assert_eq!(
-                    budget.requested_bytes(),
-                    0,
-                    "{emission:?}: emission requested storage"
+                    (
+                        budget.requests(),
+                        budget.requested_bytes(),
+                        budget.live_bytes()
+                    ),
+                    (requests, output, output),
+                    "{emission:?}: only an owned output is requested, and held"
                 );
+                assert_eq!(held.is_some(), requests == 1);
+                drop(held);
+                assert_eq!(budget.live_bytes(), 0, "{emission:?}: released with it");
                 assert_eq!(bytes.len() as u64, len);
                 emitted.push(bytes);
             }
@@ -550,13 +734,16 @@ mod tests {
     /// emission that charges it: a place without a witness does not compile.
     /// A plan of empty maps passes a gap before every head byte, the most
     /// boundaries per byte a plan can have, each cutting a segment short;
-    /// written to a caller's own storage, every byte is also initialized.
-    /// Only publication releases the gap records at its completion. Its one
-    /// caller is the `std` attribution test.
+    /// written to a caller's own storage, every byte is also initialized and
+    /// its whole length requested. Only publication releases the gap records
+    /// at its completion. Its one caller is the `std` attribution test.
     #[cfg(feature = "std")]
     fn witness(place: EmitPlace) -> (Box<dyn Schema>, Emission) {
         match place {
-            EmitPlace::Bytes | EmitPlace::Boundaries | EmitPlace::Initialization => (
+            EmitPlace::Bytes
+            | EmitPlace::Boundaries
+            | EmitPlace::Initialization
+            | EmitPlace::Output => (
                 Box::new((0..4096).map(|_| Empty).collect::<Vec<_>>()),
                 Emission::Owned,
             ),
@@ -573,7 +760,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn every_place_of_an_emission_is_within_its_term() {
-        use crate::bounded::places::{self, Factor, Ledgered, Run, WORK};
+        use crate::bounded::places::{self, Factor, Ledgered, Run, STORAGE, WORK};
         /// A source's name, the place it witnesses if any, the source and
         /// its emission.
         type Source = (String, Option<EmitPlace>, Box<dyn Schema>, Emission);
@@ -611,9 +798,12 @@ mod tests {
         }
         let mut runs = Vec::new();
         let mut witnesses = Vec::new();
+        // Each owned encoding is held until the check: what it retains is
+        // checked against its output's retained term.
+        let mut held = Vec::new();
         for (name, place, source, emission) in &sources {
             let mut policy = Ledgered::new();
-            let (len, _) = emit(planned(source.as_ref()), *emission, &mut policy);
+            let (len, _, encoded) = emit(planned(source.as_ref()), *emission, &mut policy);
             if let Some(place) = place {
                 witnesses.push((runs.len(), *place));
             }
@@ -621,15 +811,18 @@ mod tests {
                 outcome: places::Outcome::Published,
                 name: name.clone(),
                 policy,
-                terms: EmitTerms::of::<()>(len).unwrap(),
+                terms: terms::<places::Permit>(len, *emission),
             });
+            held.push(encoded);
         }
         places::check(&runs);
         places::witnessed(&runs, &witnesses);
         places::Tightness::new("emission")
             .places(&runs, &witnesses, |place| match place {
                 EmitPlace::Bytes | EmitPlace::Boundaries => Factor::Within(2),
-                EmitPlace::Completion | EmitPlace::Initialization => Factor::Within(1),
+                EmitPlace::Completion | EmitPlace::Initialization | EmitPlace::Output => {
+                    Factor::Within(1)
+                }
             })
             .joint(
                 &runs,
@@ -639,6 +832,15 @@ mod tests {
                  before every head byte, each passed in its own unit and cutting a segment \
                  short, the most boundaries a plan's bytes allow",
             )
+            .joint(
+                &runs,
+                "witness of Output",
+                STORAGE,
+                "a caller-owned output: its whole length requested once, held while it is \
+                 written and retained by the encoding it publishes, the only storage an \
+                 emission requests",
+            )
             .finish();
+        drop(held);
     }
 }

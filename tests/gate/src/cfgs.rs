@@ -10,7 +10,8 @@
 //! `cfg(test)` and under Miri and natively; every record variant
 //! ([`records::VARIANTS`]), its library tests; and each model checker's
 //! release build of every feature (`process::build`), with and without
-//! `cfg(test)`. Each build's features are resolved from the package's
+//! `cfg(test)`; and the proof harnesses' Kani build ([`proofs`]). Each
+//! build's features are resolved from the package's
 //! feature table as `cargo metadata` reports it, which lists an optional
 //! dependency's implicit feature beside the declared ones (cargo
 //! `Summary::build_feature_map`); a feature enables what it lists, a
@@ -27,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use dcbor_census::{CensusCfg, CfgForm};
 use dcbor_model_bounds::Checker;
 
-use crate::{domains, records};
+use crate::{domains, proofs, records};
 
 /// A `cfg` expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,12 +48,24 @@ const NAMES: &[&str] = &[
     "miri",
     "loom",
     "shuttle",
+    "kani",
     "unix",
     "debug_assertions",
 ];
 
 /// The keys a build gives values.
-const KEYS: &[&str] = &["feature", "target_pointer_width"];
+const KEYS: &[&str] = &[
+    "feature",
+    "target_pointer_width",
+    "target_arch",
+    "target_feature",
+];
+
+/// The target features a predicate may name, each off in every build the
+/// gates make: no gate passes `-C target-feature` or `-C target-cpu`, and
+/// none is in the x86_64 host target's baseline. Any other target feature is
+/// refused, never taken as off, since the baseline's own (`sse2`) hold.
+const TARGET_FEATURES_OFF: &[&str] = &["f16c"];
 
 /// One token of an expression's rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +169,12 @@ fn expression(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
             if !KEYS.contains(&key.as_str()) {
                 return Err(format!("an unknown cfg key {key:?}: the keys are {KEYS:?}"));
             }
+            if key == "target_feature" && !TARGET_FEATURES_OFF.contains(&value.as_str()) {
+                return Err(format!(
+                    "target_feature = {value:?}: no build's state is declared for it; the \
+                     declared ones are {TARGET_FEATURES_OFF:?}"
+                ));
+            }
             Ok((Expr::Pair(key.clone(), value.clone()), rest))
         }
         [Token::Ident(name), rest @ ..] => {
@@ -189,6 +208,10 @@ impl Build {
             Expr::Name(name) => self.names.contains(name.as_str()),
             Expr::Pair(key, value) => match key.as_str() {
                 "feature" => self.features.contains(value),
+                // The host's architecture.
+                "target_arch" => value == "x86_64",
+                // `TARGET_FEATURES_OFF`, the only ones `parse` admits.
+                "target_feature" => false,
                 // `KEYS`: the host's pointer width.
                 _ => value == "64",
             },
@@ -324,16 +347,45 @@ pub fn builds(table: &BTreeMap<String, Vec<String>>) -> Result<Vec<Build>, Strin
             });
         }
     }
+    let kani =
+        selected(table, proofs::FEATURES).map_err(|error| format!("{}: {error}", proofs::NAME))?;
+    found.push(build(proofs::NAME.to_string(), &kani, proofs::NAMES));
     Ok(found)
 }
 
 /// The predicates that hold in no gated build by design, each by file,
 /// expression and why.
-pub const EXEMPTIONS: &[(&str, &str, &str)] = &[(
-    "src/sync.rs",
-    "all (loom , shuttle)",
-    "the guard that refuses building under two model checkers at once (compile_error!)",
-)];
+pub const EXEMPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "src/sync.rs",
+        "all (loom , shuttle)",
+        "the guard that refuses building under two model checkers at once (compile_error!)",
+    ),
+    (
+        "src/lib.rs",
+        "not (any (feature = \"std\" , feature = \"no_std\"))",
+        "the guard that refuses a build with neither std nor no_std, an unsupported \
+         configuration no gate builds (compile_error!)",
+    ),
+    (
+        "src/float.rs",
+        "target_arch = \"aarch64\"",
+        "the binary16 branch marker's aarch64 arm, mirroring half's fp16 dispatch; no gate \
+         builds aarch64, and float/proofs.rs names that branch outside the evidenced domain",
+    ),
+    (
+        "src/float.rs",
+        "not (any (target_arch = \"x86\" , target_arch = \"x86_64\" , target_arch = \"aarch64\"))",
+        "the binary16 branch marker's arm for architectures where half has only its software \
+         fallback; no gate builds one",
+    ),
+    (
+        "src/float.rs",
+        "target_feature = \"f16c\"",
+        "the branch marker reports whether f16c was enabled at compile time; no gate enables \
+         it, so its true path, half's static f16c branch, is outside the gated builds",
+    ),
+];
 
 /// Every fault of `cfgs` against `builds` and `exemptions`: a predicate that
 /// does not parse, a `cfg` or `cfg_attr` predicate holding in no build, a
@@ -477,9 +529,23 @@ mod tests {
             ),
             ("all (unix , target_pointer_width = \"64\")", true),
             ("all (shuttle , not (loom))", false),
+            ("target_arch = \"x86_64\"", true),
+            (
+                "any (target_arch = \"x86\" , target_arch = \"x86_64\")",
+                true,
+            ),
+            ("target_arch = \"aarch64\"", false),
+            ("target_feature = \"f16c\"", false),
         ] {
             assert_eq!(build.holds(&parse(text).unwrap()), holds, "{text}");
         }
+        // A target feature with no declared state is refused, never taken
+        // as off: the host baseline's own hold.
+        assert!(
+            parse("target_feature = \"sse2\"")
+                .unwrap_err()
+                .contains("no build's state is declared")
+        );
         assert!(parse("windows").unwrap_err().contains("unknown cfg name"));
         assert!(
             parse("target_os = \"linux\"")
@@ -515,6 +581,25 @@ mod tests {
                 .iter()
                 .any(|build| build.name == "std tests under Miri")
         );
+        // The proof harnesses' Kani build is among the builds: `kani` holds
+        // in it, `test` does not, and its features are the proofs'
+        // selection. Dropping the build fails here, and every `cfg(kani)`
+        // in the crate would then hold in no build.
+        let kani = builds
+            .iter()
+            .find(|build| build.name == proofs::NAME)
+            .expect("the Kani build is among the gated builds");
+        assert!(kani.holds(&parse("kani").unwrap()));
+        assert!(!kani.holds(&parse("test").unwrap()));
+        assert!(kani.holds(&parse("all (unix , debug_assertions , feature = \"std\")").unwrap()));
+        assert!(!kani.holds(&parse("feature = \"hashbrown\"").unwrap()));
+        assert!(
+            builds
+                .iter()
+                .filter(|build| build.name != proofs::NAME)
+                .all(|build| !build.holds(&parse("kani").unwrap())),
+            "only the Kani build defines kani"
+        );
         let cfgs = [
             cfg(
                 "not (any (feature = \"hashbrown\" , feature = \"custom-std-collections\"))",
@@ -543,7 +628,7 @@ mod tests {
                     .to_string(),
                 "src/a.rs:7: cfg!(unix): true in every build the gates make, so its false path is compiled by none"
                     .to_string(),
-                "src/a.rs:7: cfg_attr(windows): an unknown cfg name \"windows\": the names are [\"test\", \"miri\", \"loom\", \"shuttle\", \"unix\", \"debug_assertions\"]"
+                "src/a.rs:7: cfg_attr(windows): an unknown cfg name \"windows\": the names are [\"test\", \"miri\", \"loom\", \"shuttle\", \"kani\", \"unix\", \"debug_assertions\"]"
                     .to_string(),
                 "src/a.rs: test: an exemption without a reason".to_string(),
                 "src/a.rs: test: a stale exemption".to_string(),

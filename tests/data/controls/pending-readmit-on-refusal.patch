@@ -1,0 +1,17 @@
+--- src/bounded/decode/construction/stable.rs
++++ src/bounded/decode/construction/stable.rs
+@@ -947,12 +947,12 @@
+     // in `pending` from its admission across a refused request, which the
+     // retry's grant spends.
+     let ticket = bound(pending, holder, a)?;
+-    if pending.admitted(ticket)? == Admitted::Nothing {
++    if pending.admitted(ticket)? != Admitted::Write {
+         let written = contract.written as u64;
+         admit_obligation(
+             pending,
+             holder,
+-            &[Admitted::Nothing],
++            &[Admitted::Nothing, Admitted::Release],
+             |a, owner, acquisition| {
+                 WRITE.admit_held(a, written, Obligation::Grant, owner, acquisition)
+             },

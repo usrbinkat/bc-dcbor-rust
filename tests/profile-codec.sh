@@ -6,6 +6,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tests/gate-common.sh
 : "${TMPDIR:?required: the profile log directory}"
 : "${DCBOR_CONFIGURATION:?run in the identified development shell}"
+# The gate tool, before anything else: the identity reads the Unicode
+# version through it (`source_identity`).
+gate_prepare || exit 2
 logs="$(mktemp -d "$TMPDIR/dcbor-codec-profile.XXXXXX")"
 printf 'Codec profile logs: %s\n' "$logs"
 operations="${DCBOR_PROFILE_OPERATIONS:-1000}"

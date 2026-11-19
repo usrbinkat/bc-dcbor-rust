@@ -1,0 +1,12 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -1698,7 +1698,8 @@
+ /// `allocate_grown`) and the bound over both ([`owned_growth`]) follow.
+ pub(crate) const fn grown_capacity(capacity: u64) -> Option<u64> {
+     if capacity == 0 {
+-        Some(4)
++        // Planted: an empty arena grows to two, not four.
++        Some(2)
+     } else {
+         capacity.checked_mul(2)
+     }

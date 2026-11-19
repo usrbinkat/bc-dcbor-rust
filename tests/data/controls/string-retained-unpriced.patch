@@ -1,0 +1,13 @@
+--- src/bounded/decode/string_cursor.rs
++++ src/bounded/decode/string_cursor.rs
+@@ -369,7 +369,9 @@
+             bytes: input,
+             allocated: input,
+             peak: input,
+-            retained: input,
++            // Planted: the published string is not counted as retained. Must
++            // fail "the string decode's string retains no more than its bound".
++            retained: 0,
+         };
+         Ok(Self {
+             parse: super::cursor::retained_decode_bound::<P, O, R>(input, options)?,

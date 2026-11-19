@@ -1,13 +1,15 @@
 #![cfg(feature = "std")]
 
-use dcbor::bounded::decode::construction::TypedDecoder;
-use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace, unit};
-use dcbor::bounded::decode::construction::reclamation::{
-    PeekSlot, Reclaim, Reclaimed, Slot, Written,
+use dcbor::bounded::decode::construction::DecodeOwner;
+use dcbor::bounded::decode::construction::in_place::{
+    BindingContext, Building, ConstructionCost, InPlace, admit, unit,
 };
-use dcbor::bounded::decode::{ConstructResult, DecodeError, Document, Options, wrong_type};
-use dcbor::bounded::{Allocator, BoundedError, BoundedResult, Limits};
-use dcbor_test_support as support;
+use dcbor::bounded::decode::construction::reclamation::{
+    Cleanup, PeekSlot, Reclaim, Reclaimed, Slot, Written,
+};
+use dcbor::bounded::decode::{ConstructResult, DecodeError, Options, wrong_type};
+use dcbor::bounded::{Allocator, BoundedResult, CustodySink, PermitsObserved};
+use dcbor_test_support::{self as support, Retirement, Stopped, pipeline::Unwitnessed};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static STARTS: AtomicUsize = AtomicUsize::new(0);
@@ -28,25 +30,22 @@ unsafe impl<A: Allocator> InPlace<A> for Fails {
     const COST: ConstructionCost =
         ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(3)));
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own work, as `InPlace` documents"
-    )]
-    fn build_step(
-        _: &Document<'_, A::Permit>,
-        _: usize,
-        mut slot: Slot<'_, Self, Written>,
+    /// A third-party binding admits its own work through the one route
+    /// ([`admit`]), as `InPlace` documents.
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let mut slot = ctx.into_slot();
         let (place, state) = slot.parts();
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+        admit(a, 0)?;
         if *state == Written::Empty {
             // SAFETY: the slot pairs the place with this state, which is
             // empty; the write admitted above.
             unsafe { place.write(state, Self) };
             *state = Written::Initialized;
             STARTS.fetch_add(1, Ordering::SeqCst);
-            return Ok(Built::Progress);
+            return Ok(Building::Progress);
         }
         Err(wrong_type())
     }
@@ -58,12 +57,13 @@ unsafe impl<A: Allocator> Reclaim<A> for Fails {
     type State = Written;
     const INITIAL: Written = Written::Empty;
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
-    )]
-    fn reclaim_step(mut slot: Slot<'_, Self, Written>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        a.traverse(1, 0).map_err(BoundedError::Refused)?;
+    /// A third-party binding admits its own cleanup through the one route
+    /// ([`admit`]), as `Reclaim` documents.
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Written>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        admit(cleanup, 0)?;
         let state = slot.custody();
         if *state != Written::Empty {
             CLEANED.fetch_add(1, Ordering::SeqCst);
@@ -73,37 +73,70 @@ unsafe impl<A: Allocator> Reclaim<A> for Fails {
     }
 
     /// One call, which is `Done`.
-    fn remaining(_: PeekSlot<'_, Self, Written>) -> u64 {
-        1
+    fn remaining(_: PeekSlot<'_, Self, Written>) -> Option<u64> {
+        Some(1)
+    }
+
+    /// The zero-sized value owns no permit.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, Written>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
+/// One recorded run: the decode's terminal error, its cleanup within its
+/// bound, the scope drained, the finalizer refining the stream.
 #[test]
 fn terminal_error_does_not_reinitialize_or_destroy_partial_construction() {
-    let mut limits = Limits::unlimited().logged().strict();
-    let wire = [0xf6];
-    let (mut owner, input) = support::open(&mut limits, &wire);
-    let held = limits.live_bytes();
-    let mut decoder = TypedDecoder::<_, Fails, _>::new(input, Options::normalizing(8));
-    let bound = support::typed_turns::<Fails>(wire.len());
-    let failed = support::fail_within(&mut limits, &mut decoder, bound);
-    assert!(
-        matches!(failed, DecodeError::Invalid(_)),
-        "invalid typed construction was published or never failed"
-    );
-    assert_eq!(STARTS.load(Ordering::SeqCst), 1);
-    assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-    assert!(limits.live_bytes() > held);
-    support::finish_within(&mut limits, &mut decoder, bound);
-    assert_eq!(STARTS.load(Ordering::SeqCst), 1);
-    assert_eq!(CLEANED.load(Ordering::SeqCst), 1);
-    assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        owner.outstanding(),
-        0,
-        "Finished retained operation records"
-    );
-    drop(decoder);
-    support::drain(&mut owner, &mut limits);
-    assert_eq!(limits.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let wire = [0xf6];
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.decoder::<_, Fails, _, _>(
+                    policy,
+                    support::Borrowing(&wire),
+                    Options::normalizing(8),
+                    &Unwitnessed,
+                    |decoder| {
+                        let held = decoder.with_policy(policy, |_, limits| limits.live_bytes());
+                        let bound = support::typed_turns::<Fails>(wire.len());
+                        match decoder.drive(policy, bound, Retirement::Published, |_| ()) {
+                            Err(Stopped::Operation(DecodeError::Invalid(_))) => {}
+                            Err(stop) => return Err(support::Finding::from(stop)),
+                            Ok(()) => {
+                                return Err(support::Finding::Driver(
+                                    "invalid typed construction was published".to_owned(),
+                                ));
+                            }
+                        }
+                        assert_eq!(STARTS.load(Ordering::SeqCst), 1);
+                        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+                        decoder.with_policy(policy, |_, limits| {
+                            assert!(limits.live_bytes() > held);
+                        });
+                        decoder.finish(policy, bound, Retirement::Published)?;
+                        assert_eq!(STARTS.load(Ordering::SeqCst), 1);
+                        assert_eq!(CLEANED.load(Ordering::SeqCst), 1);
+                        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+                        Ok::<_, support::Finding>(())
+                    },
+                )??;
+                assert_eq!(
+                    owner.value().outstanding(),
+                    0,
+                    "Finished retained operation records"
+                );
+                owner.drain(policy)
+            },
+        )?;
+        run.with_policy(policy, |limits| assert_eq!(limits.live_bytes(), 0));
+        Ok(())
+    });
 }

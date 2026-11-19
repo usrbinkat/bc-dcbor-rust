@@ -405,10 +405,19 @@ impl From<DateTime<Utc>> for Date {
     }
 }
 
+/// Tag 1 around the timestamp: infallible, since a date's timestamp always
+/// encodes and its tag is fixed. The tagged encoding
+/// ([`CBORTaggedEncodable::tagged_cbor`]) agrees with it.
 impl From<Date> for CBOR {
     fn from(value: Date) -> Self {
-        value.tagged_cbor()
+        CBOR::to_tagged_value(date_tag(), value.timestamp())
     }
+}
+
+/// A date's tag: 1, named `date` statically. The one definition its
+/// `CBORTagged` list and its conversion read.
+fn date_tag() -> Tag {
+    Tag::with_static_name(TAG_DATE, TAG_NAME_DATE)
 }
 
 impl TryFrom<CBOR> for Date {
@@ -436,7 +445,7 @@ impl CBORTagged for Date {
     ///
     /// A vector containing tag 1, named `date`
     fn cbor_tags() -> Vec<Tag> {
-        vec![Tag::with_static_name(TAG_DATE, TAG_NAME_DATE)]
+        vec![date_tag()]
     }
 }
 
@@ -454,9 +463,9 @@ impl CBORTaggedEncodable for Date {
     ///
     /// # Returns
     ///
-    /// A CBOR value representing the timestamp
-    fn untagged_cbor(&self) -> CBOR {
-        self.timestamp().into()
+    /// A CBOR value representing the timestamp; a timestamp always encodes.
+    fn untagged_cbor(&self) -> Result<CBOR> {
+        Ok(self.timestamp().into())
     }
 }
 
@@ -479,7 +488,7 @@ impl CBORTaggedDecodable for Date {
     /// * `Ok(Date)` - A new `Date` instance if decoding succeeds
     /// * `Err` - If the CBOR value is not a valid timestamp
     fn from_untagged_cbor(cbor: CBOR) -> Result<Self> {
-        let n = cbor.clone().try_into()?;
+        let n = f64::try_from(cbor)?;
         Ok(Date::from_timestamp(n))
     }
 }

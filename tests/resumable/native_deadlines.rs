@@ -2,27 +2,49 @@ use super::bindings::decoder;
 use super::harness::*;
 use super::support::rigor::rigor;
 use super::support::{
-    Fault, allowed, contracted, drive_faulted, drive_within, reason_matrix, refusal_matrix, refuse,
-    suspend_within,
+    Fault, Finding, Retirement, TurnSchedule, pipeline::Unwitnessed, reason_matrix, refusal_matrix,
 };
-use dcbor::bounded::{Failure, WriteWork};
+use dcbor::bounded::WriteWork;
 
 #[test]
 fn expired_before_first_admission_executes_no_work_and_allocates_nothing() {
     let wire = [0x81, 0x01];
-    let mut m = meter();
-    m.deadline(Some(0));
-    let pool = m.share();
-    let mut operation = decoder(&wire);
-    let refused = contracted(&mut m, &mut operation)
-        .err()
-        .expect("deadline was ignored");
-    assert!(refused.refused());
-    assert_eq!(m.first_refusal(), Some((0, LimitRefusal::Deadline)));
-    assert_eq!(m.used(), WriteWork::default());
-    assert_eq!(pool.live_bytes(), 0);
-    drop(operation);
-    assert_eq!(pool.live_bytes(), 0);
+    suite(|run, policy| {
+        run.with_policy(policy, |m| m.deadline(Some(0)));
+        run.holding(
+            decoder(&wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                assert_eq!(
+                    operation.suspend(
+                        policy,
+                        LimitRefusal::Deadline,
+                        1,
+                        TurnSchedule::Retained,
+                        Retirement::Released
+                    )?,
+                    0
+                );
+                operation.with_policy(policy, |_, m| {
+                    assert_eq!(m.first_refusal(), Some((0, LimitRefusal::Deadline)));
+                    assert_eq!(m.used(), WriteWork::default());
+                    assert_eq!(m.live_bytes(), 0);
+                });
+                Ok::<_, Finding>(())
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
+}
+
+/// The unobstructed decode of a wire, as detached data: the calls it
+/// attempted, those admitted, and the work it used.
+struct Baseline {
+    calls: Vec<Call>,
+    admitted: Vec<Call>,
+    used: WriteWork,
 }
 
 /// A decode of `wire` whose deadline expires at call `stop`: the expiration
@@ -32,42 +54,63 @@ fn expired_before_first_admission_executes_no_work_and_allocates_nothing() {
 /// calls admitted and the boundary valuations the decode reached.
 fn expire_at(
     wire: &[u8],
-    baseline: &Limits,
+    baseline: &Baseline,
     stop: usize,
 ) -> (Vec<Call>, dcbor::bounded::boundary::Reached) {
-    let mut m = meter();
-    m.deadline(Some(u64::try_from(stop).expect("a call index fits in u64")));
-    let pool = m.share();
-    let mut operation = decoder(wire);
-    assert_eq!(
-        suspend_within(
-            &mut m,
-            &mut operation,
-            LimitRefusal::Deadline,
-            decode_turns(wire.len()),
-            super::support::TurnSchedule::Fresh,
-        ),
-        stop
-    );
-    assert_eq!(
-        m.clock(),
-        u64::try_from(stop).expect("a call index fits in u64") + 1
-    );
-    assert_eq!(m.calls(), &baseline.calls()[..=stop]);
-    let paid = m.used();
-    m.deadline(None);
-    let document = drive_within(&mut m, &mut operation, decode_turns(wire.len()))
-        .expect("deadline recovery failed");
-    let after = m.used();
-    assert!(after.values >= paid.values && after.bytes >= paid.bytes);
-    assert_eq!(after, baseline.used());
-    m.assert_units(TURN);
-    assert_eq!(document.root().encoded(), wire);
-    drop(operation);
-    assert!(pool.live_bytes() > 0);
-    drop(document);
-    assert_eq!(pool.live_bytes(), 0);
-    (m.admitted().to_vec(), m.reached())
+    suite(|run, policy| {
+        run.with_policy(policy, |m| {
+            m.deadline(Some(u64::try_from(stop).expect("a call index fits in u64")));
+        });
+        run.holding(
+            decoder(wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                assert_eq!(
+                    operation.suspend(
+                        policy,
+                        LimitRefusal::Deadline,
+                        decode_turns(wire.len()),
+                        TurnSchedule::Fresh,
+                        Retirement::Released,
+                    )?,
+                    stop
+                );
+                let paid = operation.with_policy(policy, |_, m| {
+                    assert_eq!(
+                        m.clock(),
+                        u64::try_from(stop).expect("a call index fits in u64") + 1
+                    );
+                    assert_eq!(m.calls(), &baseline.calls[..=stop]);
+                    let paid = m.used();
+                    m.deadline(None);
+                    paid
+                });
+                operation.drive_faulted(
+                    policy,
+                    decode_turns(wire.len()),
+                    Retirement::Released,
+                    Fault::NONE,
+                    |_, _| {},
+                    |document| {
+                        document.with_policy(policy, |document, m| {
+                            let after = m.used();
+                            assert!(after.values >= paid.values && after.bytes >= paid.bytes);
+                            assert_eq!(after, baseline.used);
+                            m.assert_units(TURN);
+                            assert_eq!(document.root().encoded(), wire);
+                            assert!(m.live_bytes() > 0);
+                        });
+                    },
+                )?;
+                Ok::<_, Finding>(())
+            },
+        )?;
+        Ok(run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            (m.admitted_calls(), m.reached())
+        }))
+    })
 }
 
 #[test]
@@ -76,20 +119,27 @@ fn expiration_between_admissions_preserves_paid_work_and_can_resume() {
     // The engine sees an expired deadline as a refusal like any other: the
     // refusal matrix covers every admission.
     refusal_matrix("decoder of a flat array", rigor(), |fault: Fault| {
-        let mut m = meter();
-        refuse(&mut m, fault.refusal);
-        let pool = m.share();
-        let mut operation = decoder(&wire);
-        let turns = allowed(&m, decode_turns(wire.len()));
-        let document = drive_faulted(&mut m, &mut operation, turns, fault.cancel)
-            .expect("a canonical array decodes");
-        drop(operation);
-        drop(document);
-        assert_eq!(pool.live_bytes(), 0);
-        super::support::RefusalRun::of(&m)
+        retained_case(
+            decoder(&wire),
+            decode_turns(wire.len()),
+            fault,
+            |_, _| {},
+        )
     });
-    let mut baseline = meter();
-    drop(drive_within(&mut baseline, &mut decoder(&wire), decode_turns(wire.len())).unwrap());
+    let mut used = WriteWork::default();
+    let calls = retained_case(
+        decoder(&wire),
+        decode_turns(wire.len()),
+        Fault::NONE,
+        |_, m| {
+            used = m.used();
+        },
+    );
+    let baseline = Baseline {
+        calls: calls.calls().to_vec(),
+        admitted: calls.admitted().to_vec(),
+        used,
+    };
     // An expiration between admissions: at the decode's last, which every
     // earlier admission precedes. The exhaustive layer expires the deadline
     // at every admission and requires each to attempt exactly what the
@@ -98,13 +148,12 @@ fn expiration_between_admissions_preserves_paid_work_and_can_resume() {
     reason_matrix(
         "deadline expirations of a flat array decode",
         rigor(),
-        baseline.calls(),
+        &baseline.calls,
         &[LimitRefusal::Deadline],
         |stop, _| {
             let (admitted, reached) = expire_at(&wire, &baseline, stop);
             assert_eq!(
-                admitted,
-                baseline.admitted(),
+                admitted, baseline.admitted,
                 "deadline recovery at call {stop} replayed paid work"
             );
             reached

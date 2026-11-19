@@ -1,5 +1,7 @@
 #![cfg(feature = "derive")]
 
+use std::collections::{BTreeMap, HashMap};
+
 use dcbor::prelude::*;
 use dcbor::{CBORCodable, CBORDecodable, CBOREncodable};
 
@@ -19,7 +21,7 @@ fn struct_roundtrip() {
         name: "Alice".to_string(),
         age: 30,
     };
-    let cbor: CBOR = p.clone().into();
+    let cbor = p.encode_cbor().unwrap();
     let p2: Person = cbor.try_into().unwrap();
     assert_eq!(p, p2);
 }
@@ -30,14 +32,14 @@ fn struct_deterministic() {
         name: "Alice".to_string(),
         age: 30,
     };
-    let bytes1 = p.to_cbor_data();
-    let bytes2 = p.to_cbor_data();
+    let bytes1 = p.encode_cbor_data().unwrap();
+    let bytes2 = p.encode_cbor_data().unwrap();
     assert_eq!(bytes1, bytes2);
 
     // Decode from bytes and re-encode must produce identical bytes
     let decoded = CBOR::try_from_data(&bytes1).unwrap();
     let p3: Person = decoded.try_into().unwrap();
-    let bytes3 = p3.to_cbor_data();
+    let bytes3 = p3.encode_cbor_data().unwrap();
     assert_eq!(bytes1, bytes3);
 }
 
@@ -60,7 +62,7 @@ fn optional_field_present() {
         age: 25,
         email: Some("bob@example.com".to_string()),
     };
-    let cbor: CBOR = p.clone().into();
+    let cbor = p.encode_cbor().unwrap();
     let p2: PersonOptional = cbor.try_into().unwrap();
     assert_eq!(p, p2);
 }
@@ -72,7 +74,7 @@ fn optional_field_absent() {
         age: 40,
         email: None,
     };
-    let cbor: CBOR = p.clone().into();
+    let cbor = p.encode_cbor().unwrap();
     let p2: PersonOptional = cbor.try_into().unwrap();
     assert_eq!(p, p2);
 }
@@ -82,7 +84,7 @@ fn optional_field_absent() {
 #[test]
 fn newtype_roundtrip() {
     let w = Newtype(vec![1, 1000]);
-    let cbor: CBOR = w.clone().into();
+    let cbor = w.encode_cbor().unwrap();
     let w2: Newtype = cbor.try_into().unwrap();
     assert_eq!(w, w2);
 }
@@ -92,7 +94,7 @@ fn newtype_roundtrip() {
 #[test]
 fn enum_unit_roundtrip() {
     let s = Mixed::Point;
-    let cbor: CBOR = s.clone().into();
+    let cbor = s.encode_cbor().unwrap();
     let s2: Mixed = cbor.try_into().unwrap();
     assert_eq!(s, s2);
 }
@@ -100,7 +102,7 @@ fn enum_unit_roundtrip() {
 #[test]
 fn enum_tuple_roundtrip() {
     let s = Mixed::Circle(42);
-    let cbor: CBOR = s.clone().into();
+    let cbor = s.encode_cbor().unwrap();
     let s2: Mixed = cbor.try_into().unwrap();
     assert_eq!(s, s2);
 }
@@ -111,7 +113,7 @@ fn enum_struct_roundtrip() {
         width: Some(10),
         height: 20,
     };
-    let cbor: CBOR = s.clone().into();
+    let cbor = s.encode_cbor().unwrap();
     let s2: Mixed = cbor.try_into().unwrap();
     assert_eq!(s, s2);
 }
@@ -123,7 +125,7 @@ fn tagged_roundtrip() {
     let t = Labelled {
         data: vec![1, 2, 3],
     };
-    let tagged_cbor = t.tagged_cbor();
+    let tagged_cbor = t.tagged_cbor().unwrap();
     let t2: Labelled = tagged_cbor.try_into().unwrap();
     assert_eq!(t, t2);
 }
@@ -134,7 +136,7 @@ fn tagged_wrong_tag_rejected() {
         data: vec![1, 2, 3],
     };
     // Encode with correct tag, then re-wrap with wrong tag
-    let untagged = t.untagged_cbor();
+    let untagged = t.untagged_cbor().unwrap();
     let wrong_tagged = CBOR::to_tagged_value(99, untagged);
     let result: dcbor::Result<Labelled> = wrong_tagged.try_into();
     assert!(result.is_err());
@@ -156,7 +158,7 @@ fn codable_roundtrip() {
         left: "key".to_string(),
         right: 100,
     };
-    let bytes = p.to_cbor_data();
+    let bytes = p.encode_cbor_data().unwrap();
     let cbor = CBOR::try_from_data(&bytes).unwrap();
     let p2: Pair = cbor.try_into().unwrap();
     assert_eq!(p, p2);
@@ -176,6 +178,547 @@ fn enum_rejects_non_matching() {
     let cbor: CBOR = "not a shape".into();
     let result: dcbor::Result<Mixed> = cbor.try_into();
     assert!(result.is_err());
+}
+
+// --- Fallible fields: composition and propagation ---
+
+/// Two distinct Rust strings of one NFC form: one canonical key.
+fn colliding() -> BTreeMap<String, u8> {
+    BTreeMap::from([("\u{e9}".to_string(), 1), ("e\u{301}".to_string(), 2)])
+}
+
+/// The NFC pair as a std hash map, under its default hasher.
+fn colliding_hash() -> HashMap<String, u8> {
+    HashMap::from([("\u{e9}".to_string(), 1), ("e\u{301}".to_string(), 2)])
+}
+
+/// Host collections at every depth a record can hold them; no field type
+/// and the record itself implement `Clone`, which the encoding never needs.
+#[derive(CBOREncodable)]
+struct Holder {
+    #[cbor(n = 0)]
+    names: BTreeMap<String, u8>,
+    #[cbor(n = 1)]
+    nested: Vec<BTreeMap<String, u8>>,
+    #[cbor(n = 2)]
+    optional: Option<HashMap<String, u8>>,
+}
+
+#[derive(CBOREncodable)]
+struct HolderNewtype(Holder);
+
+#[derive(CBOREncodable)]
+enum HolderVariant {
+    #[cbor(n = 0)]
+    Tuple(u8, BTreeMap<String, u8>),
+    #[cbor(n = 1)]
+    Named {
+        #[cbor(n = 0)]
+        inner: Option<Holder>,
+    },
+}
+
+#[derive(CBOREncodable)]
+#[cbor(tag = 40_000)]
+struct TaggedHolder {
+    #[cbor(n = 0)]
+    holder: Holder,
+}
+
+fn holder() -> Holder {
+    Holder {
+        names: BTreeMap::from([("a".to_string(), 1)]),
+        nested: vec![BTreeMap::from([("b".to_string(), 2)]), BTreeMap::new()],
+        optional: Some(HashMap::from([("c".to_string(), 3)])),
+    }
+}
+
+fn duplicate<T: std::fmt::Debug>(result: dcbor::Result<T>, what: &str) {
+    assert!(
+        matches!(result, Err(dcbor::Error::DuplicateMapKey)),
+        "{what}: {result:?}"
+    );
+}
+
+/// Records whose fields hold host maps encode through them: the bytes are
+/// the canonical map, nested vector and option included.
+#[test]
+fn records_holding_host_collections_encode_through_them() {
+    let bytes = holder().encode_cbor_data().unwrap();
+    assert_eq!(
+        bytes,
+        [
+            0xa3, // map(3)
+            0x00, 0xa1, 0x61, b'a', 0x01, // 0: {"a": 1}
+            0x01, 0x82, 0xa1, 0x61, b'b', 0x02, 0xa0, // 1: [{"b": 2}, {}]
+            0x02, 0xa1, 0x61, b'c', 0x03, // 2: {"c": 3}
+        ]
+    );
+    assert_eq!(
+        HolderNewtype(holder()).encode_cbor_data().unwrap(),
+        bytes,
+        "a newtype is its field's encoding"
+    );
+    let empty = Holder {
+        names: BTreeMap::new(),
+        nested: Vec::new(),
+        optional: None,
+    };
+    assert_eq!(
+        empty.encode_cbor_data().unwrap(),
+        [0xa2, 0x00, 0xa0, 0x01, 0x80]
+    );
+}
+
+/// A colliding host map refuses the record that holds it, at every depth and
+/// shape: a direct field, inside a vector, inside an option (a hash map), a
+/// newtype, both variant shapes, and the tagged and untagged encodings of a
+/// tagged record. The refusal is the map's own, `DuplicateMapKey`.
+#[test]
+fn a_colliding_map_refuses_every_record_that_holds_it() {
+    duplicate(
+        Holder {
+            names: colliding(),
+            ..holder()
+        }
+        .encode_cbor(),
+        "direct field",
+    );
+    duplicate(
+        Holder {
+            nested: vec![BTreeMap::new(), colliding()],
+            ..holder()
+        }
+        .encode_cbor(),
+        "vector of maps",
+    );
+    duplicate(
+        Holder {
+            optional: Some(colliding_hash()),
+            ..holder()
+        }
+        .encode_cbor(),
+        "optional hash map",
+    );
+    duplicate(
+        HolderNewtype(Holder {
+            names: colliding(),
+            ..holder()
+        })
+        .encode_cbor_data(),
+        "newtype",
+    );
+    duplicate(
+        HolderVariant::Tuple(1, colliding()).encode_cbor(),
+        "tuple variant",
+    );
+    duplicate(
+        HolderVariant::Named {
+            inner: Some(Holder {
+                names: colliding(),
+                ..holder()
+            }),
+        }
+        .encode_cbor(),
+        "named variant",
+    );
+    let tagged = TaggedHolder {
+        holder: Holder {
+            nested: vec![colliding()],
+            ..holder()
+        },
+    };
+    duplicate(tagged.untagged_cbor(), "untagged");
+    duplicate(tagged.tagged_cbor(), "tagged");
+    duplicate(tagged.tagged_cbor_data(), "tagged data");
+    duplicate(vec![tagged].encode_cbor(), "a vector of tagged records");
+}
+
+/// The control: without the collision, each of those shapes encodes, so the
+/// refusals above are the collision's.
+#[test]
+fn the_same_shapes_without_a_collision_encode() {
+    holder().encode_cbor().unwrap();
+    HolderNewtype(holder()).encode_cbor().unwrap();
+    // The discriminant, then the two payload values: an array of three.
+    assert_eq!(
+        HolderVariant::Tuple(1, BTreeMap::new())
+            .encode_cbor_data()
+            .unwrap(),
+        [0x83, 0x00, 0x01, 0xa0]
+    );
+    HolderVariant::Named {
+        inner: Some(holder()),
+    }
+    .encode_cbor()
+    .unwrap();
+    assert_eq!(
+        HolderVariant::Named { inner: None }
+            .encode_cbor_data()
+            .unwrap(),
+        [0x82, 0x01, 0xa0]
+    );
+    let tagged = TaggedHolder { holder: holder() };
+    let untagged = tagged.untagged_cbor().unwrap();
+    assert_eq!(
+        tagged.tagged_cbor().unwrap(),
+        CBOR::to_tagged_value(40_000, untagged.clone())
+    );
+    assert_eq!(tagged.encode_cbor().unwrap(), untagged);
+}
+
+// --- Ownership: what each encoding path clones ---
+
+/// What happened to the [`Counted`] fields: clones made, and which of their
+/// two encodings was called, each counted apart.
+#[derive(Default)]
+struct Calls {
+    clones: std::cell::Cell<usize>,
+    borrowed: std::cell::Cell<usize>,
+    owned: std::cell::Cell<usize>,
+}
+
+impl Calls {
+    fn bump(cell: &std::cell::Cell<usize>) {
+        cell.set(cell.get() + 1);
+    }
+
+    /// `(clones, borrowed encodings, owned encodings)`, then reset.
+    fn take(&self) -> (usize, usize, usize) {
+        (
+            self.clones.replace(0),
+            self.borrowed.replace(0),
+            self.owned.replace(0),
+        )
+    }
+}
+
+/// A field that records each clone and each encoding call. Both encodings
+/// give the same value, so only the counters tell the paths apart: a
+/// consuming record encoding that fell back to borrowing would call
+/// `encode_cbor` where `into_encoded_cbor` is required.
+struct Counted {
+    number: u64,
+    calls: std::rc::Rc<Calls>,
+}
+
+impl Clone for Counted {
+    fn clone(&self) -> Self {
+        Calls::bump(&self.calls.clones);
+        Counted {
+            number: self.number,
+            calls: self.calls.clone(),
+        }
+    }
+}
+
+impl dcbor::CBOREncodable for Counted {
+    fn encode_cbor(&self) -> dcbor::Result<CBOR> {
+        Calls::bump(&self.calls.borrowed);
+        Ok(CBOR::from(self.number))
+    }
+
+    fn into_encoded_cbor(self) -> dcbor::Result<CBOR> {
+        Calls::bump(&self.calls.owned);
+        Ok(CBOR::from(self.number))
+    }
+}
+
+#[derive(CBOREncodable)]
+struct CountedRecord {
+    #[cbor(n = 0)]
+    one: Counted,
+    #[cbor(n = 1)]
+    maybe: Option<Counted>,
+    #[cbor(n = 2)]
+    many: Vec<Counted>,
+}
+
+#[derive(CBOREncodable)]
+struct CountedNewtype(Counted);
+
+#[derive(CBOREncodable)]
+enum CountedVariant {
+    #[cbor(n = 0)]
+    Tuple(Counted, Vec<Counted>),
+    #[cbor(n = 1)]
+    Named {
+        #[cbor(n = 0)]
+        one: Counted,
+        #[cbor(n = 1)]
+        maybe: Option<Counted>,
+    },
+}
+
+#[derive(CBOREncodable)]
+#[cbor(tag = 40_001)]
+struct CountedTagged {
+    #[cbor(n = 0)]
+    one: Counted,
+}
+
+/// Derived records encode by reference and by value without cloning a
+/// field, in every shape (named, optional, sequence, newtype, both variant
+/// forms, tagged), and both paths give the same value. The owned path
+/// moves every field into its own consuming encoding (each `Counted` field
+/// sees `into_encoded_cbor`, none `encode_cbor`); the borrowed path reads
+/// every field through its borrowed encoding. Equal values and an absent
+/// clone show neither: the per-method counters do, and restoring borrowed
+/// dispatch in the derive's consuming body fails the owned assertion.
+#[test]
+fn derived_encodings_clone_no_field() {
+    let calls = std::rc::Rc::new(Calls::default());
+    let counted = |number| Counted {
+        number,
+        calls: calls.clone(),
+    };
+    let record = || CountedRecord {
+        one: counted(1),
+        maybe: Some(counted(2)),
+        many: vec![counted(3), counted(4)],
+    };
+    let tuple = || CountedVariant::Tuple(counted(5), vec![counted(6)]);
+    let named = || CountedVariant::Named {
+        one: counted(7),
+        maybe: None,
+    };
+    let expected = [
+        record().encode_cbor().unwrap(),
+        CountedNewtype(counted(8)).encode_cbor().unwrap(),
+        tuple().encode_cbor().unwrap(),
+        named().encode_cbor().unwrap(),
+        CountedTagged { one: counted(9) }.tagged_cbor().unwrap(),
+    ];
+    // Fields: record 4, newtype 1, tuple 2, named 1 (its option empty),
+    // tagged 1.
+    assert_eq!(calls.take(), (0, 9, 0), "the borrowed encodings");
+    let owned = [
+        record().into_encoded_cbor().unwrap(),
+        CountedNewtype(counted(8)).into_encoded_cbor().unwrap(),
+        tuple().into_encoded_cbor().unwrap(),
+        named().into_encoded_cbor().unwrap(),
+        CBOR::to_tagged_value(
+            40_001,
+            CountedTagged { one: counted(9) }
+                .into_encoded_cbor()
+                .unwrap(),
+        ),
+    ];
+    assert_eq!(calls.take(), (0, 0, 9), "the owned encodings");
+    // Each shape's encoding runs inside its own iteration, after the
+    // previous iteration's counters were taken: an array of encoded values
+    // would run every encoding before the first take.
+    let shapes: [(&str, &dyn Fn() -> dcbor::Result<CBOR>); 5] = [
+        ("record", &|| record().into_encoded_cbor()),
+        ("newtype", &|| {
+            CountedNewtype(counted(8)).into_encoded_cbor()
+        }),
+        ("tuple variant", &|| tuple().into_encoded_cbor()),
+        ("named variant", &|| named().into_encoded_cbor()),
+        ("tagged", &|| {
+            CountedTagged { one: counted(9) }.into_encoded_cbor()
+        }),
+    ];
+    for (shape, encode) in shapes {
+        encode().unwrap();
+        let (clones, borrowed, owned) = calls.take();
+        assert_eq!(
+            (clones, borrowed),
+            (0, 0),
+            "{shape}: a field was borrowed or cloned"
+        );
+        assert!(owned > 0, "{shape}: no field was moved into its encoding");
+    }
+    assert_eq!(owned, expected);
+    assert_eq!(
+        expected[0].to_cbor_data(),
+        [0xa3, 0x00, 0x01, 0x01, 0x02, 0x02, 0x82, 0x03, 0x04]
+    );
+    // The discriminant, then the two payload values: an array of three.
+    assert_eq!(expected[2].to_cbor_data(), [0x83, 0x00, 0x05, 0x81, 0x06]);
+    assert_eq!(expected[3].to_cbor_data(), [0x82, 0x01, 0xa1, 0x00, 0x07]);
+}
+
+/// An owned derived record's byte-string field moves into its encoding:
+/// the encoding's byte string holds the field's own allocation, not a copy
+/// of it.
+#[test]
+fn an_owned_derived_record_moves_its_byte_string() {
+    #[derive(CBOREncodable)]
+    struct Holder {
+        #[cbor(n = 0)]
+        bytes: ByteString,
+    }
+    let bytes = ByteString::from(vec![7u8; 64]);
+    let address = bytes.data().as_ptr();
+    let encoded = Holder { bytes }.into_encoded_cbor().unwrap();
+    let CBORCase::Map(map) = encoded.into_case() else {
+        panic!("a record encodes as a map");
+    };
+    let (_, value) = map.iter().next().expect("one field");
+    let CBORCase::ByteString(moved) = value.as_case() else {
+        panic!("the field encodes as a byte string");
+    };
+    assert_eq!(
+        moved.data().as_ptr(),
+        address,
+        "the field's bytes were copied"
+    );
+}
+
+#[derive(Debug, CBORCodable)]
+struct BytesNewtype(ByteString);
+
+#[derive(Debug, CBORCodable)]
+enum BytesVariant {
+    #[cbor(n = 0)]
+    Tuple(ByteString),
+    #[cbor(n = 1)]
+    Named {
+        #[cbor(n = 0)]
+        bytes: ByteString,
+        #[cbor(n = 1)]
+        maybe: Option<ByteString>,
+    },
+}
+
+#[derive(Debug, CBORCodable)]
+struct BytesRecord {
+    #[cbor(n = 0)]
+    bytes: ByteString,
+    #[cbor(n = 1)]
+    maybe: Option<ByteString>,
+}
+
+/// Sixty-four bytes in an allocation of their own, and its address.
+fn bytes() -> (ByteString, *const u8) {
+    let bytes = ByteString::from(vec![7u8; 64]);
+    let address = bytes.data().as_ptr();
+    (bytes, address)
+}
+
+/// The address of the byte string `value` is, or holds at `path`: array
+/// elements and map entries, each step an index or a key.
+fn address_in(value: &CBOR, path: &[u64]) -> *const u8 {
+    let mut value = value;
+    for &step in path {
+        value = match value.as_case() {
+            CBORCase::Array(items) => &items[step as usize],
+            CBORCase::Map(map) => map
+                .iter()
+                .find(|(key, _)| **key == CBOR::from(step))
+                .map(|(_, value)| value)
+                .expect("the key is present"),
+            other => panic!("no element {step} in {other:?}"),
+        };
+    }
+    match value.as_case() {
+        CBORCase::ByteString(bytes) => bytes.data().as_ptr(),
+        other => panic!("not a byte string: {other:?}"),
+    }
+}
+
+/// The newtype, the tuple variant and the named variant move an owned byte
+/// string field into their encoding, its allocation kept, as the named
+/// record does (`an_owned_derived_record_moves_its_byte_string`).
+#[test]
+fn every_owned_derived_shape_moves_its_byte_string() {
+    let (field, address) = bytes();
+    let encoded = BytesNewtype(field).into_encoded_cbor().unwrap();
+    assert_eq!(address_in(&encoded, &[]), address, "newtype");
+    let (field, address) = bytes();
+    let encoded = BytesVariant::Tuple(field).into_encoded_cbor().unwrap();
+    assert_eq!(address_in(&encoded, &[1]), address, "tuple variant");
+    let (field, address) = bytes();
+    let (optional, optional_address) = bytes();
+    let encoded = BytesVariant::Named {
+        bytes: field,
+        maybe: Some(optional),
+    }
+    .into_encoded_cbor()
+    .unwrap();
+    assert_eq!(address_in(&encoded, &[1, 0]), address, "named variant");
+    assert_eq!(
+        address_in(&encoded, &[1, 1]),
+        optional_address,
+        "named variant, optional field"
+    );
+}
+
+/// Decoding a uniquely held value moves each named field's bytes out of the
+/// decoded map into the field: a named record's required and optional
+/// fields, and a named variant's, keep the allocation they had in the map.
+/// The control reads the same field through `Map::get`, which converts a
+/// clone of the map's handle and so copies the bytes: the witness tells a
+/// moving extraction from a copying one.
+#[test]
+fn decoding_moves_named_fields_out_of_their_map() {
+    let record = || {
+        let mut map = Map::new();
+        map.insert(0u64, bytes().0).unwrap();
+        map.insert(1u64, bytes().0).unwrap();
+        map.insert(2u64, "an unknown key, ignored").unwrap();
+        CBOR::from(map)
+    };
+
+    let value = record();
+    let (required, optional) = (address_in(&value, &[0]), address_in(&value, &[1]));
+    let decoded = BytesRecord::try_from(value).unwrap();
+    assert_eq!(decoded.bytes.data().as_ptr(), required, "required field");
+    assert_eq!(
+        decoded.maybe.as_ref().unwrap().data().as_ptr(),
+        optional,
+        "optional field"
+    );
+
+    let mut payload = Map::new();
+    payload.insert(0u64, bytes().0).unwrap();
+    let variant = CBOR::from(vec![CBOR::from(1u64), CBOR::from(payload)]);
+    let address = address_in(&variant, &[1, 0]);
+    match BytesVariant::try_from(variant).unwrap() {
+        BytesVariant::Named { bytes, maybe } => {
+            assert_eq!(bytes.data().as_ptr(), address, "named variant");
+            assert!(maybe.is_none());
+        }
+        other => panic!("decoded {other:?}"),
+    }
+
+    let value = record();
+    let address = address_in(&value, &[0]);
+    let CBORCase::Map(map) = value.into_case() else {
+        unreachable!("the record is a map");
+    };
+    let copied: ByteString = map.get(0u64).unwrap().unwrap();
+    assert_ne!(
+        copied.data().as_ptr(),
+        address,
+        "the control: a borrowed query copies, so the witness can fail"
+    );
+}
+
+/// Named decoding keeps its refusals: a required field absent, and a field
+/// present but of another type, required or optional.
+#[test]
+fn named_decoding_refuses_missing_and_mistyped_fields() {
+    let mut missing = Map::new();
+    missing.insert(1u64, bytes().0).unwrap();
+    assert!(matches!(
+        BytesRecord::try_from(CBOR::from(missing)),
+        Err(dcbor::Error::MissingMapKey)
+    ));
+    let mut mistyped = Map::new();
+    mistyped.insert(0u64, 5u64).unwrap();
+    assert!(matches!(
+        BytesRecord::try_from(CBOR::from(mistyped)),
+        Err(dcbor::Error::WrongType)
+    ));
+    let mut optional = Map::new();
+    optional.insert(0u64, bytes().0).unwrap();
+    optional.insert(1u64, "not bytes").unwrap();
+    assert!(matches!(
+        BytesRecord::try_from(CBOR::from(optional)),
+        Err(dcbor::Error::WrongType)
+    ));
 }
 
 // --- Bounded encoding from the same schema ---
@@ -242,7 +785,7 @@ fn bounded_derive_accepts_user_names_and_generic_fields() {
 /// The preparation and the write of `value`: the bytes are the symbolic
 /// encoding's, both decode strictly to one value, the length is exact, and
 /// the write reports no more than its bound and allocates nothing.
-fn bounded<T: Schema + Clone + Into<CBOR>>(value: &T) -> Vec<u8> {
+fn bounded<T: Schema + CBOREncodable>(value: &T) -> Vec<u8> {
     let prepared = prepare(value, &mut Limits::unlimited()).unwrap();
     let mut bytes = vec![0u8; prepared.len()];
     let mut written = Limits::unlimited();
@@ -257,7 +800,7 @@ fn bounded<T: Schema + Clone + Into<CBOR>>(value: &T) -> Vec<u8> {
     );
     assert_eq!(written.requests(), 0, "the write requested allocation");
     assert_eq!(written.live_bytes(), 0);
-    let symbolic = value.clone().into().to_cbor_data();
+    let symbolic = value.encode_cbor_data().unwrap();
     assert_eq!(bytes, symbolic);
     assert_eq!(
         CBOR::try_from_data(&bytes).unwrap(),
@@ -377,8 +920,7 @@ fn bounded_maps_match_the_symbolic_encoding_with_options_both_ways() {
 
 /// Newtypes, every enum shape and unit enums are encoded and constructed
 /// back ([`round_trip`]), including the unit struct's null construction.
-/// A tagged type converts
-/// untagged; its tagged construction is
+/// A tagged type encodes untagged; its tagged construction is
 /// `bounded_construction_of_a_tagged_type_requires_its_tag`.
 #[test]
 fn bounded_newtypes_units_enums_and_tags_match_the_symbolic_encoding() {
@@ -407,8 +949,8 @@ fn bounded_newtypes_units_enums_and_tags_match_the_symbolic_encoding() {
     let labelled = Labelled { data: vec![1, 2] };
     assert_eq!(
         bounded(&labelled),
-        labelled.untagged_cbor().to_cbor_data(),
-        "the conversion, bounded or not, is the untagged value"
+        labelled.untagged_cbor().unwrap().to_cbor_data(),
+        "the encoding, bounded or not, is the untagged value"
     );
 }
 
@@ -444,16 +986,18 @@ use dcbor::bounded::decode::decode_typed;
 fn round_trip<T>(value: &T) -> T
 where
     T: Schema
-        + Clone
-        + Into<CBOR>
+        + CBOREncodable
         + TryFrom<CBOR, Error = dcbor::Error>
-        + dcbor::bounded::decode::BoundedDecodable
+        + dcbor::bounded::decode::construction::in_place::Transferable<Limits>
         + PartialEq
-        + std::fmt::Debug,
+        + std::fmt::Debug
+        + 'static,
 {
     let bytes = bounded(value);
     let symbolic = T::try_from(CBOR::try_from_data(bytes.as_slice()).unwrap()).unwrap();
-    let mut limits = Limits::new(100_000, 1_000_000, 1_000_000);
+    // The decode is held to its own bound ([`decode_typed`]); these tests
+    // are its interpretation of the wire bytes, not its budget.
+    let mut limits = Limits::unlimited();
     let built = decode_typed::<T, _>(&bytes, 16, &mut limits).unwrap();
     assert_eq!(
         built.value(),
@@ -461,7 +1005,7 @@ where
         "bounded and symbolic construction must interpret the same wire bytes",
     );
     assert_eq!(
-        symbolic.clone().into().to_cbor_data(),
+        symbolic.encode_cbor_data().unwrap(),
         bytes,
         "symbolic reconstruction must preserve the canonical wire representation",
     );
@@ -479,13 +1023,13 @@ where
 #[test]
 fn bounded_construction_of_a_tagged_type_requires_its_tag() {
     let wrapped = Labelled { data: vec![1, 2] };
-    let tagged = wrapped.tagged_cbor().to_cbor_data();
-    let mut limits = Limits::new(1000, 10_000, 10_000);
+    let tagged = wrapped.tagged_cbor_data().unwrap();
+    let mut limits = Limits::unlimited();
     let built = decode_typed::<Labelled, _>(&tagged, 16, &mut limits).unwrap();
     assert_eq!(built.value(), &wrapped);
-    let untagged = wrapped.untagged_cbor().to_cbor_data();
+    let untagged = wrapped.untagged_cbor().unwrap().to_cbor_data();
     assert!(decode_typed::<Labelled, _>(&untagged, 16, &mut limits).is_err());
-    let other = CBOR::to_tagged_value(99, wrapped.untagged_cbor()).to_cbor_data();
+    let other = CBOR::to_tagged_value(99, wrapped.untagged_cbor().unwrap()).to_cbor_data();
     assert!(decode_typed::<Labelled, _>(&other, 16, &mut limits).is_err());
     drop(built);
     assert_eq!(
@@ -500,9 +1044,9 @@ fn bounded_construction_of_a_tagged_type_requires_its_tag() {
 #[test]
 fn bounded_construction_rejects_what_the_symbolic_conversion_rejects() {
     use dcbor::bounded::decode::DecodeError;
-    let mut limits = Limits::new(1000, 10_000, 10_000);
+    let mut limits = Limits::unlimited();
     let mut missing = Map::new();
-    missing.insert(0u64, true);
+    missing.insert(0u64, true).unwrap();
     let bytes = CBOR::from(missing).to_cbor_data();
     assert!(matches!(
         decode_typed::<Record, _>(&bytes, 16, &mut limits),

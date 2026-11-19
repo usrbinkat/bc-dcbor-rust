@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `dcbor::bounded::decode::construction::in_place::Initialized<'b, T>` in the current scope
+ --> tests/ui/fail/record_cloned.rs:7:13
+  |
+7 |     (record.clone(), record)
+  |             ^^^^^ method not found in `dcbor::bounded::decode::construction::in_place::Initialized<'b, u64>`

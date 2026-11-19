@@ -8,14 +8,18 @@
 #[global_allocator]
 static HEAP: support::heap::Heap = support::heap::Heap;
 
-use dcbor::bounded::decode::construction::in_place::{Built, ConstructionCost, InPlace, unit};
-use dcbor::bounded::decode::construction::reclamation::{
-    Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+use dcbor::bounded::decode::construction::in_place::{
+    BindingContext, Building, ConstructionCost, InPlace, Transferable, admit, unit,
 };
-use dcbor::bounded::decode::construction::{Borrowed, TypedDecoder, TypedValue};
-use dcbor::bounded::decode::{ConstructResult, DecodeError, Document, Options, wrong_type};
-use dcbor::bounded::{Allocator, BoundedError, Limits};
-use dcbor_test_support::{self as support, Input, drain, open};
+use dcbor::bounded::decode::construction::reclamation::{
+    Cleanup, Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+};
+use dcbor::bounded::decode::construction::{Borrowed, TypedValue};
+use dcbor::bounded::decode::{ConstructResult, DecodeError, Options, wrong_type};
+use dcbor::bounded::{Allocator, CustodySink, Limits, PermitsObserved};
+use dcbor_test_support::{
+    self as support, Borrowing, Finding, Lent, Retirement, Stopped, pipeline::Unwitnessed,
+};
 use std::cell::Cell;
 use std::ptr::addr_of_mut;
 
@@ -23,11 +27,6 @@ thread_local! {
     static STARTS: Cell<usize> = const { Cell::new(0) };
     static DROPS: Cell<usize> = const { Cell::new(0) };
     static INITIALIZED: Cell<usize> = const { Cell::new(0) };
-}
-
-/// The policy of these gates: logged, strict, refusing call `deny_at`.
-fn turns(deny_at: Option<usize>) -> Limits {
-    Limits::unlimited().logged().strict().refusing(deny_at)
 }
 
 struct Probe {
@@ -71,24 +70,21 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
         ))
     ));
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own construction, as `InPlace` documents"
-    )]
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        _: usize,
-        mut slot: Slot<'_, Self, ProbeState>,
+    /// A third-party binding admits its own construction through the one
+    /// route ([`admit`]), as `InPlace` documents.
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         allocator: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let assembly = ctx.assembly();
+        let node = ctx.node();
+        let mut slot = ctx.into_slot();
         let (place, state) = slot.parts();
         // Each field is written by raw projection alone, never through a
         // reference to the partly initialized probe.
         let raw = place.as_ptr(state);
         if !state.started {
-            allocator
-                .traverse(1, std::mem::size_of::<usize>() as u64)
-                .map_err(BoundedError::Refused)?;
+            admit(allocator, std::mem::size_of::<usize>())?;
             // SAFETY: a plain field of the slot's own destination, written by
             // raw projection.
             unsafe {
@@ -96,10 +92,10 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
             }
             STARTS.set(STARTS.get() + 1);
             state.started = true;
-            return Ok(Built::Progress);
+            return Ok(Building::Progress);
         }
         if state.written < 256 {
-            allocator.traverse(1, 64).map_err(BoundedError::Refused)?;
+            admit(allocator, 64)?;
             // SAFETY: the next 64 bytes of the inline payload, within its 256,
             // written by raw projection.
             unsafe {
@@ -112,13 +108,16 @@ unsafe impl<A: Allocator> InPlace<A> for Probe {
             if state.written == 64 {
                 INITIALIZED.set(INITIALIZED.get() + 1);
             }
-            return Ok(Built::Progress);
+            return Ok(Building::Progress);
         }
-        allocator.traverse(1, 0).map_err(BoundedError::Refused)?;
-        if document.root().encoded() == [0xf4] {
+        admit(allocator, 0)?;
+        if node.is_some_and(|node| node.encoded() == [0xf4]) {
             return Err(wrong_type());
         }
-        Ok(Built::Done)
+        // SAFETY: the address and all 256 payload bytes are written, each by
+        // an admitted unit recorded in this state, and the probe holds no
+        // other field; the slot is not reclaimed while it builds.
+        Ok(Building::Done(unsafe { assembly.assemble() }))
     }
 }
 
@@ -131,17 +130,15 @@ unsafe impl<A: Allocator> Reclaim<A> for Probe {
         written: 0,
     };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a third-party binding admits its own cleanup, as `Reclaim` documents"
-    )]
+    /// A third-party binding admits its own cleanup through the one route
+    /// ([`admit`]), as `Reclaim` documents.
     fn reclaim_step(
         mut slot: Slot<'_, Self, ProbeState>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> dcbor::bounded::BoundedResult<Reclaimed, A> {
         let state = slot.custody();
         let bytes = state.written.min(64);
-        a.traverse(1, bytes as u64).map_err(BoundedError::Refused)?;
+        admit(cleanup, bytes)?;
         state.written -= bytes;
         if state.written == 0 {
             state.started = false;
@@ -153,39 +150,69 @@ unsafe impl<A: Allocator> Reclaim<A> for Probe {
 
     /// One call per 64-byte chunk written, and one for an empty prefix,
     /// whose call reports `Done` at once.
-    fn remaining(mut slot: PeekSlot<'_, Self, ProbeState>) -> u64 {
-        (slot.custody().written.div_ceil(64) as u64).max(1)
+    fn remaining(mut slot: PeekSlot<'_, Self, ProbeState>) -> Option<u64> {
+        Some((slot.custody().written.div_ceil(64) as u64).max(1))
+    }
+
+    /// The probe's bytes are inline: it owns no permit.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, ProbeState>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
-fn finish<'s>(input: Input<'s>, m: &mut Limits) -> TypedValue<'s, Borrowed<'s>, Probe, Limits> {
-    support::decode(m, input, Options::normalizing(8)).expect("literal null did not complete")
+/// `wire`, borrowed into a scope of a recorded run, decoded as `T` under
+/// `options` ([`support::Holding::decoded`]), the published value held for
+/// `body` and retired as a published handle, which releases nothing; the
+/// scope then drains to nothing. The decode's own error is the run's
+/// finding.
+fn decoded<T: Transferable<Limits> + 'static, R>(
+    wire: &[u8],
+    options: Options,
+    body: impl FnOnce(&TypedValue<'_, Borrowed<'_>, T, Limits>) -> R,
+) -> R {
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let made = run.scoped(policy, &Unwitnessed, |owner| {
+            owner
+                .decoded::<T, _>(policy, wire, options, |output| body(output.value()))?
+                .map_err(support::failed("the typed decode"))
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(made)
+    })
 }
 
 #[test]
 fn construction_initialization_requires_an_admitted_turn() {
     STARTS.set(0);
-    let mut m = turns(None);
-    let (mut owner, input) = open(&mut m, &[0xf6]);
-    let decoder = TypedDecoder::<_, Probe, Limits>::new(input, Options::normalizing(8));
-    let starts = STARTS.get();
-    drop(decoder);
-    drain(&mut owner, &mut m);
+    let starts = support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.scoped(policy, &Unwitnessed, |owner| {
+            owner.decoder::<_, Probe, _, _>(
+                policy,
+                Borrowing(&[0xf6]),
+                Options::normalizing(8),
+                &Unwitnessed,
+                |_| STARTS.get(),
+            )
+        })
+    });
     assert_eq!(starts, 0, "new ran custom initialization without admission");
 }
 
 #[test]
 fn publication_preserves_the_initialized_value_address() {
-    let mut m = turns(None);
-    let (mut owner, input) = open(&mut m, &[0xf6]);
-    let output = finish(input, &mut m);
-    assert_eq!(output.value().inline, [0x5a; 256]);
-    assert_eq!(output.bytes(), [0xf6]);
-    let constructed = output.value().construction_address;
-    let published = std::ptr::from_ref(output.value()) as usize;
-    drop(output);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    let (constructed, published) = decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |output| {
+        assert_eq!(output.value().inline, [0x5a; 256]);
+        assert_eq!(output.bytes(), [0xf6]);
+        (
+            output.value().construction_address,
+            std::ptr::from_ref(output.value()) as usize,
+        )
+    });
     assert_eq!(
         constructed, published,
         "completion moved the initialized value"
@@ -195,12 +222,9 @@ fn publication_preserves_the_initialized_value_address() {
 #[test]
 fn dropping_output_does_not_execute_a_value_destructor() {
     DROPS.set(0);
-    let mut m = turns(None);
-    let (mut owner, input) = open(&mut m, &[0xf6]);
-    let output = finish(input, &mut m);
-    assert_eq!(DROPS.get(), 0);
-    drop(output);
-    drain(&mut owner, &mut m);
+    decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |_| {
+        assert_eq!(DROPS.get(), 0)
+    });
     assert_eq!(
         DROPS.get(),
         0,
@@ -266,6 +290,7 @@ fn every_probe_lifecycle_fault_keeps_custody_without_destructors() {
 #[cfg(feature = "derive")]
 mod large_schema {
     use super::*;
+    use dcbor::bounded::decode::construction::TypedDecoder;
 
     macro_rules! record {
         ($($name:ident = $key:literal),* $(,)?) => {
@@ -303,13 +328,9 @@ mod large_schema {
                 wire.push(key);
             }
         }
-        let mut m = turns(None);
-        let (mut owner, input) = open(&mut m, &wire);
-        let output = support::decode::<_, Large>(&mut m, input, Options::normalizing(8))
-            .expect("large schema did not publish its literal fields");
-        output.value().assert_literal_fields();
-        drop(output);
-        drain(&mut owner, &mut m);
+        decoded::<Large, _>(&wire, Options::normalizing(8), |output| {
+            output.value().assert_literal_fields()
+        });
     }
 
     #[test]
@@ -323,28 +344,49 @@ mod large_schema {
     }
 }
 
+/// A decode that fails terminally holds charged custody until its own
+/// cleanup runs: the failure leaves storage beyond the scope's, and only
+/// cleanup to `Finished` leaves the scope holding no record.
 #[test]
 fn terminal_error_cannot_report_finished_with_live_custody() {
-    let mut m = turns(None);
-    let (mut owner, input) = open(&mut m, &[0xf4]);
-    let scope = m.live_bytes();
-    let mut decoder = TypedDecoder::<_, Probe, Limits>::new(input, Options::normalizing(8));
     let bound = support::typed_turns::<Probe>(1);
-    let failed = support::fail_within(&mut m, &mut decoder, bound);
-    assert!(
-        matches!(failed, DecodeError::Invalid(_)),
-        "fixture never reached its terminal construction error"
-    );
-    assert!(m.live_bytes() > scope);
-    support::finish_within(&mut m, &mut decoder, bound);
-    assert_eq!(
-        owner.outstanding(),
-        0,
-        "Finished abandoned charged construction records"
-    );
-    drop(decoder);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.scoped(policy, &Unwitnessed, |owner| {
+            let scope_bytes = owner.with_policy(policy, |_, m| m.live_bytes());
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let scope = view.value().get();
+                view.decoder::<_, Probe, _, _>(
+                    policy,
+                    Borrowing(&[0xf4]),
+                    Options::normalizing(8),
+                    &Unwitnessed,
+                    |decoder| {
+                        match decoder.drive(policy, bound, Retirement::Published, |_| ()) {
+                            Err(Stopped::Operation(DecodeError::Invalid(_))) => {}
+                            other => {
+                                return Err(Finding::Driver(format!(
+                                    "fixture never reached its terminal construction error: \
+                                     {other:?}"
+                                )));
+                            }
+                        }
+                        let held = decoder.with_policy(policy, |_, m| m.live_bytes());
+                        assert!(held > scope_bytes, "the failure held nothing");
+                        decoder.finish(policy, bound, Retirement::Published)?;
+                        assert_eq!(
+                            scope.outstanding(),
+                            0,
+                            "Finished abandoned charged construction records"
+                        );
+                        Ok(())
+                    },
+                )
+            })?
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[path = "reclamation/typed_lifecycle_matrix.rs"]

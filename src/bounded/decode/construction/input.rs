@@ -3,13 +3,16 @@ use super::in_place::Built;
 use super::in_place::text::{BufferObservation, BufferState};
 use super::operation::{Operation, OperationTerms, Task};
 use super::reclamation::{
-    Custody, DecodeOwner, OwnedInitialized, PeekSlot, Prefix, Reclaim, Reclaimed, ScopeRef, Slot,
+    Cleanup, Custody, DecodeOwner, OwnedInitialized, PeekSlot, Prefix, Reclaim, Reclaimed,
+    ScopeRef, Slot,
 };
+use super::stable::Pending;
 use crate::ByteString;
 use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::{
-    Allocator, BoundedError, BoundedResult, Places, ResourceBound, Unit, WriteWork,
+    Allocator, BoundedError, BoundedResult, CustodySink, Performer, PermitsObserved, Places,
+    ResourceBound, Unit, WriteWork,
 };
 
 places! {
@@ -37,16 +40,23 @@ const RETIRE: Unit<InputPlace> = Unit::new(InputPlace::Borrow, 1, 0);
 /// input and its construction state are both `Send`.
 ///
 /// # Safety
-/// `bytes` must return the same byte sequence throughout this resource's live
-/// lifetime, including across calls through other shared aliases. No interior
-/// mutation may change those bytes. Reclaim must release associated evidence
-/// and reservations incrementally under the Reclaim contract.
+/// An implementation keeps one obligation beside its [`Reclaim`]'s, which
+/// releases its evidence and reservations incrementally, and the
+/// `// SAFETY:` comment on it names it as `label:`
+/// (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`, which lists every
+/// implementation):
+///
+/// - *bytes*: `bytes` returns the same byte sequence throughout this
+///   resource's live lifetime, across calls through other shared aliases
+///   too; no interior mutation changes those bytes.
 pub unsafe trait DecodeInput<A: Allocator>: Reclaim<A, State: Send> + Send {
     fn bytes(&self) -> &[u8];
 }
 
-// SAFETY: ByteString exposes immutable bytes through a shared reference and
-// its Reclaim binding releases its buffer and permits incrementally.
+// SAFETY: bytes: ByteString exposes its bytes through a shared reference,
+// and a record's value is reached only through `&self` once published, so no
+// mutation changes them while it is live; its Reclaim binding releases its
+// buffer and permits incrementally.
 unsafe impl<A: Allocator> DecodeInput<A> for ByteString
 where
     A::Permit: Send,
@@ -60,39 +70,66 @@ where
 /// bytes outlive every record and the owner of the scope.
 pub struct Borrowed<'s>(&'s [u8]);
 
-// SAFETY: a borrowed slice owns nothing; one admitted unit retires it,
-// whether or not its single prefix unit was initialized.
+// SAFETY: initial: `Prefix::EMPTY`, nothing written. state: the prefix
+// records the one unit that writes the borrow, or its release; a borrowed
+// slice owns nothing. admission: one admitted unit retires it, a refusal
+// changing nothing. cleanup: it only releases the prefix, allocating
+// nothing, never unwinding, running no destructor. done: the slice owns
+// nothing, so `Done` whether or not its prefix unit was initialized, the
+// prefix then released. order: a step after `Done` finds the prefix
+// released and reports `Done`, admitting nothing. depth: a leaf, the default
+// 1. count: one call, the retiring one or, once released, the one reporting
+// `Done`.
 unsafe impl<A: Allocator> Reclaim<A> for Borrowed<'_> {
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        RETIRE.admit(a)?;
-        *slot.custody() = Prefix::EMPTY;
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Prefix>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        if slot.custody().released() {
+            return Ok(Reclaimed::Done);
+        }
+        RETIRE.admit(cleanup)?;
+        slot.custody().release();
         Ok(Reclaimed::Done)
     }
 
-    /// One call, which is `Done`.
-    fn remaining(_: PeekSlot<'_, Self, Prefix>) -> u64 {
-        1
+    /// One call, which is `Done`: the retiring one, or, once released, the
+    /// one reporting it.
+    fn remaining(_: PeekSlot<'_, Self, Prefix>) -> Option<u64> {
+        Some(1)
+    }
+
+    /// A borrowed slice owns no permit.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, Prefix>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
-// SAFETY: a shared slice is immutable for its whole lifetime.
+// SAFETY: bytes: a shared slice is immutable for its whole lifetime, which
+// the scope's borrow outlives.
 unsafe impl<A: Allocator> DecodeInput<A> for Borrowed<'_> {
     fn bytes(&self) -> &[u8] {
         self.0
     }
 }
 
-/// An input task's own cleanup: it holds only a scope reference, released in
-/// one admitted unit, which completes the cleanup.
+/// An input task's own cleanup: it holds only a scope reference, ended in
+/// one admitted unit, which completes the cleanup. Inside cleanup, so the
+/// reference is deferred into the step's worklist, never released in place.
 fn release_scope<'s, A: Allocator>(
     scope: &mut Option<ScopeRef<'s, A>>,
-    a: &mut A,
+    cleanup: &mut Cleanup<'_, A>,
 ) -> BoundedResult<Reclaimed, A> {
-    SETTLE.admit(a)?;
-    *scope = None;
+    SETTLE.admit(cleanup)?;
+    if let Some(scope) = scope.take() {
+        scope.defer(cleanup.worklist());
+    }
     Ok(Reclaimed::Done)
 }
 
@@ -109,14 +146,27 @@ pub struct InputDetail<O> {
 }
 
 /// Copies immutable bytes incrementally into scope custody. The source is
-/// borrowed only while copying; the published handle owns its copy.
+/// borrowed only while copying; the published handle owns its copy. The
+/// record is the byte string itself, with no custody field to keep a
+/// pending in, so the copy's acquisitions are bound on the operation's one
+/// acquisition custody ([`Task::advance`]): under the owner the record
+/// stores, so the record's group holds its block and its buffer alike, and
+/// settled with the record's acquisition at the operation's cleanup entry
+/// and drop.
 pub struct CopyInput<'src, 's, A: Allocator> {
     source: &'src [u8],
     scope: Option<ScopeRef<'s, A>>,
 }
 
-// SAFETY: ByteString's own construction state tracks every initialized part;
-// there is no separate initialization prefix.
+// SAFETY: prefix: there is no separate initialization prefix (`INIT_STEPS`
+// 0): `initialize` always refuses `PlanMismatch`, changing nothing. advance:
+// `initialized` is always 0, `INIT_STEPS`; ByteString's own construction
+// state tracks every initialized part, so the record stays reclaimable after
+// every return, and completion is reported only when the copy is `Done`,
+// with no credit pending. detail: `detail` reads only the buffer's
+// observation and `observe_custody` nothing; neither changes, admits or
+// allocates. provenance: the copy reaches the record only through its slot
+// (`ByteString::copy_step`).
 unsafe impl<'s, A: Allocator> Task<'s, A> for CopyInput<'_, 's, A>
 where
     A::Permit: Send,
@@ -148,9 +198,16 @@ where
     fn advance(
         &mut self,
         slot: Slot<'_, ByteString, BufferState<A::Permit>>,
+        pending: &mut Pending<A::Origin>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
-        Ok(ByteString::copy_step(self.source, slot, a)? == Built::Done)
+        let done = ByteString::copy_step(self.source, slot, pending, a)? == Built::Done;
+        // Published only with no credit pending: the copy's acquisitions all
+        // ended.
+        if done && !pending.is_idle() {
+            return Err(BoundedError::PlanMismatch);
+        }
+        Ok(done)
     }
 
     fn publish(&mut self, record: OwnedInitialized<'s, ByteString, A>) -> Self::Output {
@@ -158,8 +215,22 @@ where
         record
     }
 
-    fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        release_scope(&mut self.scope, a)
+    fn reclaim_step(&mut self, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
+        release_scope(&mut self.scope, cleanup)
+    }
+
+    /// The copy's credit is the operation's acquisition custody's, settled
+    /// with it: nothing of the task's own.
+    fn settle(&mut self, _: Performer) {}
+
+    /// The task holds nothing outside its record but its scope reference:
+    /// the copy is the record's.
+    fn observe_custody(
+        &mut self,
+        _: Option<PeekSlot<'_, ByteString, BufferState<A::Permit>>>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 
     fn detail(
@@ -171,7 +242,7 @@ where
             length: self.source.len(),
             held: match record {
                 Some(BufferObservation::Held(custody)) => custody.copied,
-                Some(BufferObservation::Unallocated(_)) | None => 0,
+                Some(BufferObservation::Unallocated) | None => 0,
             },
             scope: self.scope.is_some(),
             record,
@@ -185,7 +256,15 @@ pub struct BorrowInput<'s, A: Allocator> {
     scope: Option<ScopeRef<'s, A>>,
 }
 
-// SAFETY: the single initialization unit writes the whole resource-free value.
+// SAFETY: prefix: the single initialization unit writes the whole
+// resource-free value and records it; once recorded, or once the record is
+// released, `initialize` refuses `PlanMismatch`, changing nothing; the
+// prefix before or after it is reclaimable by `Borrowed`'s one unit.
+// advance: refused `PlanMismatch` until the prefix is recorded, a released
+// prefix recording none, then completion, the value whole. detail:
+// `detail` reads only the prefix and `observe_custody` nothing; neither
+// changes, admits or allocates. provenance: the write goes through the
+// slot's place (`field`).
 unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
     type State = Borrowed<'s>;
     type Output = OwnedInitialized<'s, Borrowed<'s>, A>;
@@ -207,7 +286,10 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         a: &mut A,
     ) -> Result<(), Self::Error> {
         let (place, prefix) = slot.parts();
-        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, prefix.initialized()) {
+        // A released record is terminal: nothing is written again.
+        if prefix.released()
+            || Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, prefix.initialized())
+        {
             return Err(BoundedError::PlanMismatch);
         }
         let source = self.source;
@@ -223,9 +305,11 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
     fn advance(
         &mut self,
         mut slot: Slot<'_, Borrowed<'s>, Prefix>,
+        _: &mut Pending<A::Origin>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
-        if slot.custody().initialized() != Self::INIT_STEPS {
+        let prefix = slot.custody();
+        if prefix.released() || prefix.initialized() != Self::INIT_STEPS {
             return Err(BoundedError::PlanMismatch);
         }
         SETTLE.admit(a)?;
@@ -237,8 +321,20 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         record
     }
 
-    fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        release_scope(&mut self.scope, a)
+    fn reclaim_step(&mut self, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
+        release_scope(&mut self.scope, cleanup)
+    }
+
+    /// A borrow acquires nothing beyond its record: nothing to settle.
+    fn settle(&mut self, _: Performer) {}
+
+    /// The task holds nothing outside its record but its scope reference.
+    fn observe_custody(
+        &mut self,
+        _: Option<PeekSlot<'_, Borrowed<'s>, Prefix>>,
+        _: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 
     fn detail(&self, record: Option<PeekSlot<'_, Borrowed<'s>, Prefix>>) -> InputDetail<Prefix> {
@@ -285,7 +381,8 @@ where
         <CopyInput<'static, 'static, A> as Task<'static, A>>::INIT_STEPS,
         <ByteString as InPlace<A>>::COST
             .bound(len)?
-            .then(task.bound()?)?,
+            .checked_then(task.bound()?)
+            .ok_or(BoundedError::Overflow)?,
     )?;
     Ok((operation, task))
 }
@@ -348,7 +445,7 @@ impl Places for InputTerms {
 pub type InputAcquisition<'src, 's, A> = Operation<'s, CopyInput<'src, 's, A>, A>;
 pub type InputBorrow<'s, A> = Operation<'s, BorrowInput<'s, A>, A>;
 
-impl<'s, A: Allocator> DecodeOwner<'s, A> {
+impl<'s, A: crate::bounded::TerminalAllocator> DecodeOwner<'s, A> {
     /// Copy immutable bytes incrementally into scope custody. Construction
     /// allocates nothing; initialize the owner first.
     pub fn copy_input<'src>(&self, source: &'src [u8]) -> InputAcquisition<'src, 's, A>
@@ -396,16 +493,13 @@ mod tests {
                 &mut state,
             )
         };
-        let mut a = Limits::unlimited().logged();
+        let mut a = Limits::unlimited();
         assert_eq!(
             task.initialize(slot, &mut a),
             Err(BoundedError::PlanMismatch)
         );
         assert_eq!(a.attempts(), 0, "a refused unit admits nothing");
-        assert_eq!(
-            state.observe(),
-            BufferObservation::Unallocated(Default::default())
-        );
+        assert_eq!(state.observe(), BufferObservation::Unallocated);
     }
 
     /// An operation reports cancelling from its cancellation on, through
@@ -492,5 +586,44 @@ mod tests {
         }
         assert!(done, "the scope did not shut down");
         assert_eq!(a.live_bytes(), 0);
+    }
+}
+
+/// The borrowed input record's cleanup at every cut of its task
+/// ([`super::cuts::every_cut`]): its one unit releases it whether or not
+/// its prefix was written, and after `Done` a further step reports `Done`
+/// admitting nothing, initialization and advance are refused, and the
+/// record observed is released, every capability released exactly once.
+#[cfg(all(test, feature = "std"))]
+mod released {
+    use super::super::cuts::{every_cut, scope};
+    use super::*;
+    use crate::bounded::Limits;
+
+    /// The borrowed bytes, outliving every scope that borrows them.
+    static BORROWED: [u8; 2] = [1, 2];
+
+    #[test]
+    fn a_borrowed_records_cleanup_releases_it_and_admits_nothing_after_done() {
+        every_cut(
+            "a borrowed input record",
+            |a| {
+                let owner = scope(a);
+                let task = BorrowInput::<'static, Limits> {
+                    source: &BORROWED,
+                    scope: owner.reference(),
+                };
+                (owner, task)
+            },
+            |detail: &InputDetail<Prefix>, released, what| {
+                assert!(released, "{what}: the record's one unit left it unreleased");
+                assert_eq!(
+                    detail.record.map(|prefix| prefix.released()),
+                    Some(true),
+                    "{what}: the record observed"
+                );
+                assert_eq!(detail.held, 0, "{what}: a released borrow still held");
+            },
+        );
     }
 }

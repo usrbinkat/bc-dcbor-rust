@@ -1,0 +1,11 @@
+--- src/bounded/text_cursor.rs
++++ src/bounded/text_cursor.rs
+@@ -816,7 +816,7 @@
+                     // The output, if one was requested, is released in the
+                     // same unit: its request paid for its release.
+                     self.bytes = Vec::new();
+-                    self.permit = None;
++                    // Planted: the output's permit kept past cleanup.
+                     self.phase = Phase::Finished;
+                     return Ok(true);
+                 }

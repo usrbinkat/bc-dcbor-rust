@@ -5,12 +5,12 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     let mut inner_map = Map::new();
-    inner_map.insert("x", vec![1, 2]);
+    inner_map.insert("x", vec![1, 2])?;
     let mut outer_map = Map::new();
-    outer_map.insert("inner", inner_map);
-    outer_map.insert("simple", 42);
+    outer_map.insert("inner", inner_map)?;
+    outer_map.insert("simple", 42)?;
     let nested = CBOR::from(outer_map);
 
     let visit_log = RefCell::new(Vec::<String>::new());
@@ -27,4 +27,5 @@ fn main() {
         println!("{}. {}", i + 1, entry);
     }
     println!("Total count: {}", log.len());
+    Ok(())
 }

@@ -33,15 +33,14 @@
 
 mod source_tree;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use dcbor_census::CensusModule;
-use proc_macro2::{Spacing, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use quote::ToTokens;
 use source_tree::Tree;
-use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Attribute, ImplItem, Item, ItemMod, TraitItem, UseTree};
@@ -97,6 +96,25 @@ struct Module {
     /// The comparisons and bound calls its own code makes outside its
     /// test-only items and outside the seam ([`BoundarySites`]).
     boundary_sites: Vec<BoundarySite>,
+    /// Each call its own code makes of a binding's own method
+    /// ([`BINDING_METHODS`]) outside its test-only items, by the function it
+    /// lies in, the method and the line ([`binding_calls`]).
+    binding_calls: Vec<(String, String, usize)>,
+    /// Each `unsafe impl` of a governed trait ([`UNSAFE_TRAITS`]) its own
+    /// code writes outside its test-only items, a macro's transcribers
+    /// included ([`UnsafeImpls`]).
+    unsafe_impls: Vec<UnsafeImpl>,
+}
+
+/// One `unsafe impl` of a governed trait ([`UNSAFE_TRAITS`]) in a module's
+/// own code: the trait, the site writing it (the implementing type, or the
+/// `macro_rules!` definition whose transcriber holds it) and the line of its
+/// `unsafe`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnsafeImpl {
+    trait_name: String,
+    site: String,
+    line: usize,
 }
 
 /// One comparison or bound call the boundary rule governs: the function or
@@ -163,72 +181,20 @@ impl BoundarySites {
     }
 
     /// The sites of a `macro_rules!` definition, `tokens` (its name and body,
-    /// or its arms): each arm's transcriber, its fragments substituted by
-    /// their kinds ([`macro_arguments::substitute`]), parsed as items,
-    /// statements or one expression and visited as code is. A transcriber
-    /// that parses as none of them, or an arm that is not `(matcher) =>
-    /// {transcriber}`, is a site of its own.
+    /// or its arms): each arm's transcriber ([`macro_arguments::transcribers`])
+    /// visited as code is ([`macro_arguments::code`]). A transcriber that
+    /// parses as no code, or an arm that is not `(matcher) => {transcriber}`,
+    /// is a site of its own.
     fn definition(&mut self, tokens: TokenStream) {
-        let mut trees: Vec<TokenTree> = tokens.into_iter().collect();
-        if let [TokenTree::Ident(_), TokenTree::Group(body)] = trees.as_slice() {
-            trees = body.stream().into_iter().collect();
-        }
-        let mut at = 0;
-        while at < trees.len() {
-            let arm = (
-                trees.get(at),
-                trees.get(at + 1),
-                trees.get(at + 2),
-                trees.get(at + 3),
-            );
-            let (
-                Some(TokenTree::Group(matcher)),
-                Some(TokenTree::Punct(equals)),
-                Some(TokenTree::Punct(greater)),
-                Some(TokenTree::Group(transcriber)),
-            ) = arm
-            else {
-                self.record(
-                    trees[at].span().start().line,
-                    "macro_rules!: an arm not parsed".to_string(),
-                    false,
-                );
-                return;
-            };
-            if equals.as_char() != '=' || greater.as_char() != '>' {
-                self.record(
-                    equals.span().start().line,
-                    "macro_rules!: an arm not parsed".to_string(),
-                    false,
-                );
-                return;
-            }
-            let mut kinds = std::collections::BTreeMap::new();
-            macro_arguments::fragment_kinds(matcher.stream(), &mut kinds);
-            let body = macro_arguments::substitute(transcriber.stream(), &kinds);
-            self.transcribed(body, transcriber.span().start().line);
-            at += 4;
-            if matches!(trees.get(at), Some(TokenTree::Punct(punct)) if punct.as_char() == ';') {
-                at += 1;
+        let (arms, unparsed) = macro_arguments::transcribers(tokens);
+        for (body, line) in arms {
+            match macro_arguments::code(body) {
+                Some(code) => code.visit(self),
+                None => self.record(line, "macro_rules!: a body not parsed".to_string(), false),
             }
         }
-    }
-
-    /// A substituted transcriber, `body`, visited as items, statements or
-    /// one expression, whichever it parses as; none of them a site at `line`.
-    fn transcribed(&mut self, body: TokenStream, line: usize) {
-        if let Ok(file) = syn::parse2::<syn::File>(body.clone()) {
-            for item in &file.items {
-                <Self as Visit<'_>>::visit_item(self, item);
-            }
-        } else if let Ok(statements) = syn::Block::parse_within.parse2(body.clone()) {
-            for statement in &statements {
-                <Self as Visit<'_>>::visit_stmt(self, statement);
-            }
-        } else if let Ok(expr) = syn::parse2::<syn::Expr>(body) {
-            <Self as Visit<'_>>::visit_expr(self, &expr);
-        } else {
-            self.record(line, "macro_rules!: a body not parsed".to_string(), false);
+        if let Some(line) = unparsed {
+            self.record(line, "macro_rules!: an arm not parsed".to_string(), false);
         }
     }
 
@@ -371,7 +337,98 @@ mod macro_arguments {
     use proc_macro2::{Delimiter, Group, Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
     use syn::parse::{ParseStream, Parser};
     use syn::punctuated::Punctuated;
-    use syn::{Expr, Item, Pat, Token, Type};
+    use syn::visit::Visit;
+    use syn::{Expr, Item, Pat, Stmt, Token, Type};
+
+    /// What a substituted transcriber parsed as: the code a definition
+    /// expands to, visited as written code is.
+    pub(super) enum Code {
+        Items(Vec<Item>),
+        Statements(Vec<Stmt>),
+        Expression(Box<Expr>),
+    }
+
+    impl Code {
+        /// Visit the code with `visitor`, as its items, its statements or
+        /// its one expression.
+        pub(super) fn visit<V>(&self, visitor: &mut V)
+        where
+            V: for<'ast> Visit<'ast>,
+        {
+            match self {
+                Self::Items(items) => {
+                    for item in items {
+                        Visit::visit_item(visitor, item);
+                    }
+                }
+                Self::Statements(statements) => {
+                    for statement in statements {
+                        Visit::visit_stmt(visitor, statement);
+                    }
+                }
+                Self::Expression(expr) => Visit::visit_expr(visitor, expr),
+            }
+        }
+    }
+
+    /// A substituted transcriber, `body`, parsed as items, statements or one
+    /// expression, the first it parses as; `None` when it is none of them.
+    pub(super) fn code(body: TokenStream) -> Option<Code> {
+        if let Ok(file) = syn::parse2::<syn::File>(body.clone()) {
+            Some(Code::Items(file.items))
+        } else if let Ok(statements) = syn::Block::parse_within.parse2(body.clone()) {
+            Some(Code::Statements(statements))
+        } else {
+            syn::parse2::<Expr>(body)
+                .ok()
+                .map(|expr| Code::Expression(Box::new(expr)))
+        }
+    }
+
+    /// The arms of a `macro_rules!` definition, `tokens` (its name and body,
+    /// or its arms): each arm's transcriber with its fragments substituted
+    /// by their kinds ([`substitute`]), and the line it begins on, in order;
+    /// then the line of the first arm that is not `(matcher) =>
+    /// {transcriber}`, if one is not, the arms after it unread.
+    pub(super) fn transcribers(tokens: TokenStream) -> (Vec<(TokenStream, usize)>, Option<usize>) {
+        let mut trees: Vec<TokenTree> = tokens.into_iter().collect();
+        if let [TokenTree::Ident(_), TokenTree::Group(body)] = trees.as_slice() {
+            trees = body.stream().into_iter().collect();
+        }
+        let mut arms = Vec::new();
+        let mut at = 0;
+        while at < trees.len() {
+            let arm = (
+                trees.get(at),
+                trees.get(at + 1),
+                trees.get(at + 2),
+                trees.get(at + 3),
+            );
+            let (
+                Some(TokenTree::Group(matcher)),
+                Some(TokenTree::Punct(equals)),
+                Some(TokenTree::Punct(greater)),
+                Some(TokenTree::Group(transcriber)),
+            ) = arm
+            else {
+                return (arms, Some(trees[at].span().start().line));
+            };
+            if equals.as_char() != '=' || greater.as_char() != '>' {
+                return (arms, Some(equals.span().start().line));
+            }
+            let mut kinds = BTreeMap::new();
+            fragment_kinds(matcher.stream(), &mut kinds);
+            arms.push((
+                substitute(transcriber.stream(), &kinds),
+                transcriber.span().start().line,
+            ));
+            at += 4;
+            if matches!(trees.get(at), Some(TokenTree::Punct(punct)) if punct.as_char() == ';') {
+                at += 1;
+            }
+        }
+        (arms, None)
+    }
 
     /// What an invocation's arguments parsed as.
     pub(super) enum Arguments {
@@ -736,8 +793,11 @@ impl Scanned {
                             .is_some_and(|before| {
                                 matches!(before, TokenTree::Punct(punct) if punct.as_char() == '\'')
                             });
+                        // `static mut NAME`, and a lazy static's `static ref
+                        // NAME` (`lazy_static!`): the name after the word.
                         let mut next = at + 1;
-                        if matches!(trees.get(next), Some(TokenTree::Ident(word)) if word == "mut")
+                        if matches!(trees.get(next), Some(TokenTree::Ident(word))
+                            if word == "mut" || word == "ref")
                         {
                             next += 1;
                         }
@@ -839,7 +899,11 @@ impl Census {
             bucket_reads: Vec::new(),
             allocators: Vec::new(),
             boundary_sites: Vec::new(),
+            binding_calls: Vec::new(),
+            unsafe_impls: Vec::new(),
         });
+        let mut calls = Vec::new();
+        let mut impls = UnsafeImpls::default();
         let mut own = Scanned::default();
         let mut sync = StdPaths::new(&["sync"]);
         let mut threads = StdPaths::new(&["thread"]);
@@ -862,6 +926,8 @@ impl Census {
                 }
                 other => {
                     own.scan(other.to_token_stream());
+                    binding_calls(other, &mut calls);
+                    impls.visit_item(other);
                     sync.visit_item(other);
                     threads.visit_item(other);
                     alloc_paths.visit_item(other);
@@ -906,7 +972,26 @@ impl Census {
                     .any(|&(start, end)| start <= site.line && site.line <= end)
             })
             .collect();
+        let binding_calls: Vec<(String, String, usize)> = calls
+            .into_iter()
+            .filter(|(_, _, line)| {
+                !test_items
+                    .iter()
+                    .any(|&(start, end)| start <= *line && *line <= end)
+            })
+            .collect();
+        let unsafe_impls: Vec<UnsafeImpl> = impls
+            .found
+            .into_iter()
+            .filter(|found| {
+                !test_items
+                    .iter()
+                    .any(|&(start, end)| start <= found.line && found.line <= end)
+            })
+            .collect();
         let record = &mut self.modules[index];
+        record.binding_calls = binding_calls;
+        record.unsafe_impls = unsafe_impls;
         record.unsafe_tokens = own.unsafe_tokens;
         record.invoked = own.invoked;
         record.test_items = test_items;
@@ -1221,8 +1306,8 @@ fn shipped_statics(census: &Census) -> Vec<(String, String)> {
 /// static keeps is shared by every operation of the process, so an outcome
 /// would depend on what ran before it. The tag store is the caller's,
 /// passed to what reads it (`diag.rs`, `dump.rs`), never the crate's. A
-/// static added anywhere, a function's included, or a `thread_local!`,
-/// fails here.
+/// static added anywhere, a function's included, a lazy static, or a
+/// `thread_local!`, fails here.
 #[test]
 fn no_shipped_code_keeps_state_in_a_static() {
     let census = census(Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -1413,6 +1498,1053 @@ fn the_bucket_check_finds_every_read_outside_the_traversal_and_nothing_else() {
     );
 }
 
+/// A binding's own methods (`InPlace`'s and `Reclaim`'s): the engine alone
+/// dispatches them, so a binding is stepped only with its own context and,
+/// at the root, only under its session.
+const BINDING_METHODS: &[&str] = &[
+    "build_step",
+    "build_present",
+    "build_absent",
+    "reclaim_step",
+    "remaining",
+];
+
+/// The qualifiers of calls that share those names but dispatch no binding:
+/// a binding's delegation to its own method (`Self`), and the inherent
+/// methods of the record wrappers and the typed value, records the scope
+/// engine steps, and the retained obligation's remaining credit.
+/// A qualifier beginning in lower case is a module (the
+/// engine's own entries, `in_place::remaining`, or a binding's helper
+/// module, `cleanup::remaining`), never a type.
+const NOT_BINDING_DISPATCH: &[&str] = &[
+    "Self",
+    "OwnedInitialized",
+    "OwnedDocument",
+    "OwnedRecord",
+    "TypedValue",
+    "Record",
+    "Retained",
+];
+
+const IN_PLACE: &str = "crate::bounded::decode::construction::in_place";
+
+/// Where a binding's methods are dispatched, by module and function: the
+/// construction engine's entries, at the root under a session and for a
+/// part; the scope engine's dispatch of a record's cleanup and count; and an
+/// owned record's count. Each must dispatch at least one: a stale entry is
+/// reported.
+const BINDING_DISPATCH: &[(&str, &str)] = &[
+    (IN_PLACE, "build"),
+    (IN_PLACE, "build_present"),
+    (IN_PLACE, "build_absent"),
+    (IN_PLACE, "reclaim"),
+    (IN_PLACE, "remaining"),
+    (IN_PLACE, "build_part"),
+    (IN_PLACE, "build_part_present"),
+    (IN_PLACE, "build_part_absent"),
+    (IN_PLACE, "reclaim_part"),
+    (IN_PLACE, "remaining_part"),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "advance",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "finish",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation::owned",
+        "remaining",
+    ),
+];
+
+/// The binding-method calls ([`BINDING_METHODS`]) of `item`, by the function
+/// they lie in (a free function, an impl's or a trait's method), the method
+/// and the line: a path call `Q::method` or `<_ as Trait>::method`, whose
+/// qualifier is neither [`NOT_BINDING_DISPATCH`] nor a module. A method
+/// call (`value.reclaim_step(..)`) is an inherent method of a value, never
+/// a binding's, which are associated functions taking a slot. Doc text is a
+/// literal, never a name.
+fn binding_calls(item: &Item, calls: &mut Vec<(String, String, usize)>) {
+    fn scan(function: &str, tokens: TokenStream, calls: &mut Vec<(String, String, usize)>) {
+        let trees: Vec<TokenTree> = tokens.into_iter().collect();
+        for (at, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Group(group) => scan(function, group.stream(), calls),
+                TokenTree::Ident(ident) => {
+                    let name = ident.to_string();
+                    if !BINDING_METHODS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    let colon = |back: usize| {
+                        at.checked_sub(back)
+                            .and_then(|before| trees.get(before))
+                            .is_some_and(|before| {
+                                matches!(before, TokenTree::Punct(punct) if punct.as_char() == ':')
+                            })
+                    };
+                    if !(colon(1) && colon(2)) {
+                        continue;
+                    }
+                    let dispatch = match at.checked_sub(3).and_then(|before| trees.get(before)) {
+                        // A transcriber's fragment (`$t::build_step`): a
+                        // type, never a module, whatever its name's case.
+                        Some(TokenTree::Ident(_))
+                            if at
+                                .checked_sub(4)
+                                .and_then(|before| trees.get(before))
+                                .is_some_and(|before| {
+                                    matches!(before, TokenTree::Punct(punct) if punct.as_char() == '$')
+                                }) =>
+                        {
+                            true
+                        }
+                        Some(TokenTree::Ident(qualifier)) => {
+                            let qualifier = qualifier.to_string();
+                            !NOT_BINDING_DISPATCH.contains(&qualifier.as_str())
+                                && !qualifier.starts_with(|c: char| c.is_ascii_lowercase())
+                        }
+                        // `<T as InPlace<A>>::method`.
+                        Some(TokenTree::Punct(punct)) => punct.as_char() == '>',
+                        _ => false,
+                    };
+                    if dispatch {
+                        calls.push((function.to_string(), name, ident.span().start().line));
+                    }
+                }
+                TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+            }
+        }
+    }
+    match item {
+        Item::Fn(function) => scan(
+            &function.sig.ident.to_string(),
+            function.block.to_token_stream(),
+            calls,
+        ),
+        Item::Impl(block) => {
+            for inner in &block.items {
+                if let syn::ImplItem::Fn(method) = inner {
+                    scan(
+                        &method.sig.ident.to_string(),
+                        method.block.to_token_stream(),
+                        calls,
+                    );
+                }
+            }
+        }
+        Item::Trait(block) => {
+            for inner in &block.items {
+                if let syn::TraitItem::Fn(method) = inner
+                    && let Some(body) = &method.default
+                {
+                    scan(&method.sig.ident.to_string(), body.to_token_stream(), calls);
+                }
+            }
+        }
+        // A macro's definition (`macro_rules! name`) or invocation at item
+        // level, its transcribers included: no dispatch entry is one, so a
+        // binding call it makes or generates is reported.
+        Item::Macro(invocation) => {
+            let name = match &invocation.ident {
+                Some(defined) => format!("macro_rules! {defined}"),
+                None => format!(
+                    "{}!",
+                    invocation
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map_or_else(String::new, |segment| segment.ident.to_string())
+                ),
+            };
+            scan(&name, invocation.mac.tokens.clone(), calls);
+        }
+        // A constant's or static's initializer, under its name: a binding's
+        // method stored as a function pointer is a dispatch too.
+        Item::Const(constant) => scan(
+            &constant.ident.to_string(),
+            constant.expr.to_token_stream(),
+            calls,
+        ),
+        Item::Static(item) => scan(&item.ident.to_string(), item.expr.to_token_stream(), calls),
+        _ => {}
+    }
+}
+
+/// Every binding-method call shipped code makes outside the engine's
+/// dispatch ([`BINDING_DISPATCH`]), by module, function and method.
+fn binding_dispatch_violations(census: &Census) -> Vec<(String, String, String)> {
+    let mut violations = Vec::new();
+    for (index, module) in census.modules.iter().enumerate() {
+        if census.test(index) {
+            continue;
+        }
+        for (function, method, _) in &module.binding_calls {
+            if !BINDING_DISPATCH
+                .iter()
+                .any(|&(path, name)| path == module.path && name == function)
+            {
+                violations.push((module.path.clone(), function.clone(), method.clone()));
+            }
+        }
+    }
+    violations
+}
+
+/// The dispatch entries ([`BINDING_DISPATCH`]) that dispatch no binding
+/// method in `census`: stale declarations.
+fn stale_binding_dispatch(census: &Census) -> Vec<(String, String)> {
+    BINDING_DISPATCH
+        .iter()
+        .filter(|&&(path, name)| {
+            !census.modules.iter().enumerate().any(|(index, module)| {
+                !census.test(index)
+                    && module.path == path
+                    && module
+                        .binding_calls
+                        .iter()
+                        .any(|(function, _, _)| function == name)
+            })
+        })
+        .map(|&(path, name)| (path.to_string(), name.to_string()))
+        .collect()
+}
+
+/// Only the engine dispatches a binding's own methods: no shipped code
+/// outside the construction engine's entries ([`IN_PLACE`]'s `build*`,
+/// `reclaim*`, `remaining*`) and the scope engine's record dispatch calls
+/// `build_step`, `build_present`, `build_absent`, `reclaim_step` or
+/// `remaining` of a binding, so every binding is stepped with a context the
+/// engine made, at the root under its session. Generated code reaches
+/// bindings only through those entries (`dcbor-derive`'s expansions name
+/// `in_place::build_part*`, `reclaim_part`, `remaining_part`). Every entry
+/// dispatches something.
+#[test]
+fn only_the_engine_dispatches_a_bindings_methods() {
+    let census = census(Path::new(env!("CARGO_MANIFEST_DIR")));
+    assert!(census.tree.faults.is_empty(), "{:#?}", census.tree.faults);
+    assert_eq!(
+        binding_dispatch_violations(&census),
+        Vec::<(String, String, String)>::new(),
+        "a binding's method dispatched outside the engine"
+    );
+    assert_eq!(
+        stale_binding_dispatch(&census),
+        Vec::<(String, String)>::new(),
+        "a declared dispatch entry dispatches nothing"
+    );
+}
+
+/// The dispatch check's pass and fail scenarios: a binding stepped directly
+/// by a container (`T::build_step`), by a qualified path
+/// (`<T as Reclaim<A>>::remaining`) and from an engine module's other
+/// function are found; the engine's declared entries, a binding's
+/// delegation to itself (`Self::build_step`), a record wrapper's inherent
+/// method, a helper module's function, a value's method call, a test-only
+/// item and doc text are not.
+#[test]
+fn the_dispatch_check_finds_every_binding_call_outside_the_engine_and_nothing_else() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dispatch_census_tree");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("the previous fixture tree is removable");
+    }
+    let src = root.join("src");
+    let construction = src.join("bounded").join("decode").join("construction");
+    for directory in ["in_place", "reclamation"] {
+        fs::create_dir_all(construction.join(directory)).expect("the fixture tree is writable");
+    }
+    for (name, source) in [
+        ("lib.rs", "mod bounded;\nmod symbolic;\n"),
+        ("bounded.rs", "pub mod decode;\n"),
+        ("bounded/decode.rs", "pub mod construction;\n"),
+        (
+            "bounded/decode/construction.rs",
+            "pub mod in_place;\npub mod reclamation;\n",
+        ),
+        (
+            "bounded/decode/construction/in_place.rs",
+            "pub mod vector;\n\
+             pub fn build<T>() { enter(T::build_step) }\n\
+             pub fn build_present<T>() { T::build_present() }\n\
+             pub fn build_absent<T>() { T::build_absent() }\n\
+             pub fn reclaim<T>() { T::reclaim_step() }\n\
+             pub fn remaining<T>() { T::remaining() }\n\
+             pub fn build_part<T>() { T::build_step() }\n\
+             pub fn build_part_present<T>() { T::build_present() }\n\
+             pub fn build_part_absent<T>() { T::build_absent() }\n\
+             pub fn reclaim_part<T>() { T::reclaim_step() }\n\
+             pub fn remaining_part<T>() { T::remaining() }\n\
+             pub fn shortcut<T>() { T::reclaim_step() }\n\
+             trait InPlace { fn build_present() { Self::build_step() } fn build_step(); }\n\
+             /// Never T::build_step: doc text.\n\
+             pub fn helper() { cleanup::remaining(); in_place::remaining::<u8>(); }\n",
+        ),
+        (
+            "bounded/decode/construction/in_place/vector.rs",
+            "pub fn build<T>() { T::build_step(); OwnedInitialized::reclaim_step(); }\n\
+             pub fn count<T, A>() { <T as Reclaim<A>>::remaining(); storage.reclaim_step(); }\n\
+             pub fn credit() { window.map(Retained::remaining); }\n\
+             #[cfg(test)]\n\
+             fn probe<T>() { T::build_step(); }\n",
+        ),
+        (
+            "bounded/decode/construction/reclamation.rs",
+            "pub mod owned;\n\
+             unsafe fn advance<T>() { T::reclaim_step() }\n\
+             unsafe fn finish<T>() { T::remaining() }\n",
+        ),
+        (
+            "bounded/decode/construction/reclamation/owned.rs",
+            "impl<T> OwnedRecord<T> { fn remaining() { T::remaining() } }\n",
+        ),
+        (
+            "symbolic.rs",
+            "pub fn decode<T>() { T::build_step(); }\n\
+             macro_rules! direct { ($t:ty) => { fn f() { <$t as InPlace>::build_step() } } }\n\
+             macro_rules! fragment { ($t:ident) => { fn g() { $t::reclaim_step() } } }\n\
+             macro_rules! through { ($t:ty) => { fn h() { $crate::in_place::build_part::<$t>() } } }\n\
+             const STORED: fn() = Value::remaining;\n",
+        ),
+    ] {
+        fs::write(src.join(name), source).expect("the fixture tree is writable");
+    }
+    let scanned = census(&root);
+    assert!(scanned.tree.faults.is_empty(), "{:#?}", scanned.tree.faults);
+    let found = |module: &str, function: &str, method: &str| {
+        (module.to_string(), function.to_string(), method.to_string())
+    };
+    assert_eq!(
+        binding_dispatch_violations(&scanned),
+        vec![
+            found(IN_PLACE, "shortcut", "reclaim_step"),
+            found(&format!("{IN_PLACE}::vector"), "build", "build_step"),
+            found(&format!("{IN_PLACE}::vector"), "count", "remaining"),
+            found("crate::symbolic", "decode", "build_step"),
+            found("crate::symbolic", "macro_rules! direct", "build_step"),
+            found("crate::symbolic", "macro_rules! fragment", "reclaim_step"),
+            found("crate::symbolic", "STORED", "remaining"),
+        ]
+    );
+    assert_eq!(
+        stale_binding_dispatch(&scanned),
+        Vec::<(String, String)>::new()
+    );
+}
+
+/// Every public `unsafe` trait an implementation outside the engine upholds
+/// for the engine, each with the obligations the `// SAFETY:` comment on
+/// every implementation names, each as `label:`: the labels of the trait's
+/// `# Safety` section, and for `Entries` its resource obligation, `moves`,
+/// too (not memory safety, but the trusted domain the resource bounds hold
+/// under, `tests/resumable/CONTRACT.md`). The crate-private `unsafe` traits
+/// (`in_place::text::Buffer`, `in_place::vector::Sequence`) have no
+/// implementer outside the crate and are not listed.
+const UNSAFE_TRAITS: &[(&str, &[&str])] = &[
+    (
+        "TransferableSchema",
+        &["references", "cursors", "recursion"],
+    ),
+    (
+        "Entries",
+        &["cursor type", "self-reference", "transfer", "moves"],
+    ),
+    // `src/bounded.rs`.
+    (
+        "TerminalAllocator",
+        &["terminal", "traverse", "allocate", "borrow"],
+    ),
+    // `src/bounded/decode/construction/reclamation.rs`.
+    (
+        "Reclaim",
+        &[
+            "initial",
+            "state",
+            "admission",
+            "cleanup",
+            "done",
+            "order",
+            "depth",
+            "count",
+        ],
+    ),
+    // `src/bounded/decode/construction/in_place.rs`.
+    (
+        "InPlace",
+        &[
+            "admission",
+            "state",
+            "done",
+            "escape",
+            "provenance",
+            "order",
+            "cost",
+        ],
+    ),
+    // `src/bounded/decode/construction/input.rs`.
+    ("DecodeInput", &["bytes"]),
+    // `src/bounded/decode/construction/operation.rs`.
+    ("Task", &["prefix", "advance", "detail", "provenance"]),
+    // `src/bounded/decode/construction/in_place/optional.rs`.
+    ("Placeholder", &["resources", "bounded"]),
+    // `src/bounded/decode/construction/in_place/btree.rs`.
+    ("TreeKey", &["view", "order", "variant", "span"]),
+    // `src/bounded/decode/construction/in_place/enumeration.rs`.
+    (
+        "Variants",
+        &[
+            "discriminants",
+            "start",
+            "projection",
+            "tag",
+            "reference",
+            "order",
+        ],
+    ),
+    // `src/bounded/decode/construction/in_place/tagged.rs`.
+    ("Payload", &["initial", "projection", "tag", "order"]),
+    // `src/bounded/decode/construction/in_place/fields.rs`.
+    (
+        "Fields",
+        &["keys", "count", "layout", "start", "delegation", "order"],
+    ),
+];
+
+const INPUT: &str = "crate::bounded::decode::construction::input";
+
+const OPTIONAL: &str = "crate::bounded::decode::construction::in_place::optional";
+
+const SCALARS: &str = "crate::bounded::decode::construction::in_place::scalars";
+
+const BTREE: &str = "crate::bounded::decode::construction::in_place::btree";
+
+const VECTOR: &str = "crate::bounded::decode::construction::in_place::vector";
+
+const TEXT: &str = "crate::bounded::decode::construction::in_place::text";
+
+const BYTES: &str = "crate::byte_string::bounded";
+
+const NAMED: &str = "dcbor-derive/src/construction/in_place/named.rs";
+
+const VARIANTS: &str = "dcbor-derive/src/construction/in_place/enumeration.rs";
+
+const RECORDS: &str = "dcbor-derive/src/construction/in_place.rs";
+
+const ENCODING: &str = "crate::bounded::encoding";
+
+const VALUES: &str = "crate::bounded::encoding::values";
+
+/// Every shipped `unsafe impl` of a governed trait ([`UNSAFE_TRAITS`]), by
+/// where it is written, the trait and the site: in the library, a module
+/// path and the implementing type as its tokens render, or the
+/// `macro_rules!` definition whose transcriber writes it; in the derive, the
+/// source file and the generator function whose expansion writes it. Test
+/// impls are not listed: test code is no trust boundary of the shipped
+/// crate. A new impl fails until it is listed here, and an entry no impl
+/// matches is stale.
+const UNSAFE_IMPLS: &[(&str, &str, &str)] = &[
+    (
+        ENCODING,
+        "TransferableSchema",
+        "macro_rules! transferable_scalars",
+    ),
+    (ENCODING, "TransferableSchema", "Vec < T >"),
+    (ENCODING, "TransferableSchema", "[T ; N]"),
+    (ENCODING, "TransferableSchema", "Box < T >"),
+    (VALUES, "Entries", "BTreeMap < K , V >"),
+    (VALUES, "TransferableSchema", "[T]"),
+    (VALUES, "TransferableSchema", "Option < T >"),
+    (VALUES, "TransferableSchema", "& T"),
+    (VALUES, "TransferableSchema", "Arc < T >"),
+    (VALUES, "TransferableSchema", "Tagged < T >"),
+    (VALUES, "TransferableSchema", "BTreeMap < K , V >"),
+    (
+        VALUES,
+        "TransferableSchema",
+        "decode :: construction :: in_place :: StableOption < T , A >",
+    ),
+    (
+        VALUES,
+        "TransferableSchema",
+        "std :: collections :: HashMap < K , V , S >",
+    ),
+    (
+        VALUES,
+        "TransferableSchema",
+        "hashbrown :: HashMap < K , V , S >",
+    ),
+    (
+        VALUES,
+        "TransferableSchema",
+        "hashbrown :: HashTable < (K , V) >",
+    ),
+    (VALUES, "TransferableSchema", "Date"),
+    (VALUES, "TransferableSchema", "Simple"),
+    (VALUES, "TransferableSchema", "usize"),
+    (VALUES, "TransferableSchema", "f16"),
+    (VALUES, "TransferableSchema", "f32"),
+    (VALUES, "TransferableSchema", "f64"),
+    (VALUES, "TransferableSchema", "CBOR"),
+    (VALUES, "TransferableSchema", "crate :: Map"),
+    (VALUES, "TransferableSchema", "num_bigint :: BigUint"),
+    (VALUES, "TransferableSchema", "num_bigint :: BigInt"),
+    (VALUES, "TransferableSchema", "crate :: MinimalBigInt"),
+    (
+        "crate::bounded::decode::construction::in_place::stabilized",
+        "TransferableSchema",
+        "StabilizedText",
+    ),
+    ("crate::map", "Entries", "Map"),
+    (
+        "dcbor-derive/src/encoding.rs",
+        "TransferableSchema",
+        "expand",
+    ),
+    ("crate::bounded::policy", "TerminalAllocator", "Limits"),
+    (ENCODING, "Reclaim", "Planned < 's , I , T , A >"),
+    (ENCODING, "Task", "Prepare < 's , I , T , A >"),
+    (INPUT, "DecodeInput", "ByteString"),
+    (INPUT, "Reclaim", "Borrowed < '_ >"),
+    (INPUT, "DecodeInput", "Borrowed < '_ >"),
+    (INPUT, "Task", "CopyInput < '_ , 's , A >"),
+    (INPUT, "Task", "BorrowInput < 's , A >"),
+    (
+        "crate::bounded::decode::construction::parse",
+        "Reclaim",
+        "Parsed < 's , I , A >",
+    ),
+    (
+        "crate::bounded::decode::construction::parse",
+        "Task",
+        "Parse < 's , I , A >",
+    ),
+    (
+        "crate::bounded::decode::construction::construct",
+        "Reclaim",
+        "Constructed < '_ , I , T , A >",
+    ),
+    (
+        "crate::bounded::decode::construction::construct",
+        "Task",
+        "Construct < 's , I , T , A >",
+    ),
+    (IN_PLACE, "Reclaim", "macro_rules! integers"),
+    (IN_PLACE, "InPlace", "macro_rules! integers"),
+    (SCALARS, "Reclaim", "macro_rules! scalar"),
+    (SCALARS, "InPlace", "macro_rules! scalar"),
+    (SCALARS, "Placeholder", "macro_rules! scalar"),
+    (OPTIONAL, "Placeholder", "macro_rules! scalars"),
+    (OPTIONAL, "Placeholder", "String"),
+    (OPTIONAL, "Placeholder", "Vec < T >"),
+    (OPTIONAL, "Reclaim", "Option < T >"),
+    (OPTIONAL, "InPlace", "Option < T >"),
+    (
+        "crate::bounded::decode::construction::in_place::stable_option",
+        "InPlace",
+        "StableOption < T , A >",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::stable_option",
+        "Reclaim",
+        "StableOption < T , A >",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::minimal_bigint",
+        "Reclaim",
+        "MinimalBigInt",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::minimal_bigint",
+        "InPlace",
+        "MinimalBigInt",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::stabilized",
+        "Reclaim",
+        "StabilizedText",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::stabilized",
+        "InPlace",
+        "StabilizedText",
+    ),
+    (BTREE, "InPlace", "BTreeMap < K , V >"),
+    (BTREE, "Reclaim", "BTreeMap < K , V >"),
+    (BTREE, "TreeKey", "String"),
+    (BTREE, "TreeKey", "crate :: ByteString"),
+    (BTREE, "TreeKey", "macro_rules! integer_keys"),
+    (BTREE, "TreeKey", "bool"),
+    (VECTOR, "InPlace", "Vec < T >"),
+    (VECTOR, "Reclaim", "Vec < T >"),
+    (VECTOR, "InPlace", "[T ; N]"),
+    (VECTOR, "Reclaim", "[T ; N]"),
+    (TEXT, "Reclaim", "String"),
+    (TEXT, "InPlace", "String"),
+    (BYTES, "Placeholder", "ByteString"),
+    (BYTES, "InPlace", "ByteString"),
+    (BYTES, "Reclaim", "ByteString"),
+    (RECORDS, "Payload", "expand"),
+    (RECORDS, "InPlace", "expand"),
+    (RECORDS, "Reclaim", "expand"),
+    (NAMED, "Fields", "expand_fields"),
+    (NAMED, "InPlace", "expand_fields"),
+    (NAMED, "Reclaim", "expand_fields"),
+    (VARIANTS, "Variants", "expand"),
+    (VARIANTS, "InPlace", "expand"),
+    (VARIANTS, "Reclaim", "expand"),
+];
+
+/// The `unsafe impl`s of the governed traits ([`UNSAFE_TRAITS`]) among the
+/// visited items: each impl, nested ones included, by its type; each impl a
+/// `macro_rules!` transcriber writes, its fragments substituted
+/// ([`macro_arguments::transcribers`], read as the boundary rule reads
+/// them), by the macro; an invocation's arguments visited as code. A
+/// transcriber or an invocation that parses as no code but whose tokens
+/// write a governed impl ([`quoted_impls`]) has that impl recorded at a site
+/// naming the failure, so no form of code hides an impl from the listing.
+/// Doc text is a literal, never code.
+#[derive(Default)]
+struct UnsafeImpls {
+    /// The `macro_rules!` definition being read, the site of every impl its
+    /// transcribers write.
+    definition: Option<String>,
+    found: Vec<UnsafeImpl>,
+}
+
+impl UnsafeImpls {
+    /// The governed impls `tokens` write, recorded at `site`.
+    fn unparsed(&mut self, site: &str, tokens: TokenStream) {
+        let mut quoted = Vec::new();
+        quoted_impls(tokens, &mut quoted);
+        for (trait_name, line) in quoted {
+            self.found.push(UnsafeImpl {
+                trait_name,
+                site: site.to_string(),
+                line,
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for UnsafeImpls {
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if let (Some(unsafety), Some((_, path, _))) = (&item.unsafety, &item.trait_)
+            && let Some(last) = path.segments.last()
+            && UNSAFE_TRAITS.iter().any(|(name, _)| last.ident == *name)
+        {
+            let site = self
+                .definition
+                .clone()
+                .unwrap_or_else(|| item.self_ty.to_token_stream().to_string());
+            self.found.push(UnsafeImpl {
+                trait_name: last.ident.to_string(),
+                site,
+                line: unsafety.span.start().line,
+            });
+        }
+        syn::visit::visit_item_impl(self, item);
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        let Some(name) = item
+            .ident
+            .as_ref()
+            .filter(|_| item.mac.path.is_ident("macro_rules"))
+        else {
+            syn::visit::visit_item_macro(self, item);
+            return;
+        };
+        let site = format!("macro_rules! {name}");
+        let outer = self.definition.replace(site.clone());
+        let (arms, unparsed) = macro_arguments::transcribers(item.mac.tokens.clone());
+        for (body, _) in arms {
+            match macro_arguments::code(body.clone()) {
+                Some(code) => code.visit(self),
+                None => self.unparsed(&format!("{site}: a body not parsed"), body),
+            }
+        }
+        if unparsed.is_some() {
+            self.unparsed(
+                &format!("{site}: an arm not parsed"),
+                item.mac.tokens.clone(),
+            );
+        }
+        self.definition = outer;
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map_or_else(String::new, |last| last.ident.to_string());
+        match macro_arguments::invocation(&name, mac.tokens.clone()) {
+            Some(macro_arguments::Arguments::Items(items)) => {
+                for item in &items {
+                    Visit::visit_item(self, item);
+                }
+            }
+            Some(macro_arguments::Arguments::Expressions(expressions)) => {
+                for expr in &expressions {
+                    Visit::visit_expr(self, expr);
+                }
+            }
+            None => self.unparsed(
+                &format!("{name}!: arguments not parsed"),
+                mac.tokens.clone(),
+            ),
+        }
+    }
+}
+
+/// The `unsafe impl`s of the governed traits ([`UNSAFE_TRAITS`]) `tokens`
+/// write as token sequences, as a derive's `quote!` body writes them
+/// (`unsafe impl #ig dcbor::bounded::encoding::TransferableSchema for #name
+/// #tg #wc {}`), each by trait and the line of its `unsafe`: after `unsafe
+/// impl`, the trait is the last name outside angle brackets before `for`,
+/// read up to the impl's body or a `;`. Groups are descended into; doc text
+/// is a literal, never a name.
+fn quoted_impls(tokens: TokenStream, found: &mut Vec<(String, usize)>) {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    for (at, tree) in trees.iter().enumerate() {
+        if let TokenTree::Group(group) = tree {
+            quoted_impls(group.stream(), found);
+            continue;
+        }
+        let opens = matches!(tree, TokenTree::Ident(word) if word == "unsafe")
+            && matches!(trees.get(at + 1), Some(TokenTree::Ident(word)) if word == "impl");
+        if !opens {
+            continue;
+        }
+        let mut depth = 0usize;
+        // A `>` closing `->` closes no angle bracket.
+        let mut arrow = false;
+        let mut named: Option<String> = None;
+        for header in &trees[at + 2..] {
+            match header {
+                TokenTree::Group(group) if depth == 0 && group.delimiter() == Delimiter::Brace => {
+                    break;
+                }
+                TokenTree::Punct(punct) if depth == 0 && punct.as_char() == ';' => break,
+                TokenTree::Ident(word) if depth == 0 && word == "for" => {
+                    if let Some(name) = named.take().filter(|name| {
+                        UNSAFE_TRAITS
+                            .iter()
+                            .any(|(governed, _)| name.as_str() == *governed)
+                    }) {
+                        found.push((name, tree.span().start().line));
+                    }
+                    break;
+                }
+                TokenTree::Ident(word) if depth == 0 => named = Some(word.to_string()),
+                TokenTree::Punct(punct) => match punct.as_char() {
+                    '<' => depth += 1,
+                    '>' if !arrow => depth = depth.saturating_sub(1),
+                    _ => {}
+                },
+                TokenTree::Group(_) | TokenTree::Ident(_) | TokenTree::Literal(_) => {}
+            }
+            arrow = matches!(header, TokenTree::Punct(punct)
+                if punct.as_char() == '-' && punct.spacing() == Spacing::Joint);
+        }
+    }
+}
+
+/// A governed `unsafe impl` as the listing names it ([`UNSAFE_IMPLS`]):
+/// where it is written (a library module's path, or a derive source file),
+/// the trait and the site; and the file, relative to the crate root, and the
+/// line of its `unsafe`, which its SAFETY comment sits above.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Governed {
+    location: String,
+    trait_name: String,
+    site: String,
+    file: String,
+    line: usize,
+}
+
+/// The governed impls of the library's shipped modules ([`Module::unsafe_impls`]).
+fn shipped_impls(census: &Census) -> Vec<Governed> {
+    census
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| !census.test(index))
+        .flat_map(|(_, module)| {
+            module.unsafe_impls.iter().map(|found| Governed {
+                location: module.path.clone(),
+                trait_name: found.trait_name.clone(),
+                site: found.site.clone(),
+                file: module.file.clone(),
+                line: found.line,
+            })
+        })
+        .collect()
+}
+
+/// The governed impls the derive's generators write into their expansions
+/// (`dcbor-derive/src` under `root`): each function's body read as tokens
+/// ([`quoted_impls`]), test-only functions excluded ([`collect_fns`]), each
+/// impl by its file and generator function. The census walks the library
+/// alone and never sees generated code; a file that does not parse is a
+/// fault.
+fn generated_impls(root: &Path) -> Result<Vec<Governed>, Vec<String>> {
+    let mut files = BTreeSet::new();
+    source_tree::sources(&root.join("dcbor-derive").join("src"), &mut files);
+    let mut found = Vec::new();
+    let mut faults = Vec::new();
+    for file in files {
+        let shown = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{}: cannot be read: {error}", file.display()));
+        let syntax = match syn::parse_file(&source) {
+            Ok(syntax) => syntax,
+            Err(error) => {
+                faults.push(format!("{shown}: does not parse: {error}"));
+                continue;
+            }
+        };
+        let mut fns: Vec<(&syn::Signature, &syn::Block)> = Vec::new();
+        collect_fns(&syntax.items, &mut fns);
+        for (signature, block) in fns {
+            let mut quoted = Vec::new();
+            quoted_impls(block.to_token_stream(), &mut quoted);
+            for (trait_name, line) in quoted {
+                found.push(Governed {
+                    location: shown.clone(),
+                    trait_name,
+                    site: signature.ident.to_string(),
+                    file: shown.clone(),
+                    line,
+                });
+            }
+        }
+    }
+    if faults.is_empty() {
+        Ok(found)
+    } else {
+        Err(faults)
+    }
+}
+
+/// The text of the `// SAFETY:` comment directly above `line` (1-based) of
+/// `source`, attribute lines between them skipped: of the contiguous `//`
+/// comment lines ending there (a doc comment is none), those from the one
+/// beginning `SAFETY:` on, each line's text after its `//` joined by a
+/// space, so a label broken across lines reads whole. `None` when no such
+/// comment is there.
+fn safety_comment(source: &str, line: usize) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut above = line.checked_sub(1)?.min(lines.len());
+    while above > 0 && lines[above - 1].trim_start().starts_with("#[") {
+        above -= 1;
+    }
+    let end = above;
+    let comment = |text: &str| {
+        let text = text.trim_start();
+        text.starts_with("//") && !text.starts_with("///") && !text.starts_with("//!")
+    };
+    while above > 0 && comment(lines[above - 1]) {
+        above -= 1;
+    }
+    let texts: Vec<&str> = lines[above..end]
+        .iter()
+        .map(|text| text.trim_start().trim_start_matches("//").trim())
+        .collect();
+    let first = texts.iter().position(|text| text.starts_with("SAFETY:"))?;
+    Some(texts[first..].join(" "))
+}
+
+/// Every governed impl of `impls` that `listed` does not name; every one
+/// whose SAFETY comment ([`safety_comment`], read from its file under
+/// `root`) is missing or does not name each obligation of its trait
+/// ([`UNSAFE_TRAITS`]) as `label:`; and every entry of `listed` no impl
+/// matches.
+fn unsafe_impl_violations(
+    root: &Path,
+    impls: &[Governed],
+    listed: &[(&str, &str, &str)],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    for found in impls {
+        let shown = format!(
+            "{}: unsafe impl {} for {}",
+            found.location, found.trait_name, found.site
+        );
+        if !listed.iter().any(|&(location, trait_name, site)| {
+            location == found.location && trait_name == found.trait_name && site == found.site
+        }) {
+            violations.push(format!("{shown}: not listed"));
+        }
+        let source = sources.entry(found.file.clone()).or_insert_with(|| {
+            fs::read_to_string(root.join(&found.file))
+                .unwrap_or_else(|error| panic!("{}: cannot be read: {error}", found.file))
+        });
+        let obligations: &[&str] = UNSAFE_TRAITS
+            .iter()
+            .find(|(name, _)| *name == found.trait_name)
+            .map_or(&[][..], |(_, obligations)| *obligations);
+        match safety_comment(source, found.line) {
+            None => violations.push(format!(
+                "{}:{}: {shown}: no adjacent `// SAFETY:` comment",
+                found.file, found.line
+            )),
+            Some(text) => {
+                let missing: Vec<&str> = obligations
+                    .iter()
+                    .copied()
+                    .filter(|label| !text.contains(&format!("{label}:")))
+                    .collect();
+                if !missing.is_empty() {
+                    violations.push(format!(
+                        "{}:{}: {shown}: its SAFETY comment names no {missing:?}",
+                        found.file, found.line
+                    ));
+                }
+            }
+        }
+    }
+    for &(location, trait_name, site) in listed {
+        if !impls.iter().any(|found| {
+            found.location == location && found.trait_name == trait_name && found.site == site
+        }) {
+            violations.push(format!(
+                "{location}: unsafe impl {trait_name} for {site}: listed, but no such impl"
+            ));
+        }
+    }
+    violations
+}
+
+/// What an implementer upholds for the engine is known and stated at every
+/// site: every shipped `unsafe impl` of every public unsafe trait
+/// ([`UNSAFE_TRAITS`]), in the library and in what the derive generates, is
+/// listed ([`UNSAFE_IMPLS`]), and the `// SAFETY:` comment on each names
+/// every obligation of its trait, `Entries`' `moves` included. The derive's
+/// generated impls are exercised under Miri (`tests/miri-suites.txt`):
+/// `TransferableSchema` by `owned_pipeline_interleavings`'
+/// `a_derived_records_preparation_transfers_between_workers`; `Fields`,
+/// `InPlace` and `Reclaim` of field maps, newtypes and units by
+/// `resumable_contract`'s `derive::derived_nested_fields_resume_*` and
+/// `derive::derived_unit_and_newtype_resume_*`; `Variants` and `Payload` by
+/// `derive::every_enum_shape_resumes_*` and
+/// `derive::tagged_and_generic_nested_values_resume_*`.
+#[test]
+fn every_unsafe_impl_of_a_governed_trait_is_listed_and_names_its_obligations() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let census = census(root);
+    assert!(census.tree.faults.is_empty(), "{:#?}", census.tree.faults);
+    let mut impls = shipped_impls(&census);
+    impls.extend(generated_impls(root).unwrap_or_else(|faults| panic!("{faults:#?}")));
+    let violations = unsafe_impl_violations(root, &impls, UNSAFE_IMPLS);
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// The listing's pass and fail scenarios: a listed impl naming its
+/// obligations, one nested in a function, one a macro's transcriber writes
+/// and a derive generator's naming them pass; an impl with no adjacent
+/// SAFETY comment, one whose comment (above an attribute) names some
+/// obligations only, an unlisted impl and a listed impl that is gone fail; a
+/// test-only impl, a generator's test-only function, an impl of another
+/// unsafe trait and impls named only in doc text are not counted.
+#[test]
+fn the_unsafe_impl_check_finds_every_unlisted_or_unjustified_impl_and_nothing_else() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unsafe_impl_census_tree");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("the previous fixture tree is removable");
+    }
+    for directory in ["src", "dcbor-derive/src"] {
+        fs::create_dir_all(root.join(directory)).expect("the fixture tree is writable");
+    }
+    for (name, source) in [
+        (
+            "src/lib.rs",
+            "mod schemas;\n\
+             /// unsafe impl Entries for Documented {}\n\
+             pub struct Documented;\n\
+             // SAFETY: references: held. cursors: none. recursion: none.\n\
+             unsafe impl TransferableSchema for Listed {}\n\
+             unsafe impl TransferableSchema for Bare {}\n\
+             // SAFETY: cursor type: one. self-reference:\n\
+             #[cfg(feature = \"std\")]\n\
+             unsafe impl<T: Schema> crate::encoding::Entries for Wrapped<T> where T: Sync {}\n\
+             unsafe impl Send for Other {}\n\
+             #[cfg(test)]\n\
+             unsafe impl TransferableSchema for Probe {}\n\
+             pub fn nested() {\n\
+             \x20   // SAFETY: references: none. cursors: none.\n\
+             \x20   // recursion: none.\n\
+             \x20   unsafe impl TransferableSchema for Inner {}\n\
+             }\n",
+        ),
+        (
+            "src/schemas.rs",
+            "macro_rules! scalars { ($($ty:ty),*) => {$(\n\
+             \x20   // SAFETY: references: none. cursors: none. recursion: none.\n\
+             \x20   unsafe impl TransferableSchema for $ty {}\n\
+             )*}; }\n\
+             // SAFETY: references: none. cursors: none.\n\
+             unsafe impl TransferableSchema for Unlisted {}\n",
+        ),
+        (
+            "dcbor-derive/src/lib.rs",
+            "pub fn expand() -> TokenStream {\n\
+             \x20   /// unsafe impl dcbor::bounded::encoding::Entries for Doc {}\n\
+             \x20   let ig = 0;\n\
+             \x20   quote! {\n\
+             \x20       // SAFETY: references: fields. cursors: none.\n\
+             \x20       unsafe impl #ig dcbor::bounded::encoding::TransferableSchema for #name #tg #wc {}\n\
+             \x20   }\n\
+             }\n\
+             #[cfg(test)]\n\
+             fn probe() -> TokenStream { quote! { unsafe impl dcbor::bounded::encoding::Entries for Probe {} } }\n",
+        ),
+    ] {
+        fs::write(root.join(name), source).expect("the fixture tree is writable");
+    }
+    let scanned = census(&root);
+    assert!(scanned.tree.faults.is_empty(), "{:#?}", scanned.tree.faults);
+    let mut impls = shipped_impls(&scanned);
+    impls.extend(generated_impls(&root).unwrap_or_else(|faults| panic!("{faults:#?}")));
+    let listed = [
+        ("crate", "TransferableSchema", "Listed"),
+        ("crate", "TransferableSchema", "Bare"),
+        ("crate", "Entries", "Wrapped < T >"),
+        ("crate", "TransferableSchema", "Inner"),
+        (
+            "crate::schemas",
+            "TransferableSchema",
+            "macro_rules! scalars",
+        ),
+        ("dcbor-derive/src/lib.rs", "TransferableSchema", "expand"),
+        ("crate", "TransferableSchema", "Gone"),
+    ];
+    assert_eq!(
+        unsafe_impl_violations(&root, &impls, &listed),
+        vec![
+            "src/lib.rs:6: crate: unsafe impl TransferableSchema for Bare: no adjacent \
+             `// SAFETY:` comment"
+                .to_string(),
+            "src/lib.rs:9: crate: unsafe impl Entries for Wrapped < T >: its SAFETY comment \
+             names no [\"transfer\", \"moves\"]"
+                .to_string(),
+            "crate::schemas: unsafe impl TransferableSchema for Unlisted: not listed".to_string(),
+            "src/schemas.rs:6: crate::schemas: unsafe impl TransferableSchema for Unlisted: its \
+             SAFETY comment names no [\"recursion\"]"
+                .to_string(),
+            "dcbor-derive/src/lib.rs:6: dcbor-derive/src/lib.rs: unsafe impl TransferableSchema \
+             for expand: its SAFETY comment names no [\"recursion\"]"
+                .to_string(),
+            "crate: unsafe impl TransferableSchema for Gone: listed, but no such impl".to_string(),
+        ]
+    );
+}
+
 /// Where shipped code names a way to allocate other than through the global
 /// allocator ([`Module::allocators`]), by module path and name.
 fn foreign_allocators(census: &Census) -> Vec<(String, String)> {
@@ -1508,6 +2640,71 @@ fn the_allocator_check_finds_every_allocator_past_the_global_one_and_nothing_els
 /// site is stale.
 const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
+        "crate::bounded::decode::construction::construct",
+        "pending_units",
+        "the pending field's units within the recorded initialization prefix, re-used by terminal destruction without a policy",
+    ),
+    (
+        "crate::bounded::decode::construction::construct",
+        "observe_permits",
+        "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
+    ),
+    (
+        "crate::bounded::decode::construction::parse",
+        "observe_permits",
+        "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
+    ),
+    (
+        "crate::bounded::decode::cursor::publication",
+        "observe_prefix",
+        "read-only custody traversal re-checks recorded transfer and release prefixes, no policy",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::btree",
+        "drop_prefix_arenas",
+        "terminal destruction projects the recorded prefix onto four fixed arena fields; no admission or policy",
+    ),
+    (
+        "crate::bounded::decode::construction::stable",
+        "drop_pending",
+        "terminal destruction selects fixed fields from their recorded initialized prefix, no policy",
+    ),
+    (
+        "crate::bounded::decode::storage",
+        "drop_prefix",
+        "terminal destruction selects fixed fields from their recorded initialized prefix, no policy",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "descend",
+        "dispatch recursion count checked against the root's declaration, no pointer or allocation length",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "admitted_depth",
+        "const evaluation of the root's declared dispatch depth before admission (E0080)",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "set",
+        "niche encoding of an initialization count whose task bounds it before writing; no field or offset selected here",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation",
+        "record_cost",
+        "bound composition of the production record's fixed-size writes, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation::owned",
+        "defer",
+        "deferred reference counter overflow guard, no pointer derived and no policy",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation::owned",
+        "drain_terminally",
+        "test-only drain nesting instrumentation; the shipped drain has no comparison",
+    ),
+    (
         "crate::bounded",
         "write_extent",
         "const evaluation: a write extent checked at compile time (E0080)",
@@ -1534,13 +2731,33 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "then",
-        "bound composition: a peak as the larger of two",
+        "checked_then",
+        "bound composition (sequence): a peak as max(P_a, R_a + P_b), overflow None",
     ),
     (
         "crate::bounded",
-        "followed_by",
-        "bound composition: a peak as the larger of two",
+        "checked_followed_by",
+        "bound composition (sequence after release): overflow None",
+    ),
+    (
+        "crate::bounded",
+        "checked_repeated",
+        "bound composition (repeat): overflow None",
+    ),
+    (
+        "crate::bounded",
+        "checked_repeated_retained",
+        "bound composition (repeat, retained): (n-1)R + P, overflow None",
+    ),
+    (
+        "crate::bounded",
+        "checked_sequence",
+        "work composition over a sequence, overflow None",
+    ),
+    (
+        "crate::bounded",
+        "checked_times",
+        "work composition over a count, overflow None",
     ),
     (
         "crate::bounded",
@@ -1554,8 +2771,48 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "larger",
-        "bound composition: each quantity's larger",
+        "larger_of",
+        "bound composition: the larger of two quantities, in constants",
+    ),
+    (
+        "crate::bounded",
+        "additive",
+        "Places fold: summed terms, overflow None",
+    ),
+    (
+        "crate::bounded",
+        "concurrent_peak",
+        "Places fold: summed peaks, overflow None",
+    ),
+    (
+        "crate::bounded",
+        "times",
+        "a charge rule's work over a count, refused as Overflow",
+    ),
+    (
+        "crate::bounded",
+        "held",
+        "a charge rule's held part over a count, refused as Overflow",
+    ),
+    (
+        "crate::bounded",
+        "of",
+        "a charge rule's work over a count, refused as Overflow",
+    ),
+    (
+        "crate::bounded",
+        "over",
+        "a charge rule's work over a count, refused as Overflow",
+    ),
+    (
+        "crate::bounded",
+        "one_growing",
+        "growth bound composition: arenas held at once, one relocating",
+    ),
+    (
+        "crate::bounded",
+        "storage_growth",
+        "growth bound composition over a retained arena",
     ),
     (
         "crate::bounded",
@@ -1595,13 +2852,13 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::storage",
-        "allocate_grown",
-        "checked growth refused as Overflow",
+        "push_pair",
+        "the free slots against the two a pair takes, checked before Vec::push within reserved capacity, no pointer",
     ),
     (
-        "crate::bounded::decode::cursor::publication",
-        "release_remaining",
-        "a count of cleanup calls",
+        "crate::bounded",
+        "grown_capacity",
+        "the one growth rule: doubling checked, None on overflow",
     ),
     (
         "crate::bounded::decode::cursor",
@@ -1642,6 +2899,166 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "crate::bounded::decode",
         "peak_of",
         "bound arithmetic of the synchronous decode",
+    ),
+    (
+        "crate::bounded::decode",
+        "decode_typed_bound",
+        "bound composition of the one-call typed decode, overflow refused",
+    ),
+    (
+        "crate::bounded::decode",
+        "decode_typed",
+        "a count of driver steps within the bound, no pointer",
+    ),
+    (
+        "crate::bounded::decode",
+        "complete",
+        "a count of driver steps within the bound, no pointer",
+    ),
+    (
+        "crate::bounded::decode",
+        "shut_down",
+        "a count of driver steps within the bound, no pointer",
+    ),
+    (
+        "crate::bounded::decode::construction",
+        "node_at",
+        "a node index checked against the document before a safe slice index, no pointer, no policy",
+    ),
+    (
+        "crate::bounded::decode::construction::construct",
+        "of",
+        "bound composition of the owned construction, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::construct",
+        "typed_decode_bound",
+        "bound composition of the typed decode, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place",
+        "root_cost",
+        "the construction cost algebra: a root's session units, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place",
+        "remaining",
+        "a count of cleanup calls, observed without a policy",
+    ),
+    (
+        "crate::bounded",
+        "total_held",
+        "held credit observed without a policy, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::vector",
+        "build_sequence",
+        "checked lengths refused as Overflow",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::vector",
+        "remaining_sequence",
+        "a count of cleanup calls, observed without a policy",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::btree",
+        "permits_tree",
+        "custody observed without a policy: the metadata prefix re-checked before it is read, as observe",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::btree::cleanup",
+        "new",
+        "a count of cleanup calls, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::btree::cleanup",
+        "record",
+        "a count of cleanup calls, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::input",
+        "copy_terms",
+        "bound composition of the input copy, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::operation",
+        "of",
+        "bound composition of an owned operation, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::operation",
+        "peak",
+        "bound composition of an owned operation, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::parse",
+        "of",
+        "bound composition of the owned parse, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::construction::reclamation::owned",
+        "of",
+        "bound composition of an owned record, overflow refused",
+    ),
+    (
+        "crate::bounded",
+        "less",
+        "credit accounting subtraction, underflow None, no pointer",
+    ),
+    (
+        "crate::bounded::decode::construction::stable",
+        "bind",
+        "acquisition ticket counter, overflow refused before minting, no pointer",
+    ),
+    (
+        "crate::bounded::decode::cursor::publication",
+        "transfer_work",
+        "work composition of a publication's field transfers, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::cursor::publication",
+        "release_work",
+        "work composition of a publication's releases, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::storage",
+        "transfer_work",
+        "work composition of a transfer, overflow refused",
+    ),
+    (
+        "crate::bounded::decode::storage",
+        "cleanup_work",
+        "work composition of a cleanup, overflow refused",
+    ),
+    (
+        "crate::bounded::encoding",
+        "observe_permits",
+        "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
+    ),
+    (
+        "crate::bounded::encoding",
+        "text",
+        "Shape::text: a text's walk bound, overflow refused",
+    ),
+    (
+        "crate::bounded::encoding",
+        "walk_work",
+        "the walk's work from a shape's counts, overflow refused",
+    ),
+    (
+        "crate::bounded::encoding",
+        "encode_bound",
+        "bound composition of an encoding, overflow refused",
+    ),
+    (
+        "crate::bounded::encoding",
+        "owned_prepare_terms",
+        "bound composition of an owned preparation, overflow refused",
+    ),
+    (
+        "crate::bounded::encoding",
+        "initialize_step",
+        "checked subtraction of the already recorded prefix base, refused as PlanMismatch",
     ),
     (
         "crate::bounded::decode::construction::reclamation::owned",
@@ -1709,11 +3126,6 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "the construction cost algebra",
     ),
     (
-        "crate::bounded::decode::construction::in_place::vector",
-        "build",
-        "checked lengths refused as Overflow",
-    ),
-    (
         "crate::bounded::decode::construction::in_place::fields",
         "cost",
         "the construction cost algebra",
@@ -1759,6 +3171,21 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "checked lengths refused as Overflow",
     ),
     (
+        "crate::bounded::decode::construction::in_place::stabilized",
+        "stabilized_cost",
+        "the construction cost algebra",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::minimal_bigint",
+        "minimal_cost",
+        "the construction cost algebra, overflow None",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::minimal_bigint",
+        "read",
+        "a tag's child index, checked and refused as Overflow",
+    ),
+    (
         "crate::bounded::decode::construction::in_place::btree",
         "raised",
         "plan arithmetic certified for every count through 20,000 (plan_tests); its class recorded at PlanRoot",
@@ -1780,8 +3207,8 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::btree",
-        "planned",
-        "plan arithmetic certified with raised",
+        "height",
+        "the height recurrence, certified with raised; allocates nothing",
     ),
     (
         "crate::bounded::decode::construction::in_place::btree",
@@ -1837,7 +3264,12 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
         "crate::bounded::encoding",
         "advance",
-        "an entry cursor's admitted node moves against those it states (a count, admitted in units), and the instruction index, a map payload's start and the omitted gap bytes, each checked and refused as Overflow",
+        "an entry cursor's admitted node moves against those it states (a count, admitted in units), the instruction index, a map payload's start, the omitted gap bytes and the window part count (two per cursor), each checked and refused as Overflow, and the window arena's free parts against the pair it publishes, refused as PlanMismatch",
+    ),
+    (
+        "crate::bounded::encoding",
+        "window_pair",
+        "a cursor's two window part indices, checked and refused as Overflow before a safe slice range, no pointer",
     ),
     (
         "crate::bounded::encoding::values",
@@ -1876,11 +3308,6 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::tagged",
-        "remaining",
-        "a count of cleanup calls, observed without a policy",
-    ),
-    (
-        "crate::bounded::decode::construction::in_place::vector",
         "remaining",
         "a count of cleanup calls, observed without a policy",
     ),
@@ -2161,9 +3588,9 @@ fn the_registration_check_finds_every_panicking_registration_and_nothing_else() 
 }
 
 /// The static scan's pass and fail scenarios: a static at module level, one
-/// inside a function, a `static mut` and a `thread_local!` are found; the
-/// `'static` lifetime, a static of a test-only module and a test-only item
-/// of a shipped module are not.
+/// inside a function, a `static mut`, a lazy static by its name and a
+/// `thread_local!` are found; the `'static` lifetime, a static of a
+/// test-only module and a test-only item of a shipped module are not.
 #[test]
 fn the_static_scan_finds_every_shipped_static_and_nothing_else() {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("static_census_tree");
@@ -2182,6 +3609,7 @@ fn the_static_scan_finds_every_shipped_static_and_nothing_else() {
          }\n\
          static mut COUNT: u8 = 0;\n\
          std::thread_local! { static DEPTH: u8 = const { 0 }; }\n\
+         loom::lazy_static! { static ref LAZY: u8 = 0; }\n\
          #[cfg(test)]\nmod checks { static PROBE: u8 = 0; }\n\
          #[cfg(test)]\nstatic FIXTURE: u8 = 0;\n",
     )
@@ -2197,6 +3625,7 @@ fn the_static_scan_finds_every_shipped_static_and_nothing_else() {
             found("COUNT"),
             found("thread_local!"),
             found("DEPTH"),
+            found("LAZY"),
         ]
     );
 }
@@ -2323,9 +3752,9 @@ fn thread_names(census: &Census) -> Vec<(String, String)> {
 /// (`ScopeHead`), each queued record's link and published cells (`Header`),
 /// and the storage counters every reservation and shared policy holds
 /// (`Counters`, `policy.rs`; a `Limits` itself is one operation's, never
-/// shared: `share` builds a fresh one over the same counters). FF-13's
-/// premise that no per-worker identity enters the protocol is checked over
-/// exactly these.
+/// shared: `share` builds a fresh one over the same counters), with the
+/// family's credit ledgers inside them (`Ledgers`). FF-13's premise that no
+/// per-worker identity enters the protocol is checked over exactly these.
 const PROTOCOL: &[(&str, &str)] = &[
     (
         "src/bounded/decode/construction/reclamation.rs",
@@ -2337,6 +3766,7 @@ const PROTOCOL: &[(&str, &str)] = &[
         "ScopeHead",
     ),
     ("src/bounded/policy.rs", "Counters"),
+    ("src/bounded/policy.rs", "Ledgers"),
 ];
 
 /// A record's dispatch, written once by its acquisition before the record is
@@ -2355,15 +3785,23 @@ const FAMILY_ALIASES: &[&str] = &[
 
 /// Fields written only before their holder is shared, then only read, each
 /// by type and field: the release observer, which `observe_releases` sets
-/// through `Arc::get_mut`, refused once the counters are shared.
-const CONFIGURED: &[(&str, &str)] = &[("Counters", "release_observer")];
+/// through `Arc::get_mut`, refused once the counters are shared; and the
+/// recording family, installed by `Limits::recorded` before `Arc::new`.
+const CONFIGURED: &[(&str, &str)] = &[("Counters", "release_observer"), ("Counters", "recording")];
 
 /// Arrays of the family's primitives indexed by a fixed enumeration, never by
 /// a worker, each by type and field: the boundary valuations reached, one
 /// bitmask per `Predicate` (`Predicate::COUNT` of them), which any thread
-/// only ORs into. An array is otherwise refused: indexed by a worker, it
-/// would carry the worker's identity into the protocol.
-const ENUMERATED: &[(&str, &str)] = &[("Counters", "reached")];
+/// only ORs into; and the credit ledgers A, C and F, one total per quantity
+/// (values, bytes), which any thread advances by checked compare-exchange
+/// (`Ledgers::record`). An array is otherwise refused: indexed by a worker,
+/// it would carry the worker's identity into the protocol.
+const ENUMERATED: &[(&str, &str)] = &[
+    ("Counters", "reached"),
+    ("Ledgers", "admitted"),
+    ("Ledgers", "consumed"),
+    ("Ledgers", "forfeited"),
+];
 
 /// Every field of the `protocol` types under `root` that is not protocol
 /// state the atomics family carries, each `file: Type.field: type`, and
@@ -2461,8 +3899,10 @@ fn the_protocol_holds_no_worker_identity() {
 }
 
 /// The premise checks' pass and fail scenarios: a family primitive, a
-/// marker, a nested protocol type and a record's dispatch pass; a plain
-/// counter, a worker's index and a reference fail, and a protocol type that
+/// marker, a nested protocol type, a record's dispatch and the enumerated
+/// arrays (the valuations reached, a ledger's quantities) pass; a plain
+/// counter, a worker's index, an array by worker and a reference fail, and a
+/// protocol type that
 /// is gone is reported. A thread named in shipped code, through a path, a
 /// `use` of the module and a group, is found; one in a test-only item and
 /// another module's `thread` are not.
@@ -2497,8 +3937,15 @@ fn the_premise_checks_find_identity_and_plain_state_and_nothing_else() {
          struct Counters {\n\
              live: AtomicU64,\n\
              release_observer: Option<fn(u64)>,\n\
+             recording: Option<Recording>,\n\
              reached: [AtomicU64; 12],\n\
+             credits: Ledgers,\n\
              thread: Option<std::thread::ThreadId>,\n\
+         }\n\
+         struct Ledgers {\n\
+             admitted: [AtomicU64; 2],\n\
+             violated: AtomicU64,\n\
+             by_worker: [AtomicU64; 4],\n\
          }\n",
     )
     .expect("the fixture tree is writable");
@@ -2507,6 +3954,7 @@ fn the_premise_checks_find_identity_and_plain_state_and_nothing_else() {
         ("src/queue.rs", "Header"),
         ("src/queue.rs", "ScopeHead"),
         ("src/queue.rs", "Counters"),
+        ("src/queue.rs", "Ledgers"),
         ("src/queue.rs", "Scope"),
     ];
     assert_eq!(
@@ -2516,6 +3964,7 @@ fn the_premise_checks_find_identity_and_plain_state_and_nothing_else() {
             "src/queue.rs: Reclaimer.worker: [S :: Counter ; 4]".to_string(),
             "src/queue.rs: Header.owner: & 'static Reclaimer < A , S >".to_string(),
             "src/queue.rs: Counters.thread: Option < std :: thread :: ThreadId >".to_string(),
+            "src/queue.rs: Ledgers.by_worker: [AtomicU64 ; 4]".to_string(),
             "src/queue.rs: no protocol type Scope".to_string(),
         ]
     );
@@ -3119,6 +4568,487 @@ fn the_checker_check_finds_every_checker_cfg_and_nothing_else() {
         crate_root,
         &crate_root.join("src").join("bounded").join("policy.rs")
     ));
+}
+
+/// The files the window-custody rules read, relative to the crate root: the
+/// obligation and acquisition capabilities, the preparation and its window
+/// arena, the bucket traversal, and the storage engine.
+const WINDOW_FILES: [&str; 4] = [
+    "src/bounded.rs",
+    "src/bounded/encoding.rs",
+    "src/bounded/encoding/buckets.rs",
+    "src/bounded/decode/storage.rs",
+];
+
+/// The names of the removed parallel acquisition arena and its position.
+const WINDOW_ARENA_REMOVED: [&str; 2] = ["window_acquisitions", "window_acquisition_storage"];
+
+/// The removed methods by which an obligation published acquisition ends.
+const RETAINED_END_METHODS: [&str; 3] = ["ends", "absorbing", "end_settled"];
+
+/// What would move a window part other than as a whole typed element:
+/// partial initialization, suppressed destruction, raw copies, byte views.
+const WINDOW_RAW_MOVES: [&str; 5] = [
+    "MaybeUninit",
+    "ManuallyDrop",
+    "copy_nonoverlapping",
+    "transmute",
+    "from_raw_parts",
+];
+
+/// The slice accessors by which a window part would be indexed.
+const WINDOW_SLICE_ACCESSORS: [&str; 11] = [
+    "as_slice",
+    "as_mut_slice",
+    "get",
+    "get_mut",
+    "split_at_mut",
+    "first",
+    "first_mut",
+    "last",
+    "last_mut",
+    "iter",
+    "iter_mut",
+];
+
+/// The one function that indexes a cursor's window parts.
+const WINDOW_PAIR: &str = "window_pair";
+
+/// The shipped items of `items`, inline modules flattened, test-only items
+/// and modules excluded.
+fn shipped_items(items: &[Item]) -> Vec<&Item> {
+    let mut shipped = Vec::new();
+    for item in items {
+        if source_tree::test_only(item_attrs(item)).unwrap_or(false) {
+            continue;
+        }
+        if let Item::Mod(module) = item
+            && let Some((_, inner)) = &module.content
+        {
+            shipped.extend(shipped_items(inner));
+        } else {
+            shipped.push(item);
+        }
+    }
+    shipped
+}
+
+/// The last path segment of a type, `None` for a type that is no path.
+fn type_last_ident(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+}
+
+/// An item as the window rules name it.
+fn window_item_name(item: &Item) -> String {
+    match item {
+        Item::Fn(function) => function.sig.ident.to_string(),
+        Item::Struct(structure) => structure.ident.to_string(),
+        Item::Enum(enumeration) => enumeration.ident.to_string(),
+        Item::Const(constant) => constant.ident.to_string(),
+        Item::Static(constant) => constant.ident.to_string(),
+        Item::Trait(definition) => definition.ident.to_string(),
+        Item::Type(alias) => alias.ident.to_string(),
+        Item::Impl(implementation) => {
+            type_last_ident(&implementation.self_ty).unwrap_or_else(|| "<impl>".to_string())
+        }
+        _ => "<item>".to_string(),
+    }
+}
+
+/// The shipped struct `name` of `items`.
+fn shipped_struct<'a>(items: &[&'a Item], name: &str) -> Option<&'a syn::ItemStruct> {
+    items.iter().find_map(|item| match item {
+        Item::Struct(structure) if structure.ident == name => Some(structure),
+        _ => None,
+    })
+}
+
+/// Whether `expr` is the window arena: a binding or field named `windows`,
+/// through references and parentheses.
+fn windows_receiver(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path.path.is_ident("windows"),
+        syn::Expr::Field(field) => {
+            matches!(&field.member, syn::Member::Named(name) if name == "windows")
+        }
+        syn::Expr::Reference(reference) => windows_receiver(&reference.expr),
+        syn::Expr::Paren(paren) => windows_receiver(&paren.expr),
+        _ => false,
+    }
+}
+
+/// The window arena's accesses in one function's body that bypass the one
+/// pair accessor: a slice accessor or an index on the arena, except the
+/// arena's slice passed directly to [`WINDOW_PAIR`]; and every `unsafe`
+/// block that reaches the arena or names its element.
+struct WindowSites<'a> {
+    function: &'a str,
+    sites: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for WindowSites<'_> {
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        let tokens = node.block.to_token_stream();
+        if names(tokens.clone(), "WindowPart") || names(tokens, "windows") {
+            self.sites.push(format!(
+                "{}:{}: an unsafe block reaches the window arena",
+                self.function,
+                node.span().start().line
+            ));
+        }
+        syn::visit::visit_expr_unsafe(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(callee) = &*node.func
+            && callee
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == WINDOW_PAIR)
+        {
+            for argument in &node.args {
+                match argument {
+                    syn::Expr::MethodCall(call)
+                        if windows_receiver(&call.receiver)
+                            && (call.method == "as_slice" || call.method == "as_mut_slice") => {}
+                    other => self.visit_expr(other),
+                }
+            }
+            return;
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method = node.method.to_string();
+        if windows_receiver(&node.receiver) && WINDOW_SLICE_ACCESSORS.contains(&method.as_str()) {
+            self.sites.push(format!(
+                "{}:{}: indexes the window arena by `{method}` outside {WINDOW_PAIR}",
+                self.function,
+                node.method.span().start().line
+            ));
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_index(&mut self, node: &'ast syn::ExprIndex) {
+        if windows_receiver(&node.expr) {
+            self.sites.push(format!(
+                "{}:{}: indexes the window arena by `[]` outside {WINDOW_PAIR}",
+                self.function,
+                node.span().start().line
+            ));
+        }
+        syn::visit::visit_expr_index(self, node);
+    }
+}
+
+/// Every violation of the window-custody structure in the crate at `root`
+/// ([`WINDOW_FILES`], test-only items excluded), sorted, as `file: what`:
+///
+/// - the preparation holds exactly one window arena (one `Preparation`
+///   field whose type names `WindowPart`), and no shipped item names the
+///   removed parallel acquisition arena ([`WINDOW_ARENA_REMOVED`]);
+/// - `Retained` holds no acquisition and has no acquisition-end authority:
+///   no field naming `Acquisition`, none of [`RETAINED_END_METHODS`], no
+///   method naming `end` or `Acquisition`;
+/// - a window part moves only as a whole typed element: no shipped function
+///   of the preparation naming `WindowPart` names a raw move
+///   ([`WINDOW_RAW_MOVES`]), no `unsafe` block reaches the window arena, and
+///   neither the bucket traversal nor the storage engine names `WindowPart`;
+/// - `BucketWalk` stores no `WindowPart`: its acquisition and credit are its
+///   own fields;
+/// - one pair-indexing implementation: [`WINDOW_PAIR`] is the one function
+///   naming `WindowPart` that splits a slice, and no other function indexes
+///   the window arena ([`WindowSites`]).
+fn window_custody_violations(root: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut parsed = Vec::new();
+    for shown in WINDOW_FILES {
+        let source = match fs::read_to_string(root.join(shown)) {
+            Ok(source) => source,
+            Err(error) => {
+                violations.push(format!("{shown}: cannot be read: {error}"));
+                continue;
+            }
+        };
+        match syn::parse_file(&source) {
+            Ok(syntax) => parsed.push((shown, syntax)),
+            Err(error) => violations.push(format!("{shown}: does not parse: {error}")),
+        }
+    }
+    for (shown, syntax) in &parsed {
+        let items = shipped_items(&syntax.items);
+        for item in &items {
+            for name in WINDOW_ARENA_REMOVED {
+                if names(item.to_token_stream(), name) {
+                    violations.push(format!(
+                        "{shown}: {}: names the removed arena's `{name}`",
+                        window_item_name(item)
+                    ));
+                }
+            }
+        }
+        match *shown {
+            "src/bounded.rs" => retained_violations(shown, &items, &mut violations),
+            "src/bounded/encoding.rs" => {
+                preparation_violations(shown, &syntax.items, &items, &mut violations);
+            }
+            _ => {
+                for item in &items {
+                    if names(item.to_token_stream(), "WindowPart") {
+                        violations.push(format!(
+                            "{shown}: {}: names WindowPart",
+                            window_item_name(item)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations.sort();
+    violations
+}
+
+/// The `Retained` rules of [`window_custody_violations`].
+fn retained_violations(shown: &str, items: &[&Item], violations: &mut Vec<String>) {
+    match shipped_struct(items, "Retained") {
+        Some(structure) => {
+            for field in &structure.fields {
+                let name = field
+                    .ident
+                    .as_ref()
+                    .map_or_else(|| "<unnamed>".to_string(), ToString::to_string);
+                if names(field.ty.to_token_stream(), "Acquisition")
+                    || field.ident.as_ref().is_some_and(|name| name == "ends")
+                {
+                    violations.push(format!(
+                        "{shown}: Retained: holds an acquisition in `{name}`"
+                    ));
+                } else if RETAINED_END_METHODS.contains(&name.as_str()) {
+                    violations.push(format!(
+                        "{shown}: Retained: holds acquisition-end state in `{name}`"
+                    ));
+                }
+            }
+        }
+        None => violations.push(format!("{shown}: Retained: not found")),
+    }
+    for item in items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        if type_last_ident(&implementation.self_ty).as_deref() != Some("Retained") {
+            continue;
+        }
+        for member in &implementation.items {
+            let ImplItem::Fn(function) = member else {
+                continue;
+            };
+            if source_tree::test_only(&function.attrs).unwrap_or(false) {
+                continue;
+            }
+            let name = function.sig.ident.to_string();
+            if RETAINED_END_METHODS.contains(&name.as_str()) {
+                violations.push(format!(
+                    "{shown}: Retained::{name}: an acquisition-end method"
+                ));
+            } else if names(function.block.to_token_stream(), "end")
+                || names(function.block.to_token_stream(), "Acquisition")
+            {
+                violations.push(format!("{shown}: Retained::{name}: ends an acquisition"));
+            }
+        }
+    }
+}
+
+/// The preparation rules of [`window_custody_violations`].
+fn preparation_violations(
+    shown: &str,
+    all: &[Item],
+    items: &[&Item],
+    violations: &mut Vec<String>,
+) {
+    match shipped_struct(items, "Preparation") {
+        Some(structure) => {
+            let arenas: Vec<_> = structure
+                .fields
+                .iter()
+                .filter(|field| names(field.ty.to_token_stream(), "WindowPart"))
+                .collect();
+            if arenas.len() != 1 {
+                violations.push(format!(
+                    "{shown}: Preparation: {} window arenas, not one",
+                    arenas.len()
+                ));
+            } else if arenas[0]
+                .ident
+                .as_ref()
+                .is_none_or(|name| name != "windows")
+                || arenas[0].ty.to_token_stream().to_string()
+                    != "Storage < WindowPart < O > , P , O >"
+            {
+                violations.push(format!(
+                    "{shown}: Preparation must own exactly windows: Storage<WindowPart<O>, P, O>"
+                ));
+            }
+        }
+        None => violations.push(format!("{shown}: Preparation: not found")),
+    }
+    match shipped_struct(items, "BucketWalk") {
+        Some(structure) => {
+            for field in &structure.fields {
+                if names(field.ty.to_token_stream(), "WindowPart") {
+                    let field = field
+                        .ident
+                        .as_ref()
+                        .map_or_else(|| "<unnamed>".to_string(), ToString::to_string);
+                    violations.push(format!(
+                        "{shown}: BucketWalk: stores WindowPart in `{field}`"
+                    ));
+                }
+            }
+        }
+        None => violations.push(format!("{shown}: BucketWalk: not found")),
+    }
+    let mut fns = Vec::new();
+    collect_fns(all, &mut fns);
+    let mut splitting = Vec::new();
+    for (signature, block) in fns {
+        let name = signature.ident.to_string();
+        let tokens = quote::quote!(#signature #block);
+        let part = names(tokens.clone(), "WindowPart");
+        if part {
+            if let Some(raw) = WINDOW_RAW_MOVES
+                .iter()
+                .find(|raw| names(tokens.clone(), raw))
+            {
+                violations.push(format!("{shown}: {name}: moves a window part by `{raw}`"));
+            }
+            if names(block.to_token_stream(), "split_at_mut") {
+                splitting.push(name.clone());
+            }
+        }
+        if name == WINDOW_PAIR {
+            continue;
+        }
+        let mut sites = WindowSites {
+            function: &name,
+            sites: Vec::new(),
+        };
+        sites.visit_block(block);
+        violations.extend(
+            sites
+                .sites
+                .into_iter()
+                .map(|site| format!("{shown}: {site}")),
+        );
+    }
+    if splitting != [WINDOW_PAIR] {
+        violations.push(format!(
+            "{shown}: window pair indexing in {splitting:?}, not {WINDOW_PAIR} alone"
+        ));
+    }
+}
+
+/// The window custody's structure holds in this crate
+/// ([`window_custody_violations`]).
+#[test]
+fn window_custody_has_one_arena_one_pair_accessor_and_no_retained_end() {
+    assert_eq!(
+        window_custody_violations(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        Vec::<String>::new()
+    );
+}
+
+/// The window rules' pass and fail scenarios: a second window arena, the
+/// removed arena's name, an acquisition in `Retained`, a removed end method
+/// and an end call in its impl, a `WindowPart` in `BucketWalk`, in the
+/// bucket traversal and in the storage engine, a second slice-splitting pair
+/// accessor, arena indexing outside the accessor and an unsafe block
+/// reaching the arena, and a `MaybeUninit` part all fail; the arena's slice
+/// passed to the accessor, a plain obligation method, and test-only items
+/// pass.
+#[test]
+fn the_window_check_finds_every_structural_violation_and_nothing_else() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("window_census_tree");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("the previous fixture tree is removable");
+    }
+    fs::create_dir_all(root.join("src/bounded/encoding")).expect("the fixture tree is writable");
+    fs::create_dir_all(root.join("src/bounded/decode")).expect("the fixture tree is writable");
+    for (name, source) in [
+        (
+            "src/bounded.rs",
+            "pub struct Retained<O> { origin: O, acquisition: Option<Acquisition<O>> }\n\
+             impl<O> Retained<O> {\n\
+             \x20   pub fn absorbing(self) {}\n\
+             \x20   pub fn settle(self) { self.origin.end(1, 2, 3) }\n\
+             \x20   pub fn spend(self) { self.origin.settle() }\n\
+             }\n\
+             #[cfg(test)]\n\
+             mod checks { impl super::Retained<()> { fn end_settled(self) {} } }\n",
+        ),
+        (
+            "src/bounded/encoding.rs",
+            "enum WindowPart<O> { Acquisition(Option<O>), Credit(Option<O>) }\n\
+             pub struct Preparation<O> { windows: Storage<WindowPart<O>>, window_acquisitions: Storage<Option<O>>, spare: Storage<WindowPart<O>> }\n\
+             struct BucketWalk<O> { part: WindowPart<O> }\n\
+             fn window_pair<O>(parts: &mut [WindowPart<O>], cursor: usize) { let (a, b) = parts.split_at_mut(cursor); }\n\
+             fn other_pair<O>(parts: &mut [WindowPart<O>]) { parts.split_at_mut(1); }\n\
+             fn advance<O>(windows: &mut Spare<WindowPart<O>>) {\n\
+             \x20   window_pair(windows.as_mut_slice(), 0);\n\
+             \x20   let first = windows.as_slice()[0];\n\
+             \x20   let last = windows.last_mut();\n\
+             \x20   unsafe { core::ptr::read(&windows) };\n\
+             }\n\
+             fn moved<O>(part: WindowPart<O>) -> core::mem::MaybeUninit<WindowPart<O>> { core::mem::MaybeUninit::new(part) }\n\
+             #[cfg(test)]\n\
+             mod tests { fn probe(windows: &mut [u8]) { windows[0] = 1; } }\n",
+        ),
+        (
+            "src/bounded/encoding/buckets.rs",
+            "pub struct BucketCursor<'c, O> { part: &'c mut WindowPart<O> }\n",
+        ),
+        (
+            "src/bounded/decode/storage.rs",
+            "pub fn push_pair<T>(values: [T; 2]) {}\n\
+             fn relocate_part(part: &WindowPart<()>) {}\n\
+             #[cfg(test)]\n\
+             mod t { fn f(_: WindowPart<()>) {} }\n",
+        ),
+    ] {
+        fs::write(root.join(name), source).expect("the fixture tree is writable");
+    }
+    let mut expected = vec![
+        "src/bounded.rs: Retained: holds an acquisition in `acquisition`".to_string(),
+        "src/bounded.rs: Retained::absorbing: an acquisition-end method".to_string(),
+        "src/bounded.rs: Retained::settle: ends an acquisition".to_string(),
+        "src/bounded/encoding.rs: Preparation: names the removed arena's `window_acquisitions`"
+            .to_string(),
+        "src/bounded/encoding.rs: Preparation: 2 window arenas, not one".to_string(),
+        "src/bounded/encoding.rs: BucketWalk: stores WindowPart in `part`".to_string(),
+        "src/bounded/encoding.rs: advance:8: indexes the window arena by `as_slice` outside window_pair"
+            .to_string(),
+        "src/bounded/encoding.rs: advance:9: indexes the window arena by `last_mut` outside window_pair"
+            .to_string(),
+        "src/bounded/encoding.rs: advance:10: an unsafe block reaches the window arena".to_string(),
+        "src/bounded/encoding.rs: moved: moves a window part by `MaybeUninit`".to_string(),
+        "src/bounded/encoding.rs: window pair indexing in [\"window_pair\", \"other_pair\"], not window_pair alone"
+            .to_string(),
+        "src/bounded/encoding/buckets.rs: BucketCursor: names WindowPart".to_string(),
+        "src/bounded/decode/storage.rs: relocate_part: names WindowPart".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(window_custody_violations(&root), expected);
 }
 
 /// Whether `tokens` contain the identifier `name`.

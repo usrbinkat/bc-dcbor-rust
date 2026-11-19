@@ -1,35 +1,46 @@
 //! Native Option projections through a valid, resource-free placeholder.
 extern crate alloc;
 use super::*;
-use crate::bounded::decode::construction::reclamation::{Admitted, Custody, Place, Reduction};
-use crate::bounded::decode::construction::stable::{self, Installed};
+use crate::bounded::decode::construction::reclamation::{Custody, Place, Reduction};
+use crate::bounded::decode::construction::stable::{self, Installed, Pending, Ticket};
 use crate::sync::{Atomics, Representation};
 use alloc::{string::String, vec::Vec};
 
 /// A resource-free placeholder whose construction and move fit one quantum.
 ///
 /// # Safety
-/// The value must own no resources and require no destructor. Returning it must
-/// take bounded work independent of child count. In-place initialization may
-/// overwrite this placeholder without running Drop. This is deliberately not a
-/// blanket Default implementation: arbitrary defaults do not meet this contract.
+/// An implementation keeps two obligations, and the `// SAFETY:` comment on
+/// it names each as `label:` (`tests/unsafe_census.rs`, `UNSAFE_TRAITS`,
+/// which lists every implementation). In-place initialization may overwrite
+/// the placeholder without running Drop. This is deliberately not a blanket
+/// Default implementation: arbitrary defaults do not meet this contract.
+///
+/// - *resources*: the value owns no resources and needs no destructor.
+/// - *bounded*: returning it takes bounded work, independent of any child
+///   count.
 pub unsafe trait Placeholder: Sized {
     fn placeholder() -> Self;
 }
 
 macro_rules! scalars {
     ($($ty:ty),*) => {$(
-        // SAFETY: a scalar zero has no owned resources and constant-size storage.
+        // SAFETY: resources: a scalar zero owns nothing and has no
+        // destructor. bounded: one constant, written in constant work.
         unsafe impl Placeholder for $ty { fn placeholder() -> Self { 0 } }
     )*};
 }
 scalars!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
-// SAFETY: empty String and Vec own no allocations; their headers have fixed size.
+// SAFETY: resources: an empty String owns no allocation, so dropping it
+// frees nothing. bounded: `String::new` allocates nothing and writes a
+// fixed-size header.
 unsafe impl Placeholder for String {
     fn placeholder() -> Self {
         String::new()
     }
 }
+// SAFETY: resources: an empty Vec owns no allocation and no element, so
+// dropping it frees nothing. bounded: `Vec::new` allocates nothing and writes
+// a fixed-size header, whatever `T`.
 unsafe impl<T> Placeholder for Vec<T> {
     fn placeholder() -> Self {
         Vec::new()
@@ -46,6 +57,10 @@ pub enum Phase {
     Child,
     Complete,
     Absent,
+    /// The payload's cleanup under way: entered by the first cleanup unit
+    /// the payload completes without finishing, so no build reaches a
+    /// payload being cleaned up.
+    Reclaim,
     Release,
 }
 struct Meta<S, T> {
@@ -70,12 +85,13 @@ const fn contract<S, T, P>() -> stable::Contract<Meta<S, T>, Meta<S, T>, P> {
 
 /// The construction state of a native `Option` of payload `T`, whose state
 /// is `S`, with permits of `P`: whether it was entered as a present map field
-/// (`build_present`), so null is not absence; what its metadata's
-/// acquisition has admitted; and its metadata once acquired. Only the
-/// option's own construction reads or changes it.
+/// (`build_present`), so null is not absence; the ticket of its metadata's
+/// acquisition while it is pending ([`Ticket`]), whose credit is the
+/// operation's; and its metadata once acquired. Only the option's own
+/// construction reads or changes it.
 pub struct OptionalState<S, T, P> {
     present: bool,
-    admitted: stable::Admitted,
+    ticket: Option<Ticket>,
     meta: Option<Installed<Meta<S, T>, P>>,
 }
 
@@ -100,14 +116,14 @@ unsafe impl<S: Send, T: Send, P: Send> Send for OptionalState<S, T, P> {}
 unsafe impl<S, T, P> Sync for OptionalState<S, T, P> {}
 
 /// What a native option's construction holds: whether it was entered as a
-/// present map field; then no metadata block, with the admissions held
-/// toward it, or the block, at a phase, holding the payload's construction
-/// state, whose whole observation it carries.
+/// present map field; then no metadata block, or the block, at a phase,
+/// holding the payload's construction state, whose whole observation it
+/// carries. Progress alone: an acquisition bound for the block is the root
+/// pending's custody (`CustodySink::bound`), never this observation's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OptionalObservation<S> {
     Unallocated {
         present: bool,
-        admitted: Admitted,
     },
     Held {
         present: bool,
@@ -133,8 +149,8 @@ pub enum OptionalClass<C> {
 
 // Cleanup reads the metadata's presence and the phase, grouped as above, and
 // steps the payload in `Child` and `Complete` alike; whether the option was
-// entered as a present field and what its acquisition admitted never change
-// a cleanup unit. The payload's own relation is a simulation of its
+// entered as a present field never changes a cleanup unit. The payload's own
+// relation is a simulation of its
 // cleanup, and the option leaves `Live` exactly when the payload's cleanup
 // reports done, so the relation is a simulation of cleanup.
 impl<S: Reduction, T, P> Reduction for OptionalState<S, T, P> {
@@ -145,7 +161,9 @@ impl<S: Reduction, T, P> Reduction for OptionalState<S, T, P> {
             OptionalObservation::Unallocated { .. } => OptionalClass::Unallocated,
             OptionalObservation::Held { phase, child, .. } => match phase {
                 Phase::Empty | Phase::Absent => OptionalClass::Idle,
-                Phase::Child | Phase::Complete => OptionalClass::Live(S::class(child)),
+                Phase::Child | Phase::Complete | Phase::Reclaim => {
+                    OptionalClass::Live(S::class(child))
+                }
                 Phase::Release => OptionalClass::Release,
             },
         }
@@ -158,10 +176,7 @@ impl<S: Custody, T, P> Custody for OptionalState<S, T, P> {
     fn observe(&mut self) -> Self::Observation {
         let present = self.present;
         let Some(installed) = self.meta.as_mut() else {
-            return OptionalObservation::Unallocated {
-                present,
-                admitted: self.admitted,
-            };
+            return OptionalObservation::Unallocated { present };
         };
         let meta = installed.get();
         OptionalObservation::Held {
@@ -186,16 +201,21 @@ const fn cost<S, T, O, P>(payload: ConstructionCost) -> Option<ConstructionCost>
     ConstructionCost::fixed(fixed).checked_add(payload)
 }
 
+/// The payload's own state, a part of the option's: what the metadata holds.
+type Payload<T, A> = <T as Reclaim<A>>::State;
+
 fn metadata<T: Reclaim<A>, A: Allocator>(
-    state: &mut OptionalState<T::State, T, A::Permit>,
+    state: &mut OptionalState<Payload<T, A>, T, A::Permit>,
+    pending: &mut Pending<A::Origin>,
     a: &mut A,
 ) -> BoundedResult<(), A> {
     // SAFETY: the header is the whole metadata, every field written.
     unsafe {
-        stable::install::<Meta<T::State, T>, Meta<T::State, T>, A>(
-            const { contract::<T::State, T, A::Permit>() },
+        stable::install::<Meta<Payload<T, A>, T>, Meta<Payload<T, A>, T>, A>(
+            const { contract::<Payload<T, A>, T, A::Permit>() },
             &mut state.meta,
-            &mut state.admitted,
+            pending,
+            &mut state.ticket,
             || Meta {
                 child: T::INITIAL,
                 place: None,
@@ -207,39 +227,62 @@ fn metadata<T: Reclaim<A>, A: Allocator>(
     }
 }
 
-// SAFETY: None owns no child; Some retains its child's place and cleanup
-// state. No assumed Option layout or whole-value destructor is used. Every
-// cleanup that releases the metadata leaves the state `INITIAL`.
-unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> {
+// SAFETY: initial: not present, no ticket, no metadata. state: the metadata
+// block, its phase, the payload's place and the payload's own state record
+// everything: None owns no child; Some retains its child's place and its
+// state, through which alone the payload is built and cleaned up, as a part.
+// admission: each cleanup unit, the option's and the payload's
+// (`reclaim_part`), is admitted before it runs, a refusal changing nothing.
+// cleanup: no assumed Option layout or whole-value destructor is used; the
+// payload is reclaimed by its own binding, then the metadata released,
+// allocating nothing and never unwinding. done: `Done` once the payload is
+// reclaimed and the metadata released, which leaves the state `INITIAL`.
+// order: a step after `Done` reports `Done`; the count and observation read
+// only the state and the payload's recorded place. depth: the payload's
+// plus two, one more than its counted dispatches, the census recording the
+// margin. count: the payload's remaining plus the option's own units.
+unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> {
+    // One level more than its counted dispatches (its own and the
+    // payload's, `build_part` and `reclaim_part` straight from its own
+    // frame): the placeholder write and the payload's `reach` are no
+    // dispatch, so no stack frame accounts for it. Kept for compatibility
+    // with every declaration composed over it; the census records the
+    // margin (`every_bindings_declaration_exceeds_its_dispatch_by_its_recorded_margin`).
     const DISPATCH_DEPTH: usize = T::DISPATCH_DEPTH.saturating_add(2);
-    type State = OptionalState<T::State, T, A::Permit>;
+    type State = OptionalState<Payload<T, A>, T, A::Permit>;
     const INITIAL: Self::State = OptionalState {
         present: false,
-        admitted: stable::Admitted::Nothing,
+        ticket: None,
         meta: None,
     };
 
     fn reclaim_step(
         mut slot: Slot<'_, Self, Self::State>,
-        a: &mut A,
+        a: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A> {
         let state = slot.custody();
         let Some(installed) = state.meta.as_mut() else {
             STEP.admit(a)?;
             state.present = false;
-            state.admitted = stable::Admitted::Nothing;
+            // The metadata's acquisition, if pending, had its credit settled
+            // at the operation's cleanup entry: the ticket is forgotten.
+            state.ticket = None;
             return Ok(Reclaimed::Done);
         };
         let meta = installed.get();
         match meta.phase {
-            Phase::Child | Phase::Complete => {
+            Phase::Child | Phase::Complete | Phase::Reclaim => {
                 let child = meta.place.ok_or(BoundedError::PlanMismatch)?;
                 // SAFETY: the payload's place, kept from `Some`'s write,
                 // paired with its own state.
                 let payload = unsafe { Slot::new(child, &mut meta.child) };
-                if T::reclaim_step(payload, a)? == Reclaimed::Done {
-                    meta.phase = Phase::Release;
-                }
+                // A refused unit returned above, the phase unchanged; one
+                // the payload completed moves the option into cleanup, so
+                // no build reaches the payload again.
+                meta.phase = match reclaim_part::<T, A>(payload, a)? {
+                    Reclaimed::Done => Phase::Release,
+                    _ => Phase::Reclaim,
+                };
             }
             Phase::Empty | Phase::Absent => {
                 STEP.admit(a)?;
@@ -259,56 +302,93 @@ unsafe impl<T: Reclaim<A> + Placeholder, A: Allocator> Reclaim<A> for Option<T> 
     /// No metadata: one call. Nothing or `None` written: one to `Release`,
     /// one to release. The payload live: its own calls, the last of which
     /// reaches `Release`, then one. `Release`: one.
-    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, Self::State>) -> Option<u64> {
         let Some(installed) = slot.custody().meta.as_mut() else {
-            return 1;
+            return Some(1);
         };
         let meta = installed.get();
         match meta.phase {
-            Phase::Empty | Phase::Absent => 2,
-            Phase::Child | Phase::Complete => match meta.place {
+            Phase::Empty | Phase::Absent => Some(2),
+            Phase::Child | Phase::Complete | Phase::Reclaim => match meta.place {
                 // SAFETY: the payload's place, observed, paired with its own
                 // state.
-                Some(child) => T::remaining(unsafe { Slot::new(child.observe(), &mut meta.child) })
-                    .saturating_add(1),
+                Some(child) => {
+                    remaining_part::<T, A>(unsafe { Slot::new(child.observe(), &mut meta.child) })?
+                        .checked_add(1)
+                }
                 // Cleanup refuses a missing place as a defect in one call.
-                None => 1,
+                None => Some(1),
             },
-            Phase::Release => 1,
+            Phase::Release => Some(1),
+        }
+    }
+
+    /// The metadata block's permit, then the payload's own, whenever its
+    /// place is kept: a payload built or reclaimed in part reports what it
+    /// still holds.
+    fn observe_permits(
+        mut slot: PeekSlot<'_, Self, Self::State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        let Some(installed) = slot.custody().meta.as_mut() else {
+            return PermitsObserved::Complete;
+        };
+        sink.permit(installed.permit(), None);
+        let meta = installed.get();
+        match meta.place {
+            // SAFETY: the payload's place, observed, paired with its own
+            // state, as the cleanup count reads it.
+            Some(child) => {
+                observe_part::<T, A>(unsafe { Slot::new(child.observe(), &mut meta.child) }, sink)
+            }
+            None => PermitsObserved::Complete,
         }
     }
 }
 
-// SAFETY: only bounded, resource-free placeholders are used. The payload's
-// place is found while Some is valid, before child construction, and kept:
-// a place stays valid for the option's whole life, so no reference is ever
-// formed through a partially initialized Option.
+// SAFETY: admission: the metadata, the `Some` write and every payload step
+// (`build_part`) are admitted before they run. state: each is recorded in
+// the option's state before the step returns, on error too; only bounded,
+// resource-free placeholders are written (`Placeholder`). done: `Done` once
+// the payload is built at its kept place, or `None` written. escape: the
+// payload's place is kept in the option's own metadata and never returned.
+// provenance: the payload's place is found while Some is valid, before child
+// construction, and kept: a place stays valid for the option's whole life,
+// so no reference is ever formed through a partially initialized Option.
+// order: a build past completion or once cleanup began is refused
+// `PlanMismatch`, nothing changed. cost: `cost` of the option's parts plus
+// `T::COST`.
 unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> {
     const OPTIONAL: bool = true;
 
-    /// The option's own parts ([`cost`]) and its payload's.
+    /// The option's own parts (`cost`) and its payload's.
     const COST: ConstructionCost =
-        crate::const_cost!(cost::<T::State, T, Self, A::Permit>(T::COST));
+        crate::const_cost!(cost::<Payload<T, A>, T, Self, A::Permit>(T::COST));
 
-    fn build_present(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        mut slot: Slot<'_, Self, Self::State>,
+    fn build_present<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let mut ctx = ctx;
+        let mut slot = ctx.slot();
         let state = slot.custody();
         if !state.present {
             STEP.admit(a)?;
             state.present = true;
-            return Ok(Built::Progress);
+            return Ok(Building::Progress);
         }
-        Self::build_step(document, index, slot, a)
+        Self::build_step(ctx, a)
     }
-    fn build_absent(mut slot: Slot<'_, Self, Self::State>, a: &mut A) -> ConstructResult<Built, A> {
+    fn build_absent<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
+        a: &mut A,
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let assembly = ctx.assembly();
+        let (mut slot, pending) = ctx.into_acquiring();
         let (place, state) = slot.parts();
         if state.meta.is_none() {
-            metadata::<T, A>(state, a)?;
-            return Ok(Built::Progress);
+            metadata::<T, A>(state, pending, a)?;
+            return Ok(Building::Progress);
         }
         if state.installed()?.phase != Phase::Empty {
             return Err(BoundedError::PlanMismatch.into());
@@ -318,30 +398,37 @@ unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> 
         // nothing is written yet; the write is admitted above.
         unsafe { place.write(state, None) };
         state.installed()?.phase = Phase::Absent;
-        Ok(Built::Done)
+        // SAFETY: `None`, the whole value, was written above by an admitted
+        // unit, and the phase records it.
+        Ok(Building::Done(unsafe { assembly.assemble() }))
     }
 
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        mut slot: Slot<'_, Self, Self::State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let mut ctx = ctx;
+        let index = ctx.index();
+        let node = ctx.node();
+        let assembly = ctx.assembly();
+        let (mut slot, pending) = ctx.acquiring();
         let (place, state) = slot.parts();
         let present = state.present;
         if state.meta.is_none() {
-            metadata::<T, A>(state, a)?;
-            return Ok(Built::Progress);
+            metadata::<T, A>(state, pending, a)?;
+            return Ok(Building::Progress);
         }
         match state.installed()?.phase {
             Phase::Empty => {
                 sized::<Self>().admit(a)?;
-                let node = node_at(document, index).ok_or_else(wrong_type)?;
+                let node = node.ok_or_else(wrong_type)?;
                 if !present && matches!(node.kind(), Kind::Null) {
                     // SAFETY: nothing is written yet; the write is admitted.
                     unsafe { place.write(state, None) };
                     state.installed()?.phase = Phase::Absent;
-                    return Ok(Built::Done);
+                    // SAFETY: `None`, the whole value, was written by the
+                    // admitted unit above, and the phase records it.
+                    return Ok(Building::Done(unsafe { assembly.assemble() }));
                 }
                 // SAFETY: nothing is written yet; the write is admitted. The
                 // placeholder is resource-free, so the payload is then
@@ -353,19 +440,37 @@ unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> 
                 let meta = state.installed()?;
                 meta.place = Some(child);
                 meta.phase = Phase::Child;
-                Ok(Built::Progress)
+                Ok(Building::Progress)
             }
             Phase::Child => {
-                let meta = state.installed()?;
-                let child = meta.place.ok_or(BoundedError::PlanMismatch)?;
-                // SAFETY: the payload's place, kept from `Some`'s write,
-                // paired with its own state.
-                let payload = unsafe { Slot::new(child, &mut meta.child) };
-                let result = T::build_step(document, index, payload, a)?;
-                if result == Built::Done {
-                    meta.phase = Phase::Complete;
+                // The payload is a part from the option's own node, the
+                // context's index; the option keeps no index of its own. It
+                // is built only in `Child`, which a refused or erroring part
+                // leaves unchanged and only the payload's `Done` ends;
+                // cleanup moves the option out of it with the payload's
+                // first completed unit (`reclaim_step`), and every other
+                // phase is refused below.
+                // SAFETY: the payload's place, kept from `Some`'s write, and
+                // its own state, both held in this option's metadata.
+                let payload = unsafe {
+                    ctx.part(index, |slot| {
+                        let meta = slot.into_parts().1.installed()?;
+                        let child = meta.place.ok_or(BoundedError::PlanMismatch)?;
+                        Ok::<_, BoundedError<A::Refusal>>(Slot::new(child, &mut meta.child))
+                    })
+                }?;
+                // The payload's record is verified and consumed by the part
+                // entry in this step; its `Done` is the coverage `Complete`
+                // records, set right after it and nowhere else.
+                if build_part::<T, A>(payload, a)? == Built::Progress {
+                    return Ok(Building::Progress);
                 }
-                Ok(result)
+                ctx.slot().custody().installed()?.phase = Phase::Complete;
+                // SAFETY: `Some` was written with its placeholder, and the
+                // payload over it is done, its record, confined to this step
+                // by its brand, verified against the payload's place and
+                // consumed here; `Complete` records it.
+                Ok(Building::Done(unsafe { assembly.assemble() }))
             }
             _ => Err(BoundedError::PlanMismatch.into()),
         }
@@ -375,8 +480,8 @@ unsafe impl<T: InPlace<A> + Placeholder, A: Allocator> InPlace<A> for Option<T> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bounded::Limits;
     use crate::bounded::decode::decode;
+    use crate::bounded::{Budget, Limits};
     use core::mem::MaybeUninit;
     use core::ops::ControlFlow;
     use core::ptr::NonNull;
@@ -394,25 +499,22 @@ mod tests {
         let document = decode(wire, 2, &mut parser).unwrap();
         let mut a = Limits::unlimited();
         let mut value = MaybeUninit::<Option<T>>::uninit();
-        let mut state = <Option<T> as Reclaim<Limits>>::INITIAL;
+        let mut session = Session::new(<Option<T> as Reclaim<Limits>>::INITIAL);
+        let mut pending = Pending::new(a.owner().expect("an ordinary family mints an owner"));
         // SAFETY: the test owns the destination and pairs it with its
-        // initial state; every access to either is through this slot.
-        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
-        crate::bounded::within_steps(
-            name,
-            64,
-            || match <Option<T> as InPlace<Limits>>::build_step(
-                &document,
-                0,
-                slot.reborrow(),
+        // initial session; every access to either is through this slot.
+        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut session) };
+        crate::bounded::within_steps(name, 64, || {
+            match build::<Option<T>, Limits>(
+                Context::root(&document, slot.reborrow(), &mut pending),
                 &mut a,
             )
             .unwrap()
             {
                 Built::Done => ControlFlow::Break(()),
                 Built::Progress => ControlFlow::Continue(()),
-            },
-        );
+            }
+        });
         let (place, built) = slot.parts();
         // SAFETY: construction reported the option written.
         assert_eq!(
@@ -420,9 +522,15 @@ mod tests {
             Some(&expected),
             "{name}"
         );
-        let declared = <Option<T> as Reclaim<Limits>>::remaining(slot.observe());
+        assert!(
+            pending.is_idle(),
+            "{name}: a completed build left credit pending"
+        );
+        let declared = remaining::<Option<T>, Limits>(slot.observe())
+            .expect("an option's cleanup count fits in u64");
         crate::bounded::within_steps(name, declared, || {
-            match <Option<T> as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a).unwrap() {
+            match reclaim::<Option<T>, Limits>(slot.reborrow(), &mut Cleanup::new(&mut a)).unwrap()
+            {
                 Reclaimed::Done => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
             }

@@ -1,0 +1,20 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -711,13 +711,13 @@
+     rule: Forfeit,
+ ) {
+     windows.for_each_mut(|part| {
+-        if let WindowPart::Credit(window) = part {
+-            settle_window_credit(window, Some(rule), by);
++        if let WindowPart::Acquisition(acquisition) = part {
++            end_window_acquisition(acquisition, by);
+         }
+     });
+     windows.for_each_mut(|part| {
+-        if let WindowPart::Acquisition(acquisition) = part {
+-            end_window_acquisition(acquisition, by);
++        if let WindowPart::Credit(window) = part {
++            settle_window_credit(window, Some(rule), by);
+         }
+     });
+ }

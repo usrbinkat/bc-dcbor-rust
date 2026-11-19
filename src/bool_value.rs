@@ -27,8 +27,8 @@ use crate::{CBOR, CBORCase, Error, Result, Simple};
 ///
 /// // Maps can use boolean keys
 /// let mut map = Map::new();
-/// map.insert(true, "this is true");
-/// map.insert(false, "this is false");
+/// map.insert(true, "this is true").unwrap();
+/// map.insert(false, "this is false").unwrap();
 ///
 /// // Convert back to boolean
 /// let value: bool = cbor_true.try_into().unwrap();

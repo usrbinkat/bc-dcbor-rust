@@ -6,9 +6,13 @@
 # Run in the configured development shell, whose cargo-miri and sysroot are
 # built from the patched library the flake installs. Do not substitute a
 # normal cargo test run. Each suite runs in its mutation domain's build
-# (tests/miri-suites.txt): every feature, where the ordered-collection
+# (tests/miri-suites.txt), one of the domains defined once in the gate tool
+# (tests/gate/src/domains.rs): every feature, where the ordered-collection
 # schemas, whose stepped cursors live in the engine's Slot, exist only with
-# custom-std-collections; or the no_std build, whose abort only it compiles.
+# custom-std-collections; the no_std build, whose abort only it compiles; or
+# the crate's default std build, with neither hashbrown nor the forked
+# collections, whose preparation retains no bucket cursor and charges no
+# bucket traversal, code only it compiles.
 #
 # Every test runs under strict provenance: an integer cast to a pointer is an
 # error, not a permissive fallback, so a pointer that loses its provenance
@@ -65,6 +69,7 @@ for tool in cargo rustc patch time sha256sum git tar; do
 	fi
 done
 gate_prepare || exit 2
+miri_models || exit 2
 mode=gate
 if [[ "${1:-}" == --judge ]]; then
 	if (($# != 4)); then
@@ -128,7 +133,10 @@ done | {
 	printf 'rigor\t%s\twitness\t%s\n' "$DCBOR_RIGOR" "$DCBOR_WITNESS"
 	printf 'race seeds\t%s\n' "${seeds[*]}"
 	cat
-} | identity "$logs"
+} | identity "$logs" || {
+	event "FAIL the run's identity could not be written; nothing was run"
+	exit 2
+}
 echo "identity: $(cat "$logs/identity.txt")"
 
 # The toolchain's own Miri sysroot and build cache (tests/gate-common.sh).
@@ -228,14 +236,27 @@ model_verdict() {
 		fi
 		inventories+=("$dir/$index.inventory")
 	done
-	if gate miri coverage "$logs/$base-native.inventory" "$logs/$base-$model.inventory" \
-		"$logs/$base-$model-coverage.diff" "${inventories[@]}" >/dev/null 2>&1; then
+	# The tool's own report is kept beside the difference: status 1 is a
+	# difference (written to the diff), status 2 the tool failing, whose
+	# diff may not exist.
+	local status=0
+	gate miri coverage "$logs/$base-native.inventory" "$logs/$base-$model.inventory" \
+		"$logs/$base-$model-coverage.diff" "${inventories[@]}" \
+		>"$logs/$base-$model-coverage.log" 2>&1 || status=$?
+	case $status in
+	0)
 		event "PASS $base-$model ($count tests), inventory equals native"
 		echo pass >"$logs/$base-$model.verdict"
-	else
-		event "FAIL $base-$model inventory, $logs/$base-$model-coverage.diff"
+		;;
+	1)
+		event "FAIL $base-$model inventory differs, $logs/$base-$model-coverage.diff"
 		echo fail >"$logs/$base-$model.verdict"
-	fi
+		;;
+	*)
+		event "FAIL $base-$model the coverage comparison failed (status $status), $logs/$base-$model-coverage.log"
+		echo fail >"$logs/$base-$model.verdict"
+		;;
+	esac
 }
 
 # The native baseline of a suite of kind `$2`, its tests `$3...` up to `--`,
@@ -544,7 +565,13 @@ wait
 # runner, its verdict (the native baseline; each model's runs with their
 # inventory equal to the native run's); under the run's identity. Its verdict:
 # every row passed.
-gate miri results "$logs" "${MIRI_MODELS[@]}"
+# The binary16 conversion's two branch obligations are rows of the same
+# results (tests/gate, `conversion`): the contract test's native run took
+# half's accelerated branch, each model's run its software branch, each
+# marker agreeing with this build and this checkout's Cargo.lock. A host
+# without f16c leaves the accelerated one unmet, a failing row of the
+# persisted evidence.
+gate miri results "$PWD" "$logs" "${MIRI_MODELS[@]}"
 status=$?
 event "DONE ${#listing[@]} lines, status $status; results $logs/results.tsv"
 exit "$status"

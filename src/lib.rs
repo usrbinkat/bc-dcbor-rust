@@ -83,6 +83,15 @@
 //! arrays with heterogenous elements, maps, and user-defined types with custom
 //! CBOR tags.
 
+#[cfg(not(any(feature = "std", feature = "no_std")))]
+compile_error!("dcbor requires the feature `std` or `no_std`");
+
+/// The revision of the dCBOR specification this crate implements, its
+/// Internet-Draft's full name: the one definition the conformance vectors'
+/// data file (`tests/data/dcbor-appendix-a.md`) must name and every evidence
+/// gate's identity records (`gate dcbor-draft`).
+pub const DCBOR_DRAFT_REVISION: &str = "draft-mcnally-deterministic-cbor-18";
+
 #[macro_use]
 mod stdlib;
 
@@ -146,6 +155,9 @@ pub use set::{Set, SetIter};
 
 mod string;
 
+mod stabilized_text;
+pub use stabilized_text::{StabilizedText, UNICODE_VERSION, is_assigned};
+
 mod string_util;
 
 mod simple;
@@ -162,9 +174,14 @@ pub use num_bigint::{
     BigInt, BigUint, Sign, bigint_from_negative_untagged_cbor, biguint_from_untagged_cbor,
 };
 
+mod minimal_bigint;
+pub use minimal_bigint::MinimalBigInt;
+
 pub mod walk;
 
 pub mod bounded;
+
+pub mod cddl;
 
 /// The exact hashbrown dependency used by the bounded map implementations.
 /// Use this re-export to preserve map type identity across consumers.
@@ -178,8 +195,18 @@ mod conveniences;
 // Re-export derive macros when the `derive` feature is enabled
 #[cfg(feature = "derive")]
 pub use dcbor_derive::{
-    CBORBoundedDecodable, CBORBoundedEncodable, CBORCodable, CBORDecodable, CBOREncodable,
+    CBORBoundedDecodable, CBORBoundedEncodable, CBORCddl, CBORCodable, CBORDecodable, CBOREncodable,
 };
+
+/// The crate's own name inside its unit tests, so the paths the derives
+/// generate (`dcbor::...`) resolve where a unit test derives a record: the
+/// generated code itself is what those tests measure. Gated as the one
+/// module that derives is (`in_place`'s `derived` census).
+#[cfg(all(test, feature = "std", feature = "derive"))]
+extern crate self as dcbor;
+
+#[doc(hidden)]
+pub mod __derive;
 
 // Re-export standard library types used in our public API
 #[doc(hidden)]

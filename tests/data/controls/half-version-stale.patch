@@ -1,0 +1,13 @@
+--- src/float.rs
++++ src/float.rs
+@@ -305,7 +305,9 @@
+     /// `binary16/arch.rs` of: the version `Cargo.lock` resolves, asserted
+     /// against it in [`the_branch_marker_names_the_resolved_half`]. A
+     /// dependency's version is not available through `env!`.
+-    const HALF_VERSION: &str = "2.7.1";
++    // Planted: a version the lock does not resolve. Must fail
++    // the_branch_marker_names_the_resolved_half, "Cargo.lock does not resolve half 2.7.0".
++    const HALF_VERSION: &str = "2.7.0";
+
+     /// The binary16 conversion branch `half` dispatches to here, by its own
+     /// selection (`half` 2.7.1 `binary16/arch.rs:14-83`, the conversions

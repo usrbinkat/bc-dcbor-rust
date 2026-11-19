@@ -1,16 +1,22 @@
 [workspace]
 # The record format is a leaf (tests/record), and the model-bounds and census
-# rows leaves over it (tests/model-bounds, tests/census); the test support
-# crate, this package's tests and the gate tool (tests/gate) each depend on
-# them, and the tests never on the gate nor the gate on them.
+# rows leaves over it (tests/model-bounds, tests/census); the refinement
+# machine and the trace row format (tests/refinement) read this package's
+# vocabulary and the record format; the test support crate, this package's
+# tests and the gate tool (tests/gate) each depend on them, and the tests
+# never on the gate nor the gate on them.
 members = [
     ".",
     "dcbor-derive",
     "tests/record",
     "tests/model-bounds",
     "tests/census",
+    "tests/refinement",
     "tests/support",
     "tests/gate",
+    # The CDDL every derive emits checked against the decoders' accepted
+    # domain, with an independent validator (`cddl`) as the oracle.
+    "tests/cddl",
 ]
 # The fuzz crate builds with cargo-fuzz on nightly; it is its own package.
 exclude = ["fuzz"]
@@ -27,9 +33,17 @@ loom = "=0.7.2"
 shuttle = "=0.9.9"
 
 # Each checker's cfg is set by RUSTFLAGS alone (`--cfg loom`, `--cfg
-# shuttle`); any other unknown cfg is a defect.
+# shuttle`), and the proof harnesses' by `cargo kani` (`cfg(kani)`,
+# src/bounded/proofs.rs); any other unknown cfg is a defect. A dropped
+# `#[must_use]` value is a defect too: a driver's stop, a drain's or a
+# cleanup's result left unread is a failure no run reports.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
+unexpected_cfgs = { level = "deny", check-cfg = [
+    "cfg(loom)",
+    "cfg(shuttle)",
+    "cfg(kani)",
+] }
+unused_must_use = "deny"
 
 [package]
 name = "dcbor"
@@ -67,7 +81,12 @@ half = { version = "^2.4.1", default-features = false }
 # usrbinkat/rust std fork (library/hashbrown, flake.lock's rust-fork).
 hashbrown = { version = "=0.17.1", git = "https://github.com/usrbinkat/hashbrown", rev = "ccb26a32445a94dbf228acf518efa216c6dbfeef", optional = true }
 hex = { version = "^0.4.3", default-features = true }
-num-bigint = { version = "0.4.6", default-features = false, optional = true }
+# The bignum emission reads magnitudes through `iter_u64_digits`
+# (`ExactSizeIterator`, `DoubleEndedIterator`; src/bounded/bigint.rs).
+# `MinimalBigInt` (src/minimal_bigint.rs) holds its encoding's bytes, not
+# num-bigint's digits, and converts to and from num-bigint at the symbolic
+# edge only.
+num-bigint = { version = "0.4.8", default-features = false, optional = true }
 thiserror = { version = "^2.0", default-features = false, optional = true }
 # Exact: src/bounded/text.rs restates this release's composition algorithm
 # over its character primitives; another release is adopted only after the
@@ -86,6 +105,9 @@ dcbor-model-bounds = { path = "tests/model-bounds" }
 # The census rows tests/unsafe_census.rs writes and the gate's reach map and
 # mutation plan read.
 dcbor-census = { path = "tests/census" }
+# The refinement machine every recorded admission trace is checked against,
+# and the trace row format (tests/resumable/native_traces.rs).
+dcbor-refinement = { path = "tests/refinement" }
 dcbor-test-support = { path = "tests/support" }
 hex-literal = "^1.1.0"
 indoc = "^2.0.0"

@@ -79,8 +79,8 @@ fn test_traversal_counts() {
 
     // Simple map
     let mut map = Map::new();
-    map.insert("a", 1);
-    map.insert("b", 2);
+    map.insert("a", 1).unwrap();
+    map.insert("b", 2).unwrap();
     let map_cbor = CBOR::from(map);
     let count = count_visits(&map_cbor);
     // Root + 2 key-value pairs + 4 individual keys/values = 7
@@ -94,10 +94,10 @@ fn test_traversal_counts() {
 
     // Nested structure
     let mut inner_map = Map::new();
-    inner_map.insert("x", vec![1, 2]);
+    inner_map.insert("x", vec![1, 2]).unwrap();
     let mut outer_map = Map::new();
-    outer_map.insert("inner", inner_map);
-    outer_map.insert("simple", 42);
+    outer_map.insert("inner", inner_map).unwrap();
+    outer_map.insert("simple", 42).unwrap();
     let nested = CBOR::from(outer_map);
     let count = count_visits(&nested);
     // Should visit:
@@ -232,13 +232,13 @@ fn test_early_termination() {
 fn test_depth_limited_traversal() {
     // Create deeply nested structure
     let mut level3 = Map::new();
-    level3.insert("deep", "value");
+    level3.insert("deep", "value").unwrap();
 
     let mut level2 = Map::new();
-    level2.insert("level3", level3);
+    level2.insert("level3", level3).unwrap();
 
     let mut level1 = Map::new();
-    level1.insert("level2", level2);
+    level1.insert("level2", level2).unwrap();
 
     let root = CBOR::from(level1);
 
@@ -267,17 +267,21 @@ fn test_depth_limited_traversal() {
 fn test_text_extraction() {
     // Create a complex structure with text at various levels
     let mut metadata = Map::new();
-    metadata.insert("title", "Important Document");
-    metadata.insert("author", "Alice Smith");
+    metadata.insert("title", "Important Document").unwrap();
+    metadata.insert("author", "Alice Smith").unwrap();
 
     let mut content = Map::new();
-    content.insert("body", "Lorem ipsum dolor sit amet");
-    content.insert("footer", "Copyright 2024");
+    content
+        .insert("body", "Lorem ipsum dolor sit amet")
+        .unwrap();
+    content.insert("footer", "Copyright 2024").unwrap();
 
     let mut document = Map::new();
-    document.insert("metadata", metadata);
-    document.insert("content", content);
-    document.insert("tags", vec!["urgent", "confidential", "draft"]);
+    document.insert("metadata", metadata).unwrap();
+    document.insert("content", content).unwrap();
+    document
+        .insert("tags", vec!["urgent", "confidential", "draft"])
+        .unwrap();
 
     let cbor = CBOR::from(document);
 
@@ -329,8 +333,8 @@ fn test_text_extraction() {
 #[test]
 fn test_traversal_order_and_edge_types() {
     let mut map = Map::new();
-    map.insert("a", vec![1, 2]);
-    map.insert("b", 42);
+    map.insert("a", vec![1, 2]).unwrap();
+    map.insert("b", 42).unwrap();
     let cbor = CBOR::from(map);
 
     let traversal_log = RefCell::new(Vec::<(String, EdgeType)>::new());
@@ -401,8 +405,8 @@ fn test_tagged_value_traversal() {
 #[test]
 fn test_map_keyvalue_semantics() {
     let mut map = Map::new();
-    map.insert("simple", 42);
-    map.insert("nested", vec![1, 2]);
+    map.insert("simple", 42).unwrap();
+    map.insert("nested", vec![1, 2]).unwrap();
     let cbor = CBOR::from(map);
 
     let keyvalue_count = RefCell::new(0);
@@ -524,23 +528,29 @@ fn test_primitive_values() {
 fn test_real_world_document() {
     // Simulate a JSON-like document converted to CBOR
     let mut person = Map::new();
-    person.insert("name", "John Doe");
-    person.insert("age", 30);
-    person.insert("email", "john@example.com");
+    person.insert("name", "John Doe").unwrap();
+    person.insert("age", 30).unwrap();
+    person.insert("email", "john@example.com").unwrap();
 
     let mut address = Map::new();
-    address.insert("street", "123 Main St");
-    address.insert("city", "Anytown");
-    address.insert("zipcode", "12345");
+    address.insert("street", "123 Main St").unwrap();
+    address.insert("city", "Anytown").unwrap();
+    address.insert("zipcode", "12345").unwrap();
 
-    person.insert("address", address);
-    person.insert("hobbies", vec!["reading", "cycling", "cooking"]);
+    person.insert("address", address).unwrap();
+    person
+        .insert("hobbies", vec!["reading", "cycling", "cooking"])
+        .unwrap();
 
     let mut skills = Map::new();
-    skills.insert("programming", vec!["Rust", "Python", "JavaScript"]);
-    skills.insert("languages", vec!["English", "Spanish"]);
+    skills
+        .insert("programming", vec!["Rust", "Python", "JavaScript"])
+        .unwrap();
+    skills
+        .insert("languages", vec!["English", "Spanish"])
+        .unwrap();
 
-    person.insert("skills", skills);
+    person.insert("skills", skills).unwrap();
 
     let document = CBOR::from(person);
 

@@ -1,0 +1,16 @@
+--- src/bounded/growth_proofs.rs
++++ src/bounded/growth_proofs.rs
+@@ -93,7 +93,12 @@
+ /// The closed form after `k` growths (the module's "The invariant").
+ fn closed(k: u128, size: u128) -> State {
+     if k == 0 {
+-        return EMPTY;
++        // Planted: the base case claims a capacity before any growth. Must
++        // fail the_recurrence_starts_at_its_base_case, "no growth, no counts".
++        return State {
++            capacity: 4,
++            ..EMPTY
++        };
+     }
+     let capacity = 4u128 << (k - 1);
+     State {

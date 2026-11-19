@@ -1,0 +1,12 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -2381,7 +2381,8 @@
+ /// levels a merge of `n` entries passes (`ceil(log2 n)`), and the probes a
+ /// binary lookup among them makes.
+ fn levels<R>(n: u64) -> Result<u64, BoundedError<R>> {
+-    add(u64::from(n.max(1).ilog2()), 1)
++    // Planted: one level more than floor(log2 n) + 1.
++    add(u64::from(n.max(1).ilog2()), 2)
+ }
+
+ /// The [`ResourceBound`] of a [`Preparation`] of a source of `shape`, from

@@ -1,13 +1,64 @@
 use super::harness::*;
 use super::support::{
-    Fault, allowed, drive_faulted, drive_within, finish_within, refusal_matrix, refuse,
-    rigor::rigor,
+    Fault, Finding, RefusalRun, Retirement, Stopped, pipeline::Unwitnessed, recorded_run,
+    refusal_matrix, rigor::rigor,
 };
+use dcbor::bounded::Family;
 use dcbor::bounded::decode::{DecodeError, Options, cursor::Decoder};
 use unicode_normalization::{IsNormalized, is_nfc_quick};
 
-fn quick(input: &[u8]) -> Decoder<'_, Reservation> {
+fn quick(input: &[u8]) -> Decoder<'_, Reservation, Family> {
     Decoder::new(input, Options::quick_only(8))
+}
+
+/// The same retained decode and cleanup scenario serves literal verdicts
+/// and upstream comparisons, including publication surviving its decoder.
+fn quick_run(wire: &[u8], accepted: bool, fault: Fault, case: &str) -> RefusalRun {
+    recorded_run(|run| {
+        let policy = run.observed_policy(POOL);
+        let cleanup = run.shared_policy(policy);
+        let bound = decode_turns(wire.len());
+        run.holding(
+            quick(wire),
+            Retirement::Released,
+            &Unwitnessed,
+            |operation| {
+                match operation.drive_faulted(
+                    policy,
+                    bound,
+                    Retirement::Released,
+                    fault,
+                    |_, _| {},
+                    |document| {
+                        assert!(accepted, "{case}: unproven text accepted");
+                        assert_eq!(document.value().root().encoded(), wire, "{case}");
+                        document.with_policy(policy, |_, m| {
+                            m.assert_units(TURN);
+                            assert!(m.live_bytes() > 0);
+                        });
+                    },
+                ) {
+                    Ok(Some(())) => {}
+                    Ok(None) => assert!(fault.cancel, "{case}: unscheduled cancellation"),
+                    Err(Stopped::Operation(error)) => {
+                        assert!(!accepted, "{case}: proven text refused: {error:?}");
+                        assert!(
+                            matches!(error, DecodeError::UnprovenText),
+                            "{case}: lost the specific QuickOnly rejection: {error:?}"
+                        );
+                        operation.with_policy(policy, |_, m| m.assert_units(TURN));
+                        operation.finish(cleanup, bound, Retirement::Released)?;
+                    }
+                    Err(stop) => return Err(Finding::from(stop)),
+                }
+                Ok(())
+            },
+        )?;
+        Ok(run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            RefusalRun::of(m)
+        }))
+    })
 }
 
 /// For each fixture, every refusal of a QuickOnly decode resumed to the same
@@ -16,7 +67,8 @@ fn quick(input: &[u8]) -> Decoder<'_, Reservation> {
 /// the decode held. A rejected decode's own cleanup runs under a shared
 /// policy, outside the measured trace.
 #[test]
-fn quick_only_policy_survives_every_refusal_without_silent_normalization() {
+fn quick_only_policy_survives_every_refusal_without_silent_normalization()
+-> Result<(), Vec<Finding>> {
     let fixtures = [
         ("ASCII", true),
         ("\u{e9}", true),
@@ -26,44 +78,11 @@ fn quick_only_policy_survives_every_refusal_without_silent_normalization() {
     every_fixture(fixtures.len(), |fixture| {
         let (text, accepted) = fixtures[fixture];
         let wire = text_wire(text);
-        refusal_matrix(
-            &format!("QuickOnly decode of {text:?}"),
-            rigor(),
-            |fault: Fault| {
-                let mut m = meter();
-                refuse(&mut m, fault.refusal);
-                let pool = m.share();
-                let mut operation = quick(&wire);
-                let turns = allowed(&m, decode_turns(wire.len()));
-                match drive_faulted(&mut m, &mut operation, turns, fault.cancel) {
-                    Ok(Some(document)) => {
-                        assert!(accepted, "unproven text accepted");
-                        assert_eq!(document.root().encoded(), wire);
-                        m.assert_units(TURN);
-                        drop(operation);
-                        assert!(pool.live_bytes() > 0);
-                        drop(document);
-                    }
-                    Ok(None) => {
-                        assert!(fault.cancel, "unscheduled cancellation");
-                        drop(operation);
-                    }
-                    Err(error) => {
-                        assert!(!accepted, "proven text refused: {error:?}");
-                        assert!(
-                            matches!(error, DecodeError::UnprovenText),
-                            "lost the specific QuickOnly rejection: {error:?}"
-                        );
-                        m.assert_units(TURN);
-                        finish_within(&mut m.share(), &mut operation, decode_turns(wire.len()));
-                        drop(operation);
-                    }
-                }
-                assert_eq!(pool.live_bytes(), 0);
-                super::support::RefusalRun::of(&m)
-            },
-        );
-    });
+        refusal_matrix(&format!("QuickOnly decode of {text:?}"), rigor(), |fault| {
+            quick_run(&wire, accepted, fault, text)
+        });
+        Ok(())
+    })
 }
 
 /// Payload validation proceeds in quanta of at most 64 bytes. An ASCII prefix
@@ -72,7 +91,8 @@ fn quick_only_policy_survives_every_refusal_without_silent_normalization() {
 /// quantum's end. The QuickOnly verdict must equal upstream's for the whole
 /// text wherever the boundary falls.
 #[test]
-fn quick_check_agrees_with_upstream_wherever_a_scalar_meets_a_quantum_boundary() {
+fn quick_check_agrees_with_upstream_wherever_a_scalar_meets_a_quantum_boundary()
+-> Result<(), Vec<Finding>> {
     let texts = [
         "\u{e9}",
         "\u{1f600}",
@@ -90,27 +110,13 @@ fn quick_check_agrees_with_upstream_wherever_a_scalar_meets_a_quantum_boundary()
             let source = format!("{}{text}", "x".repeat(prefix));
             let proven = is_nfc_quick(source.chars()) == IsNormalized::Yes;
             let wire = text_wire(&source);
-            let mut m = meter();
-            let mut operation = quick(&wire);
-            let bound = decode_turns(wire.len());
-            match drive_within(&mut m, &mut operation, bound) {
-                Ok(document) => {
-                    assert!(proven, "unproven text accepted: prefix={prefix} {text:?}");
-                    assert_eq!(document.root().encoded(), wire);
-                    drop(document);
-                }
-                Err(error) => {
-                    assert!(
-                        matches!(error, DecodeError::UnprovenText),
-                        "prefix={prefix} {text:?}: {error:?}"
-                    );
-                    assert!(!proven, "proven text refused: prefix={prefix} {text:?}");
-                    finish_within(&mut m, &mut operation, bound);
-                }
-            }
-            m.assert_units(TURN);
-            drop(operation);
-            assert_eq!(m.live_bytes(), 0);
+            quick_run(
+                &wire,
+                proven,
+                Fault::NONE,
+                &format!("prefix={prefix} {text:?}"),
+            );
         }
-    });
+        Ok(())
+    })
 }

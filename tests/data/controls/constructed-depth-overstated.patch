@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/construct.rs
++++ src/bounded/decode/construction/construct.rs
+@@ -166,7 +166,7 @@
+     for Constructed<'_, I, T, A>
+ {
+     const DISPATCH_DEPTH: usize = {
+-        let value = T::DISPATCH_DEPTH.saturating_add(1);
++        let value = T::DISPATCH_DEPTH.saturating_add(2);
+         let input = I::DISPATCH_DEPTH.saturating_add(3);
+         if value > input { value } else { input }
+     };

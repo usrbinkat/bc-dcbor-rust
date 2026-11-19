@@ -2,12 +2,12 @@ use super::*;
 use crate::bounded::decode::construction::reclamation::Slot;
 use crate::bounded::decode::initialization::{init_field, init_part};
 
-impl<S: Copy, P> TextContinuation<S, P> {
+impl<S: Copy, P, O: Origin> TextContinuation<S, P, O> {
     /// The arena's and the ordering's own steps, then one per scalar field;
     /// the decomposition scratch is one field, its extent checked by
     /// [`field`](crate::bounded::decode::initialization::field).
     pub(crate) const INIT_STEPS: usize =
-        Storage::<char, P>::INIT_STEPS + ordering::Ordering::<P>::INIT_STEPS + 17;
+        Storage::<char, P, O>::INIT_STEPS + ordering::Ordering::<P, O>::INIT_STEPS + 20;
 
     /// Initialize one unit of the continuation in `slot`, its stable
     /// destination paired with its units initialized: the character arena
@@ -16,13 +16,13 @@ impl<S: Copy, P> TextContinuation<S, P> {
     /// needs no destruction; a continuation that published its output holds
     /// nothing, so it is initialized again the same way for its next text.
     /// Refused once initialized.
-    pub(crate) fn initialize_step<A: Allocator<Permit = P>>(
+    pub(crate) fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: Slot<'_, Self, usize>,
         source: S,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        let storage = Storage::<char, P>::INIT_STEPS;
-        let ordering = ordering::Ordering::<P>::INIT_STEPS;
+        let storage = Storage::<char, P, O>::INIT_STEPS;
+        let ordering = ordering::Ordering::<P, O>::INIT_STEPS;
         let units = *slot.custody();
         if Bound::new(Predicate::Prefix, storage).below(a, units) {
             init_part!(slot, chars, 0, a, |chars| Storage::initialize_step(
@@ -54,6 +54,11 @@ impl<S: Copy, P> TextContinuation<S, P> {
             14 => init_field!(slot, emit_at, || 0, a)?,
             15 => init_field!(slot, bytes, Vec::new, a)?,
             16 => init_field!(slot, permit, || None, a)?,
+            // The output acquisition's owner, identity and held release:
+            // none until its first entry, which takes the owner.
+            17 => init_field!(slot, owner, || None, a)?,
+            18 => init_field!(slot, acquisition, || None, a)?,
+            19 => init_field!(slot, output_release, || None, a)?,
             _ => return Err(BoundedError::PlanMismatch),
         }
         let units = slot.custody();

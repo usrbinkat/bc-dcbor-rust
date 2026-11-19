@@ -15,7 +15,8 @@ use crate::{
 /// Returns an error if the data is not well-formed deterministic CBOR.
 pub fn decode_cbor(data: impl AsRef<[u8]>) -> Result<CBOR> {
     let data = data.as_ref();
-    let (cbor, len) = decode_cbor_internal(data)?;
+    // The root is the first frame of the symbolic profile.
+    let (cbor, len) = decode_cbor_internal(data, 1)?;
     let remaining = data.len() - len;
     if remaining > 0 {
         return Err(Error::UnusedData(remaining));
@@ -105,6 +106,20 @@ pub(crate) fn parse_header_varint(data: &[u8]) -> Result<(MajorType, u64, usize)
     Ok((major_type, value, varint_len))
 }
 
+/// The integer a major-type-1 head carrying `argument` encodes, `-1 -
+/// argument`, when it is in dCBOR's integer range, at least `-2^63`
+/// (`float::DCBOR_INT_MIN`): an argument of at most `2^63 - 1`. A larger
+/// argument is refused [`Error::OutOfRange`]. The one range rule of every
+/// decoder: the symbolic decoder below, the bounded flat decoder
+/// (`bounded::decode::decode_with`) and the retained cursor
+/// (`bounded::decode::cursor`) each call it.
+pub(crate) fn negative(argument: u64) -> Result<i64> {
+    if argument > i64::MAX as u64 {
+        return Err(Error::OutOfRange);
+    }
+    Ok(-1 - argument as i64)
+}
+
 fn parse_bytes(data: &[u8], len: usize) -> Result<&[u8]> {
     if data.len() < len {
         return Err(Error::Underrun);
@@ -112,7 +127,16 @@ fn parse_bytes(data: &[u8], len: usize) -> Result<&[u8]> {
     Ok(&data[0..len])
 }
 
-fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
+/// The item at the front of `data`, at frame `depth` of the symbolic profile,
+/// and its encoded length. Each array element, map key, map value and tagged
+/// item is decoded one frame deeper; a frame past
+/// [`crate::bounded::SYMBOLIC_DEPTH`] is refused before it is read, so the
+/// recursion never goes deeper than the profile, and `depth + 1` never
+/// exceeds `SYMBOLIC_DEPTH + 1`.
+fn decode_cbor_internal(data: &[u8], depth: usize) -> Result<(CBOR, usize)> {
+    if depth > crate::bounded::SYMBOLIC_DEPTH {
+        return Err(Error::DepthLimit);
+    }
     if data.is_empty() {
         return Err(Error::Underrun);
     }
@@ -120,13 +144,12 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
     match major_type {
         MajorType::Unsigned => Ok((CBORCase::Unsigned(value).into(), header_varint_len)),
         MajorType::Negative => {
-            if value > (-1 - crate::float::DCBOR_INT_MIN) as u64 {
-                return Err(Error::OutOfRange);
-            }
+            negative(value)?;
             Ok((CBORCase::Negative(value).into(), header_varint_len))
         }
         MajorType::ByteString => {
-            let data_len = value as usize;
+            // A length beyond the address space exceeds any input.
+            let data_len = usize::try_from(value).map_err(|_| Error::Underrun)?;
             let bytes = parse_bytes(&data[header_varint_len..], data_len)?
                 .to_vec()
                 .into();
@@ -136,7 +159,7 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
             ))
         }
         MajorType::Text => {
-            let data_len = value as usize;
+            let data_len = usize::try_from(value).map_err(|_| Error::Underrun)?;
             let buf = parse_bytes(&data[header_varint_len..], data_len)?;
             let string = str::from_utf8(buf)?;
             if !is_nfc(string) {
@@ -145,10 +168,14 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
             Ok((string.into(), header_varint_len + data_len))
         }
         MajorType::Array => {
+            let count = usize::try_from(value).map_err(|_| Error::Underrun)?;
             let mut pos = header_varint_len;
-            let mut items = Vec::new();
-            for _ in 0..value {
-                let (item, item_len) = decode_cbor_internal(&data[pos..])?;
+            // Every element takes at least one byte of the input, so the
+            // reservation is at most the input's remaining length, whatever
+            // count the head claims.
+            let mut items = Vec::with_capacity(count.min(data.len() - header_varint_len));
+            for _ in 0..count {
+                let (item, item_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
                 items.push(item);
                 pos += item_len;
             }
@@ -158,16 +185,16 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
             let mut pos = header_varint_len;
             let mut map = Map::new();
             for _ in 0..value {
-                let (key, key_len) = decode_cbor_internal(&data[pos..])?;
+                let (key, key_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
                 pos += key_len;
-                let (value, value_len) = decode_cbor_internal(&data[pos..])?;
+                let (value, value_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
                 pos += value_len;
                 map.insert_next(key, value)?;
             }
             Ok((map.into(), pos))
         }
         MajorType::Tagged => {
-            let (item, item_len) = decode_cbor_internal(&data[header_varint_len..])?;
+            let (item, item_len) = decode_cbor_internal(&data[header_varint_len..], depth + 1)?;
             let tagged = CBOR::to_tagged_value(value, item);
             Ok((tagged, header_varint_len + item_len))
         }
@@ -196,3 +223,8 @@ fn decode_cbor_internal(data: &[u8]) -> Result<(CBOR, usize)> {
         },
     }
 }
+
+/// Kani harnesses of the checks a scalar item meets after its head (register
+/// item 4): compiled only by `cargo kani`.
+#[cfg(kani)]
+mod proofs;

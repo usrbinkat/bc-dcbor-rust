@@ -1,8 +1,12 @@
 //! User-defined construction-state destructors must never become cleanup.
 use super::*;
+use dcbor::bounded::Allocator;
 use dcbor::bounded::decode::Kind;
-use dcbor::bounded::decode::construction::in_place::{TreeKey, TreeKeyView};
-use dcbor::bounded::decode::construction::reclamation::Written;
+use dcbor::bounded::decode::construction::in_place::{
+    BindingContext, Building, TreeKey, TreeKeyView, build_part, observe_part, reclaim_part,
+    remaining_part, reported,
+};
+use dcbor::bounded::decode::construction::reclamation::{Cleanup, Written};
 use std::collections::BTreeMap;
 
 #[repr(transparent)]
@@ -36,21 +40,37 @@ impl Drop for State {
 // SAFETY: Value has exactly u64's representation and no additional resources.
 // All reclamation is delegated to u64; the enclosing state needs no Drop.
 unsafe impl<A: Allocator> Reclaim<A> for Value {
+    // Its own level and the wrapped scalar's, dispatched as a part.
+    const DISPATCH_DEPTH: usize = <u64 as Reclaim<A>>::DISPATCH_DEPTH + 1;
     type State = State;
     const INITIAL: State = State(Written::Empty);
 
-    fn reclaim_step(slot: Slot<'_, Self, State>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(
+        slot: Slot<'_, Self, State>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
         // SAFETY: transparent representation and the matching u64 state.
         let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
-        u64::reclaim_step(scalar, a)
+        reclaim_part::<u64, A>(scalar, cleanup)
     }
 
     /// The wrapped scalar's own count.
-    fn remaining(slot: PeekSlot<'_, Self, State>) -> u64 {
+    fn remaining(slot: PeekSlot<'_, Self, State>) -> Option<u64> {
         // SAFETY: transparent representation and the matching u64 state; the
         // cast is the projection construction and cleanup use.
         let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
-        <u64 as Reclaim<A>>::remaining(scalar)
+        remaining_part::<u64, A>(scalar)
+    }
+
+    /// The wrapped scalar's own permits: none.
+    fn observe_permits(
+        slot: PeekSlot<'_, Self, State>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        // SAFETY: transparent representation and the matching u64 state; the
+        // cast is the projection construction and cleanup use.
+        let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
+        observe_part::<u64, A>(scalar, sink)
     }
 }
 
@@ -59,77 +79,102 @@ unsafe impl<A: Allocator> Reclaim<A> for Value {
 unsafe impl<A: Allocator> InPlace<A> for Value {
     const COST: ConstructionCost = <u64 as InPlace<A>>::COST;
 
-    fn build_step(
-        document: &Document<'_, A::Permit>,
-        index: usize,
-        slot: Slot<'_, Self, State>,
+    fn build_step<'b>(
+        ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,
-    ) -> ConstructResult<Built, A> {
-        // SAFETY: transparent representation and the matching u64 state.
-        let scalar = unsafe { slot.child(|value| value.cast::<u64>(), |state| &mut state.0) };
-        u64::build_step(document, index, scalar, a)
+    ) -> ConstructResult<Building<'b, Self>, A> {
+        let mut ctx = ctx;
+        let assembly = ctx.assembly();
+        let index = ctx.index();
+        // SAFETY: transparent representation and the matching u64 state,
+        // projected from this value's own slot: the scalar is a part of the
+        // value, from the same node.
+        let scalar = match unsafe {
+            ctx.part(index, |slot| {
+                Ok::<_, core::convert::Infallible>(
+                    slot.child(|value| value.cast::<u64>(), |state| &mut state.0),
+                )
+            })
+        } {
+            Ok(scalar) => scalar,
+            Err(never) => match never {},
+        };
+        let built = build_part::<u64, A>(scalar, a)?;
+        // SAFETY: `Done` is reported only once `build_part` verified the
+        // scalar's record against its place, this value's own by the
+        // transparent representation, so the value is initialized whole.
+        Ok(unsafe { reported(built, assembly) })
     }
 }
 
 /// The tree's decode stopped at turn `stop`, cancelled with its cleanup or,
-/// when `terminal`, dropped with its scope: the turn it ended at, and the
+/// when `terminal`, dropped with its scope, as one recorded run whose
+/// finalizer refines the stream at quiescence: the turn it ended at, and the
 /// boundary valuations the run reached.
 fn run(stop: Option<usize>, terminal: bool) -> (usize, dcbor::bounded::boundary::Reached) {
-    let mut m = meter();
-    let mut owner = scope(&mut m);
-    // Twelve entries require internal nodes and relocation of custody records.
+    // Twelve entries require internal nodes and relocation of custody
+    // records.
     let mut wire = vec![0xac];
     for key in 0..12u8 {
         wire.extend_from_slice(&[key, key]);
     }
-    let input = support::copy(&owner, &mut m, &wire);
-    let mut decoder =
-        TypedDecoder::<_, BTreeMap<Value, Value>, Limits>::new(input, Options::normalizing(8));
     let bound = support::typed_turns::<BTreeMap<Value, Value>>(wire.len());
-    for turn in 0..bound {
-        if stop == Some(turn) {
-            if terminal {
-                drop(decoder);
-                // Exercise the owner's non-refusing terminal cleanup too.
-                drop(owner);
-                assert_eq!(m.live_bytes(), 0);
-                return (turn, m.reached());
-            }
-            decoder.cancel();
-            support::finish_within(&mut m, &mut decoder, bound);
-            drop(decoder);
-            drain(&mut owner, &mut m);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let turn = run.holding(
+            dcbor::bounded::decode::construction::DecodeOwner::<'static, Limits>::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                let turn = owner.decoder::<_, BTreeMap<Value, Value>, _, _>(
+                    policy,
+                    support::Copying(&wire),
+                    Options::normalizing(8),
+                    &Unwitnessed,
+                    |decoder| {
+                        let mut turn = 0;
+                        let published = decoder.controlled(
+                            policy,
+                            bound,
+                            Retirement::Published,
+                            true,
+                            |_, _, at| {
+                                turn = at;
+                                stop == Some(at)
+                            },
+                            |value| {
+                                for key in 0..12u64 {
+                                    assert_eq!(
+                                        value.value().value().get(&Value(key)).unwrap().0,
+                                        key
+                                    );
+                                }
+                            },
+                        )?;
+                        if published.is_some() {
+                            assert!(stop.is_none(), "requested cancellation was not observed");
+                        } else {
+                            assert_eq!(stop, Some(turn), "decode stopped at another boundary");
+                            if !terminal {
+                                decoder.value().cancel();
+                                decoder.finish(policy, bound, Retirement::Published)?;
+                            }
+                        }
+                        Ok::<_, Finding>(turn)
+                    },
+                )??;
+                if !terminal {
+                    owner.drain(policy)?;
+                }
+                Ok::<_, Finding>(turn)
+            },
+        )?;
+        run.with_policy(policy, |m| {
             assert_eq!(m.live_bytes(), 0);
-            return (turn, m.reached());
-        }
-        match support::checked(&mut m, |m| support::contracted(m, &mut decoder)) {
-            Ok(Step::Progress) => {}
-            Err(error) if support::ordinary_exhaustion(&m, &error) => {}
-            Ok(Step::Complete(value)) => {
-                assert!(stop.is_none(), "requested cancellation was not observed");
-                for key in 0..12u64 {
-                    assert_eq!(value.value().get(&Value(key)).unwrap().0, key);
-                }
-                drop(value);
-                drop(decoder);
-                if terminal {
-                    drop(owner);
-                } else {
-                    drain(&mut owner, &mut m);
-                }
-                assert_eq!(m.live_bytes(), 0);
-                return (turn, m.reached());
-            }
-            other => panic!(
-                "unexpected decode outcome: {}",
-                match other {
-                    Ok(_) => "finished without publication",
-                    Err(_) => "decode failed",
-                }
-            ),
-        }
-    }
-    panic!("tree construction exceeded the typed decode's bound");
+            Ok((turn, m.reached()))
+        })
+    })
 }
 
 /// The tree's decode stopped after every number of turns through its

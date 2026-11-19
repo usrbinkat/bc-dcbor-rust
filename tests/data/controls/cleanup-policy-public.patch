@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -80,6 +80,6 @@
+ /// (`cleanup_field.rs`, E0616).
+ pub struct Cleanup<'a, A: Allocator> {
+-    policy: &'a mut A,
++    pub policy: &'a mut A,
+     /// The scope references this step released inside cleanup, deferred
+     /// rather than released in place ([`owned::Worklist`]): the minting
+     /// frame's combinator processes them once the step returns

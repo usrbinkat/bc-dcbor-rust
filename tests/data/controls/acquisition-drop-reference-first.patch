@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -897,6 +897,9 @@
+     /// token owned or cancelled holds nothing, so nothing is settled or
+     /// freed twice. Its scope reference is released after, at this frame.
+     fn drop(&mut self) {
++        // Planted: the scope reference released in place, at its own
++        // frame, before the token's credit is settled.
++        drop(self.scope.take());
+         self.cancel(Performer::None);
+     }
+ }

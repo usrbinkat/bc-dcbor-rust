@@ -2,14 +2,24 @@
 
 ## Independent correctness
 
-- `numeric_profile.rs`: draft-mcnally-deterministic-cbor-12 §7.1 literals
-  through symbolic and bounded encoders, in every exactly representing float
-  source precision; all §7.2 rejection vectors; all 65,536 half patterns;
-  adjacent single- and double-precision values at every finite normal exponent
-  boundary, public extraction refusal for rounded integers, and numeric map-key
-   identity across source precisions; integer-to-float coercion and rejection
-   of fractional float-to-integer conversion. Invalid published vectors name
-   their exact rejection classes.
+- `appendix_a.rs`: Appendix A of the pinned draft revision
+  (`dcbor::DCBOR_DRAFT_REVISION`), compiled in from
+  `data/dcbor-appendix-a.md` and parsed from the draft's own two tables, its
+  revision checked first (planted controls: the neighbouring revisions and no
+  provenance line; malformed rows refused naming their line). Every valid
+  row through the symbolic and bounded encoders from each host value naming
+  it (integers, and each float width holding the value exactly; every width
+  for "any size", every NaN payload of the invalid table for "any payload"),
+  and through both decoders to its value; every invalid row refused by both
+  decoders with the error its reason names.
+- `numeric_profile.rs`: vectors beyond Appendix A through symbolic and bounded
+  encoders, in every exactly representing float source precision, and two
+  rejection vectors beyond it, each naming its exact rejection class; all
+  65,536 half patterns; adjacent single- and double-precision values at every
+  finite normal exponent boundary, public extraction refusal for rounded
+  integers, and numeric map-key identity across source precisions;
+  integer-to-float coercion and rejection of fractional float-to-integer
+  conversion.
 - `normalization.rs`: all five NFC identities for each of 20,034 Unicode
   17.0.0 conformance rows; independently expected long ordered, reversed and
    equal-class combining runs, expansion, and Hangul contraction. Both encoders
@@ -114,7 +124,8 @@ integers are rejected, exactly equal float source types encode identically,
 and negative f32 reduction preserves the input value. Direct construction of
 `CBORCase::Negative` remains a low-level escape hatch; callers can construct
 out-of-profile symbolic values. The bounded encoder accepts `CBOR`, but rejects
-out-of-profile negative values and paths exceeding 128 symbolic nodes.
+out-of-profile negative values and paths exceeding `bounded::SYMBOLIC_DEPTH`
+frames, which the symbolic decoder refuses too (`Error::DepthLimit`).
 
 Run the complete workspace battery with:
 
@@ -140,10 +151,14 @@ cargo doc --no-deps
 
 `fuzz/README.md` records the nine fuzz targets, `owned_lifecycle` among
 them, and their build and smoke commands. Source availability is not evidence that those runs succeeded.
-The bounded module's executable output-owner example demonstrates separate
-output admission through `Prepared::encode_owned` (fallible allocation,
-initialization admission, permit lifetime and discard on write refusal). It is
-not a verified external consumer adapter.
+The bounded module's executable output-owner example demonstrates writing under
+a policy of the caller's own through `Prepared::encode_owned(&mut policy)`: the
+output's release admitted first, its storage then requested from that policy at
+exactly the encoding's length and its permit minted by the call, then the
+initialization and the write admitted; the permit lives with the bytes and a
+refused write discards both. `encoding::owned_emit_bound` is its bound, checked
+against the owned emission in `src/bounded/encoding/writer.rs`. It is not a
+verified external consumer adapter.
 
 `docs/bounded-consumers.md` explains the executable record adapter, borrowed
 decoder, and optional Linux worker isolation example. The latter requires

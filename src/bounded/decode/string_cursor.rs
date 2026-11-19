@@ -1,6 +1,7 @@
 //! Retained parsing and owned UTF-8 construction with an exact output permit.
 use super::cursor::Decoder;
 use super::*;
+use crate::bounded::Custodial;
 
 places! {
     /// The places a [`StringDecoder`] charges, one term of [`string_bound`]
@@ -41,15 +42,41 @@ const fn string_released<P>() -> Unit<StringPlace> {
     const { Unit::written::<(String, Option<P>)>(StringPlace::Copies) }
 }
 
-/// The value's allocation is destroyed before its reservation.
+/// The value's allocation is destroyed before its reservation. It carries
+/// the identity of the owner its acquisition was bound under, immutable for
+/// its life: observational identity only, never settlement authority.
 pub struct OwnedString<P> {
     value: String,
     _permit: P,
+    owner: Identity,
 }
 
 impl<P> OwnedString<P> {
     pub fn value(&self) -> &String {
         &self.value
+    }
+
+    /// The permit its storage holds, read: an observation naming it
+    /// ([`crate::bounded::Releasing::permit_identity`]); never moved or
+    /// released here.
+    pub fn permit(&self) -> &P {
+        &self._permit
+    }
+
+    /// The owner its acquisition was bound under.
+    pub fn owner(&self) -> Identity {
+        self.owner
+    }
+}
+
+impl<P> Custodial<P> for OwnedString<P> {
+    /// Its custody, observed ([`CustodySink`]): one group under its owner,
+    /// holding its permit. Never contended.
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        sink.begin(Some(self.owner));
+        sink.permit(&self._permit, None);
+        sink.end();
+        PermitsObserved::Complete
     }
 }
 
@@ -63,6 +90,9 @@ pub enum Phase {
     Allocate,
     Copy,
     Publish,
+    /// The parse ended in a terminal error: its own cleanup reclaims what
+    /// it holds, one of its units per step, before the decode finishes.
+    ReclaimParser,
     Finished,
 }
 
@@ -75,16 +105,41 @@ pub struct Position {
 
 /// Holds parser storage until construction completes. Source text is borrowed
 /// from immutable input, while the completed string owns its copied payload.
-pub struct StringDecoder<'a, P> {
-    parser: Decoder<'a, P>,
+///
+/// The decode is the custody of its string's one acquisition. Made with no
+/// policy, it takes its owner ([`Owner`]) at that acquisition's first entry
+/// (`Release`), minted by the policy that enters it and kept for the
+/// decode's life; the acquisition's identity is minted once, at the same
+/// entry, and kept across every refused request and every change of policy
+/// until the grant. Every later entry (`Allocate`) validates the performing
+/// policy against that owner before requesting anything
+/// ([`Budget::validate_owner`]). The release admitted for the string is held
+/// here ([`Retained`], its origin the family that admitted it) from
+/// `Release` until the grant spends it at the permit, or a terminal error
+/// forfeits it.
+pub struct StringDecoder<'a, P, O: Origin> {
+    parser: Decoder<'a, P, O>,
     document: Option<Document<'a, P>>,
     source: &'a str,
     value: String,
     permit: Option<P>,
+    owner: Option<Owner>,
+    acquisition: Option<Acquisition<O>>,
+    release: Option<Retained<O>>,
     phase: Phase,
 }
 
-impl<'a, P> StringDecoder<'a, P> {
+/// A decode dropped with its acquisition still bound is that acquisition's
+/// destruction: the release it holds forfeited into its origin, then the
+/// acquisition ended, both with no policy performing them
+/// ([`StringDecoder::cancel_acquisition`]). Allocation-free, non-unwinding.
+impl<P, O: Origin> Drop for StringDecoder<'_, P, O> {
+    fn drop(&mut self) {
+        self.cancel_acquisition(Performer::None);
+    }
+}
+
+impl<'a, P, O: Origin> StringDecoder<'a, P, O> {
     pub fn new(input: &'a [u8], options: Options) -> Self {
         Self {
             parser: Decoder::new(input, options),
@@ -92,6 +147,9 @@ impl<'a, P> StringDecoder<'a, P> {
             source: "",
             value: String::new(),
             permit: None,
+            owner: None,
+            acquisition: None,
+            release: None,
             phase: Phase::Parse,
         }
     }
@@ -103,23 +161,92 @@ impl<'a, P> StringDecoder<'a, P> {
             copied_bytes: self.value.len(),
         }
     }
+}
 
-    pub fn step<A: Allocator<Permit = P>>(
+impl<P, O: Origin> Custodial<P> for StringDecoder<'_, P, O> {
+    /// The decode's custody, observed once ([`CustodySink`]): its own group
+    /// under the owner of its string's acquisition (deferred until that
+    /// acquisition's first entry takes it), holding the string's release from
+    /// `Release` until its grant and the string's permit from its grant
+    /// until publication; inside it, the parser's components
+    /// ([`super::cursor::ParserContinuation::observe_custody`]) and the
+    /// parsed document while it is held ([`Document::observe_custody`]),
+    /// each under its own stored owner. Read from its state alone: it
+    /// allocates, admits, mints, publishes and settles nothing. Never
+    /// contended.
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<P>) -> PermitsObserved {
+        sink.begin(self.owner.as_ref().map(Owner::id));
+        // The bound acquisition, credit or none, from its bind to its end.
+        if let Some(acquisition) = &self.acquisition {
+            sink.bound(acquisition.id());
+        }
+        if let Some(release) = &self.release
+            && release.remaining() != WriteWork::default()
+        {
+            sink.held(release.observation());
+        }
+        if let Some(permit) = &self.permit {
+            sink.permit(permit, None);
+        }
+        let mut observed = self.parser.observe_custody(sink);
+        if let Some(document) = &mut self.document {
+            observed = observed_all([observed, document.observe_custody(sink)]);
+        }
+        sink.end();
+        observed
+    }
+}
+
+impl<P, O: Origin> StringDecoder<'_, P, O> {
+    /// The credit this decode's custody holds: the checked fold of its
+    /// observation ([`Self::observe_custody`], [`total_held`]). `None` when
+    /// the sum does not fit. The public conservation observation of the
+    /// decode: read beside its policies' [`crate::bounded::Limits::credits`],
+    /// it is the `held` that [`crate::bounded::Credits::conserved_with`]
+    /// checks.
+    pub fn held_credit(&mut self) -> Option<WriteWork> {
+        total_held(|sink| self.observe_custody(sink))
+    }
+
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> ConstructResult<Step<OwnedString<P>>, A> {
+        let entered = self.phase;
         let result = self.advance(allocator);
         if matches!(&result, Err(error) if !matches!(error, DecodeError::Resource(BoundedError::Refused(_))))
         {
+            // A terminal error before the string's grant forfeits the release
+            // held for it into its origin, then ends its acquisition; a
+            // granted one spent it and ended it already.
+            self.cancel_acquisition(allocator.performer());
             self.value = String::new();
             self.permit = None;
             self.document = None;
-            self.phase = Phase::Finished;
+            // A parse that failed still holds its arenas, left to its own
+            // cleanup; once it has published, it holds nothing.
+            self.phase = match entered {
+                Phase::Parse | Phase::ReclaimParser => Phase::ReclaimParser,
+                _ => Phase::Finished,
+            };
         }
         result
     }
 
-    fn advance<A: Allocator<Permit = P>>(
+    /// The bound acquisition cancelled, `by` the performer: its release, if
+    /// held, forfeited ([`Forfeit::Cancelled`]) into its origin, then its
+    /// capability ended, once; nothing when none is bound. The one
+    /// cancellation of a terminal error and of a drop.
+    fn cancel_acquisition(&mut self, by: Performer) {
+        if let Some(release) = self.release.take() {
+            release.forfeit(Forfeit::Cancelled, None, by);
+        }
+        if let Some(acquisition) = self.acquisition.take() {
+            acquisition.end(by);
+        }
+    }
+
+    fn advance<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> ConstructResult<Step<OwnedString<P>>, A> {
@@ -142,16 +269,75 @@ impl<'a, P> StringDecoder<'a, P> {
                 self.phase = Phase::Release;
             }
             Phase::Release => {
-                string_released::<P>().admit(allocator)?;
+                // The decode's owner, taken at its first acquisition entry and
+                // kept; the acquisition's identity, minted once and kept across
+                // a refused admission below, so a retry never mints again.
+                if self.owner.is_none() {
+                    self.owner = Some(allocator.owner().map_err(BoundedError::Refused)?);
+                }
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                let acquisition = match &self.acquisition {
+                    Some(acquisition) => acquisition.id(),
+                    None => {
+                        let minted = allocator
+                            .acquisition(owner)
+                            .map_err(BoundedError::Refused)?;
+                        let id = minted.id();
+                        self.acquisition = Some(minted);
+                        id
+                    }
+                };
+                // Held from here until the grant: this decode is its custody
+                // across a refused request ([`Self::held_credit`]). The route
+                // validates the performing policy against the owner first.
+                let release = string_released::<P>().admit_held(
+                    allocator,
+                    Obligation::Release,
+                    owner,
+                    acquisition,
+                )?;
+                self.release = Some(release);
                 self.phase = Phase::Allocate;
             }
             Phase::Allocate => {
+                // A resumed entry, possibly under another policy: validated
+                // against the decode's owner before anything is requested.
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?;
+                allocator
+                    .validate_owner(owner)
+                    .map_err(BoundedError::Refused)?;
+                let acquisition = self
+                    .acquisition
+                    .as_ref()
+                    .ok_or(BoundedError::PlanMismatch)?
+                    .id();
                 let bytes = widen(self.source.len())?;
                 let permit = at(StringPlace::Copies, || allocator.allocate(bytes))
                     .map_err(BoundedError::Refused)?;
-                self.value
-                    .try_reserve_exact(self.source.len())
-                    .map_err(|_| BoundedError::Allocation { bytes })?;
+                let id = A::permit_identity(&permit);
+                let by = allocator.performer();
+                // Granted: the release is spent at the permit, which carries
+                // it and whose drop performs it on every path below.
+                self.release
+                    .take()
+                    .ok_or(BoundedError::PlanMismatch)?
+                    .spend(Some(id), by);
+                // A failed reservation's permit is dropped inside this step
+                // ([`reserved`]).
+                let (value, length) = (&mut self.value, self.source.len());
+                let reservation = reserved(allocator, permit, acquisition, || {
+                    value
+                        .try_reserve_exact(length)
+                        .map_err(|_| Forfeit::AcquisitionFailed)
+                });
+                // The acquisition ends with its physical outcome, its one
+                // obligation spent: `cancel_acquisition` finds no release.
+                self.cancel_acquisition(by);
+                let Ok((permit, ())) = reservation else {
+                    // The decode holds nothing any more and ends.
+                    self.phase = Phase::Finished;
+                    return Err(BoundedError::Allocation { bytes }.into());
+                };
                 self.permit = Some(permit);
                 self.phase = Phase::Copy;
                 return self.advance(allocator);
@@ -172,13 +358,25 @@ impl<'a, P> StringDecoder<'a, P> {
             }
             Phase::Publish => {
                 PUBLISH.admit(allocator)?;
+                // The string carries the owner its acquisition was bound
+                // under, the one this decode stored at its first entry.
+                let owner = self.owner.as_ref().ok_or(BoundedError::PlanMismatch)?.id();
                 let permit = self.permit.take().ok_or(BoundedError::PlanMismatch)?;
                 self.document = None;
                 self.phase = Phase::Finished;
                 return Ok(Step::Complete(OwnedString {
                     value: core::mem::take(&mut self.value),
                     _permit: permit,
+                    owner,
                 }));
+            }
+            // The parse's cleanup, a term of the parse's own bound
+            // ([`super::cursor::retained_decode_bound`] covers any failure
+            // and the cleanup after it).
+            Phase::ReclaimParser => {
+                if at(StringPlace::Parse, || self.parser.reclaim_step(allocator))? {
+                    self.phase = Phase::Finished;
+                }
             }
             Phase::Finished => return Ok(Step::Finished),
         }
@@ -192,11 +390,18 @@ impl<'a, P> StringDecoder<'a, P> {
 /// is held throughout; the inspection; the string's release, admitted before
 /// it is requested, and its allocation of at most every input byte; its
 /// copies in units of at least 61 bytes (64 less a scalar's continuation
-/// bytes), every byte once; and publication. A terminal error releases
-/// everything at once, each release paid for by its acquisition. The string
-/// is what publication retains.
-pub fn string_bound<P, R>(input: u64, options: Options) -> Result<ResourceBound, BoundedError<R>> {
-    StringTerms::of::<P, R>(input, options)?.bound()
+/// bytes), every byte once; and publication. A terminal error releases the
+/// document and the string at once, each release paid for by its
+/// acquisition; one of the parse is followed by the parse's own cleanup,
+/// within the parse's term. The string
+/// is what publication retains. `O` is the policy's credit origin
+/// ([`Budget::Origin`]), of which the parse's custody holds credit
+/// ([`super::cursor::retained_decode_bound`]).
+pub fn string_bound<P, O: Origin, R>(
+    input: u64,
+    options: Options,
+) -> Result<ResourceBound, BoundedError<R>> {
+    StringTerms::of::<P, O, R>(input, options)?.bound()
 }
 
 /// The terms [`string_bound`] sums, one per [`StringPlace`].
@@ -208,21 +413,26 @@ struct StringTerms {
 }
 
 impl StringTerms {
-    fn of<P, R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
+    fn of<P, O: Origin, R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
         // Every copy before the last covers at most a scalar's continuation
         // bytes short of a quantum; the last is partial.
         let copies = add(input.div_ceil(COPIED), 1)?;
         let released = string_released::<P>().times(1)?;
+        // The string's release admitted, then the string requested at every
+        // input byte, held and kept, and copied into.
+        let string = ResourceBound {
+            values: mul(copies, COPY.values())?,
+            bytes: input,
+            allocated: input,
+            peak: input,
+            retained: input,
+        };
         Ok(Self {
-            parse: super::cursor::retained_decode_bound::<P, R>(input, options)?,
+            parse: super::cursor::retained_decode_bound::<P, O, R>(input, options)?,
             inspection: INSPECT.times(1)?,
-            copies: ResourceBound {
-                values: add(mul(copies, COPY.values())?, released.values)?,
-                bytes: add(input, released.bytes)?,
-                allocated: input,
-                peak: input,
-                retained: input,
-            },
+            copies: ResourceBound::of_work(released)
+                .checked_then(string)
+                .ok_or(BoundedError::Overflow)?,
             publication: PUBLISH.times(1)?,
         })
     }
@@ -247,11 +457,16 @@ impl Places for StringTerms {
 
     /// The document is held throughout: the string is built beside it.
     fn peak<R>(&self) -> Result<u64, BoundedError<R>> {
-        self.parse.then::<R>(self.copies).map(|bound| bound.peak)
+        self.parse
+            .checked_then(self.copies)
+            .map(|bound| bound.peak)
+            .ok_or(BoundedError::Overflow)
     }
 }
 
-impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for StringDecoder<'a, P> {
+impl<'a, P, O: Origin, A: Allocator<Permit = P, Origin = O>> Resumable<A>
+    for StringDecoder<'a, P, O>
+{
     type Output = OwnedString<P>;
     type Error = DecodeError<A::Refusal>;
     type Position = Position;
@@ -264,6 +479,11 @@ impl<'a, P, A: Allocator<Permit = P>> Resumable<A> for StringDecoder<'a, P> {
         StringDecoder::position(self)
     }
 }
+
+/// Kani harness of the string decode's whole-operation bound (register item
+/// 4): compiled only by `cargo kani`.
+#[cfg(kani)]
+mod proofs;
 
 /// Place attribution of a string decode, which this crate's tests record
 /// under `std`.
@@ -344,8 +564,8 @@ mod attribution {
         let mut strings = Vec::new();
         for (name, place, input, text) in &inputs {
             let mut policy = Ledgered::new();
-            let mut decoder = StringDecoder::<Permit>::new(input, options);
-            let bound = string_bound::<Permit, ()>(input.len() as u64, options).unwrap();
+            let mut decoder = StringDecoder::<Permit, ()>::new(input, options);
+            let bound = string_bound::<Permit, (), ()>(input.len() as u64, options).unwrap();
             within(name, bound, || match decoder.step(&mut policy) {
                 Ok(Step::Progress) => ControlFlow::Continue(()),
                 Ok(Step::Complete(string)) => {
@@ -362,11 +582,11 @@ mod attribution {
             if let Some(place) = place {
                 witnesses.push((runs.len(), *place));
             }
-            let terms = StringTerms::of::<Permit, ()>(input.len() as u64, options).unwrap();
+            let terms = StringTerms::of::<Permit, (), ()>(input.len() as u64, options).unwrap();
             places::nested(
                 StringPlace::Parse,
                 terms.parse,
-                super::super::cursor::retained_decode_bound::<Permit, ()>(
+                super::super::cursor::retained_decode_bound::<Permit, (), ()>(
                     input.len() as u64,
                     options,
                 )

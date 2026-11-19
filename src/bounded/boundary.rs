@@ -5,7 +5,7 @@
 //!
 //! Every such comparison goes through this module: a limit comparison
 //! through a [`Bound`], whose methods are its only comparisons, and any other
-//! predicate through [`boundary!`]. Each records its valuation to the policy
+//! predicate through `boundary!`. Each records its valuation to the policy
 //! it was given ([`Budget::boundary`]) and returns exactly the result of the
 //! comparison it replaces: recording is observation, in every build, and
 //! never changes control flow or a result. A policy that does not record
@@ -105,6 +105,21 @@ named! {
         /// reached: which field's place the next unit projects, present or
         /// omitted.
         Field = "field",
+        /// A map key's canonical bytes against its immediate predecessor's,
+        /// after numeric reduction, where the source claims canonical order
+        /// (the ordered-entries check, `dynamic.rs` `Verify`):
+        /// [`Valuation::Below`] strictly before it, refused as misordered;
+        /// [`Valuation::At`] equal to it, a collision, refused;
+        /// [`Valuation::Past`] strictly after it, in order.
+        KeyOrder = "key-order",
+        /// The later run's current merge candidate key against the earlier
+        /// run's, in a merge of two sorted runs of map keys (`maps/order.rs`;
+        /// heads merging forward, tails merging backward), after numeric
+        /// reduction. The two are not adjacent in the input or the output:
+        /// [`Valuation::Below`] and [`Valuation::Past`] are ordinary merge
+        /// decisions, which candidate is written next; [`Valuation::At`] is
+        /// a collision, refused.
+        MergeOrder = "merge-order",
     }
 }
 
@@ -231,13 +246,22 @@ pub fn compare<B: Budget + ?Sized, T: Measure>(
     }
     budget.boundary(Boundary {
         predicate,
-        valuation: match ordering {
-            Ordering::Less => Valuation::Below,
-            Ordering::Equal => Valuation::At,
-            Ordering::Greater => Valuation::Past,
-        },
+        valuation: side(ordering),
     });
     ordering
+}
+
+/// The side of its reference an ordering names: [`Valuation::Below`] for
+/// `Less`, [`Valuation::At`] for `Equal`, [`Valuation::Past`] for `Greater`.
+/// The one mapping of an ordering to a valuation, a limit's
+/// ([`compare`]), a predecessor key's ([`Predicate::KeyOrder`]) and a merge
+/// candidate's ([`Predicate::MergeOrder`]) alike.
+pub const fn side(ordering: Ordering) -> Valuation {
+    match ordering {
+        Ordering::Less => Valuation::Below,
+        Ordering::Equal => Valuation::At,
+        Ordering::Greater => Valuation::Past,
+    }
 }
 
 /// Record that `predicate` reached `valuation`: a predicate that is not a
@@ -458,11 +482,55 @@ mod tests {
     /// A policy that does not record makes the seam a plain comparison.
     #[test]
     fn a_policy_that_records_nothing_still_gets_the_comparison() {
+        use crate::bounded::{Effect, Hold, Identity, Owner, Performer, WriteWork};
+        /// A budget that records nothing: every admission accepted, no
+        /// credit family (`()`), no identities, no performer.
         struct Silent;
         impl Budget for Silent {
             type Refusal = ();
             fn traverse(&mut self, _: u64, _: u64) -> Result<(), ()> {
                 Ok(())
+            }
+
+            type Origin = ();
+
+            fn origin(&self) {}
+
+            fn admitted(&mut self, _: WriteWork) {}
+
+            fn identify(&mut self) -> Result<Identity, ()> {
+                Ok(Identity::UNOBSERVED)
+            }
+
+            fn held(&mut self, _: WriteWork, _: Hold) {}
+
+            fn effect(&mut self, _: Effect) {}
+
+            fn owner(&mut self) -> Result<Owner, ()> {
+                Ok(Owner::unobserved())
+            }
+
+            fn acquisition(
+                &mut self,
+                owner: &Owner,
+            ) -> Result<crate::bounded::Acquisition<()>, ()> {
+                self.validate_owner(owner)?;
+                crate::bounded::Acquisition::unobserved(owner).ok_or(())
+            }
+
+            /// An ordinary budget pairs only with an ordinary owner: a
+            /// recorded one is refused, and its session invalidated,
+            /// stickily ([`Budget::validate_owner`]).
+            fn validate_owner(&mut self, owner: &Owner) -> Result<(), ()> {
+                if owner.recorded_in_any() {
+                    owner.invalidate();
+                    return Err(());
+                }
+                Ok(())
+            }
+
+            fn performer(&self) -> Performer {
+                Performer::None
             }
         }
         let bound = Bound::new(Predicate::Quantum, 64u64);
@@ -526,6 +594,60 @@ mod tests {
         );
         assert_eq!(Reached::parse_row("relocation\tsideways"), None);
         assert_eq!(Reached::parse_row("relocation"), None);
+    }
+
+    /// A key's order against its predecessor is named `key-order` and a
+    /// merge candidate's `merge-order`, the last two predicates, distinct; each
+    /// ordering names its side, and each side reached by either round-trips
+    /// through its own row, never the other's.
+    #[test]
+    fn key_and_merge_order_name_each_side_apart() {
+        assert_eq!(Predicate::KeyOrder.name(), "key-order");
+        assert_eq!(Predicate::MergeOrder.name(), "merge-order");
+        assert_eq!(Predicate::parse("key-order"), Some(Predicate::KeyOrder));
+        assert_eq!(Predicate::parse("merge-order"), Some(Predicate::MergeOrder));
+        assert_eq!(Predicate::KeyOrder.index(), Predicate::COUNT - 2);
+        assert_eq!(Predicate::MergeOrder.index(), Predicate::COUNT - 1);
+        assert_eq!(
+            [
+                side(Ordering::Less),
+                side(Ordering::Equal),
+                side(Ordering::Greater)
+            ],
+            [Valuation::Below, Valuation::At, Valuation::Past]
+        );
+        for (predicate, name) in [
+            (Predicate::KeyOrder, "key-order"),
+            (Predicate::MergeOrder, "merge-order"),
+        ] {
+            let mut a = Limits::unlimited();
+            let mut expected = Reached::new();
+            for ordering in [Ordering::Less, Ordering::Equal, Ordering::Greater] {
+                boundary!(&mut a, predicate => side(ordering));
+                expected.insert(Boundary {
+                    predicate,
+                    valuation: side(ordering),
+                });
+            }
+            let reached = a.reached();
+            assert_eq!(reached, expected);
+            let rows: alloc::vec::Vec<_> = reached.rows().collect();
+            assert_eq!(
+                rows,
+                ["below", "at", "past"].map(|side| alloc::format!("{name}\t{side}"))
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| Reached::parse_row(row))
+                    .collect::<alloc::vec::Vec<_>>(),
+                [Valuation::Below, Valuation::At, Valuation::Past].map(|valuation| Some(
+                    Boundary {
+                        predicate,
+                        valuation
+                    }
+                ))
+            );
+        }
     }
 
     /// A reached set missing a valuation the other reached names it, and a

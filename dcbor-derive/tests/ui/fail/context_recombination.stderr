@@ -1,0 +1,11 @@
+error[E0599]: no method named `origin` found for struct `dcbor::bounded::decode::construction::Context<'b, 'c, 's, 'a, T, S, A>` in the current scope
+  --> tests/ui/fail/context_recombination.rs:17:13
+   |
+17 |     foreign.origin().context(index, own.into_slot())
+   |             ^^^^^^ method not found in `dcbor::bounded::decode::construction::Context<'b, 'c, 's, 'a, u64, dcbor::bounded::decode::construction::Written, A>`
+
+error[E0599]: no method named `origin` found for struct `dcbor::bounded::decode::construction::Context<'b, 'c, 's, 'a, T, S, A>` in the current scope
+  --> tests/ui/fail/context_recombination.rs:29:26
+   |
+29 |         .map(|_| foreign.origin().context(index, own.into_slot()))
+   |                          ^^^^^^ method not found in `dcbor::bounded::decode::construction::Context<'b, 'c, 's, 'a, u64, dcbor::bounded::decode::construction::Written, A>`

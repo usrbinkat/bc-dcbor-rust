@@ -76,11 +76,12 @@ fn nested_keys(levels: usize) -> CBOR {
     let mut value = CBOR::from(0u64);
     for level in 0..levels {
         let mut map = Map::new();
-        map.insert(value.clone(), level as u64);
+        map.insert(value.clone(), level as u64).unwrap();
         map.insert(
             CBOR::from(vec![value.clone(), CBOR::from(level as u64)]),
             1u64,
-        );
+        )
+        .unwrap();
         value = CBOR::from(map);
     }
     value
@@ -149,14 +150,18 @@ fn the_bound_covers_normalization_fallback_and_its_rejection() {
 #[test]
 fn the_bound_covers_records_and_arbitrary_bytes() {
     let mut record = Map::new();
-    record.insert(0u64, ByteString::new(vec![0xa5u8; 16]));
-    record.insert(1u64, u64::MAX);
-    record.insert(2u64, "sha256:00ff");
-    record.insert(
-        3u64,
-        vec![CBOR::from(true), CBOR::null(), CBOR::from(1.5f64)],
-    );
-    record.insert(4u64, nested_keys(2));
+    record
+        .insert(0u64, ByteString::new(vec![0xa5u8; 16]))
+        .unwrap();
+    record.insert(1u64, u64::MAX).unwrap();
+    record.insert(2u64, "sha256:00ff").unwrap();
+    record
+        .insert(
+            3u64,
+            vec![CBOR::from(true), CBOR::null(), CBOR::from(1.5f64)],
+        )
+        .unwrap();
+    record.insert(4u64, nested_keys(2)).unwrap();
     let input = CBOR::from(record).to_cbor_data();
     assert!(covered(&input, 8));
     covered_with_prefixes(&input);

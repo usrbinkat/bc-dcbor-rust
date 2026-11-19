@@ -83,28 +83,28 @@ pub struct PermutationPosition {
     pub bitmap_bytes: usize,
 }
 
-pub(super) struct Permutation<P> {
-    pub(super) visited: Storage<u8, P>,
+pub(super) struct Permutation<P, O: Origin> {
+    pub(super) visited: Storage<u8, P, O>,
     position: PermutationPosition,
     pub(super) saved: u8,
 }
 
-impl<P> Permutation<P> {
+impl<P, O: Origin> Permutation<P, O> {
     /// Every unit of [`Self::initialize_step`]: the bitmap arena, the nine
     /// position fields, and the saved byte. The position exceeds one admitted
     /// write, so its fields are written separately.
-    pub const INIT_STEPS: usize = Storage::<u8, P>::INIT_STEPS + 10;
+    pub const INIT_STEPS: usize = Storage::<u8, P, O>::INIT_STEPS + 10;
 
     /// Initialize one unit of the empty permutation [`Self::new`] builds in
     /// `slot`, its destination paired with its units initialized: the bitmap
     /// arena, then one field per unit. An incomplete prefix owns nothing.
     /// Refused once initialized.
-    pub fn initialize_step<A: Allocator<Permit = P>>(
+    pub fn initialize_step<A: Allocator<Permit = P, Origin = O>>(
         mut slot: reclamation::Slot<'_, Self, usize>,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
         use decode::initialization::{init_field, init_part};
-        let storage = Storage::<u8, P>::INIT_STEPS;
+        let storage = Storage::<u8, P, O>::INIT_STEPS;
         let units = *slot.custody();
         if Bound::new(Predicate::Prefix, storage).below(a, units) {
             init_part!(slot, visited, 0, a, |visited| Storage::initialize_step(
@@ -136,8 +136,12 @@ impl<P> Permutation<P> {
     }
 
     /// One admitted unit releasing the visited bitmap; true once released.
-    /// The caller supplies the place.
-    pub fn reclaim_step<A: Allocator<Permit = P>>(&mut self, a: &mut A) -> BoundedResult<bool, A> {
+    /// The caller supplies the place. Bounded on [`Releasing`]: no new
+    /// allocation through the supplied cleanup capability.
+    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<bool, A> {
         self.visited.reclaim_copy_step(a)
     }
 
@@ -158,14 +162,14 @@ impl<P> Permutation<P> {
 
     /// The visited bitmap, settled; or, while it relocates, one unit of its
     /// relocation as the step's work and `None`.
-    fn settled<'s, A: Allocator<Permit = P>>(
-        visited: &'s mut Storage<u8, P>,
+    fn settled<'s, A: Allocator<Permit = P, Origin = O>>(
+        visited: &'s mut Storage<u8, P, O>,
         a: &mut A,
     ) -> BoundedResult<Option<&'s mut Owned<u8, P>>, A> {
         at(PreparationPlace::Visited, || visited.settle_step(a))
     }
 
-    pub fn step<A: Allocator<Permit = P>>(
+    pub fn step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         entries: &mut [Entry],
         bytes: &mut [u8],

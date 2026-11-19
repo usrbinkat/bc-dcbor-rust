@@ -1,0 +1,12 @@
+--- src/varint.rs
++++ src/varint.rs
+@@ -66,7 +66,8 @@
+     const fn resolved(self) -> (u8, usize, u64) {
+         match self {
+             Self::Shortest(value) => {
+-                if value <= 23 {
++                // Planted: 24 written in the initial byte, the one-byte marker.
++                if value <= 24 {
+                     (value as u8, 0, value)
+                 } else if value <= u8::MAX as u64 {
+                     (ONE_BYTE, 1, value)

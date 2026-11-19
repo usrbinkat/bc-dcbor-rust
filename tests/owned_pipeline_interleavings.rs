@@ -1,55 +1,34 @@
 //! Shared-owner independence and cross-thread plan retirement through the
-//! production owned pipeline. No test-owned lifecycle substitute is used.
+//! production owned pipeline, every value held by the run's holdings from
+//! its acquisition to its retirement. No test-owned lifecycle substitute is
+//! used.
 #![cfg(feature = "std")]
 #![forbid(unsafe_code)]
 use dcbor::ByteString;
 use dcbor::bounded::decode::Options;
+use dcbor::bounded::decode::construction::DecodeOwner;
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
-use dcbor::bounded::decode::construction::{DecodeOwner, TypedValue};
 use dcbor::bounded::encoding::{OwnedPreparation, OwnedPrepared};
-use dcbor::bounded::{Limits, Step};
-use dcbor_test_support as support;
+use dcbor::bounded::{Answer, Call, Custodial, Event, Limits, Reservation};
+use dcbor_test_support::{
+    self as support, CustodyBatch, Finding, Holding, Lent, PolicyId, Retirement, Scope,
+    pipeline::Unwitnessed,
+};
 
-fn meter() -> Limits {
-    Limits::unlimited().logged().strict()
-}
+/// A preparation of a decoded text, and the plan it publishes.
+type Preparation = OwnedPreparation<'static, ByteString, String, Limits>;
+type Plan = OwnedPrepared<'static, ByteString, String, Limits>;
 
-/// `text` decoded into a value held by `owner`'s scope.
-fn decoded(
-    owner: &DecodeOwner<'static, Limits>,
-    m: &mut Limits,
-    text: &str,
-) -> TypedValue<'static, ByteString, String, Limits> {
-    let wire = dcbor::CBOR::from(text).to_cbor_data();
-    let input = support::copy(owner, m, &wire);
-    support::decode(m, input, Options::normalizing(8)).expect("typed construction failed")
-}
-
-/// One checked turn of an optional preparation; its plan once published, the
-/// preparation then retired.
-fn advance(
-    m: &mut Limits,
-    operation: &mut Option<OwnedPreparation<'static, ByteString, String, Limits>>,
-) -> Option<OwnedPrepared<'static, ByteString, String, Limits>> {
-    let preparation = operation.as_mut()?;
-    match support::checked(m, |m| support::contracted(m, preparation)) {
-        Ok(Step::Progress) => None,
-        Ok(Step::Complete(plan)) => {
-            support::exhausted(m, preparation);
-            *operation = None;
-            Some(plan)
-        }
-        Err(error) if support::ordinary_exhaustion(m, &error) => None,
-        other => panic!("preparation failed: {}", support::label(&other)),
-    }
-}
+/// The two texts the interleaved preparations encode: the first takes the
+/// retained normalization path, the second is plain.
+const TEXTS: [&str; 2] = ["\u{301}\u{301}\u{301}", "independent value"];
 
 /// The turns preparing `value` may take: its owned preparation's bound
 /// (`encoding::owned_prepare_bound`) of the value's own shape.
-fn preparation_turns(value: &TypedValue<'static, ByteString, String, Limits>) -> usize {
+fn preparation_turns(value: &impl dcbor::bounded::encoding::Schema) -> usize {
     support::turns(
         dcbor::bounded::encoding::owned_prepare_bound::<ByteString, String, Limits, ()>(
-            support::shape(value.value()),
+            support::shape(value),
         )
         .expect("the preparation bound of a decoded value fits in u64"),
     )
@@ -97,137 +76,553 @@ impl Interleaving {
     }
 }
 
+/// What one interleaved run observed: the first preparation's boundaries
+/// while it is live, each the cleanup class of its state there
+/// (`classes::prepare`), the `k`th observed where a cut of `k` retires it;
+/// and the retirement's cleanup: every call admitted during retirement,
+/// by the scope's queue steps after the cut, then by its final drain, the survivor's own
+/// turns and its plan's emission excluded. An uncut run's cleanup is the
+/// drain of the plans alone.
+struct Interleaved {
+    boundaries: Vec<Option<support::classes::Class>>,
+    cleanup: Vec<Call>,
+}
+
+/// Disjoint recording intervals owned by retirement and queue cleanup.
+/// Survivor execution lies between intervals and is excluded.
+struct RetirementTrace {
+    boundaries: Vec<Option<support::classes::Class>>,
+    intervals: Vec<std::ops::Range<usize>>,
+    drain_start: usize,
+}
+
 /// Prepare two values in one scope in `interleaving`, retiring the first
 /// preparation after its `cut`th turn while the second continues and the
-/// scope drains the first's records between turns. Returns the first
-/// preparation's turns.
-fn interleave(cut: Option<usize>, interleaving: Interleaving) -> usize {
-    let mut m = meter();
-    let mut owner = support::scope(&mut m);
-    let first = decoded(&owner, &mut m, "\u{301}\u{301}\u{301}");
-    let second = decoded(&owner, &mut m, "independent value");
+/// scope steps its queue between turns, as one recorded run. The two
+/// preparations, and the plans they publish, are held side by side
+/// ([`CustodyBatch`]), each turn taken by drawing its preparation and
+/// depositing it back, or its plan, so every turn is checkpointed with both
+/// in custody ([`Interleaved`]).
+fn interleave(cut: Option<usize>, interleaving: Interleaving) -> Interleaved {
+    let cleanup = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let boundaries = support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let mut trace = run.scoped(policy, &Unwitnessed, |owner| {
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let scope = view.value().get();
+                view.holding(
+                    CustodyBatch::<Preparation>::slots(2),
+                    Retirement::Exhausted,
+                    |operations| {
+                        operations.lending(Retirement::Exhausted, Lent::new, |operations| {
+                            let preparations = operations.value().get();
+                            operations.holding(
+                                CustodyBatch::<Plan>::slots(2),
+                                Retirement::Exhausted,
+                                |plans| {
+                                    plans.lending(Retirement::Exhausted, Lent::new, |plans| {
+                                        let published = plans.value().get();
+                                        interleaved(
+                                            plans,
+                                            policy,
+                                            Shared {
+                                                scope,
+                                                preparations,
+                                                plans: published,
+                                            },
+                                            cut,
+                                            interleaving,
+                                        )
+                                    })
+                                },
+                            )
+                        })
+                    },
+                )
+            })
+        })?;
+        trace.intervals.push(trace.drain_start..run.boundary());
+        let cleanup = cleanup.clone();
+        run.inspect_evidence(move |observed, _| {
+            let mut previous_end = 0;
+            let mut calls = cleanup.borrow_mut();
+            for interval in trace.intervals {
+                assert!(
+                    previous_end <= interval.start && interval.start <= interval.end,
+                    "cleanup intervals overlap or run backwards: {interval:?}"
+                );
+                previous_end = interval.end;
+                calls.extend(observed[interval].iter().filter_map(|observation| {
+                    match observation.event {
+                        Event::Call(_, Answer::Refused { .. }) => None,
+                        Event::Call(call, _) => Some(call),
+                        _ => None,
+                    }
+                }));
+            }
+        });
+        Ok(trace.boundaries)
+    });
+    let cleanup = std::mem::take(&mut *cleanup.borrow_mut());
+    Interleaved {
+        boundaries,
+        cleanup,
+    }
+}
+
+/// What the interleaved schedule shares from the holdings around it: the
+/// scope's authority, the preparations' slots and the plans' slots.
+struct Shared<'v> {
+    scope: &'v DecodeOwner<'static, Limits>,
+    preparations: &'v CustodyBatch<Preparation>,
+    plans: &'v CustodyBatch<Plan>,
+}
+
+/// [`interleave`]'s schedule, under `holding`, the innermost of the
+/// holdings that lend `shared`: both preparations made and deposited, their
+/// turns taken in `interleaving`, the first retired at its `cut`th turn, the
+/// scope stepped after every turn; then the second's plan emitted to its
+/// exact bytes and both plans retired. A driver's stop is the run's
+/// finding. Returns the boundaries and disjoint cleanup intervals, followed
+/// by the start of the final drain ([`RetirementTrace`]).
+fn interleaved<H: Custodial<Reservation>>(
+    holding: &mut Holding<'_, '_, H, Unwitnessed>,
+    policy: PolicyId,
+    shared: Shared<'_>,
+    cut: Option<usize>,
+    interleaving: Interleaving,
+) -> Result<RetirementTrace, Finding> {
+    let Shared {
+        scope,
+        preparations,
+        plans,
+    } = shared;
     // Every turn advances one live preparation, so their bounds together
     // bound the turns.
-    let turns = preparation_turns(&first) + preparation_turns(&second);
-    let mut a = Some(OwnedPreparation::prepare(first));
-    let mut b = Some(OwnedPreparation::prepare(second));
-    let mut plan_a = None;
-    let mut plan_b = None;
-    let mut a_turns = 0;
+    let mut turns = 0;
+    // Observe each cut where it executes: after setup and any preceding
+    // queue step, before either operation takes the next scheduled turn.
+    let mut boundaries = Vec::new();
+    for (slot, text) in TEXTS.into_iter().enumerate() {
+        let wire = dcbor::CBOR::from(text).to_cbor_data();
+        turns += holding.holding(Lent::new(scope), Retirement::Exhausted, |view| {
+            view.copied(policy, &wire, |input| {
+                input.decode::<String, _>(policy, Options::normalizing(8), |value| {
+                    let bound = preparation_turns(value.value().value());
+                    value.transfer(
+                        OwnedPreparation::prepare,
+                        Retirement::Stopped,
+                        |preparation| preparation.deposit(preparations, slot),
+                    );
+                    bound
+                })
+            })
+        })??;
+    }
+    let mut live = [true, true];
+    let mut published = [false, false];
+    let mut first_turns = 0;
+    let mut intervals = Vec::new();
+    let mut retired = false;
     for turn in 0..turns {
-        if cut == Some(a_turns) {
-            a = None;
+        if live[0] && boundaries.len() == first_turns {
+            holding.drawn(preparations, 0, Retirement::Stopped, |preparation| {
+                boundaries.push(support::classes::prepare(&preparation.value().position()));
+                preparation.deposit(preparations, 0);
+            });
         }
-        if interleaving.first(turn, a.is_some(), b.is_some()) {
-            a_turns += 1;
-            if let Some(plan) = advance(&mut m, &mut a) {
-                plan_a = Some(plan);
+        if cut == Some(first_turns) && live[0] {
+            let before = holding.boundary();
+            holding.drawn(preparations, 0, Retirement::Stopped, |preparation| {
+                assert_eq!(
+                    boundaries.last(),
+                    Some(&support::classes::prepare(&preparation.value().position())),
+                    "the recorded boundary must describe the state immediately before retirement"
+                );
+            });
+            intervals.push(before..holding.boundary());
+            retired = true;
+            live[0] = false;
+        }
+        let slot = if interleaving.first(turn, live[0], live[1]) {
+            first_turns += 1;
+            0
+        } else {
+            1
+        };
+        if live[slot] {
+            let publication =
+                holding.drawn(preparations, slot, Retirement::Stopped, |preparation| {
+                    // One turn: the controller admits the first and stops
+                    // before the second.
+                    let mut taken = false;
+                    let plan = preparation.controlled(
+                        policy,
+                        2,
+                        Retirement::Published,
+                        true,
+                        |_, _, _| core::mem::replace(&mut taken, true),
+                        |plan| plan.deposit(plans, slot),
+                    )?;
+                    if plan.is_none() {
+                        preparation.deposit(preparations, slot);
+                    }
+                    Ok::<_, Finding>(plan.is_some())
+                })?;
+            if publication {
+                live[slot] = false;
+                published[slot] = true;
             }
-        } else if let Some(plan) = advance(&mut m, &mut b) {
-            plan_b = Some(plan);
         }
-        // Drain the first's retired records while the second stays live.
-        match support::scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
-            Ok(Reclaimed::Progress | Reclaimed::Waiting | Reclaimed::Done) => {}
-            Err(error) if support::ordinary_exhaustion(&m, &error) => {}
-            Err(error) => panic!("interleaved cleanup failed: {error:?}"),
-        }
-        if a.is_none() && b.is_none() {
+        // The scope's queue stepped while the other preparation stays live:
+        // the first's retired records drain beside it, each call the step
+        // admits after the cut the retirement's cleanup.
+        holding.holding(Lent::new(scope), Retirement::Exhausted, |view| {
+            let before = view.boundary();
+            view.with_policy(policy, |view, m| {
+                let stepped =
+                    support::scheduled_scope(m, view, turn, |view, m| view.scope().step(m))?;
+                match stepped {
+                    Ok(Reclaimed::Progress | Reclaimed::Waiting | Reclaimed::Done) => Ok(()),
+                    Err(error) if support::ordinary_exhaustion(m, &error) => Ok(()),
+                    Err(error) => Err(Finding::Driver(format!(
+                        "interleaved cleanup failed: {error:?}"
+                    ))),
+                }
+            })?;
+            if retired {
+                intervals.push(before..view.boundary());
+            }
+            view.checkpoint();
+            Ok::<_, Finding>(())
+        })?;
+        if !live[0] && !live[1] {
             break;
         }
     }
-    assert!(
-        a.is_none() && b.is_none(),
-        "finite shared-owner preparation"
-    );
-    let plan_b = plan_b.expect("the second must publish despite the first's retirement");
-    let len = plan_b.len();
-    let bytes = support::emit(&mut m, &mut plan_b.into_writer(), len);
-    assert_eq!(bytes, dcbor::CBOR::from("independent value").to_cbor_data());
-    drop(plan_a);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
-    a_turns
+    if live[0] || live[1] {
+        return Err(Finding::Driver(format!(
+            "the shared-owner preparations exceeded their {turns} turns"
+        )));
+    }
+    if retired != cut.is_some() {
+        return Err(Finding::Driver(format!(
+            "requested retirement {cut:?} was not reached"
+        )));
+    }
+    if !published[1] {
+        return Err(Finding::Driver(
+            "the second did not publish beside the first's retirement".to_owned(),
+        ));
+    }
+    holding.drawn(plans, 1, Retirement::Published, |plan| {
+        let len = plan.value().len();
+        plan.transfer(
+            OwnedPrepared::into_writer,
+            Retirement::Published,
+            |writer| {
+                let mut bytes = Vec::with_capacity(len);
+                if !writer.emit(policy, &mut bytes, len, |_, _, _| false)? {
+                    return Err(Finding::Driver("the second's emission stopped".to_owned()));
+                }
+                assert_eq!(bytes, dcbor::CBOR::from(TEXTS[1]).to_cbor_data());
+                Ok(())
+            },
+        )
+    })?;
+    if published[0] {
+        holding.drawn(plans, 0, Retirement::Published, |_| ());
+    }
+    // Every survivor operation has ended: what the scope admits from here
+    // is its final drain.
+    Ok(RetirementTrace {
+        boundaries,
+        intervals,
+        drain_start: holding.boundary(),
+    })
 }
 
-/// The first preparation retired at each of its boundaries, in every
-/// interleaving with the second: the second publishes its exact bytes and the
-/// scope recovers everything. A preparation's boundaries declare no cleanup
-/// class, so every boundary runs in both layers.
+/// The boundaries a cut retires the first preparation at under `rigor`, of
+/// its boundaries' classes `boundaries`: the exhaustive layer every one; the
+/// fast layer the first boundary of each class and every boundary of none,
+/// as every matrix's fast layer selects its stops ([`support::rigor`]). The
+/// reduction is this test's own claim, not the single-pipeline
+/// certification `classes::prepare` carries: the exhaustive layer requires
+/// every member of a class, in its interleaving, to retire with the same
+/// cleanup ([`retiring_each_preparation_boundary_preserves_other_operations`]).
+fn cuts(
+    rigor: support::rigor::Rigor,
+    boundaries: &[Option<support::classes::Class>],
+) -> Vec<usize> {
+    let mut first = std::collections::BTreeSet::new();
+    boundaries
+        .iter()
+        .enumerate()
+        .filter(|(_, class)| {
+            rigor == support::rigor::Rigor::Exhaustive
+                || class
+                    .as_ref()
+                    .is_none_or(|class| first.insert(class.clone()))
+        })
+        .map(|(cut, _)| cut)
+        .collect()
+}
+
+/// The first preparation retired at its boundaries, in every interleaving
+/// with the second: the second publishes its exact bytes and the scope
+/// recovers everything. Each boundary is classed by `classes::prepare` of
+/// the first preparation's state where the cut retires it, which reads the
+/// operation's own fields and the scope's outstanding record count, never
+/// the survivor's state or the queue's custody; an interleaving's classes
+/// are its own, each classed from its own uncut run. The fast layer retires
+/// at the first boundary of each class and at every unclassified one, the
+/// exhaustive layer at every boundary ([`cuts`]); the exhaustive layer then
+/// requires every member of a class, in one interleaving, to retire with
+/// the same cleanup ([`Interleaved::cleanup`], `support::agree`): the
+/// evidence the fast layer's reduction rests on. The first preparation has
+/// the same boundaries in every interleaving: its turns are its own,
+/// whatever the other takes.
 #[test]
 fn retiring_each_preparation_boundary_preserves_other_operations() {
-    let turns = interleave(None, Interleaving::FirstThenSecond);
-    assert!(turns > 0);
-    for interleaving in INTERLEAVINGS {
+    let classed: Vec<(Interleaving, Vec<Option<support::classes::Class>>)> = INTERLEAVINGS
+        .into_iter()
+        .map(|interleaving| (interleaving, interleave(None, interleaving).boundaries))
+        .collect();
+    let boundaries = classed[0].1.len();
+    assert!(boundaries > 0);
+    for (interleaving, classes) in &classed {
         assert_eq!(
-            interleave(None, interleaving),
-            turns,
-            "{interleaving:?}: the first preparation's turns depend on the other's"
+            classes.len(),
+            boundaries,
+            "{interleaving:?}: the first preparation's boundaries depend on the other's"
         );
     }
+    let selected: Vec<(Interleaving, Vec<usize>)> = classed
+        .iter()
+        .map(|(interleaving, classes)| (*interleaving, cuts(support::rigor::rigor(), classes)))
+        .collect();
     let mut progress = support::rigor::Progress::new("a preparation retired beside another");
     progress.stage(
-        "every boundary in every interleaving",
-        turns * INTERLEAVINGS.len(),
-        turns * INTERLEAVINGS.len(),
+        "a boundary of each class in every interleaving",
+        selected.iter().map(|(_, cuts)| cuts.len()).sum(),
+        boundaries * INTERLEAVINGS.len(),
     );
-    for cut in 0..turns {
-        for interleaving in INTERLEAVINGS {
-            progress.case(format!("retired after {cut} turns, {interleaving:?}"));
-            interleave(Some(cut), interleaving);
+    // Every classed cut's cleanup, keyed by its interleaving and class: the
+    // members of a class must clean up alike.
+    let mut members = Vec::new();
+    for ((interleaving, cuts), (_, classes)) in selected.iter().zip(&classed) {
+        for &cut in cuts {
+            let at = format!(
+                "retired after {cut} turns, {interleaving:?}, class {:?}",
+                classes[cut]
+            );
+            progress.case(&at);
+            let retired = interleave(Some(cut), *interleaving);
+            assert_eq!(
+                retired.boundaries.get(cut),
+                classes.get(cut),
+                "{interleaving:?}, cut {cut}: retirement class differs from baseline"
+            );
+            if let Some(class) = &classes[cut] {
+                members.push((
+                    at,
+                    (format!("{interleaving:?}"), class.clone()),
+                    retired.cleanup,
+                ));
+            }
+        }
+    }
+    support::agree("a preparation retired beside another", members);
+}
+
+/// A cut at the first preparation's first boundary is observed once both
+/// preparations exist, and retires it as every other cut does.
+#[test]
+fn retirement_zero_is_observed_after_both_preparations_exist() {
+    for interleaving in INTERLEAVINGS {
+        let baseline = interleave(None, interleaving);
+        for cut in [0, 1, 2] {
+            let retired = interleave(Some(cut), interleaving);
+            assert_eq!(
+                retired.boundaries.get(cut),
+                baseline.boundaries.get(cut),
+                "{interleaving:?}, cut {cut}: baseline sampled another state"
+            );
+            assert!(
+                !retired.cleanup.is_empty(),
+                "cut {cut}: cleanup was not recorded"
+            );
         }
     }
 }
 
+/// A requested cut beyond publication must not silently become an uncut run.
+#[test]
+#[should_panic(expected = "was not reached")]
+fn a_retirement_past_publication_is_rejected() {
+    interleave(Some(usize::MAX), Interleaving::FirstThenSecond);
+}
+
+/// The comparison the reduction rests on refuses a planted class merging two
+/// boundaries whose retirements clean up differently: the first boundary,
+/// before the first preparation took a turn, and its last before it
+/// publishes, each retired beside the second.
+#[test]
+#[should_panic(expected = "clean up differently")]
+fn a_class_merging_retirements_of_different_cleanup_is_rejected() {
+    let boundaries = interleave(None, Interleaving::FirstThenSecond)
+        .boundaries
+        .len();
+    let planted = ("FirstThenSecond".to_owned(), "planted".to_owned());
+    support::agree(
+        "a planted preparation class",
+        [0, boundaries - 1].map(|cut| {
+            (
+                format!("retired after {cut} turns"),
+                planted.clone(),
+                interleave(Some(cut), Interleaving::FirstThenSecond).cleanup,
+            )
+        }),
+    );
+}
+
+/// The fast layer's cuts are the first boundary of each class and every
+/// unclassified boundary; the exhaustive layer's, every boundary.
+#[test]
+fn the_fast_layer_retires_once_per_class() {
+    use support::rigor::Rigor;
+    let class = |name: &str| Some(name.to_owned());
+    let boundaries = [class("a"), class("a"), None, class("b"), None, class("a")];
+    assert_eq!(cuts(Rigor::Fast, &boundaries), [0, 2, 3, 4]);
+    assert_eq!(cuts(Rigor::Exhaustive, &boundaries), [0, 1, 2, 3, 4, 5]);
+}
+
+/// Two plans of one scope, published and held beside it: a shutdown with
+/// them live closes the queue and cannot complete; the authority is then
+/// dropped, the scope abandoned to the plans' references
+/// ([`Retirement::Abandoned`]); and the two plans are retired at once, each
+/// destroyed on a worker thread of its own, the workers released together
+/// ([`Holding::retire_concurrently`]), so the two last references race to
+/// release the scope, whichever is last draining it terminally
+/// ([`Retirement::LastReference`]). In either order of the plans' slots no
+/// record or block is released twice: the retirement's rule and the run's
+/// refinement hold it, and nothing remains live.
 #[test]
 fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
-    use std::sync::{Arc, Barrier};
     for reverse in [false, true] {
-        let mut m = meter();
-        let mut owner = support::scope(&mut m);
-        let values = [
-            decoded(&owner, &mut m, "first"),
-            decoded(&owner, &mut m, "second"),
-        ];
-        let mut plans = Vec::new();
-        for value in values {
-            let bound = preparation_turns(&value);
-            plans.push(
-                support::drive_within(&mut m, &mut OwnedPreparation::prepare(value), bound)
-                    .expect("preparation failed"),
-            );
-        }
-        if reverse {
-            plans.reverse();
-        }
-        let barrier = Arc::new(Barrier::new(3));
-        std::thread::scope(|scope| {
-            for plan in plans {
-                let barrier = barrier.clone();
-                scope.spawn(move || {
-                    barrier.wait();
-                    drop(plan);
-                });
-            }
-            assert_ne!(
-                support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).ok(),
-                Some(Reclaimed::Done),
-                "shutdown completed with live plans"
-            );
-            barrier.wait();
-            // Draining overlaps the retiring workers; the joins precede the
-            // final drain, so scheduler starvation is not mistaken for a leak.
-            for _ in 0..64 {
-                match support::scope_checked(&mut m, &mut owner, |owner, m| owner.step(m)) {
-                    Ok(_) => {}
-                    Err(error) if support::ordinary_exhaustion(&m, &error) => {}
-                    Err(error) => panic!("overlapping cleanup failed: {error:?}"),
-                }
-            }
+        support::recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            run.holding(
+                CustodyBatch::<Plan>::slots(2),
+                Retirement::LastReference,
+                &Unwitnessed,
+                |plans| {
+                    plans.lending(Retirement::Exhausted, Lent::new, |lent| {
+                        let batch = lent.value().get();
+                        lent.holding(DecodeOwner::new(), Retirement::Abandoned, |owner| {
+                            owner.initialize(policy)?;
+                            for (index, text) in ["first", "second"].into_iter().enumerate() {
+                                let slot = if reverse { 1 - index } else { index };
+                                let wire = dcbor::CBOR::from(text).to_cbor_data();
+                                owner.copied(policy, &wire, |input| {
+                                    input.decode::<String, _>(
+                                        policy,
+                                        Options::normalizing(8),
+                                        |value| {
+                                            value.prepare(policy, |plan| plan.deposit(batch, slot))
+                                        },
+                                    )
+                                })???;
+                            }
+                            let shutdown = owner.with_policy(policy, |owner, m| {
+                                support::scheduled_scope(m, owner, 0, |owner, m| {
+                                    owner.shutdown_step(m)
+                                })
+                            })?;
+                            assert_ne!(
+                                shutdown.ok(),
+                                Some(Reclaimed::Done),
+                                "shutdown completed with live plans"
+                            );
+                            Ok::<_, Finding>(())
+                        })
+                    })?;
+                    plans.retire_concurrently();
+                    Ok::<_, Finding>(())
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
         });
-        support::drain(&mut owner, &mut m);
-        assert_eq!(m.live_bytes(), 0);
     }
+}
+
+/// `T` decoded from `wire` in a scope of a recorded run, `inspect` reading
+/// the value, then prepared with every turn on a worker thread of its own
+/// ([`Holding::drive_threaded`]), the preparation read in the parent between
+/// turns, and its plan emitted: the bytes emitted, and whether a retained
+/// entry cursor and a retained normalization each crossed a worker boundary.
+#[cfg(feature = "custom-std-collections")]
+fn prepared_across_workers<T>(wire: &[u8], inspect: impl FnOnce(&T)) -> (Vec<u8>, bool, bool)
+where
+    T: dcbor::bounded::decode::construction::in_place::Transferable<Limits>
+        + dcbor::bounded::encoding::TransferableSchema
+        + Send
+        + 'static,
+{
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let made = run.scoped(policy, &Unwitnessed, |owner| {
+            owner.copied(policy, wire, |input| {
+                input.decode::<T, _>(policy, Options::normalizing(16), |value| {
+                    inspect(value.value().value());
+                    let turns = support::turns(
+                        dcbor::bounded::encoding::owned_prepare_bound::<ByteString, T, Limits, ()>(
+                            support::shape(value.value().value()),
+                        )
+                        .expect("the preparation bound of a decoded value fits in u64"),
+                    );
+                    value.transfer(
+                        OwnedPreparation::prepare,
+                        Retirement::Stopped,
+                        |preparation| {
+                            let (mut cursor, mut normalization) = (false, false);
+                            let bytes = preparation.drive_threaded(
+                                policy,
+                                turns,
+                                Retirement::Published,
+                                |_, preparation| {
+                                    if let Some(position) =
+                                        preparation.position().detail.preparation
+                                    {
+                                        cursor |= position.cursors != 0;
+                                        normalization |= position.normalizing
+                                            && position.normalization.is_some();
+                                    }
+                                },
+                                |plan| {
+                                    let len = plan.value().len();
+                                    plan.transfer(
+                                        OwnedPrepared::into_writer,
+                                        Retirement::Published,
+                                        |writer| {
+                                            let mut bytes = Vec::with_capacity(len);
+                                            writer
+                                                .emit(policy, &mut bytes, len, |_, _, _| false)?;
+                                            Ok::<_, Finding>(bytes)
+                                        },
+                                    )
+                                },
+                            )??;
+                            Ok::<_, Finding>((bytes, cursor, normalization))
+                        },
+                    )
+                })
+            })??
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(made)
+    })
 }
 
 /// Every turn of a map's preparation taken on a worker thread of its own,
@@ -255,58 +650,12 @@ fn suspended_entry_cursors_and_texts_transfer_between_workers() {
         .collect();
     let mut symbolic = dcbor::Map::new();
     for (key, value) in &source {
-        symbolic.insert(key.clone(), value.clone());
+        symbolic.insert(key.clone(), value.clone()).unwrap();
     }
     let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
-    let mut m = meter();
-    let mut owner = support::scope(&mut m);
-    let input = support::copy(&owner, &mut m, &wire);
-    let value: TypedValue<'static, ByteString, BTreeMap<String, String>, Limits> =
-        support::decode(&mut m, input, Options::normalizing(16)).expect("map decode");
-    let turns = support::turns(
-        dcbor::bounded::encoding::owned_prepare_bound::<
-            ByteString,
-            BTreeMap<String, String>,
-            Limits,
-            (),
-        >(support::shape(value.value()))
-        .expect("the preparation bound of a decoded map fits in u64"),
-    );
-    let mut operation = OwnedPreparation::prepare(value);
-    let mut published = None;
-    let mut observed_cursor = false;
-    let mut observed_normalization = false;
-    for _ in 0..turns {
-        if let Some(position) = operation.position().detail.preparation {
-            observed_cursor |= position.cursors != 0;
-            observed_normalization |= position.normalizing && position.normalization.is_some();
-        }
-        let (next, next_meter, output) = std::thread::spawn(move || {
-            let output = match support::checked(&mut m, |m| support::contracted(m, &mut operation))
-            {
-                Ok(Step::Complete(plan)) => Some(plan),
-                Ok(Step::Progress) => None,
-                Err(error) if support::ordinary_exhaustion(&m, &error) => None,
-                other => panic!("worker preparation: {}", support::label(&other)),
-            };
-            (operation, m, output)
-        })
-        .join()
-        .expect("worker panicked");
-        operation = next;
-        m = next_meter;
-        if output.is_some() {
-            published = output;
-            break;
-        }
-    }
-    drop(operation);
-    let plan = published.expect("finite transferable preparation");
-    let len = plan.len();
-    let bytes = support::emit(&mut m, &mut plan.into_writer(), len);
-    support::drain(&mut owner, &mut m);
+    let (bytes, observed_cursor, observed_normalization) =
+        prepared_across_workers::<BTreeMap<String, String>>(&wire, |_| {});
     assert_eq!(bytes, wire);
-    assert_eq!(m.live_bytes(), 0);
     assert!(
         observed_cursor,
         "no retained cursor crossed a worker boundary"
@@ -314,5 +663,56 @@ fn suspended_entry_cursors_and_texts_transfer_between_workers() {
     assert!(
         observed_normalization,
         "no retained normalization crossed a worker boundary"
+    );
+}
+
+/// The derive's generated `TransferableSchema` impl exercised: every turn
+/// of a derived record's preparation taken on a worker thread of its own,
+/// the suspended preparation moved between them, as the map's above. The
+/// record holds a map and a text, so a retained entry cursor reached through
+/// the generated field instructions, and a retained normalization of a
+/// generated field's text, each cross a worker boundary. The unsafe census
+/// lists the generator's impl (`dcbor-derive/src/encoding.rs`, `expand`);
+/// this is what that impl does, run under Miri (`tests/miri-suites.txt`).
+/// Sizes as the map's: 12 entries at minimal witness sizes, the fewest whose
+/// tree has an internal node.
+#[test]
+#[cfg(all(feature = "derive", feature = "custom-std-collections"))]
+fn a_derived_records_preparation_transfers_between_workers() {
+    use dcbor_test_support::rigor::sized;
+    use std::collections::BTreeMap;
+
+    #[derive(dcbor::CBORBoundedDecodable, dcbor::CBORBoundedEncodable)]
+    struct Record {
+        #[cbor(n = 1)]
+        entries: BTreeMap<String, String>,
+        #[cbor(n = 2)]
+        text: String,
+    }
+
+    let (entries, pairs) = sized((16, 16), (12, 16));
+    let marks = || format!("q{}", "\u{301}\u{316}".repeat(pairs));
+    let mut symbolic_entries = dcbor::Map::new();
+    for index in 0..entries {
+        symbolic_entries
+            .insert(format!("key-{index:02}"), marks())
+            .unwrap();
+    }
+    let mut symbolic = dcbor::Map::new();
+    symbolic.insert(1u64, symbolic_entries).unwrap();
+    symbolic.insert(2u64, marks()).unwrap();
+    let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
+    let (bytes, observed_cursor, observed_normalization) =
+        prepared_across_workers::<Record>(&wire, |record| {
+            assert_eq!(record.entries.len(), entries);
+        });
+    assert_eq!(bytes, wire);
+    assert!(
+        observed_cursor,
+        "no retained cursor of the derived record crossed a worker boundary"
+    );
+    assert!(
+        observed_normalization,
+        "no retained normalization of the derived record crossed a worker boundary"
     );
 }

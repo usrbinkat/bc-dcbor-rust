@@ -158,7 +158,6 @@ dependencies = [
  "dcbor-test-support",
  "half",
  "libfuzzer-sys",
- "num-bigint",
  "unicode-normalization",
 ]
 
@@ -174,12 +173,21 @@ name = "dcbor-record"
 version = "0.0.0"
 
 [[package]]
+name = "dcbor-refinement"
+version = "0.0.0"
+dependencies = [
+ "dcbor",
+ "dcbor-record",
+]
+
+[[package]]
 name = "dcbor-test-support"
 version = "0.0.0"
 dependencies = [
  "dcbor",
  "dcbor-model-bounds",
  "dcbor-record",
+ "dcbor-refinement",
  "loom",
  "shuttle",
 ]

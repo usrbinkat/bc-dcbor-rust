@@ -1,0 +1,10 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -522,6 +522,7 @@
+                 from.remaining
+                     .as_mut_slice()
+                     .iter_mut()
++                    .skip(1)
+                     .for_each(&mut visit);
+                 into.get().items.iter_mut().for_each(visit);
+             }

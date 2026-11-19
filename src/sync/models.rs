@@ -46,10 +46,10 @@ use loom::thread;
 #[cfg(all(shuttle, not(loom)))]
 use shuttle::thread;
 
-use crate::bounded::Limits;
 use crate::bounded::decode::construction::reclamation::{
     Acquisition, DecodeOwner, OwnedRecord, Reclaimed,
 };
+use crate::bounded::{Call, Capacity, Limits, Session, Step};
 
 type Owner = DecodeOwner<'static, Limits>;
 type Record = OwnedRecord<'static, u64, Limits>;
@@ -217,12 +217,163 @@ fn last_worker_reclaims(workers: usize) {
     released(&m, "last worker reclaims");
 }
 
+/// Workers reclaim records of an abandoned scope in place, concurrently:
+/// each record's cleanup defers its scope reference into its own step's
+/// worklist ([`OwnedRecord::reclaim_step`]), and each step processes its list
+/// after returning, so one worker's deferral races another's processing of
+/// the same scope (an `n - 1` batch, the compare-exchange from 1 to 0, a
+/// deferral listing the scope again after it), and the release a processing
+/// performs runs the scope's terminal drain. The oracles, in every
+/// interleaving: a drain begun inside another aborts (the nesting oracle of
+/// `drain_terminally`, per model thread), so drains never nest; a deferred
+/// release lost leaves the scope block's permit held and a release performed
+/// twice frees the block twice, so `released`'s zero live bytes requires
+/// exactly one free, after the last counted reference; and every record is
+/// reclaimed, so nothing remains outstanding. Planted control
+/// `tests/data/controls/deferral-clear-unchecked.patch` (the 1-to-0
+/// compare-exchange replaced by a store, losing a deferral made between the
+/// load and the store) fails "deferral racing processing".
+fn deferral_races_processing(workers: usize) {
+    let mut m = Limits::unlimited();
+    let owner = initialized(&mut m);
+    let reclaiming: Vec<_> = (0..workers)
+        .map(|_| {
+            let record = allocated(&owner, &mut m);
+            let mut local = m.share();
+            thread::spawn(move || {
+                let mut slot = Some(record);
+                while Record::reclaim_step(&mut slot, &mut local)
+                    .expect("an unlimited policy admits every cleanup unit")
+                    != Reclaimed::Done
+                {}
+            })
+        })
+        .collect();
+    drop(owner);
+    for worker in reclaiming {
+        worker.join().expect("a reclaiming worker panicked");
+    }
+    released(&m, "deferral racing processing");
+}
+
+/// Workers retire into a scope another thread is stepping: each cancels an
+/// input acquisition once its record is allocated, whose cleanup defers the
+/// record's and the acquisition's scope references into its step's worklist
+/// and processes them at that step's end, then retires a record of its own
+/// into the queue, while the stepping thread removes and reclaims queued
+/// records and the authority's thread shuts the scope down after. The
+/// oracles: the nesting oracle in every interleaving, a release performed
+/// twice or lost through the permits' accounting, and `released`'s zero
+/// live bytes with nothing outstanding.
+fn retirement_into_a_stepped_scope(workers: usize) {
+    let mut m = Limits::unlimited();
+    let owner = initialized(&mut m);
+    let records: Vec<_> = (0..workers).map(|_| allocated(&owner, &mut m)).collect();
+    let owner = Arc::new(owner);
+    let stepper = {
+        let owner = Arc::clone(&owner);
+        let mut local = m.share();
+        thread::spawn(move || {
+            loop {
+                match owner
+                    .step(&mut local)
+                    .expect("an unlimited policy admits every cleanup unit")
+                {
+                    Reclaimed::Done => return,
+                    Reclaimed::Progress => {}
+                    Reclaimed::Waiting => thread::yield_now(),
+                }
+            }
+        })
+    };
+    let retiring: Vec<_> = records
+        .into_iter()
+        .map(|record| {
+            let owner = Arc::clone(&owner);
+            let mut local = m.share();
+            thread::spawn(move || {
+                let mut copy = owner.copy_input(&[]);
+                while !copy.position().allocated {
+                    copy.step(&mut local)
+                        .expect("an unlimited policy admits the input's record");
+                }
+                copy.cancel();
+                while !matches!(
+                    copy.step(&mut local)
+                        .expect("an unlimited policy admits every cleanup unit"),
+                    Step::Finished
+                ) {}
+                drop(copy);
+                drop(record);
+            })
+        })
+        .collect();
+    for worker in retiring {
+        worker.join().expect("a retiring worker panicked");
+    }
+    stepper.join().expect("the stepping thread panicked");
+    let mut owner = Arc::try_unwrap(owner)
+        .ok()
+        .expect("every thread's reference to the authority was dropped at its join");
+    assert_eq!(
+        owner.outstanding(),
+        0,
+        "a record outlived the stepped drain"
+    );
+    shut_down(&mut owner, &mut m);
+    released(&m, "retirement into a stepped scope");
+}
+
+/// The recording capacity of one drained scope, derived from what the
+/// scenario performs under one unlimited recorded policy, nothing refused,
+/// by the session's publication rules: each admission through the route
+/// publishes its call and its credit (two), an owner minted and an
+/// acquisition bound one each, a grant its call and its physical effect
+/// (two), a held obligation's spend one, and a permit's drop its release.
+///
+/// - The scope's acquisition (`DecodeOwner::initialize_step`,
+///   `stable::acquire`): its owner minted, its acquisition bound, its write
+///   and its release admitted held (four), the block granted and reserved
+///   (two), both obligations spent at the grant (two); then its terminal
+///   dispatch written in one admitted unit (two): 12.
+/// - The record's (`allocate_step`): the same ten for its acquisition, its
+///   token's owner minted at its first entry, then its owner stage in one
+///   admitted unit (`OWNER`, two): 12.
+/// - Retirement publishes nothing (the queue push admits nothing); a
+///   waiting step admits nothing, a removal admitted before a wait being
+///   retained, never admitted again.
+/// - The drain (`Reclaimer::step`): the removal unit (`REMOVAL`, two); the
+///   `u64` record's one cleanup unit (its `remaining` is 1, two); its block
+///   freed, its permit's release (one); then the scope block freed by the
+///   authority's last shutdown step, its release (one): 6.
+///
+/// 30 observations and 2 permit records, the scope block's and the
+/// record's, none split. An observation beyond either invalidates the
+/// session, so a derivation short of what production publishes fails the
+/// scenario at its finish, naming the recording, never passing short.
+const DRAINED: Capacity = Capacity {
+    permits: 2,
+    events: 30,
+};
+
 /// A record carried across `hops` workers, the last of which retires it
 /// while the authority shuts the scope down, or retired on the main thread
-/// itself when `hops` is zero; the policy that drained it. Spawns `hops`
-/// threads in all.
-fn drained(hops: usize) -> Limits {
-    let mut m = Limits::unlimited().logged();
+/// itself when `hops` is zero; the calls the draining policy admitted after
+/// the record was allocated. The policy is a family of its own recording
+/// session ([`Limits::recorded_unlimited`]), made inside this model
+/// execution and recording from the scope's initialization through the
+/// drain: `measure` scopes only the policy's own admission history, never
+/// the session's stream. The policy, the scope and the record are dropped
+/// and the session finished whole, then its entire stream is refined by the
+/// one checker, acceptance required (`dcbor_test_support::refine_words`):
+/// every permit's lifecycle, every obligation's settlement into its origin,
+/// every acquisition's owner and every physical outcome. The checker links
+/// its own build of this crate, so the stream crosses as each observation's
+/// whole storage form ([`crate::bounded::Observed::to_words`]). Spawns `hops` threads in
+/// all.
+fn drained(hops: usize) -> Vec<Call> {
+    let session = Session::new(DRAINED);
+    let mut m = Limits::recorded_unlimited(&session);
     let mut owner = initialized(&mut m);
     let record = allocated(&owner, &mut m);
     m.measure();
@@ -243,7 +394,22 @@ fn drained(hops: usize) -> Limits {
         worker.join().expect("the retiring worker panicked");
     }
     released(&m, "worker transfer");
-    m
+    let admitted = m.admitted_calls();
+    drop((owner, m));
+    let observed = session.finish().unwrap_or_else(|incomplete| {
+        panic!("worker transfer: the drain's recording is incomplete: {incomplete:?}")
+    });
+    let words: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            observation.to_words().unwrap_or_else(|| {
+                panic!("worker transfer: observation {index} has no storage form: {observation:?}")
+            })
+        })
+        .collect();
+    dcbor_test_support::refine_words(&words);
+    admitted
 }
 
 /// A record handed between workers is drained with exactly the admissions a
@@ -255,15 +421,17 @@ fn worker_transfer(workers: usize) {
     let threaded = drained(workers);
     let local = drained(0);
     assert_eq!(
-        threaded.admitted(),
-        local.admitted(),
+        threaded, local,
         "a transferred record's drain admitted differently from a local one's"
     );
 }
 
 /// The I3 witness under the build's atomics: a scope and a record admit
 /// their production representation, though the checker's atomics are what
-/// is stored. One thread.
+/// is stored. One thread. The witness concludes its recording session inside
+/// the model, as [`drained`] does: the session's finish loads the checker's
+/// atomics, which moves only this model's step bound, measured and recorded,
+/// never a contract quantity.
 fn production_representation() {
     crate::bounded::decode::construction::reclamation::admits_its_production_representation();
 }
@@ -303,6 +471,10 @@ mod loom_models {
     scenario!(contended_queue_step: workers_1 = 1, workers_2 = 2, workers_3 = 3, workers_4 = 4);
     scenario!(last_worker_reclaims: workers_1 = 1, workers_2 = 2, workers_3 = 3, workers_4 = 4);
     scenario!(worker_transfer: workers_1 = 1, workers_2 = 2, workers_3 = 3, workers_4 = 4);
+    scenario!(deferral_races_processing: workers_1 = 1, workers_2 = 2, workers_3 = 3, workers_4 = 4);
+    // The stepping thread beside the workers: three workers reach loom's
+    // five threads.
+    scenario!(retirement_into_a_stepped_scope: workers_1 = 1, workers_2 = 2, workers_3 = 3);
 
     /// I3 under loom's atomics: one thread.
     #[test]
@@ -347,6 +519,8 @@ mod shuttle_models {
     scenario!(contended_queue_step);
     scenario!(last_worker_reclaims);
     scenario!(worker_transfer);
+    scenario!(deferral_races_processing);
+    scenario!(retirement_into_a_stepped_scope);
 
     /// I3 under shuttle's atomics: one task.
     #[test]

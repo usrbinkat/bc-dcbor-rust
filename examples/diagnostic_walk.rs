@@ -3,20 +3,20 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Test with various CBOR structures to show diagnostic_flat works during
     // traversal
     let test_cases = vec![
         ("Simple array", CBOR::from(vec![1, 2, 3])),
         ("Simple map", {
             let mut map = Map::new();
-            map.insert("key", "value");
+            map.insert("key", "value")?;
             CBOR::from(map)
         }),
         ("Nested structure", {
             let mut map = Map::new();
-            map.insert("numbers", vec![1, 2, 3]);
-            map.insert("text", "hello");
+            map.insert("numbers", vec![1, 2, 3])?;
+            map.insert("text", "hello")?;
             CBOR::from(map)
         }),
     ];
@@ -37,4 +37,5 @@ fn main() {
         cbor.walk((), &visitor);
         println!();
     }
+    Ok(())
 }

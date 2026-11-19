@@ -76,10 +76,14 @@ export DCBOR_CLASS_COVERAGE=1
 export DCBOR_WITNESS=minimal
 # The coverage build's own flags: nothing from the caller's environment.
 counter_relocation="-C llvm-args=-runtime-counter-relocation"
+# Read before the identity is written: a substitution inside its pipeline
+# would record an empty version if the tool failed.
+coverage_version="$(cargo llvm-cov --version)"
+[[ -n "$coverage_version" ]]
 {
 	printf 'rigor\t%s\twitness\t%s\n' "$DCBOR_RIGOR" "$DCBOR_WITNESS"
 	printf 'compared\tfull\n'
-	printf 'coverage\t%s\tRUSTFLAGS\t%s\n' "$(cargo llvm-cov --version)" "$counter_relocation"
+	printf 'coverage\t%s\tRUSTFLAGS\t%s\n' "$coverage_version" "$counter_relocation"
 } | identity "$out"
 echo "identity: $(cat "$out/identity.txt")"
 
@@ -127,7 +131,11 @@ event "PLAN ${#bases[@]} suites, $planned tests, $((planned * 2)) test runs (min
 # replace them. `show-env` names the workspace `target` too
 # (CARGO_LLVM_COV_TARGET_DIR, CARGO_LLVM_COV_BUILD_DIR).
 export DCBOR_PROFILER=1
-eval "$(cargo llvm-cov show-env --sh)"
+# Captured first: `eval` of a failed substitution's empty output succeeds,
+# and the build would then run uninstrumented.
+coverage_env="$(cargo llvm-cov show-env --sh)"
+[[ -n "$coverage_env" ]]
+eval "$coverage_env"
 export RUSTFLAGS="$counter_relocation"
 unset CARGO_ENCODED_RUSTFLAGS
 tools="$(rustc --print target-libdir)/../bin"

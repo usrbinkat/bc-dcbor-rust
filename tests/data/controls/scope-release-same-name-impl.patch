@@ -1,0 +1,28 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -1259,15 +1259,24 @@
+             if self.ready {
+                 scope(&block).owner.closed.store(true, Ordering::Release);
+                 scope(&block).owner.abandoned.store(true, Ordering::Release);
+-                with_worklist(|worklist| release_reference(block, worklist));
+             } else {
+                 // SAFETY: partial initialization exposed no references and
+                 // acquired no records. The scope's release was prepaid.
+                 unsafe { stable::free(block) };
+             }
+         }
+     }
+ }
++
++mod twin {
++    pub(super) struct DecodeOwner<A: super::Allocator>(pub(super) core::ptr::NonNull<super::ScopeBlock<A>>);
++}
++
++impl<A: Allocator> Drop for twin::DecodeOwner<A> {
++    fn drop(&mut self) {
++        with_worklist(|worklist| release_reference(self.0, worklist));
++    }
++}
+
+ /// An owning stable destination; retirement transfers to the scope's queue.
+ pub struct OwnedRecord<'s, T: Reclaim<A>, A: Allocator> {

@@ -1,0 +1,12 @@
+--- src/bounded/encoding/writer.rs
++++ src/bounded/encoding/writer.rs
+@@ -389,7 +389,8 @@
+     fn of<R>(len: u64) -> Result<Self, BoundedError<R>> {
+         // At most `len` gaps, each ending at most one segment early.
+         Ok(Self {
+-            bytes: SEGMENT.covering(len, len)?,
++            // Planted: the segments gaps end early are not counted.
++            bytes: SEGMENT.covering(len, 0)?,
+             boundaries: BOUNDARY.times(len)?,
+             completion: COMPLETE.times(1)?,
+             // A caller-owned output's every byte, initialized once.

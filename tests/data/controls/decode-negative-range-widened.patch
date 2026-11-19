@@ -1,0 +1,12 @@
+--- src/decode.rs
++++ src/decode.rs
+@@ -114,7 +114,8 @@
+ /// (`bounded::decode::decode_with`) and the retained cursor
+ /// (`bounded::decode::cursor`) each call it.
+ pub(crate) fn negative(argument: u64) -> Result<i64> {
+-    if argument > i64::MAX as u64 {
++    // Planted: the argument 2^63 - 1, the integer -2^63, is refused.
++    if argument >= i64::MAX as u64 {
+         return Err(Error::OutOfRange);
+     }
+     Ok(-1 - argument as i64)

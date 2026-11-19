@@ -9,15 +9,17 @@ use core::ptr::addr_of_mut;
 use super::input::DecodeInput;
 use super::operation::{Observed, Operation, OperationTerms, Task};
 use super::reclamation::{
-    EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed, ScopeRef, Slot,
-    reclaim_within, slot_place,
+    Cleanup, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
+    ScopeRef, Slot, reclaim_within, slot_place,
 };
+use super::stable::Pending;
 use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::cursor::{self, ArenaParts, ParserContinuation, Resources};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::{DecodeError, Document, DocumentArena, Node, Options};
 use crate::bounded::{
-    Allocator, BoundedError, BoundedResult, Places, ResourceBound, Step, Unit, WriteWork, at,
+    Allocator, BoundedError, BoundedResult, Custodial, CustodySink, PermitsObserved, Places,
+    ResourceBound, Step, Unit, WriteWork, at, observed_all,
 };
 
 places! {
@@ -78,21 +80,31 @@ pub struct Parsed<'s, I: DecodeInput<A>, A: Allocator> {
 /// for its transfer and its release.
 struct ParseCustody<'s, I: DecodeInput<A>, A: Allocator> {
     input: Option<OwnedInitialized<'s, I, A>>,
-    parser: MaybeUninit<ParserContinuation<(), A::Permit>>,
+    parser: MaybeUninit<ParserContinuation<(), A::Permit, A::Origin>>,
     /// Arena parts transferred from the parser, then released.
     parts: ArenaParts,
     phase: ParsePhase,
 }
 
+/// Whether the parse record still holds its parser in `phase`: from the end
+/// of `ReclaimParser` on, its drained parser has been dropped in place
+/// (`Parsed`'s `reclaim_step`), so its storage arenas' owners have released
+/// their session references, and nothing reads the parser again.
+const fn holds_parser(phase: ParsePhase) -> bool {
+    !matches!(phase, ParsePhase::ReclaimInput | ParsePhase::Done)
+}
+
 impl<'s, I: DecodeInput<A>, A: Allocator> Parsed<'s, I, A> {
     const PREFIX: usize = 4;
-    const INIT_STEPS: usize = Self::PREFIX + ParserContinuation::<(), A::Permit>::INIT_STEPS;
+    const INIT_STEPS: usize =
+        Self::PREFIX + ParserContinuation::<(), A::Permit, A::Origin>::INIT_STEPS;
 
-    /// The arena's place within the record, by field projection alone: the
-    /// one way its transfer and its release reach it, each paired with the
-    /// record's arena parts. A published document's views borrow the arena,
-    /// so it is never reborrowed through the record.
-    fn arena(slot: &mut Slot<'_, Self, Prefix>) -> Place<DocumentArena<A::Permit>> {
+    /// The arena's place within the record, in the slot's mode, by field
+    /// projection alone: the one way its transfer, its release and its
+    /// observation reach it, each paired with the record's arena parts. A
+    /// published document's views borrow the arena, so it is never
+    /// reborrowed through the record.
+    fn arena<M: Mode>(slot: &mut Slot<'_, Self, Prefix, M>) -> Place<DocumentArena<A::Permit>, M> {
         let (place, _) = slot.parts();
         // SAFETY: a field projection by raw pointer within the slot's own
         // record, forming no reference; `MaybeUninit` lays out its value at
@@ -136,26 +148,57 @@ impl<'s, I: DecodeInput<A>, A: Allocator> Parsed<'s, I, A> {
     }
 }
 
-// SAFETY: the initialization prefix is the input handle, scalar metadata and
-// the parser's resource-free prefix. Cleanup releases arena, parser, then the
-// input, in place; it never reads the arena before transfer recorded it.
+// SAFETY: initial: no prefix unit initialized and nothing transferred or
+// released. state: the initialization prefix (the input handle, scalar
+// metadata and the parser's resource-free prefix), the transfer count and
+// the release count record everything initialized and acquired. admission:
+// each cleanup unit is admitted before it runs, a refusal changing nothing.
+// cleanup: it releases the arena, the parser, then the input, in place,
+// through their own cleanup, and drops the drained parser in place, which
+// releases its arenas' owners' session references; it never reads the arena
+// before the transfer recorded it, nor the parser once dropped
+// (`holds_parser`); nothing is allocated, nothing unwinds and no arbitrary
+// destructor runs. done: `Done` once the arena, the parser and the input are
+// all released; an incomplete prefix's release leaves it released
+// (`Prefix::release`). order: a step after `Done` reports `Done`, admitting
+// nothing, from `ParsePhase::Done` or a released prefix alike; the count and
+// observation read only the recorded prefix, nothing of a released one, and
+// never the dropped parser. depth: the input's plus two,
+// its own level and the input handle's, the census recording the margin.
+// count: the units the recorded state leaves.
 unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A> {
+    // One level more than its counted dispatches (its own advance, then the
+    // input record's advance): the extra level accounts for the stack frames
+    // of the input handle's chain between the two, `OwnedInitialized` then
+    // `OwnedRecord::reclaim_under`, `reclaim_within` and
+    // `Record::reclaim_step`, which are no dispatch level, as the derive's
+    // declaration accounts for its generated frames. The census records the
+    // margin.
     const DISPATCH_DEPTH: usize = I::DISPATCH_DEPTH.saturating_add(2);
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
-        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, slot.custody().initialized()) {
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Prefix>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        // Released: terminal, `Done` admitting nothing.
+        if slot.custody().released() {
+            return Ok(Reclaimed::Done);
+        }
+        if Bound::new(Predicate::Prefix, Self::INIT_STEPS)
+            .below(cleanup, slot.custody().initialized())
+        {
             if let Some(input) = Self::input(&mut slot)
                 && input.is_some()
             {
                 at(ParsePlace::Input, || {
-                    OwnedInitialized::reclaim_step(input, a)
+                    OwnedInitialized::reclaim_under(input, cleanup)
                 })?;
                 return Ok(Reclaimed::Progress);
             }
-            CLEANUP.admit(a)?;
-            *slot.custody() = Prefix::EMPTY;
+            CLEANUP.admit(cleanup)?;
+            slot.custody().release();
             return Ok(Reclaimed::Done);
         }
         // The arena is reached only by raw pointer, taken before the custody
@@ -174,28 +217,44 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
                 // release released.
                 let arena = unsafe { Slot::new(arena, parts) };
                 if at(ParsePlace::Cleanup, || {
-                    DocumentArena::release_parts_step(arena, a)
+                    DocumentArena::release_parts_step(arena, cleanup)
                 })? {
                     *phase = ParsePhase::ReclaimParser;
                 }
             }
             ParsePhase::ReclaimParser => {
-                // SAFETY: the parser prefix is complete.
-                let parser = unsafe { parser.assume_init_mut() };
-                if at(ParsePlace::Parse, || parser.reclaim_step(a))? {
+                let drained = at(ParsePlace::Parse, || {
+                    // SAFETY: the parser prefix is complete, and the parser
+                    // is held until this phase ends (`holds_parser`).
+                    unsafe { parser.assume_init_mut() }.reclaim_step(cleanup)
+                })?;
+                if drained {
+                    // The drained parser dropped in place: the record's block
+                    // runs no destructor, and the parser's arenas each keep a
+                    // pending whose owner holds its session's store until it
+                    // drops. Drained, the arenas hold no allocation and their
+                    // pendings no credit, and its normalizer is retired, so
+                    // the drop frees nothing, records nothing, allocates
+                    // nothing and does not unwind (`Storage`'s `Drop`).
+                    // SAFETY: the parser is initialized and held in this
+                    // phase; the phase moves past it below, and no later
+                    // step, count, observation or detail reads it.
+                    unsafe { parser.assume_init_drop() };
                     *phase = ParsePhase::ReclaimInput;
                 }
             }
             ParsePhase::ReclaimInput => {
                 let charge = slot_place(input, ParsePlace::Input, ParsePlace::Cleanup);
-                if at(charge, || OwnedInitialized::reclaim_step(input, a))? == Reclaimed::Done {
+                if at(charge, || OwnedInitialized::reclaim_under(input, cleanup))?
+                    == Reclaimed::Done
+                {
                     *phase = ParsePhase::Done;
                     return Ok(Reclaimed::Done);
                 }
             }
             ParsePhase::Done => return Ok(Reclaimed::Done),
             _ => {
-                CLEANUP.admit(a)?;
+                CLEANUP.admit(cleanup)?;
                 *phase = ParsePhase::ReclaimArena;
             }
         }
@@ -206,13 +265,17 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
     /// one releasing the record. After it: the transition into cleanup unless
     /// it has begun, the arena's parts not yet released, the parser's own
     /// count and the input slot's.
-    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> Option<u64> {
+        // Released: the one call reporting `Done`.
+        if slot.custody().released() {
+            return Some(1);
+        }
         if slot.custody().initialized() < Self::INIT_STEPS {
             return match Self::input(&mut slot) {
                 Some(input) if input.is_some() => {
-                    OwnedInitialized::remaining(input).saturating_add(1)
+                    OwnedInitialized::remaining(input)?.checked_add(1)
                 }
-                _ => 1,
+                _ => Some(1),
             };
         }
         // The arena, which a document view borrows, is never reborrowed.
@@ -223,22 +286,89 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
             phase,
         }) = Self::custody::<_, ()>(&mut slot)
         else {
-            return 1;
+            return Some(1);
         };
         let (released, phase) = (parts.released, *phase);
-        let input = OwnedInitialized::remaining(input);
-        // SAFETY: a complete prefix includes the parser's.
-        let parser = unsafe { parser.assume_init_ref() }
-            .reclaim_remaining()
-            .saturating_add(input);
-        let arena = DocumentArena::<A::Permit>::release_remaining(released).saturating_add(parser);
+        let input = OwnedInitialized::remaining(input)?;
+        // The parser is read only while it is held (`holds_parser`).
         match phase {
-            ParsePhase::Done => 1,
-            ParsePhase::ReclaimInput => input,
-            ParsePhase::ReclaimParser => parser,
-            ParsePhase::ReclaimArena => arena,
-            _ => arena.saturating_add(1),
+            ParsePhase::Done => return Some(1),
+            ParsePhase::ReclaimInput => return Some(input),
+            _ => {}
         }
+        // SAFETY: a complete prefix includes the parser's, held in this phase.
+        let parser = unsafe { parser.assume_init_ref() }
+            .reclaim_remaining()?
+            .checked_add(input)?;
+        let arena = DocumentArena::<A::Permit>::release_remaining(released).checked_add(parser)?;
+        match phase {
+            ParsePhase::ReclaimParser => Some(parser),
+            ParsePhase::ReclaimArena => Some(arena),
+            _ => arena.checked_add(1),
+        }
+    }
+
+    /// The record's value's custody, each independently owning part a group
+    /// of its own inside the record's ([`CustodySink`]): its input handle,
+    /// once initialized and still held, under the owner its own record
+    /// stores ([`OwnedInitialized::observe_custody`]); and, once the
+    /// prefix is complete, the parser's ([`ParserContinuation::observe_custody`],
+    /// its arenas, normalizer and output under their own owners) and the
+    /// document arena's at every transfer and release prefix
+    /// ([`DocumentArena::observe_prefix`]): the permit the transfer has
+    /// moved, under the parser arena's owner until the arena's own owner
+    /// field is written and under that field after, so the permit is
+    /// reported by exactly one of the parser and the arena. The parser's
+    /// resource-free prefix owns nothing. Read-only; the completeness of
+    /// every part, combined.
+    fn observe_permits(
+        mut slot: PeekSlot<'_, Self, Prefix>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        // Released: nothing held, nothing read.
+        if slot.custody().released() {
+            return PermitsObserved::Complete;
+        }
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            return match Self::input(&mut slot) {
+                Some(Some(input)) => input.observe_custody(sink),
+                _ => PermitsObserved::Complete,
+            };
+        }
+        // The arena is reached only by raw pointer, taken before the custody
+        // is borrowed.
+        let arena = Self::arena(&mut slot);
+        let Ok(ParseCustody {
+            input,
+            parser,
+            parts,
+            phase,
+        }) = Self::custody::<_, ()>(&mut slot)
+        else {
+            return PermitsObserved::Complete;
+        };
+        let input = match input {
+            Some(input) => input.observe_custody(sink),
+            None => PermitsObserved::Complete,
+        };
+        if !holds_parser(*phase) {
+            // The parser dropped once drained, and the arena released before
+            // it (`ReclaimArena` precedes `ReclaimParser`): only the input
+            // remains.
+            return input;
+        }
+        // SAFETY: a complete prefix includes the parser's, held in this phase.
+        let parser = unsafe { parser.assume_init_mut() };
+        // Read before the traversal borrows the parser exclusively.
+        let arena_owner = parser.arena_owner();
+        // SAFETY: the record's parts are its arena's own custody: they count
+        // exactly the parts its transfer wrote and its release released.
+        let arena = unsafe { Slot::new(arena, parts) };
+        observed_all([
+            input,
+            parser.observe_custody(sink),
+            DocumentArena::observe_prefix(arena, arena_owner, sink),
+        ])
     }
 }
 
@@ -260,8 +390,17 @@ pub struct Parse<'s, I: DecodeInput<A>, A: Allocator> {
     options: Options,
 }
 
-// SAFETY: initialization writes the input handle, three scalars, then the
-// parser's resource-free prefix; advance keeps every phase reclaimable.
+// SAFETY: prefix: initialization writes the input handle, three scalars,
+// then the parser's resource-free prefix, one unit each, recorded as it is
+// written; every prefix is reclaimable by `Parsed`'s cleanup, and past
+// `INIT_STEPS`, or once released, it refuses, changing nothing. advance:
+// refused until the prefix is whole, a released prefix recording none, and
+// in every cleanup phase before the parser is borrowed; it keeps every phase
+// reclaimable and reports completion only once the document is transferred
+// whole. detail: `detail` and
+// `observe_custody` read only the recorded prefix, changing, admitting and
+// allocating nothing. provenance: every field is reached through the
+// record's slot place, by raw projection.
 unsafe impl<'s, I: DecodeInput<A> + 's, A: Allocator + 's> Task<'s, A> for Parse<'s, I, A>
 where
     A::Permit: Send,
@@ -287,7 +426,10 @@ where
     ) -> Result<(), Self::Error> {
         let prefix = Parsed::<'s, I, A>::PREFIX;
         let (place, progress) = slot.parts();
-        if Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, progress.initialized()) {
+        // A released record is terminal: nothing is written again.
+        if progress.released()
+            || Bound::new(Predicate::Prefix, Self::INIT_STEPS).reached(a, progress.initialized())
+        {
             return Err(BoundedError::PlanMismatch.into());
         }
         let raw = place.as_ptr(progress);
@@ -312,8 +454,11 @@ where
                 let parser = unsafe {
                     Slot::new(
                         place.project(|record| {
-                            addr_of_mut!((*record).custody.parser)
-                                .cast::<ParserContinuation<(), A::Permit>>()
+                            addr_of_mut!((*record).custody.parser).cast::<ParserContinuation<
+                                (),
+                                A::Permit,
+                                A::Origin,
+                            >>()
                         }),
                         &mut units,
                     )
@@ -327,9 +472,13 @@ where
         Ok(())
     }
 
+    /// The parse's acquisitions are its parser's arenas', each held in its
+    /// own storage's pending inside the record: the operation's pending is
+    /// left idle.
     fn advance(
         &mut self,
         mut slot: Slot<'_, Self::State, Prefix>,
+        _: &mut Pending<A::Origin>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
         // The arena is reached only by raw pointer, taken before the custody
@@ -342,7 +491,20 @@ where
             parts,
             phase,
         } = Parsed::custody(&mut slot)?;
-        // SAFETY: a complete prefix includes the parser's.
+        // Only the construction phases advance; every cleanup phase is
+        // refused before the parser is borrowed, since from `ReclaimInput`
+        // on it is dropped (`holds_parser`).
+        if !matches!(
+            *phase,
+            ParsePhase::Parse
+                | ParsePhase::Transfer
+                | ParsePhase::ReleaseParser
+                | ParsePhase::Publish
+        ) {
+            return Err(BoundedError::PlanMismatch.into());
+        }
+        // SAFETY: a complete prefix includes the parser's, held in every
+        // construction phase (`holds_parser`).
         let parser = unsafe { parser.assume_init_mut() };
         match *phase {
             ParsePhase::Parse => {
@@ -390,10 +552,16 @@ where
         OwnedDocument { record }
     }
 
-    fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(&mut self, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
         let place = slot_place(&self.input, ParsePlace::Input, ParsePlace::Cleanup);
-        at(place, || OwnedInitialized::reclaim_step(&mut self.input, a))
+        at(place, || {
+            OwnedInitialized::reclaim_under(&mut self.input, cleanup)
+        })
     }
+
+    /// The task holds no pending credit of its own: the parser's arenas
+    /// keep theirs within the record ([`ParserContinuation`]).
+    fn settle(&mut self, _: crate::bounded::Performer) {}
 
     fn detail(&self, record: Observed<'_, 's, Self, A>) -> ParseDetail {
         // Before the record is complete only whether the input is held is
@@ -434,15 +602,36 @@ where
                 .project(|record| addr_of_mut!((*record).custody))
                 .get(&*prefix)
         };
-        // SAFETY: a complete prefix includes the parser's.
-        let parser = unsafe { custody.parser.assume_init_ref() };
+        // The parser, read only while it is held (`holds_parser`): dropped
+        // once drained, it reports no position and no resources.
+        let parser = holds_parser(custody.phase).then(|| {
+            // SAFETY: a complete prefix includes the parser's, held in this
+            // phase.
+            unsafe { custody.parser.assume_init_ref() }
+        });
         ParseDetail {
             input: custody.input.is_some(),
             phase: Some(custody.phase),
-            parser: Some(parser.position()),
-            resources: Some(parser.resources()),
+            parser: parser.map(|parser| parser.position()),
+            resources: parser.map(|parser| parser.resources()),
             transferred: custody.parts.transferred,
             released: custody.parts.released,
+        }
+    }
+
+    /// The task's custody outside its record: the input handle while the
+    /// task, not yet its record, holds it, under the owner its own record
+    /// stores ([`OwnedInitialized::observe_custody`]). The task holds no
+    /// credit of its own ([`Self::settle`]); everything inside the record is
+    /// the record's to report ([`Parsed`]'s [`Reclaim::observe_permits`]).
+    fn observe_custody(
+        &mut self,
+        _: Observed<'_, 's, Self, A>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        match self.input.as_mut() {
+            Some(input) => input.observe_custody(sink),
+            None => PermitsObserved::Complete,
         }
     }
 }
@@ -503,20 +692,32 @@ impl<'s, I: DecodeInput<A>, A: Allocator> OwnedDocument<'s, I, A> {
         }
     }
 
-    /// Operation-local cleanup of this document, input included.
+    /// Operation-local cleanup of this document, input included, the
+    /// cleanup capability minted here over `a`.
     pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        super::reclamation::with_cleanup(a, |cleanup| Self::reclaim_under(slot, cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under `cleanup`, a capability already minted:
+    /// how a cleanup that holds the document (a construction's record, or a
+    /// third-party binding's state) steps it.
+    pub fn reclaim_under(
+        slot: &mut Option<Self>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
         reclaim_within(
             slot,
-            a,
+            cleanup,
             |document| document.record,
             |record| Self { record },
-            OwnedInitialized::reclaim_step,
+            OwnedInitialized::reclaim_under,
         )
     }
 
     /// The calls [`Self::reclaim_step`] still takes from `slot`
-    /// ([`OwnedInitialized::remaining`]).
-    pub(crate) fn remaining(slot: &mut Option<Self>) -> u64 {
+    /// ([`OwnedInitialized::remaining`]), `None` when it does not fit in
+    /// `u64`.
+    pub(crate) fn remaining(slot: &mut Option<Self>) -> Option<u64> {
         let mut record = slot.take().map(|document| document.record);
         let remaining = OwnedInitialized::remaining(&mut record);
         *slot = record.map(|record| Self { record });
@@ -528,12 +729,23 @@ impl<'s, I: DecodeInput<A>, A: Allocator> OwnedDocument<'s, I, A> {
     }
 }
 
+/// The document's custody: its record's group, under the owner of the
+/// acquisition that allocated it, with its input, parser and arena inside
+/// (its record's [`Custodial`] traversal); `&mut self` excludes every view of
+/// the document meanwhile. Read-only.
+impl<I: DecodeInput<A>, A: Allocator> Custodial<A::Permit> for OwnedDocument<'_, I, A> {
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        self.record.observe_custody(sink)
+    }
+}
+
 /// The [`ResourceBound`] of parsing an input handle of at most `len` bytes
 /// into an owned document ([`DocumentDecoder`]) under `options`: the record,
 /// initialized field by field and then the parser's prefix; the retained
 /// parse ([`cursor::retained_decode_bound`]), the parser's release and its
-/// last cleanup unit included; the arena's transfer in its storage's three
-/// units;
+/// last cleanup unit included; the arena's transfer, its storage's parts
+/// then its owner's identity, one unit each
+/// ([`DocumentArena::transfer_work`]);
 /// publication; and the record's own cleanup: its transition, the arena's
 /// two parts and the input slot emptied by [`OwnedDocument::into_input`] or
 /// by the record's initialization. The input is held by the record but
@@ -581,12 +793,14 @@ impl ParseTerms {
         options: Options,
         input: ResourceBound,
     ) -> Result<Self, BoundedError<R>> {
+        let emptied = EMPTIED.times::<R>(1)?;
         Ok(Self {
-            parse: cursor::retained_decode_bound::<A::Permit, R>(len, options)?,
+            parse: cursor::retained_decode_bound::<A::Permit, A::Origin, R>(len, options)?,
             // The transition, then the arena's transfer from its parser.
             transfer: TRANSITION
                 .times(1)?
-                .then(DocumentArena::<A::Permit>::transfer_work()?)?,
+                .checked_then(DocumentArena::<A::Permit>::transfer_work()?)
+                .ok_or(BoundedError::Overflow)?,
             publish: PUBLISH.times(1)?,
             // The record's transition, or its release before initialization
             // completed; the arena's parts; and one emptied input slot: the
@@ -595,8 +809,9 @@ impl ParseTerms {
             // record holding its input reclaims it at `Input`.
             cleanup: CLEANUP
                 .times(1)?
-                .then(DocumentArena::<A::Permit>::release_work()?)?
-                .then(EMPTIED.times(1)?)?,
+                .checked_then(DocumentArena::<A::Permit>::release_work()?)
+                .and_then(|work| work.checked_then(emptied))
+                .ok_or(BoundedError::Overflow)?,
             input,
         })
     }
@@ -618,7 +833,8 @@ impl Places for ParseTerms {
 
 pub type DocumentDecoder<'s, I, A> = Operation<'s, Parse<'s, I, A>, A>;
 
-impl<'s, I: DecodeInput<A> + 's, A: Allocator + 's> DocumentDecoder<'s, I, A>
+impl<'s, I: DecodeInput<A> + 's, A: crate::bounded::TerminalAllocator + 's>
+    DocumentDecoder<'s, I, A>
 where
     A::Permit: Send,
 {
@@ -628,5 +844,51 @@ where
             input: Some(input),
             options,
         })
+    }
+}
+
+/// The parse record's cleanup at every cut of its task
+/// ([`super::cuts::every_cut`]): every capability released exactly once,
+/// and after `Done`, released prefix or `ParsePhase::Done`, nothing admitted,
+/// initialization refused, advance refused before the dropped parser is
+/// borrowed, and no parser observed.
+#[cfg(all(test, feature = "std"))]
+mod released {
+    use super::super::cuts::{completed, every_cut, scope};
+    use super::*;
+    use crate::ByteString;
+    use crate::bounded::Limits;
+
+    #[test]
+    fn a_parse_records_cleanup_releases_every_capability_and_admits_nothing_after_done() {
+        // The text "first", canonical.
+        const TEXT: [u8; 6] = [0x65, b'f', b'i', b'r', b's', b't'];
+        every_cut(
+            "a parse record",
+            |a| {
+                let owner = scope(a);
+                let input = completed(owner.copy_input(&TEXT), a);
+                (
+                    owner,
+                    Parse::<'static, ByteString, Limits> {
+                        input: Some(input),
+                        options: Options::normalizing(8),
+                    },
+                )
+            },
+            |detail: &ParseDetail, released, what| {
+                assert_eq!(detail.parser, None, "{what}: a parser observed after Done");
+                assert_eq!(
+                    detail.resources, None,
+                    "{what}: parser resources observed after Done"
+                );
+                if released {
+                    assert_eq!(detail.phase, None, "{what}: a released record's phase read");
+                } else {
+                    assert_eq!(detail.phase, Some(ParsePhase::Done), "{what}");
+                    assert!(!detail.input, "{what}: the released input observed");
+                }
+            },
+        );
     }
 }

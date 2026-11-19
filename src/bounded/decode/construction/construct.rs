@@ -8,20 +8,22 @@
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
-use super::in_place::{Built, InPlace, Transferable};
+use super::Context;
+use super::in_place::{self, Built, InPlace, Session, Transferable};
 use super::input::DecodeInput;
 use super::operation::{Observed, Operation, OperationTerms, Position, Task};
 use super::parse::{DocumentDecoder, OwnedDocument, ParseDetail};
 use super::reclamation::{
-    Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
+    Cleanup, Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
     ScopeRef, Slot, reclaim_within, slot_place,
 };
+use super::stable::{self, PENDING_UNITS, Pending};
 use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::decode::{ConstructResult, DecodeError, Options};
 use crate::bounded::{
-    Allocator, BoundedError, BoundedResult, Places, ResourceBound, Resumable, Step, Unit,
-    WriteWork, at,
+    Allocator, BoundedError, BoundedResult, Budget, Custodial, CustodySink, PermitsObserved,
+    Places, ResourceBound, Resumable, Step, TerminalAllocator, Unit, WriteWork, at, observed_all,
 };
 
 places! {
@@ -75,19 +77,41 @@ pub struct Constructed<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> {
 
 /// A construction record's own custody ([`Place::custody`]): the document
 /// it holds until detachment, the input it holds after, the value's
-/// construction state and the phase. Initialized field by field; reached
+/// construction state, the phase, and the credit of the one acquisition
+/// the value's construction holds pending. Initialized field by field, the
+/// pending credit one unit per its own field ([`PENDING_UNITS`]); reached
 /// whole, once initialized, through one exclusive borrow of the record's
 /// progress, its fields then borrowing disjointly.
 struct ConstructCustody<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> {
     document: Option<OwnedDocument<'s, I, A>>,
     input: Option<OwnedInitialized<'s, I, A>>,
-    /// The value's own construction state.
-    build: T::State,
+    /// The value's session over its own construction state: the root's
+    /// binding, which the engine binds to the document's root node, the
+    /// document this record owns.
+    build: Session<T::State>,
     phase: ConstructPhase,
+    /// The value's construction's pending acquisition, whose credit is held
+    /// here once and by no part of the value's state; its owner is this
+    /// record's, minted when its unit is written. The record's own
+    /// acquisition, by the operation's scope, is not among it: that credit
+    /// stays with the operation's acquisition, outside the record it
+    /// acquires.
+    pending: Pending<A::Origin>,
 }
 
 impl<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> Constructed<'s, I, T, A> {
-    const INIT_STEPS: usize = 4;
+    /// The fields written before the pending credit's: document, input,
+    /// session and phase.
+    const OWN_STEPS: usize = 4;
+
+    /// Every custody field's unit: the record's own, then the pending
+    /// credit's ([`PENDING_UNITS`]).
+    const INIT_STEPS: usize = Self::OWN_STEPS + PENDING_UNITS;
+
+    /// The pending credit's initialized units, from the record's progress.
+    const fn pending_units(initialized: usize) -> usize {
+        initialized.saturating_sub(Self::OWN_STEPS)
+    }
 
     /// The value's place within the record's, in the record's mode: the one
     /// projection its construction, its cleanup and its count share.
@@ -132,10 +156,24 @@ impl<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> Constructed<'s, I, T, A
     }
 }
 
-// SAFETY: the prefix is the document handle, the input slot, the value's
-// initial construction state and the phase. Cleanup reclaims the value
-// through its own state, then the document and the input in place; no
-// destructor of T runs.
+// SAFETY: initial: no prefix unit initialized. state: the prefix (the
+// document handle, the input slot, the value's initial construction state,
+// the phase and the pending credit's units), the value's own state and the
+// session record everything initialized and acquired. admission: each
+// cleanup unit, the record's and the value's (through its session), is
+// admitted before it runs, a refusal changing nothing. cleanup: it settles
+// the pending credit at its entry, reclaims the value through its own
+// state, then the document and the input in place, and drops the pending
+// credit's written units in place; no destructor of T runs, nothing is
+// allocated and nothing unwinds. done: `Done` once the value, the document
+// and the input are released; an incomplete prefix's release leaves it
+// released (`Prefix::release`). order: a step after `Done` reports `Done`,
+// admitting nothing, from `ConstructPhase::Done` or a released prefix alike;
+// the count and observation read only the recorded prefix and state,
+// nothing of a released prefix, and never the dropped pending. depth:
+// the larger of `T`'s plus one and the input's plus three, the two chains its
+// cleanup dispatches. count: the value's remaining plus the record's own
+// units, composed checked.
 unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     for Constructed<'_, I, T, A>
 {
@@ -147,20 +185,39 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     type State = Prefix;
     const INITIAL: Prefix = Prefix::EMPTY;
 
-    fn reclaim_step(mut slot: Slot<'_, Self, Prefix>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Prefix>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
+        let a = cleanup;
+        // Released: terminal, `Done` admitting nothing.
+        if slot.custody().released() {
+            return Ok(Reclaimed::Done);
+        }
         if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, slot.custody().initialized()) {
             if let Some(document) = Self::document(&mut slot)
                 && document.is_some()
             {
                 at(ConstructPlace::Document, || {
-                    OwnedDocument::reclaim_step(document, a)
+                    OwnedDocument::reclaim_under(document, a)
                 })?;
                 return Ok(Reclaimed::Progress);
             }
-            // The rest of the prefix is resource-free: the empty input slot,
-            // the value's initial state and the phase.
+            // The rest of the prefix holds no admitted credit: the empty
+            // input slot, the value's initial state, the phase, and the
+            // pending credit's written units, idle (no acquisition binds
+            // before the prefix is complete), whose owner is dropped in
+            // place after the admitted unit.
             CLEANUP.admit(a)?;
-            *slot.custody() = Prefix::EMPTY;
+            let (place, prefix) = slot.parts();
+            let written = Self::pending_units(prefix.initialized());
+            let raw = place.as_ptr(prefix);
+            // SAFETY: the progress records exactly `written` units of the
+            // pending credit initialized; the projection forms no reference,
+            // and the progress is released below, so nothing reads them
+            // again.
+            unsafe { stable::drop_pending(addr_of_mut!((*raw).custody.pending), written) };
+            slot.custody().release();
             return Ok(Reclaimed::Done);
         }
         let value = Self::value(&mut slot);
@@ -169,14 +226,15 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
             input,
             build,
             phase,
+            pending,
         } = Self::custody(&mut slot)?;
         match *phase {
             ConstructPhase::ReclaimValue => {
-                // SAFETY: the value's place, paired with its construction
-                // state, which the record keeps beside it and which describes
-                // every initialized part.
+                // SAFETY: the value's place, paired with its session, which
+                // the record keeps beside it and which describes every
+                // initialized part.
                 if at(ConstructPlace::Build, || {
-                    T::reclaim_step(unsafe { Slot::new(value, &mut *build) }, a)
+                    in_place::reclaim::<T, A>(unsafe { Slot::new(value, &mut *build) }, a)
                 })? == Reclaimed::Done
                 {
                     *phase = ConstructPhase::ReclaimDocument;
@@ -185,19 +243,35 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
             ConstructPhase::ReclaimDocument => {
                 let charge =
                     slot_place(document, ConstructPlace::Document, ConstructPlace::Cleanup);
-                if at(charge, || OwnedDocument::reclaim_step(document, a))? == Reclaimed::Done {
+                if at(charge, || OwnedDocument::reclaim_under(document, a))? == Reclaimed::Done {
                     *phase = ConstructPhase::ReclaimInput;
                 }
             }
             ConstructPhase::ReclaimInput => {
                 let charge = slot_place(input, ConstructPlace::Input, ConstructPlace::Cleanup);
-                if at(charge, || OwnedInitialized::reclaim_step(input, a))? == Reclaimed::Done {
+                if at(charge, || OwnedInitialized::reclaim_under(input, a))? == Reclaimed::Done {
                     *phase = ConstructPhase::Done;
+                    // The record's last unit: the pending credit, idle since
+                    // cleanup's entry, dropped in place, releasing its
+                    // owner's session reference. Nothing reads it in `Done`.
+                    // SAFETY: every unit of it is initialized and settled,
+                    // and no later step or observation of a `Done` record
+                    // reads the pending credit.
+                    unsafe { stable::drop_pending(core::ptr::from_mut(pending), PENDING_UNITS) };
                     return Ok(Reclaimed::Done);
                 }
             }
             ConstructPhase::Done => return Ok(Reclaimed::Done),
             _ => {
+                // Cleanup's entry, in this order: the pending acquisition's
+                // credit settled by origin, explicitly, each obligation
+                // forfeited into the family that admitted it under this
+                // step's performer, and the pending idle (never through a
+                // retained obligation's drop); then the admitted transition;
+                // then the value's installed resources, reclaimed from
+                // `ReclaimValue` on. Settlement is idempotent, so a refused
+                // transition retried settles nothing twice.
+                pending.settle_all(a.performer());
                 CLEANUP.admit(a)?;
                 *phase = ConstructPhase::ReclaimValue;
             }
@@ -209,13 +283,17 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     /// the one releasing the record. After it: the transition into cleanup
     /// unless it has begun, the value's own count, the document slot's and
     /// the input slot's.
-    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> u64 {
+    fn remaining(mut slot: PeekSlot<'_, Self, Prefix>) -> Option<u64> {
+        // Released: the one call reporting `Done`.
+        if slot.custody().released() {
+            return Some(1);
+        }
         if slot.custody().initialized() < Self::INIT_STEPS {
             return match Self::document(&mut slot) {
                 Some(document) if document.is_some() => {
-                    OwnedDocument::remaining(document).saturating_add(1)
+                    OwnedDocument::remaining(document)?.checked_add(1)
                 }
-                _ => 1,
+                _ => Some(1),
             };
         }
         // The value, which a reader of the published record may hold
@@ -226,23 +304,89 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
             input,
             build,
             phase,
+            ..
         }) = Self::custody::<_, ()>(&mut slot)
         else {
-            return 1;
+            return Some(1);
         };
         let phase = *phase;
-        let input = OwnedInitialized::remaining(input);
-        let document = OwnedDocument::remaining(document).saturating_add(input);
-        // SAFETY: the value's place, observed, paired with its own state, as
-        // its cleanup steps it.
-        let value = T::remaining(unsafe { Slot::new(value, build) }).saturating_add(document);
+        let input = OwnedInitialized::remaining(input)?;
+        let document = OwnedDocument::remaining(document)?.checked_add(input)?;
+        // SAFETY: the value's place, observed, paired with its own session,
+        // as its cleanup steps it.
+        let value = super::in_place::remaining::<T, A>(unsafe { Slot::new(value, build) })?
+            .checked_add(document)?;
         match phase {
-            ConstructPhase::Done => 1,
-            ConstructPhase::ReclaimInput => input,
-            ConstructPhase::ReclaimDocument => document,
-            ConstructPhase::ReclaimValue => value,
-            _ => value.saturating_add(1),
+            ConstructPhase::Done => Some(1),
+            ConstructPhase::ReclaimInput => Some(input),
+            ConstructPhase::ReclaimDocument => Some(document),
+            ConstructPhase::ReclaimValue => Some(value),
+            _ => value.checked_add(1),
         }
+    }
+
+    /// The record's value's custody, each independently owning part a group
+    /// of its own inside the record's ([`CustodySink`]): the document, while
+    /// held, under the owner its own record stores
+    /// ([`OwnedDocument::observe_custody`]); once the prefix is complete and
+    /// until the record's last unit drops it, the value's construction, a
+    /// group under the owner its pending stores, every acquisition of the
+    /// value's bound under it: the pending's held obligations
+    /// ([`Pending::observe_custody`]) and the value's permits
+    /// ([`in_place::observe_permits`]); and the detached input, under the
+    /// owner its own record stores. The prefix's pending units hold no
+    /// credit (no acquisition binds before the prefix is complete) and its
+    /// value holds nothing. Read-only; the completeness of every part,
+    /// combined.
+    fn observe_permits(
+        mut slot: PeekSlot<'_, Self, Prefix>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        // Released: nothing held, nothing read.
+        if slot.custody().released() {
+            return PermitsObserved::Complete;
+        }
+        if slot.custody().initialized() < Self::INIT_STEPS {
+            return match Self::document(&mut slot) {
+                Some(Some(document)) => document.observe_custody(sink),
+                _ => PermitsObserved::Complete,
+            };
+        }
+        // The value, which a reader of the published record may hold
+        // borrowed, is never reborrowed: its place is observed.
+        let value = Self::value(&mut slot);
+        let Ok(ConstructCustody {
+            document,
+            input,
+            build,
+            phase,
+            pending,
+        }) = Self::custody::<_, ()>(&mut slot)
+        else {
+            return PermitsObserved::Complete;
+        };
+        let document = match document {
+            Some(document) => document.observe_custody(sink),
+            None => PermitsObserved::Complete,
+        };
+        let construction = if *phase == ConstructPhase::Done {
+            // The record's last unit dropped the pending in place, after the
+            // value's cleanup released everything it held.
+            PermitsObserved::Complete
+        } else {
+            sink.begin(pending.owner_id());
+            let held = pending.observe_custody(sink);
+            // SAFETY: the value's place, observed, paired with its own
+            // session, as its cleanup count reads it.
+            let owned = in_place::observe_permits::<T, A>(unsafe { Slot::new(value, build) }, sink);
+            sink.end();
+            observed_all([held, owned])
+        };
+        let input = match input {
+            Some(input) => input.observe_custody(sink),
+            None => PermitsObserved::Complete,
+        };
+        observed_all([document, construction, input])
     }
 }
 
@@ -250,7 +394,9 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
 /// record's phase; whether the record, or before the record holds it the
 /// task, holds the document; whether the record holds the detached input;
 /// and the value's construction state, observed whole, once the record's
-/// prefix is written.
+/// prefix is written. Whether an acquisition of the value's construction is
+/// bound is the record's custody's to report ([`CustodySink::bound`], from
+/// [`Pending::observe_custody`]), not its progress's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConstructDetail<O> {
     pub phase: Option<ConstructPhase>,
@@ -264,19 +410,28 @@ pub struct Construct<'s, I: DecodeInput<A>, T, A: Allocator> {
     marker: core::marker::PhantomData<fn() -> T>,
 }
 
-// SAFETY: initialization moves the document handle in and writes three
-// resource-free fields; every later phase is recorded before it acquires.
+// SAFETY: prefix: initialization moves the document handle in and writes
+// three resource-free fields, one unit each, recorded as it is written;
+// every prefix is reclaimable by `Constructed`'s cleanup, and past
+// `INIT_STEPS`, or once released, it refuses, changing nothing. advance:
+// refused until the prefix is whole, a released prefix recording none;
+// every later phase is recorded before it acquires, and
+// completion is reported only once the value is built whole. detail:
+// `detail` and `observe_custody` read only the recorded prefix and the
+// value's observation, changing, admitting and allocating nothing.
+// provenance: every field and the value are reached through the record's
+// slot place, by raw projection.
 unsafe impl<'s, I, T, A> Task<'s, A> for Construct<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
     T: Transferable<A> + 's,
-    A: Allocator + 's,
+    A: TerminalAllocator + 's,
     A::Permit: Send,
 {
     type State = Constructed<'s, I, T, A>;
     type Output = TypedValue<'s, I, T, A>;
     type Error = DecodeError<A::Refusal>;
-    type Detail = ConstructDetail<<T::State as Custody>::Observation>;
+    type Detail = ConstructDetail<<Session<T::State> as Custody>::Observation>;
     const INIT_STEPS: usize = Constructed::<'s, I, T, A>::INIT_STEPS;
 
     fn scope(&self) -> Option<&ScopeRef<'s, A>> {
@@ -293,6 +448,10 @@ where
         a: &mut A,
     ) -> Result<(), Self::Error> {
         let (place, prefix) = slot.parts();
+        // A released record is terminal: nothing is written again.
+        if prefix.released() {
+            return Err(BoundedError::PlanMismatch.into());
+        }
         let raw = place.as_ptr(prefix);
         // SAFETY: the slot pairs the record's place with its progress, so the
         // unit the progress names next is uninitialized; each unit writes
@@ -306,12 +465,33 @@ where
                     a,
                 )?,
                 1 => field(addr_of_mut!((*raw).custody.input), || None, a)?,
-                2 => field(addr_of_mut!((*raw).custody.build), || T::INITIAL, a)?,
+                2 => field(
+                    addr_of_mut!((*raw).custody.build),
+                    || Session::new(T::INITIAL),
+                    a,
+                )?,
                 3 => field(
                     addr_of_mut!((*raw).custody.phase),
                     || ConstructPhase::Build,
                     a,
                 )?,
+                written if Bound::new(Predicate::Prefix, Self::INIT_STEPS).below(a, written) => {
+                    let unit = Constructed::<'s, I, T, A>::pending_units(written);
+                    // The record's owner, minted with the pending credit's
+                    // head, the unit that stores it: the one capability of
+                    // this custody, held in the pending credit alone.
+                    let owner = if unit == 0 {
+                        Some(a.owner().map_err(BoundedError::Refused)?)
+                    } else {
+                        None
+                    };
+                    stable::initialize_pending(
+                        addr_of_mut!((*raw).custody.pending),
+                        unit,
+                        owner,
+                        a,
+                    )?
+                }
                 _ => return Err(BoundedError::PlanMismatch.into()),
             }
         }
@@ -319,9 +499,13 @@ where
         Ok(())
     }
 
+    /// The value's acquisitions bind on the pending the record keeps, under
+    /// the owner the record's construction group reports: the operation's
+    /// pending is left idle.
     fn advance(
         &mut self,
         mut slot: Slot<'_, Self::State, Prefix>,
+        _: &mut Pending<A::Origin>,
         a: &mut A,
     ) -> Result<bool, Self::Error> {
         // The value is reached only through its place; the custody is refused
@@ -332,16 +516,21 @@ where
             input,
             build,
             phase,
+            pending,
         } = Constructed::custody(&mut slot)?;
         match *phase {
             ConstructPhase::Build => {
                 let document = document.as_ref().ok_or(BoundedError::PlanMismatch)?;
-                // SAFETY: the value's place and its construction state, kept
-                // in the record's custody, are retained across every call; the
-                // document view ends with this call.
+                // SAFETY: the value's place and its session, kept in the
+                // record's custody, are retained across every call; the
+                // document view ends with this call. The context is minted
+                // here, from the document this record owns and the pending
+                // credit it keeps, at its root: the only context the value's
+                // construction ever receives.
                 let built = at(ConstructPlace::Build, || {
                     document.with_document(|view| {
-                        T::build_step(view, 0, unsafe { Slot::new(value, &mut *build) }, a)
+                        let slot = unsafe { Slot::new(value, &mut *build) };
+                        in_place::build::<T, A>(Context::root(view, slot, &mut *pending), a)
                     })
                 })?;
                 if built == Built::Done {
@@ -357,6 +546,11 @@ where
                 *phase = ConstructPhase::Publish;
             }
             ConstructPhase::Publish => {
+                // A value is published only with no credit pending: every
+                // acquisition of its construction ended.
+                if !pending.is_idle() {
+                    return Err(BoundedError::PlanMismatch.into());
+                }
                 PUBLISH.admit(a)?;
                 *phase = ConstructPhase::Published;
                 return Ok(true);
@@ -370,13 +564,36 @@ where
         TypedValue { record }
     }
 
-    fn reclaim_step(&mut self, a: &mut A) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(&mut self, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
         let place = slot_place(
             &self.document,
             ConstructPlace::Document,
             ConstructPlace::Cleanup,
         );
-        at(place, || OwnedDocument::reclaim_step(&mut self.document, a))
+        at(place, || {
+            OwnedDocument::reclaim_under(&mut self.document, cleanup)
+        })
+    }
+
+    /// The task holds no pending credit of its own: the value's
+    /// construction keeps its pending acquisition in the record's custody,
+    /// settled at the record's own cleanup entry ([`Constructed`]).
+    fn settle(&mut self, _: crate::bounded::Performer) {}
+
+    /// The task's custody outside its record: the document while the task,
+    /// not yet its record, holds it, under the owner its own record stores
+    /// ([`OwnedDocument::observe_custody`]). Everything inside the record is
+    /// the record's to report ([`Constructed`]'s
+    /// [`Reclaim::observe_permits`]).
+    fn observe_custody(
+        &mut self,
+        _: Observed<'_, 's, Self, A>,
+        sink: &mut dyn CustodySink<A::Permit>,
+    ) -> PermitsObserved {
+        match self.document.as_mut() {
+            Some(document) => document.observe_custody(sink),
+            None => PermitsObserved::Complete,
+        }
     }
 
     fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
@@ -461,20 +678,32 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> TypedValue<'s, I, T, A>
         self.input().bytes()
     }
 
-    /// Operation-local cleanup of this value and its input.
+    /// Operation-local cleanup of this value and its input, the cleanup
+    /// capability minted here over `a`.
     pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {
+        super::reclamation::with_cleanup(a, |cleanup| Self::reclaim_under(slot, cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under `cleanup`, a capability already minted:
+    /// how a cleanup that holds this handle (an owned preparation's record
+    /// or task, or a third-party binding's state) steps it
+    /// ([`OwnedInitialized::reclaim_under`]).
+    pub fn reclaim_under(
+        slot: &mut Option<Self>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
         reclaim_within(
             slot,
-            a,
+            cleanup,
             |value| value.record,
             |record| Self { record },
-            OwnedInitialized::reclaim_step,
+            OwnedInitialized::reclaim_under,
         )
     }
 
     /// The calls [`Self::reclaim_step`] still takes from `slot`
     /// ([`OwnedInitialized::remaining`]).
-    pub(crate) fn remaining(slot: &mut Option<Self>) -> u64 {
+    pub fn remaining(slot: &mut Option<Self>) -> Option<u64> {
         let mut record = slot.take().map(|value| value.record);
         let remaining = OwnedInitialized::remaining(&mut record);
         *slot = record.map(|record| Self { record });
@@ -543,14 +772,20 @@ impl ConstructTerms {
         input: ResourceBound,
     ) -> Result<Self, BoundedError<R>> {
         Ok(Self {
-            build: T::COST.bound(len)?,
+            // The value's own cost and its session's two transitions.
+            build: in_place::root_cost(T::COST)
+                .ok_or(BoundedError::Overflow)?
+                .bound(len)?,
             detach: DETACH.times(1)?,
             publish: PUBLISH.times(1)?,
             // The record's transition, or its release before initialization
             // completed; then two emptied slots: the record never holds both
             // the document and the input, and the task's document moved into
             // the record at its first initialization unit.
-            cleanup: CLEANUP.times(1)?.then(EMPTIED.times(2)?)?,
+            cleanup: CLEANUP
+                .times(1)?
+                .checked_then(EMPTIED.times(2)?)
+                .ok_or(BoundedError::Overflow)?,
             document,
             input,
         })
@@ -586,7 +821,9 @@ where
     T: InPlace<A>,
     A: Allocator,
 {
-    super::parse::parse_bound::<I, A, R>(len, options)?.then(construction_bound::<I, T, A, R>(len)?)
+    super::parse::parse_bound::<I, A, R>(len, options)?
+        .checked_then(construction_bound::<I, T, A, R>(len)?)
+        .ok_or(BoundedError::Overflow)
 }
 
 /// Construction from an owned document.
@@ -596,7 +833,7 @@ impl<'s, I, T, A> Construction<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
     T: Transferable<A> + 's,
-    A: Allocator + 's,
+    A: TerminalAllocator + 's,
     A::Permit: Send,
 {
     /// Construct `T` from `document`'s root. Construction allocates nothing.
@@ -650,7 +887,7 @@ enum Stage<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
     T: Transferable<A> + 's,
-    A: Allocator + 's,
+    A: TerminalAllocator + 's,
     A::Permit: Send,
 {
     Parse(DocumentDecoder<'s, I, A>),
@@ -658,12 +895,46 @@ where
     Finished,
 }
 
+/// The value's custody: its record's group, under the owner of the
+/// acquisition that allocated it, with its construction and its input
+/// inside (its record's [`Custodial`] traversal), the completeness returned
+/// whole; `&mut self` excludes every reader of the value meanwhile.
+/// Read-only.
+impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Custodial<A::Permit>
+    for TypedValue<'s, I, T, A>
+{
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        self.record.observe_custody(sink)
+    }
+}
+
+/// The decode's custody ([`CustodySink`]): its current stage's operation's,
+/// the parse's while it parses and the construction's once the parsed
+/// document moved into it, its completeness returned whole. A finished
+/// decode holds nothing: its published value or its cleaned-up records are
+/// no longer its own. Read-only.
+impl<'s, I, T, A> Custodial<A::Permit> for TypedDecoder<'s, I, T, A>
+where
+    I: DecodeInput<A> + 's,
+    T: Transferable<A> + 's,
+    A: TerminalAllocator + 's,
+    A::Permit: Send,
+{
+    fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
+        match &mut self.stage {
+            Stage::Parse(operation) => operation.observe_custody(sink),
+            Stage::Construct(operation) => operation.observe_custody(sink),
+            Stage::Finished => PermitsObserved::Complete,
+        }
+    }
+}
+
 /// Typed decoding: a parse, then construction from the parsed document.
 pub struct TypedDecoder<'s, I, T, A>
 where
     I: DecodeInput<A>,
     T: Transferable<A>,
-    A: Allocator,
+    A: TerminalAllocator,
     A::Permit: Send,
 {
     stage: Stage<'s, I, T, A>,
@@ -673,7 +944,7 @@ impl<'s, I, T, A> TypedDecoder<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
     T: Transferable<A> + 's,
-    A: Allocator + 's,
+    A: TerminalAllocator + 's,
     A::Permit: Send,
 {
     /// A typed decode of `input`. Construction allocates nothing.
@@ -691,7 +962,7 @@ where
         }
     }
 
-    pub fn position(&mut self) -> TypedPosition<<T::State as Custody>::Observation> {
+    pub fn position(&mut self) -> TypedPosition<<Session<T::State> as Custody>::Observation> {
         match &mut self.stage {
             Stage::Parse(operation) => TypedPosition::Parse(operation.position()),
             Stage::Construct(operation) => TypedPosition::Construct(operation.position()),
@@ -735,12 +1006,12 @@ impl<'s, I, T, A> Resumable<A> for TypedDecoder<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
     T: Transferable<A> + 's,
-    A: Allocator + 's,
+    A: TerminalAllocator + 's,
     A::Permit: Send,
 {
     type Output = TypedValue<'s, I, T, A>;
     type Error = DecodeError<A::Refusal>;
-    type Position = TypedPosition<<T::State as Custody>::Observation>;
+    type Position = TypedPosition<<Session<T::State> as Custody>::Observation>;
 
     fn step(&mut self, a: &mut A) -> Result<Step<TypedValue<'s, I, T, A>>, Self::Error> {
         TypedDecoder::step(self, a)
@@ -748,5 +1019,262 @@ where
 
     fn position(&mut self) -> Self::Position {
         TypedDecoder::position(self)
+    }
+}
+
+/// The construction record's cleanup at every cut of its task
+/// ([`super::cuts::every_cut`]): every capability released exactly once,
+/// the value's pending dropped in place at the record's last unit, and
+/// after `Done`, released prefix or `ConstructPhase::Done`, nothing
+/// admitted, initialization and advance refused, and neither document nor
+/// input observed.
+#[cfg(all(test, feature = "std"))]
+mod released {
+    use super::super::cuts::{completed, every_cut, scope};
+    use super::*;
+    use crate::ByteString;
+    use crate::bounded::Limits;
+
+    #[test]
+    fn a_construction_records_cleanup_releases_every_capability_and_admits_nothing_after_done() {
+        // The text "first", canonical.
+        const TEXT: [u8; 6] = [0x65, b'f', b'i', b'r', b's', b't'];
+        every_cut(
+            "a construction record",
+            |a| {
+                let owner = scope(a);
+                let input = completed(owner.copy_input(&TEXT), a);
+                let document = completed(DocumentDecoder::parse(input, Options::normalizing(8)), a);
+                (
+                    owner,
+                    Construct::<'static, ByteString, String, Limits> {
+                        document: Some(document),
+                        marker: core::marker::PhantomData,
+                    },
+                )
+            },
+            |detail: &ConstructDetail<_>, released, what| {
+                if released {
+                    assert_eq!(detail.phase, None, "{what}: a released record's phase read");
+                    assert_eq!(detail.build, None, "{what}: a released record's value read");
+                } else {
+                    assert_eq!(detail.phase, Some(ConstructPhase::Done), "{what}");
+                    assert!(!detail.document, "{what}: the released document observed");
+                    assert!(!detail.input, "{what}: the released input observed");
+                }
+            },
+        );
+    }
+}
+
+/// The records' dispatch census: each record's declared dispatch depth less
+/// the deepest level its whole life reaches, driven through its public
+/// operations and handles alone, its scope shut down after, exactly. A
+/// record is dispatched by its cleanup (its own advance, then the records
+/// its custody holds), and a value's construction by the engine below it.
+/// `Parsed` declares one level over its input chain (1). `Constructed`
+/// declares the larger of its value's chain (0, the value dominating) and
+/// its document's (1, `Parsed`'s margin, reached when the construction is
+/// cancelled while the record still holds the document). `Planned` declares
+/// one level over the published value it holds, so its margin is that
+/// value's (0). A change in either direction fails here and is re-recorded
+/// deliberately. Planted control
+/// `tests/data/controls/parsed-depth-margin-changed.patch` (`Parsed`
+/// declaring one level more) fails "Parsed".
+#[cfg(all(test, feature = "std"))]
+mod depth {
+    use super::super::parse::Parsed;
+    use super::super::reclamation::{DecodeOwner, deepest_reached};
+    use super::*;
+    use crate::ByteString;
+    use crate::bounded::Limits;
+    use crate::bounded::encoding::{OwnedPreparation, OwnedPrepared, Planned};
+
+    /// A value whose chain dominates its input's: three sequences over a
+    /// scalar, four levels.
+    type Nested = Vec<Vec<Vec<u64>>>;
+
+    /// `[[[7]]]`, canonical.
+    const NESTED: [u8; 4] = [0x81, 0x81, 0x81, 0x07];
+
+    /// `operation` stepped to its output.
+    fn completed<'s, K: Task<'s, Limits>>(
+        mut operation: Operation<'s, K, Limits>,
+        a: &mut Limits,
+    ) -> K::Output
+    where
+        K::Error: core::fmt::Debug,
+    {
+        loop {
+            match operation.step(a).unwrap() {
+                Step::Complete(output) => return output,
+                Step::Progress => {}
+                Step::Finished => panic!("an operation finished without its output"),
+            }
+        }
+    }
+
+    /// `wire` copied into `owner`'s scope and parsed into a document.
+    fn parsed(
+        owner: &DecodeOwner<'static, Limits>,
+        wire: &[u8],
+        a: &mut Limits,
+    ) -> OwnedDocument<'static, ByteString, Limits> {
+        let input = completed(owner.copy_input(wire), a);
+        completed(DocumentDecoder::parse(input, Options::normalizing(8)), a)
+    }
+
+    /// An initialized scope.
+    fn scope(a: &mut Limits) -> DecodeOwner<'static, Limits> {
+        let mut owner = DecodeOwner::new();
+        owner.initialize_step(a).unwrap();
+        owner
+    }
+
+    /// `owner` shut down to `Done`, every record it queued reclaimed.
+    fn shut_down(mut owner: DecodeOwner<'static, Limits>, a: &mut Limits) {
+        while owner.shutdown_step(a).unwrap() != Reclaimed::Done {}
+    }
+
+    /// `run`'s deepest dispatch level against `declared`: their difference is
+    /// `expected`, and `run` left no storage held.
+    fn margin(what: &str, declared: usize, expected: usize, run: impl FnOnce(&mut Limits)) {
+        let mut a = Limits::unlimited();
+        let measured = deepest_reached(|| run(&mut a));
+        assert_eq!(a.live_bytes(), 0, "{what}: storage left held");
+        assert_eq!(
+            declared.checked_sub(measured),
+            Some(expected),
+            "{what}: declared {declared}, measured {measured}"
+        );
+    }
+
+    #[test]
+    fn every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin() {
+        margin(
+            "Parsed",
+            <Parsed<'static, ByteString, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH,
+            1,
+            |a| {
+                let owner = scope(a);
+                let mut document = Some(parsed(&owner, &[0x07], a));
+                while OwnedDocument::reclaim_step(&mut document, a).unwrap() != Reclaimed::Done {}
+                shut_down(owner, a);
+            },
+        );
+        margin(
+            "Constructed, its value",
+            <Constructed<'static, ByteString, Nested, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH,
+            0,
+            |a| {
+                let owner = scope(a);
+                let document = parsed(&owner, &NESTED, a);
+                let mut value = Some(completed(
+                    Construction::<'static, ByteString, Nested, Limits>::construct(document),
+                    a,
+                ));
+                let expected: Nested = vec![vec![vec![7]]];
+                assert_eq!(value.as_ref().map(TypedValue::value), Some(&expected));
+                while TypedValue::reclaim_step(&mut value, a).unwrap() != Reclaimed::Done {}
+                shut_down(owner, a);
+            },
+        );
+        margin(
+            "Constructed, its document",
+            <Constructed<'static, ByteString, u64, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH,
+            1,
+            |a| {
+                let owner = scope(a);
+                let document = parsed(&owner, &[0x07], a);
+                let mut construction =
+                    Construction::<'static, ByteString, u64, Limits>::construct(document);
+                // The record holds the document from its first unit; its
+                // phase is written before the value is built or detached.
+                while construction.position().detail.phase != Some(ConstructPhase::Build) {
+                    assert!(matches!(construction.step(a).unwrap(), Step::Progress));
+                }
+                construction.cancel();
+                while !matches!(construction.step(a).unwrap(), Step::Finished) {}
+                drop(construction);
+                shut_down(owner, a);
+            },
+        );
+        margin(
+            "Planned",
+            <Planned<'static, ByteString, Nested, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH,
+            0,
+            |a| {
+                let owner = scope(a);
+                let document = parsed(&owner, &NESTED, a);
+                let value = completed(
+                    Construction::<'static, ByteString, Nested, Limits>::construct(document),
+                    a,
+                );
+                let mut plan = Some(completed(OwnedPreparation::prepare(value), a));
+                assert_eq!(plan.as_ref().map(OwnedPrepared::len), Some(NESTED.len()));
+                while OwnedPrepared::reclaim_step(&mut plan, a).unwrap() != Reclaimed::Done {}
+                shut_down(owner, a);
+            },
+        );
+    }
+
+    /// A valid construction whose declaration is its true depth (its value
+    /// dominating, margin 0), suspended once its value's build has
+    /// dispatched its innermost element, is dropped (its record queued in
+    /// the scope, unpublished) and its scope abandoned: the authority's drop
+    /// releases the last reference, and the terminal drain reclaims the
+    /// record through every level its declaration names and no further,
+    /// under the terminal policy, nothing refused, nothing left held. On a
+    /// recorded session, its stream concluded complete and refined. Planted
+    /// control `tests/data/controls/constructed-depth-overstated.patch` (the
+    /// record declaring one level over its value's) keeps the finding "the
+    /// terminal drain's deepest level".
+    #[test]
+    fn a_construction_suspended_at_its_declared_depth_drains_terminally() {
+        use super::super::findings::{Expected, ExpectedHistory, Findings};
+        use crate::bounded::{Capacity, Session};
+        let declared =
+            <Constructed<'static, ByteString, Nested, Limits> as Reclaim<Limits>>::DISPATCH_DEPTH;
+        let innermost = <Nested as Reclaim<Limits>>::DISPATCH_DEPTH;
+        let session = Session::new(Capacity {
+            permits: 64,
+            events: 4096,
+        });
+        let mut m = Limits::recorded_unlimited(&session);
+        let mut findings = Findings::new();
+        let owner = scope(&mut m);
+        let document = parsed(&owner, &NESTED, &mut m);
+        let mut construction =
+            Construction::<'static, ByteString, Nested, Limits>::construct(document);
+        // Stepped until the value's build reaches its own declaration, its
+        // innermost element dispatched; every step of it is progress.
+        let mut built = 0;
+        while built < innermost {
+            let mut progressed = false;
+            built = built.max(deepest_reached(|| {
+                progressed = matches!(construction.step(&mut m), Ok(Step::Progress));
+            }));
+            if !progressed {
+                findings.check(
+                    false,
+                    || "the construction stopped before its innermost element was dispatched",
+                );
+                break;
+            }
+        }
+        findings.equal("the build's deepest level", built, innermost);
+        // Dropped mid-construction: its record is queued, the settled
+        // acquisition holds nothing; then the scope is abandoned and drained
+        // terminally by its last reference's release.
+        drop(construction);
+        let drained = deepest_reached(|| drop(owner));
+        findings.equal("the terminal drain's deepest level", drained, declared);
+        findings.equal("the storage after the drain", m.live_bytes(), 0);
+        findings.policies([("m", m, ExpectedHistory::Readable)]);
+        findings.conclude(&[(
+            "the suspended construction's session",
+            &session.finish(),
+            Expected::Complete,
+        )]);
     }
 }

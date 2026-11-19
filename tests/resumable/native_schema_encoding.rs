@@ -1,10 +1,11 @@
 use super::harness::*;
 use super::support::{
-    Fault, allowed, drive_faulted_observed, refusal_matrix, refuse, rigor::rigor,
+    Fault, Finding, Retirement, pipeline::Unwitnessed, prepare_turns, refusal_matrix,
+    rigor::rigor, shape,
 };
 use dcbor::bounded::{
-    BoundedError, Failure,
-    encoding::{Instruction, Schema},
+    BoundedError,
+    encoding::{Instruction, Preparation, Schema},
 };
 use dcbor_derive::CBORBoundedEncodable;
 
@@ -50,64 +51,42 @@ enum Shape<T> {
 
 /// The fault matrix of emitting `source`'s plan into a guarded destination
 /// ([`refusal_matrix`]): every refusal resumed without replay, a refused
-/// step leaving the emitted prefix unchanged, and a cancellation at every
-/// call ending the trace there. Emission never allocates, never writes
-/// outside its destination, and never releases the plan's storage. Named by
-/// its call site.
+/// step moving nothing, and a cancellation at every call ending the trace
+/// there. The plan is prepared and held by the run, then emitted by the
+/// held emission schedule ([`emit_held`]), which never allocates, never
+/// writes outside its destination, and never changes the plan's storage.
+/// Each run prepares its plan under a family of its own and emits it under
+/// another, the fault applied to the emission alone, so the matrix reads
+/// the emission's calls. Named by its call site.
 #[track_caller]
 fn emission_matrix(source: &dyn Schema, expected: &[u8]) {
     let name = format!("emit at {}", std::panic::Location::caller());
-    let (plan, pool) = prepared(source);
-    assert_eq!(plan.len(), expected.len());
-    let live = pool.live_bytes();
     refusal_matrix(&name, rigor(), |fault: Fault| {
-        let mut bytes = vec![0xee; expected.len() + 2];
-        let mut writer = plan.writer(&mut bytes[1..expected.len() + 1]);
-        let mut m = meter();
-        refuse(&mut m, fault.refusal);
-        let turns = allowed(&m, emit_turns(expected.len()));
-        let mut prefix = Vec::new();
-        let output = drive_faulted_observed(
-            &mut m,
-            &mut writer,
-            turns,
-            fault.cancel,
-            |_, writer, result| {
-                if matches!(result, Err(error) if error.refused()) {
-                    assert_eq!(
-                        writer.emitted_prefix(),
-                        prefix,
-                        "a refused step changed the emitted prefix"
-                    );
-                }
-                assert_eq!(
-                    writer.emitted_prefix(),
-                    &expected[..writer.emitted_prefix().len()]
-                );
-                prefix.clear();
-                prefix.extend_from_slice(writer.emitted_prefix());
-                assert_eq!(
-                    pool.live_bytes(),
-                    live,
-                    "emission changed the plan's storage"
-                );
-            },
-        )
-        .expect("emission failed");
-        if output.is_some() {
-            assert_eq!(writer.emitted_prefix(), expected);
-        }
-        assert_eq!(m.requests(), 0, "emission requested allocation");
-        // The writer's borrow of `bytes` ends here; it has no destructor.
-        assert_eq!(
-            (bytes[0], bytes[expected.len() + 1]),
-            (0xee, 0xee),
-            "emission wrote outside its destination"
-        );
-        super::support::RefusalRun::of(&m)
+        super::support::recorded_run(|run| {
+            let preparing = run.policy(POOL);
+            let emitting = run.policy(POOL);
+            run.holding(
+                Preparation::new(source),
+                Retirement::Released,
+                &Unwitnessed,
+                |operation| {
+                    operation
+                        .drive(
+                            preparing,
+                            prepare_turns(shape(source)),
+                            Retirement::Released,
+                            |plan| emit_held(plan, preparing, emitting, expected, fault),
+                        )
+                        .map_err(Finding::from)?
+                },
+            )?;
+            run.with_policy(preparing, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(run.with_policy(emitting, |m| {
+                assert_eq!(m.requests(), 0, "emission requested allocation");
+                super::support::RefusalRun::of(m)
+            }))
+        })
     });
-    drop(plan);
-    assert_eq!(pool.live_bytes(), 0);
 }
 
 #[test]
@@ -146,12 +125,13 @@ fn enum_generic_optional_tagged_and_numeric_literals_survive_emission_refusals()
 /// pass. The symbolic encoder is the independent oracle for every literal.
 mod ordered {
     use super::*;
-    use dcbor::{CBOR, CBORCase, Map};
+    use dcbor::{CBOR, CBORCase, CBOREncodable, Map};
     use std::collections::BTreeMap;
 
-    /// The symbolic encoder's bytes for `value`.
-    fn symbolic(value: impl Into<CBOR>) -> Vec<u8> {
-        value.into().to_cbor_data()
+    /// The symbolic encoder's bytes for `value` ([`CBOREncodable`]), by
+    /// reference; the fixtures here all encode.
+    fn symbolic<T: CBOREncodable>(value: &T) -> Vec<u8> {
+        value.encode_cbor_data().expect("the fixture encodes")
     }
 
     /// The canonical encoding of a map of `count` entries `n => n`.
@@ -186,7 +166,7 @@ mod ordered {
         let expected = [
             0xa4, 0x61, b'b', 2, 0x61, b'z', 3, 0x62, b'a', b'a', 1, 0x62, 0xc3, 0xa9, 4,
         ];
-        assert_eq!(symbolic(source.clone()), expected);
+        assert_eq!(symbolic(&source), expected);
         prepare_matrix(&source, Ok(&expected));
         emission_matrix(&source, &expected);
     }
@@ -205,30 +185,61 @@ mod ordered {
             (0, BTreeMap::new()),
         ]);
         let expected = [0xa2, 0, 0xa0, 1, 0xa1, 2, 0x81, 3];
-        assert_eq!(symbolic(values.clone()), expected);
+        assert_eq!(symbolic(&values), expected);
         prepare_matrix(&values, Ok(&expected));
         // A key's cursor is started and finished while the outer cursor is
         // suspended between two of its entries.
         let keys = BTreeMap::from([(BTreeMap::from([(1u64, 0u64)]), 7u64), (BTreeMap::new(), 8)]);
         let expected = [0xa2, 0xa0, 8, 0xa1, 1, 0, 7];
-        assert_eq!(symbolic(keys.clone()), expected);
+        assert_eq!(symbolic(&keys), expected);
         prepare_matrix(&keys, Ok(&expected));
     }
 
+    /// The fewest entries whose tree has an internal node, read from the
+    /// engine's height ([`dcbor::bounded::encoding::tree_height`]): its cursor
+    /// descends, ascends and yields from an internal node.
+    fn internal_node_entries() -> usize {
+        (1..)
+            .find(|&len| dcbor::bounded::encoding::tree_height(len) > 1)
+            .expect("some tree has an internal node")
+    }
+
+    /// More entries than one leaf holds: the cursor descends, ascends and
+    /// yields from internal nodes, one admitted transition per instruction.
+    /// The fast layer's tree holds the fewest entries whose tree has an
+    /// internal node ([`internal_node_entries`]); the two-byte map head and
+    /// two-byte keys are emission's concern, refused at every admission by
+    /// `wide_schema_finalizes_multibyte_map_head_without_payload_relocation`.
+    /// The exhaustive layer's tree holds 40.
     #[test]
     fn multi_level_tree_is_walked_through_every_internal_node_transition() {
-        // More entries than one leaf holds: the cursor descends, ascends and
-        // yields from internal nodes, one admitted transition per instruction.
-        let source: BTreeMap<u64, u64> = (0..40).map(|n| (n, n)).collect();
-        let expected = identity_map(40);
-        assert_eq!(symbolic(source.clone()), expected);
+        use super::super::support::rigor::Rigor;
+        let entries = match rigor() {
+            Rigor::Fast => internal_node_entries(),
+            Rigor::Exhaustive => 40,
+        };
+        let source: BTreeMap<u64, u64> = (0..entries as u64).map(|n| (n, n)).collect();
+        let expected = identity_map(entries as u64);
+        assert_eq!(symbolic(&source), expected);
         prepare_matrix(&source, Ok(&expected));
         emission_matrix(&source, &expected);
     }
 
+    /// Every physical request of a tree's preparation failed in a run of its
+    /// own. Each key needs normalization and the values' marks run from none
+    /// to seven, so every text path, quick-check proven or normalized, is
+    /// taken. The fast layer's tree holds the fewest entries whose tree has
+    /// an internal node ([`internal_node_entries`]); the exhaustive layer's
+    /// holds 64.
     #[test]
     fn every_tree_preparation_allocation_failure_preserves_physical_ownership() {
-        let source: BTreeMap<String, String> = (0..64)
+        use super::super::support::rigor::Rigor;
+        let entries = match rigor() {
+            Rigor::Fast => internal_node_entries(),
+            Rigor::Exhaustive => 64,
+        };
+        assert!(entries >= 8, "the values' marks run from none to seven");
+        let source: BTreeMap<String, String> = (0..entries)
             .map(|n| (format!("{n:02}e\u{301}"), "e\u{301}".repeat(n % 8)))
             .collect();
         prepare_physical_matrix(&source);
@@ -237,9 +248,9 @@ mod ordered {
     #[test]
     fn dcbor_map_matches_the_symbolic_encoder_across_every_refusal() {
         let mut map = Map::new();
-        map.insert("k", 1.5f64);
-        map.insert(-1i64, true);
-        map.insert(10u64, "a");
+        map.insert("k", 1.5f64).unwrap();
+        map.insert(-1i64, true).unwrap();
+        map.insert(10u64, "a").unwrap();
         let expected = [
             0xa3, 0x0a, 0x61, b'a', 0x20, 0xf5, 0x61, b'k', 0xf9, 0x3e, 0x00,
         ];
@@ -253,8 +264,8 @@ mod ordered {
     #[test]
     fn symbolic_values_of_every_major_type_match_the_symbolic_encoder() {
         let mut inner = Map::new();
-        inner.insert("b", 2u64);
-        inner.insert("a", 1u64);
+        inner.insert("b", 2u64).unwrap();
+        inner.insert("a", 1u64).unwrap();
         let value = CBOR::from(vec![
             CBOR::from(0u64),
             CBOR::from(-25i64),
@@ -297,9 +308,9 @@ mod ordered {
             super::super::support::shape(&valid_element),
         );
         let mut entry = Map::new();
-        entry.insert(0u64, wide.clone());
+        entry.insert(0u64, wide.clone()).unwrap();
         let mut valid_entry = Map::new();
-        valid_entry.insert(0u64, boundary.clone());
+        valid_entry.insert(0u64, boundary.clone()).unwrap();
         prepare_matrix_bounded(
             &CBOR::from(entry),
             Err(BoundedError::OutOfRange),
@@ -339,6 +350,135 @@ mod ordered {
     }
 }
 
+/// Map keys that collide after numeric reduction, on the ordered path: tree
+/// sources whose entry cursor yields the two keys as predecessor and
+/// successor. Two sources, one per refusal site:
+///
+/// - a `BTreeMap<Number, u64>`, whose `Entries::ordered` is `false`
+///   (`encoding/values.rs`: Rust key order is not canonical key order), so
+///   its entries are merge-ordered by their prepared key bytes and an equal
+///   pair is refused by the merge (`encoding/maps/order.rs`, `Compare`);
+/// - [`Claimed`], the same tree claiming canonical order, whose keys the
+///   engine checks each against the one before it instead of sorting
+///   (`encoding/dynamic.rs`, `Verify`), the path a `dcbor::Map` takes, which
+///   itself can no longer hold two keys of one canonical encoding.
+///
+/// Either refuses an equal pair as `DuplicateKey`. The merge records its run
+/// heads' comparison as `merge-order`, the predecessor check its adjacent
+/// keys' as `key-order`: two events, two predicates.
+mod key_order {
+    use super::*;
+    use dcbor::bounded::encoding::{Entries, EntryStep, Slot};
+    use std::collections::BTreeMap;
+
+    /// A tree whose entries are claimed to come in canonical order. Its
+    /// cursor is the tree's own; the claim is what the engine checks pair by
+    /// pair, refusing an out-of-order pair, so a false claim is a refusal,
+    /// never unsound.
+    struct Claimed(BTreeMap<Number, u64>);
+
+    impl Schema for Claimed {
+        fn instruction(&self, index: usize) -> Instruction<'_> {
+            match index {
+                0 => Instruction::CountedUnorderedMap(self.0.len() as u64),
+                1 => Instruction::Entries(self),
+                _ => Instruction::End,
+            }
+        }
+    }
+
+    // SAFETY: `start`, `moves` and `next` delegate to the tree's own
+    // `Entries` implementation, whose cursor `start` stores in the slot and
+    // `next` reads back as the same type; only `ordered` differs, a claim the
+    // engine verifies key by key.
+    unsafe impl Entries for Claimed {
+        fn start(&self, slot: &mut Slot) {
+            self.0.start(slot);
+        }
+
+        fn moves(&self) -> u64 {
+            self.0.moves()
+        }
+
+        fn ordered(&self) -> bool {
+            true
+        }
+
+        unsafe fn next<'a>(&'a self, slot: &mut Slot) -> EntryStep<'a> {
+            // SAFETY: `start` stored the tree's cursor in `slot`.
+            unsafe { self.0.next(slot) }
+        }
+    }
+
+    /// The tree of `first => 1` and `second => 2`, required to yield them in
+    /// that order, so `first` is `second`'s predecessor: an integer orders
+    /// before every float ([`Number`]).
+    fn tree(first: Number, second: Number) -> BTreeMap<Number, u64> {
+        let tree = BTreeMap::from([(first, 1), (second, 2)]);
+        assert_eq!(
+            tree.keys().copied().collect::<Vec<_>>(),
+            [first, second],
+            "the tree yields its keys in the order the fixture names"
+        );
+        tree
+    }
+
+    /// The pairs that are one canonical key after numeric reduction.
+    const COLLIDING: [(Number, Number); 2] = [
+        (Number::Integer(10), Number::Float(10.0)),
+        (Number::Integer(0), Number::Float(-0.0)),
+    ];
+
+    /// `10` then `10.0`, and `0` then `-0.0`: each pair refused as an
+    /// invalid input (`DuplicateKey`, `Class::Invalid`) at its comparison,
+    /// which records a collision of its own predicate: `merge-order` by the
+    /// merge (`order.rs`) for the tree, `key-order` by the predecessor check
+    /// (`dynamic.rs`) for the claimed tree; across every refusal and
+    /// cancellation schedule too.
+    #[test]
+    fn keys_colliding_after_reduction_are_refused_on_the_ordered_path() {
+        for (first, second) in COLLIDING {
+            let merged = tree(first, second);
+            let checked = Claimed(tree(first, second));
+            for (site, source, collision) in [
+                ("merge", &merged as &dyn Schema, MERGE_COLLISION),
+                ("predecessor check", &checked as &dyn Schema, KEY_COLLISION),
+            ] {
+                let reached = key_order(source, Err(BoundedError::DuplicateKey));
+                assert!(
+                    reached.contains(collision),
+                    "{first:?} then {second:?}, {site}: no {collision:?} recorded"
+                );
+                prepare_matrix(source, Err(BoundedError::DuplicateKey));
+            }
+        }
+    }
+
+    /// The control: `10` then `10.5`, distinct canonical keys, encode in
+    /// canonical order at both sites, each comparison recorded as strictly
+    /// after, by its own predicate, and never as a collision of either.
+    #[test]
+    fn distinct_keys_encode_and_record_their_order_on_the_ordered_path() {
+        let merged = tree(Number::Integer(10), Number::Float(10.5));
+        let checked = Claimed(tree(Number::Integer(10), Number::Float(10.5)));
+        let expected = [0xa2, 0x0a, 0x01, 0xf9, 0x49, 0x40, 0x02];
+        for (site, source, after) in [
+            ("merge", &merged as &dyn Schema, MERGE_AFTER),
+            ("predecessor check", &checked as &dyn Schema, KEY_AFTER),
+        ] {
+            let reached = key_order(source, Ok(&expected));
+            assert!(reached.contains(after), "{site}: no {after:?} recorded");
+            for collision in [KEY_COLLISION, MERGE_COLLISION] {
+                assert!(
+                    !reached.contains(collision),
+                    "{site}: distinct keys recorded {collision:?}"
+                );
+            }
+            prepare_matrix(source, Ok(&expected));
+        }
+    }
+}
+
 /// A field map of the first `n` integer keys, each holding zero, whose head
 /// waits in a gap for the count its fields reach.
 struct GapFields(u64);
@@ -371,12 +511,22 @@ fn many_map_headers_and_multibyte_payloads_preserve_gap_order_and_prefixes() {
     emission_matrix(&source, &expected);
 }
 
+/// Every physical request of a derived record's preparation failed in a run
+/// of its own: an omitted optional, a scalar, and nested vectors of a
+/// 96-byte text that normalizes and crosses the 64-byte quantum. Every outer
+/// element repeats the same text's requests, so the fast layer holds two,
+/// the first and a sibling after it; the exhaustive layer holds eight.
 #[test]
 fn every_schema_preparation_allocation_failure_preserves_physical_ownership() {
+    use super::support::rigor::Rigor;
+    let elements = match rigor() {
+        Rigor::Fast => 2,
+        Rigor::Exhaustive => 8,
+    };
     prepare_physical_matrix(&Record {
         omitted: None,
         enabled: true,
-        nested: vec![vec!["e\u{301}".repeat(32)]; 8],
+        nested: vec![vec!["e\u{301}".repeat(32)]; elements],
     });
 }
 

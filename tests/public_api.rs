@@ -8,18 +8,18 @@
 use core::cmp::Ordering;
 use core::hash::{Hash, Hasher};
 use dcbor::bounded::decode::comparison::{KeyComparison, comparison_bound};
+use dcbor::bounded::decode::construction::DecodeOwner;
+use dcbor::bounded::decode::construction::in_place::Transferable;
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
-use dcbor::bounded::decode::construction::{DecodeOwner, TypedValue};
-use dcbor::bounded::decode::{BoundedDecodable, DecodeError, Options, decode_typed};
-use dcbor::bounded::encoding::{
-    OwnedEmitStep, OwnedPreparation, OwnedPrepared, OwnedWriter, Preparation, owned_prepare_bound,
-};
+use dcbor::bounded::decode::{DecodeError, Options, decode_typed};
+use dcbor::bounded::encoding::{OwnedPrepared, OwnedWriter, Preparation, owned_prepare_bound};
 use dcbor::bounded::text_cursor::pipeline::TextPreparation;
-use dcbor::bounded::{
-    BoundedError, BoundedResult, Failure, LimitRefusal, Limits, ResourceBound, Step,
-};
+use dcbor::bounded::{BoundedError, LimitRefusal, Limits, ResourceBound, Step};
 use dcbor::{ByteString, CBOR, Error, Map};
-use dcbor_test_support as support;
+use dcbor_test_support::{
+    self as support, Finding, Holding, Lent, PolicyId, Retirement, pipeline::Unwitnessed,
+    reclamation::Reclaiming,
+};
 
 /// The bytes a value hashes into a hasher, in order.
 #[derive(Default)]
@@ -50,12 +50,19 @@ fn a_maps_queries_and_default_answer_by_encoded_key() {
     assert!(empty.is_empty());
     assert_eq!(empty, Map::new());
     let mut map = Map::new();
-    map.insert(1, "one");
+    map.insert(1, "one").unwrap();
     assert!(!map.is_empty());
-    assert!(map.contains_key(1));
-    assert!(map.contains_key(1.0));
-    assert!(!map.contains_key(2));
-    assert!(!map.contains_key("1"));
+    assert!(map.contains_key(1).unwrap());
+    assert!(map.contains_key(1.0).unwrap());
+    assert!(!map.contains_key(2).unwrap());
+    assert!(!map.contains_key("1").unwrap());
+    // The float is the same key: inserting it is refused, the map unchanged.
+    assert!(matches!(
+        map.insert(1.0, "float one"),
+        Err(Error::DuplicateMapKey)
+    ));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get::<_, String>(1).unwrap(), Some("one".to_string()));
 }
 
 /// A map hashes its entry count, then each entry's encoded key, its key and
@@ -64,8 +71,8 @@ fn a_maps_queries_and_default_answer_by_encoded_key() {
 #[test]
 fn a_map_hashes_and_shows_each_entry_by_its_encoded_key() {
     let mut map = Map::new();
-    map.insert("b", 2);
-    map.insert(1, "one");
+    map.insert("b", 2).unwrap();
+    map.insert(1, "one").unwrap();
     let entries = [
         (CBOR::from(1), CBOR::from("one")),
         (CBOR::from("b"), CBOR::from(2)),
@@ -95,8 +102,8 @@ fn a_map_hashes_and_shows_each_entry_by_its_encoded_key() {
 #[test]
 fn a_map_converts_to_a_hash_map_of_its_entries() {
     let mut map = Map::new();
-    map.insert(1, "one");
-    map.insert("b", 2);
+    map.insert(1, "one").unwrap();
+    map.insert("b", 2).unwrap();
     let table: dcbor::HashMap<CBOR, CBOR> = CBOR::from(map)
         .try_into()
         .expect("a map converts to a hash map");
@@ -155,25 +162,46 @@ fn a_key_comparisons_bound_is_the_work_it_admits() {
 fn every_prepared_encoding_holds_at_least_its_head() {
     for (text, len) in [("", 1usize), ("abc", 4)] {
         let source = text.to_string();
-        let mut m = Limits::unlimited();
-        let plan = support::drive_within(
-            &mut m,
-            &mut Preparation::new(&source),
-            support::prepare_turns(support::shape(&source)),
-        )
-        .expect("an unlimited preparation completes");
-        assert_eq!(plan.len(), len, "{text:?}");
-        assert!(!plan.is_empty(), "{text:?}");
-        let prepared = support::drive_within(
-            &mut m,
-            &mut TextPreparation::new(text),
-            support::normalize_turns(text),
-        )
-        .expect("an unlimited text preparation completes");
-        assert_eq!(prepared.len(), len as u64, "{text:?}");
-        assert!(!prepared.is_empty(), "{text:?}");
-        drop((plan, prepared));
-        assert_eq!(m.live_bytes(), 0, "{text:?}");
+        support::recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            run.holding(
+                Preparation::new(&source),
+                Retirement::Released,
+                &Unwitnessed,
+                |preparation| {
+                    preparation.drive(
+                        policy,
+                        support::prepare_turns(support::shape(&source)),
+                        Retirement::Released,
+                        |plan| {
+                            assert_eq!(plan.value().len(), len, "{text:?}");
+                            assert!(!plan.value().is_empty(), "{text:?}");
+                            plan.holding(
+                                TextPreparation::new(text),
+                                Retirement::Released,
+                                |preparation| {
+                                    preparation.drive(
+                                        policy,
+                                        support::normalize_turns(text),
+                                        Retirement::Released,
+                                        |prepared| {
+                                            assert_eq!(
+                                                prepared.value().len(),
+                                                len as u64,
+                                                "{text:?}"
+                                            );
+                                            assert!(!prepared.value().is_empty(), "{text:?}");
+                                        },
+                                    )
+                                },
+                            )
+                        },
+                    )?
+                },
+            )?;
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0, "{text:?}"));
+            Ok(())
+        });
     }
 }
 
@@ -209,7 +237,9 @@ fn decode_errors_name_their_cause() {
 }
 
 /// `value` decoded as `T` by the typed decoder, everything it held released.
-fn typed<T: BoundedDecodable + Copy>(value: CBOR) -> Result<T, DecodeError<LimitRefusal>> {
+fn typed<T: Transferable<Limits> + Copy + 'static>(
+    value: CBOR,
+) -> Result<T, DecodeError<LimitRefusal>> {
     let wire = value.to_cbor_data();
     let mut limits = Limits::unlimited();
     let decoded = decode_typed::<T, _>(&wire, 0, &mut limits).map(|typed| *typed.value());
@@ -255,84 +285,74 @@ fn typed_numbers_decode_within_their_types_range() {
 /// the preparation's, which its owned bound covers, then the source value's,
 /// which the value's decode bound covers (`owned_prepare_bound`: the source
 /// is accounted by its decode), with the copied input it holds, which the
-/// copy's own bound covers. A writer reclaims through the same record.
-fn planned<'s>(
-    owner: &DecodeOwner<'s, Limits>,
-    m: &mut Limits,
+/// copy's own bound covers. A writer reclaims through the same record. Or a
+/// driver's stop as the run's finding.
+struct PlanCase<'v> {
+    owner: &'v DecodeOwner<'static, Limits>,
+    policy: PolicyId,
+    scope_bytes: u64,
+    cleanup: usize,
+}
+
+fn planned<R>(
     wire: &[u8],
-) -> (OwnedPrepared<'s, ByteString, String, Limits>, usize) {
-    let input = support::copy(owner, m, wire);
-    let value: TypedValue<'s, ByteString, String, Limits> =
-        support::decode(m, input, Options::quick_only(8)).expect("the text decodes");
-    let bound = support::turns(
-        owned_prepare_bound::<ByteString, String, Limits, ()>(support::shape(value.value()))
-            .expect("the owned preparation bound fits in u64"),
-    );
-    let plan = support::drive_within(m, &mut OwnedPreparation::prepare(value), bound)
-        .expect("the plan is prepared");
-    let copied = support::turns(
-        dcbor::bounded::decode::construction::copy_bound::<Limits, ()>(wire.len() as u64)
-            .expect("the copy bound of an input held in memory fits in u64"),
-    );
-    (
-        plan,
-        bound + support::typed_turns::<String>(wire.len()) + copied,
-    )
-}
-
-/// Operation-local cleanup of `slot` under fresh checked turns: progress
-/// keeps the handle, `Done` empties the slot; within `turns`.
-fn reclaimed<W>(
-    m: &mut Limits,
-    slot: &mut Option<W>,
-    turns: usize,
-    step: impl Fn(&mut Option<W>, &mut Limits) -> BoundedResult<Reclaimed, Limits>,
-    mut observe: impl FnMut(&W),
-) {
-    for _ in 0..turns {
-        match support::checked(m, |m| step(slot, m)) {
-            Ok(Reclaimed::Done) => {
-                assert!(slot.is_none(), "cleanup reported done and kept its handle");
-                return;
-            }
-            Ok(Reclaimed::Progress) => observe(
-                slot.as_ref()
-                    .expect("cleanup in progress dropped its handle"),
-            ),
-            other => panic!("operation-local cleanup failed: {other:?}"),
-        }
-    }
-    panic!("operation-local cleanup exceeded {turns} turns");
-}
-
-/// `owner`'s queue stepped under fresh checked turns until nothing in it can
-/// advance: every record a finished operation retired is removed and
-/// released, so only records live handles hold remain outstanding. Bounded
-/// by `support::TURNS`, the documented bound of a scope's drain: each record
-/// declares its own cleanup count, which the scope enforces, but no public
-/// method sums a scope's records.
-fn retired(owner: &mut DecodeOwner<'_, Limits>, m: &mut Limits) {
-    for _ in 0..support::TURNS {
-        match support::scope_checked(m, owner, |owner, m| owner.step(m)) {
-            Ok(Reclaimed::Progress) => {}
-            Ok(Reclaimed::Done | Reclaimed::Waiting) => return,
-            Err(error) if error.refused() => {}
-            Err(error) => panic!("queued cleanup failed: {error:?}"),
-        }
-    }
-    panic!("queued cleanup exceeded {} turns", support::TURNS);
+    body: impl FnOnce(
+        &mut Holding<'_, '_, OwnedPrepared<'static, ByteString, String, Limits>, Unwitnessed>,
+        PlanCase<'_>,
+    ) -> Result<R, Finding>,
+) -> R {
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let result = run.scoped(policy, &Unwitnessed, |owner| {
+            let scope_bytes = owner.with_policy(policy, |_, m| m.live_bytes());
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let owner = view.value().get();
+                view.copied(policy, wire, |input| {
+                    input.decode::<String, _>(policy, Options::quick_only(8), |value| {
+                        let prepared = support::turns(
+                            owned_prepare_bound::<ByteString, String, Limits, ()>(support::shape(
+                                value.value().value(),
+                            ))
+                            .expect("the owned preparation bound fits in u64"),
+                        );
+                        let copied = support::turns(
+                            dcbor::bounded::decode::construction::copy_bound::<Limits, ()>(
+                                wire.len() as u64,
+                            )
+                            .expect("the copy bound fits in u64"),
+                        );
+                        value.prepare(policy, |plan| {
+                            plan.holding(Lent::new(owner), Retirement::Exhausted, |queue| {
+                                queue.quiesce(policy)
+                            })?;
+                            assert!(owner.outstanding() > 0, "the plan holds no record");
+                            body(
+                                plan,
+                                PlanCase {
+                                    owner,
+                                    policy,
+                                    scope_bytes,
+                                    cleanup: prepared
+                                        + support::typed_turns::<String>(wire.len())
+                                        + copied,
+                                },
+                            )
+                        })?
+                    })?
+                })?
+            })
+        })?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(result)
+    })
 }
 
 /// An emptied slot's step reports `Done`, admitting the completion it
 /// reports.
-fn emptied<W>(
-    m: &mut Limits,
-    slot: &mut Option<W>,
-    step: impl Fn(&mut Option<W>, &mut Limits) -> BoundedResult<Reclaimed, Limits>,
-) {
-    assert!(slot.is_none());
+fn emptied<W>(m: &mut Limits, slot: &mut Reclaiming<W>) {
+    assert!(slot.value().is_none());
     let attempts = m.attempts();
-    assert!(matches!(step(slot, m), Ok(Reclaimed::Done)));
+    assert!(matches!(slot.probe_empty(m), Ok(Reclaimed::Done)));
     assert_eq!(m.attempts(), attempts + 1);
 }
 
@@ -341,32 +361,28 @@ fn emptied<W>(
 /// the scope then holds only itself.
 #[test]
 fn an_owned_plan_reclaimed_in_place_releases_its_record_and_source() {
-    let mut m = Limits::unlimited().logged().strict();
-    let mut owner = support::scope(&mut m);
-    let scope = m.live_bytes();
     let wire = CBOR::from("an owned plan").to_cbor_data();
-    let (plan, cleanup) = planned(&owner, &mut m, &wire);
-    assert_eq!(plan.len(), wire.len());
-    assert!(!plan.is_empty());
-    retired(&mut owner, &mut m);
-    assert!(owner.outstanding() > 0, "the plan holds no record");
-    let mut slot = Some(plan);
-    reclaimed(
-        &mut m,
-        &mut slot,
-        cleanup,
-        OwnedPrepared::reclaim_step,
-        |_| {},
-    );
-    assert_eq!(owner.outstanding(), 0, "a record outlived cleanup");
-    assert_eq!(
-        m.live_bytes(),
-        scope,
-        "the plan or its source outlived cleanup"
-    );
-    emptied(&mut m, &mut slot, OwnedPrepared::reclaim_step);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    planned(&wire, |plan, case| {
+        assert_eq!(plan.value().len(), wire.len());
+        assert!(!plan.value().is_empty());
+        plan.transfer(
+            |plan| Reclaiming::new(plan, OwnedPrepared::reclaim_step),
+            Retirement::Stopped,
+            |cleanup| {
+                cleanup.reclaim(case.policy, case.cleanup, |_| {})?;
+                assert_eq!(case.owner.outstanding(), 0, "a record outlived cleanup");
+                cleanup.with_policy(case.policy, |slot, m| {
+                    assert_eq!(
+                        m.live_bytes(),
+                        case.scope_bytes,
+                        "the plan or its source outlived cleanup"
+                    );
+                    emptied(m, slot);
+                });
+                Ok(())
+            },
+        )
+    });
 }
 
 /// A writer reclaimed in place partway through its emission keeps its
@@ -375,35 +391,41 @@ fn an_owned_plan_reclaimed_in_place_releases_its_record_and_source() {
 /// is shut down.
 #[test]
 fn a_writer_reclaimed_in_place_keeps_its_emission_position() {
-    let mut m = Limits::unlimited().logged().strict();
-    let mut owner = support::scope(&mut m);
-    let scope = m.live_bytes();
     let wire = CBOR::from("w".repeat(100).as_str()).to_cbor_data();
-    let (plan, cleanup) = planned(&owner, &mut m, &wire);
-    let mut writer = plan.into_writer();
-    retired(&mut owner, &mut m);
-    assert!(owner.outstanding() > 0, "the writer holds no record");
-    match support::emit_turn(&mut m, &mut writer) {
-        Ok(OwnedEmitStep::Chunk(chunk)) => assert_eq!(chunk, &wire[..64]),
-        other => panic!("the first emission step emitted no chunk: {other:?}"),
-    }
-    let at = writer.position().emission;
-    assert_eq!((at.written, at.finished), (64, false));
-    let mut slot = Some(writer);
-    reclaimed(
-        &mut m,
-        &mut slot,
-        cleanup,
-        OwnedWriter::reclaim_step,
-        |writer| assert_eq!(writer.position().emission, at, "cleanup moved the emission"),
-    );
-    assert_eq!(owner.outstanding(), 0, "a record outlived cleanup");
-    assert_eq!(
-        m.live_bytes(),
-        scope,
-        "the plan or its source outlived cleanup"
-    );
-    emptied(&mut m, &mut slot, OwnedWriter::reclaim_step);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    planned(&wire, |plan, case| {
+        plan.transfer(
+            OwnedPrepared::into_writer,
+            Retirement::Published,
+            |writer| {
+                let mut bytes = Vec::with_capacity(wire.len());
+                assert!(!writer.emit(case.policy, &mut bytes, wire.len(), |_, _, at| at == 1)?);
+                assert_eq!(bytes, wire[..64]);
+                let at = writer.value().position().emission;
+                assert_eq!((at.written, at.finished), (64, false));
+                writer.transfer(
+                    |writer| Reclaiming::new(writer, OwnedWriter::reclaim_step),
+                    Retirement::Stopped,
+                    |cleanup| {
+                        cleanup.reclaim(case.policy, case.cleanup, |writer| {
+                            assert_eq!(
+                                writer.position().emission,
+                                at,
+                                "cleanup moved the emission"
+                            );
+                        })?;
+                        assert_eq!(case.owner.outstanding(), 0, "a record outlived cleanup");
+                        cleanup.with_policy(case.policy, |slot, m| {
+                            assert_eq!(
+                                m.live_bytes(),
+                                case.scope_bytes,
+                                "the plan or its source outlived cleanup"
+                            );
+                            emptied(m, slot);
+                        });
+                        Ok(())
+                    },
+                )
+            },
+        )
+    });
 }

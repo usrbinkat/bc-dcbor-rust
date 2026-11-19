@@ -3,6 +3,7 @@ use super::{
     BoundedError, Budget, Caller, Capped, DecodeError, MAX_HEAD_LEN, MajorType, Places,
     ResourceBound, Resumable, Step, Unit, WriteWork, add, at, mul,
 };
+use crate::bounded::{Custodial, CustodySink, PermitsObserved};
 
 /// Acquiring one head byte. The operation running the cursor supplies the
 /// place.
@@ -107,10 +108,11 @@ impl<'a> HeaderCursor<'a> {
 /// nothing is allocated or retained.
 pub fn header_bound(input: u64) -> ResourceBound {
     let terms = HeaderTerms::of(input);
-    ResourceBound::of_work(WriteWork::new(
-        terms.acquisition.values + terms.validation.values,
-        terms.acquisition.bytes + terms.validation.bytes,
-    ))
+    // At most nine acquisitions, then one validation of at most nine bytes:
+    // ten values and eighteen bytes, which no sum overflows.
+    ResourceBound::of_work(terms.acquisition)
+        .checked_then(ResourceBound::of_work(terms.validation))
+        .expect("a head's acquisition and validation are at most ten values and eighteen bytes")
 }
 
 /// The terms [`header_bound`] sums, one per [`HeaderPlace`]: at most
@@ -123,7 +125,9 @@ struct HeaderTerms {
 
 impl HeaderTerms {
     fn of(input: u64) -> Self {
-        const { assert!(ACQUIRE.values() == 1 && ACQUIRE.bytes() == 1 && VALIDATE.values() == 1) };
+        const {
+            assert!(ACQUIRE.values() == 1 && ACQUIRE.bytes() == 1 && VALIDATE.values() == 1);
+        }
         let acquired = input.min(MAX_HEAD_LEN as u64);
         Self {
             acquisition: WriteWork::new(acquired, acquired),
@@ -148,10 +152,26 @@ impl Places for HeaderTerms {
 /// node and one of a head the input ends inside, over at most the input's
 /// bytes in all.
 pub(crate) fn heads_work<R>(input: u64) -> Result<WriteWork, BoundedError<R>> {
-    ACQUIRE.times(input)?.then(WriteWork::new(
-        mul(add(input, 1)?, VALIDATE.values())?,
-        input,
-    ))
+    WriteWork::checked_sequence(&[
+        ACQUIRE.times(input)?,
+        WriteWork::new(mul(add(input, 1)?, VALIDATE.values())?, input),
+    ])
+    .ok_or(BoundedError::Overflow)
+}
+
+/// A head's cursor holds no permit: it borrows its input and retains at most
+/// nine head bytes inline.
+impl<P> Custodial<P> for HeaderCursor<'_> {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
+    }
+}
+
+/// A head holds no permit: it is plain data.
+impl<P> Custodial<P> for Header {
+    fn observe_custody(&mut self, _: &mut dyn CustodySink<P>) -> PermitsObserved {
+        PermitsObserved::Complete
+    }
 }
 
 impl<B: Budget> Resumable<B> for HeaderCursor<'_> {
@@ -237,6 +257,11 @@ impl HeaderState {
         Ok(Step::Progress)
     }
 }
+
+/// Kani harness of the header cursor's whole-operation bound (register item
+/// 4): compiled only by `cargo kani`.
+#[cfg(kani)]
+mod proofs;
 
 /// Place attribution of a head's acquisition, which this crate's tests
 /// record under `std`.

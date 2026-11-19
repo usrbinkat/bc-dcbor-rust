@@ -1,0 +1,19 @@
+--- src/bounded/decode/comparison.rs
++++ src/bounded/decode/comparison.rs
+@@ -187,7 +187,14 @@
+     let count = Bound::new(Predicate::Quantum, QUANTUM).clamp(budget, remaining);
+     COMPARE.admit(budget, count as u64)?;
+-    for _ in 0..count {
+-        let ordering = left[*position].cmp(&right[*position]);
++    for at in 0..count {
++        // Planted: a resumed turn's first pair is not compared. Must fail
++        // long_keys_compare_in_canonical_order, "two keys compare in the
++        // bytewise lexicographic order of their encodings".
++        let ordering = if at == 0 && *position >= QUANTUM {
++            Ordering::Equal
++        } else {
++            left[*position].cmp(&right[*position])
++        };
+         *position += 1;
+         if ordering != Ordering::Equal {
+             return Ok(Some(ordering));

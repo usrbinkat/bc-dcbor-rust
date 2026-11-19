@@ -3,9 +3,10 @@
 //! accessors this crate's forks provide.
 use super::super::boundary::{Bound, Predicate, Valuation, boundary};
 use super::super::{
-    BoundedError, BoundedResult, Budget, Places, Rate, ResourceBound, Unit, WriteWork, add,
+    Acquisition, BoundedError, BoundedResult, Budget, CustodySink, Forfeit, Identity, Obligation,
+    Origin, Owner, Performer, Places, Rate, ResourceBound, Retained, Unit, WriteWork, add,
 };
-use super::{BUCKET_WINDOW, Schema};
+use super::{BUCKET_WINDOW, Schema, close_window, window_obligation};
 
 places! {
     /// The places bucket enumeration ([`BucketCursor`]) charges, one term of
@@ -202,38 +203,129 @@ pub enum BucketStep<'a> {
 }
 
 /// The position of the one enumeration of a table's buckets: the next index
-/// to inspect, the entries yielded, and the controls of the current window
-/// admitted and not yet inspected. Plain data, borrowing nothing: the table
-/// is given to each call, so a preparation retains the cursor beside its
-/// table's reference across suspensions and relocations, and its position
-/// and credit are what it resumes from, never recomputed. Creation scans
-/// and admits nothing.
+/// to inspect, the entries yielded, and whether it has ended. Plain data,
+/// borrowing nothing and owning no credit: the table is given to each call,
+/// so a preparation retains the position beside its table's reference, in
+/// its cursor arena's slot, across suspensions and relocations. The
+/// window's credit is not here: it is the window obligation the cursor's
+/// custody holds beside it ([`BucketCursor`]). Creation scans and admits
+/// nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BucketCursor {
+pub struct BucketPosition {
     next: usize,
     yielded: usize,
-    held: usize,
     finished: bool,
 }
 
-impl BucketCursor {
+impl BucketPosition {
     pub const fn new() -> Self {
         Self {
             next: 0,
             yielded: 0,
-            held: 0,
             finished: false,
         }
     }
 
     /// The next index to inspect, unchanged by a refusal.
-    pub const fn position(&self) -> usize {
+    pub const fn index(&self) -> usize {
         self.next
     }
+}
 
-    /// The controls admitted and not yet inspected.
-    pub const fn held(&self) -> usize {
-        self.held
+/// The custody of one enumeration of a table's buckets: its position; the
+/// obligation of its current window's controls admitted and not yet
+/// inspected ([`Obligation::BucketWindow`]), held with the origin that
+/// admitted it, which every later spend and forfeit reaches whichever
+/// budget performs it; and that window's acquisition's capability
+/// ([`Acquisition`]), the one authority that publishes its end. A view over
+/// the three, which their holder keeps apart (a preparation: the position
+/// in its cursor arena's slot, the window's credit and its acquisition in
+/// two parts of one window arena, each element one relocation unit; a
+/// shape walk: all three on its frame); this is the one implementation of
+/// the traversal, its settlement and its acquisitions' ends. Not `Copy`:
+/// the window is custody.
+pub struct BucketCursor<'c, O: Origin> {
+    position: &'c mut BucketPosition,
+    window: &'c mut Option<Retained<O>>,
+    acquisition: &'c mut Option<Acquisition<O>>,
+}
+
+impl<'c, O: Origin> BucketCursor<'c, O> {
+    /// The enumeration at `position`, its window's credit in `window` and
+    /// its window's acquisition in `acquisition`.
+    pub fn new(
+        position: &'c mut BucketPosition,
+        window: &'c mut Option<Retained<O>>,
+        acquisition: &'c mut Option<Acquisition<O>>,
+    ) -> Self {
+        Self {
+            position,
+            window,
+            acquisition,
+        }
+    }
+
+    /// The window's acquisition, bound from its window's opening to its
+    /// closing, as its holder reports it ([`CustodySink::bound`]).
+    pub fn bound(&self) -> Option<Identity> {
+        self.acquisition.as_ref().map(Acquisition::id)
+    }
+
+    /// The next index to inspect, unchanged by a refusal.
+    pub fn position(&self) -> usize {
+        self.position.next
+    }
+
+    /// The controls admitted and not yet inspected: the window's remaining
+    /// bytes, one per control, the one record of them.
+    pub fn held(&self) -> usize {
+        held(self.window)
+    }
+
+    /// The obligation this cursor's custody holds, if any: its window's, a
+    /// nonzero remainder reported once ([`window_obligation`]). A fragment,
+    /// never a complete observation: emitted only inside the group its
+    /// holder has open as `begin(Some(owner.id()))` of the very [`Owner`]
+    /// the holder stores and passes to [`Self::step`], the owner every
+    /// window acquisition binds under, since the cursor keeps no owner of
+    /// its own ([`CustodySink`]). Its only caller is such a holder, the
+    /// admission-trace bucket case; a preparation, which stores its window
+    /// owner too, reports its windows through its window arena with the same
+    /// leaf reading. Read-only and allocation-free; it admits, mints,
+    /// publishes and settles nothing.
+    pub fn observe_window<P>(&self, sink: &mut dyn CustodySink<P>) {
+        if let Some(acquisition) = self.bound() {
+            sink.bound(acquisition);
+        }
+        window_obligation(self.window, &mut |hold| sink.held(hold));
+    }
+
+    /// The credit this cursor's custody holds ([`Obligation::BucketWindow`]):
+    /// its one window's remaining work, read from the retained obligation
+    /// itself, its controls admitted and not yet inspected or forfeited, a
+    /// byte each; nothing when no window is open. The public conservation
+    /// observation of the enumeration: read beside its policies'
+    /// [`crate::bounded::Limits::credits`], it is the `held` that
+    /// [`crate::bounded::Credits::conserved_with`] checks. Always `Some`:
+    /// the signature is the one every custody's `held_credit` shares.
+    pub fn held_credit(&self) -> Option<WriteWork> {
+        Some(
+            self.window
+                .as_ref()
+                .map_or(WriteWork::default(), Retained::remaining),
+        )
+    }
+
+    /// End the enumeration before its completion, its window's unspent
+    /// credit forfeited under `rule` into the family that admitted it, `by`
+    /// the performing budget ([`Budget::performer`]):
+    /// [`Forfeit::EnumerationComplete`] when its map's declared count was
+    /// reached, [`Forfeit::Cancelled`] when an error or cleanup ends it; the
+    /// window's acquisition then ended ([`super::close_window`]). Admits nothing;
+    /// later calls return [`BucketStep::Finished`].
+    pub fn end(&mut self, by: Performer, rule: Forfeit) {
+        close_window(self.window, self.acquisition, Some(rule), by);
+        self.position.finished = true;
     }
 
     /// One call: once every entry is yielded, the completion; otherwise, a
@@ -244,41 +336,90 @@ impl BucketCursor {
     /// table whose buckets run out short of its count is refused as a plan
     /// mismatch. Records, through the one seam, the window against the
     /// table's end and the states of the controls inspected.
-    pub fn step<'a, B: Budget>(
+    ///
+    /// A window's controls are one acquisition of `owner`, the custody that
+    /// holds the cursor: its identity minted ([`Budget::acquisition`]),
+    /// then the call's value and the controls admitted, the controls held
+    /// ([`Rate::admit_held`]); a refused admission keeps the acquisition
+    /// for the retry without holding credit. A call within a window admits its
+    /// value alone and mints nothing.
+    pub fn step<'a, B: Budget<Origin = O>>(
         &mut self,
         table: &'a dyn Buckets,
+        owner: &Owner,
         budget: &mut B,
     ) -> BoundedResult<BucketStep<'a>, B> {
-        if self.finished {
+        let p = &mut *self.position;
+        if p.finished {
             return Ok(BucketStep::Finished);
         }
-        if self.yielded == table.entry_count() {
+        budget
+            .validate_owner(owner)
+            .map_err(BoundedError::Refused)?;
+        if let Some(window) = self.window.as_ref()
+            && self.acquisition.as_ref().map(Acquisition::id) != Some(window.acquisition())
+        {
+            return Err(BoundedError::PlanMismatch);
+        }
+        if p.yielded == table.entry_count() {
             COMPLETE.admit(budget)?;
             // The rest of the window's credit is forfeited: the
             // enumeration is complete.
-            self.held = 0;
-            self.finished = true;
+            self.end(budget.performer(), Forfeit::EnumerationComplete);
             return Ok(BucketStep::Complete);
         }
         let buckets = table.num_buckets();
-        if self.next == buckets {
-            self.finished = true;
+        if p.next == buckets {
+            self.end(budget.performer(), Forfeit::Cancelled);
             return Err(BoundedError::PlanMismatch);
         }
         // The credit is spent only at a window's end, so `next` is then
         // the start of the next window: a full window, or the table's
-        // last, short one (`Below`).
-        let window = if self.held == 0 {
-            Bound::new(Predicate::Buckets, BUCKET_WINDOW).clamp(budget, buckets - self.next)
+        // last, short one (`Below`). A window opens in two stages: its
+        // acquisition minted and kept in its slot, then its controls
+        // admitted held. A refused admission keeps the acquisition for the
+        // retry, which admits the controls alone and mints nothing; a
+        // window holding credit with no acquisition is a defect.
+        if self.window.is_none() {
+            if self.acquisition.is_none() {
+                *self.acquisition = Some(budget.acquisition(owner).map_err(BoundedError::Refused)?);
+            }
+            let acquisition = self
+                .acquisition
+                .as_ref()
+                .ok_or(BoundedError::PlanMismatch)?
+                .id();
+            let window =
+                Bound::new(Predicate::Buckets, BUCKET_WINDOW).clamp(budget, buckets - p.next);
+            *self.window = Some(INSPECT.admit_held(
+                budget,
+                window as u64,
+                Obligation::BucketWindow,
+                owner,
+                acquisition,
+            )?);
+        } else if self.acquisition.is_none() {
+            return Err(BoundedError::PlanMismatch);
         } else {
-            0
-        };
-        INSPECT.admit(budget, window as u64)?;
-        self.held += window;
-        let index = self.next;
-        let end = index + self.held;
+            INSPECT.admit(budget, 0)?;
+        }
+        let p = &mut *self.position;
+        let index = p.next;
+        let end = index + held(self.window);
         let found = table.next_full_bucket(index, end);
         let stop = found.map_or(end, |bucket| bucket + 1);
+        // The controls inspected now spend their credit; a window whose
+        // every control is inspected holds nothing and goes.
+        let inspected = INSPECT.held((stop - index) as u64)?;
+        let by = budget.performer();
+        if let Some(window) = self.window.as_mut() {
+            window.consume(inspected, None, by)?;
+            // A window whose every control is inspected closes: nothing
+            // left to spend, its acquisition ended.
+            if window.remaining() == WriteWork::default() {
+                close_window(self.window, self.acquisition, None, by);
+            }
+        }
         let mut vacant = false;
         let mut deleted = false;
         for at in index..stop {
@@ -294,13 +435,15 @@ impl BucketCursor {
         if deleted {
             boundary!(budget, Predicate::Buckets => Valuation::Tombstone);
         }
-        self.held -= stop - index;
-        self.next = stop;
+        self.position.next = stop;
         match found {
             Some(bucket) => {
-                let (key, value) = table.entry(bucket).ok_or(BoundedError::PlanMismatch)?;
+                let Some((key, value)) = table.entry(bucket) else {
+                    self.end(budget.performer(), Forfeit::Cancelled);
+                    return Err(BoundedError::PlanMismatch);
+                };
                 boundary!(budget, Predicate::Buckets => Valuation::Occupied);
-                self.yielded += 1;
+                self.position.yielded += 1;
                 Ok(BucketStep::Entry {
                     index: bucket,
                     key,
@@ -310,6 +453,14 @@ impl BucketCursor {
             None => Ok(BucketStep::Vacant { index }),
         }
     }
+}
+
+/// The controls a window obligation still holds: its remaining bytes, one
+/// per control ([`INSPECT`]'s per-element part); none without a window.
+fn held<O: Origin>(window: &Option<Retained<O>>) -> usize {
+    window
+        .as_ref()
+        .map_or(0, |window| window.remaining().bytes as usize)
 }
 
 /// The [`ResourceBound`] of enumerating a table of `buckets` buckets,
@@ -332,7 +483,7 @@ pub(crate) fn bucket_work<R>(
     entries: u64,
 ) -> Result<WriteWork, BoundedError<R>> {
     let terms = BucketTerms::of::<R>(tables, buckets, entries)?;
-    terms.inspection.then(terms.completion)
+    WriteWork::checked_sequence(&[terms.inspection, terms.completion]).ok_or(BoundedError::Overflow)
 }
 
 /// The windows of a table of `buckets` buckets: [`BUCKET_WINDOW`] controls
@@ -429,11 +580,13 @@ mod attribution {
         B::Refusal: core::fmt::Debug,
     {
         let bound = bucket_bound::<()>(table.num_buckets() as u64, table.len() as u64).unwrap();
-        let mut cursor = BucketCursor::new();
+        let owner = policy.owner().expect("an unlimited policy makes an owner");
+        let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+        let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
         let mut entries = 0u64;
         crate::bounded::within("bucket enumeration", bound, || {
             match cursor
-                .step(table, policy)
+                .step(table, &owner, policy)
                 .expect("an unlimited policy never refuses")
             {
                 BucketStep::Entry { .. } => {
@@ -517,15 +670,24 @@ mod attribution {
     #[test]
     fn a_window_is_admitted_once_and_its_credit_survives_refusal() {
         let table = dense();
+        // An ordinary owner, made apart from the refusing policy, whose
+        // every admission is refused once.
+        let owner = crate::bounded::Limits::unlimited()
+            .owner()
+            .expect("an ordinary owner");
         let mut policy = crate::bounded::Limits::unlimited().refusing_each();
-        let mut cursor = BucketCursor::new();
-        let before = cursor;
+        let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+        let before = position;
         assert!(
-            cursor.step(&table, &mut policy).is_err(),
+            BucketCursor::new(&mut position, &mut window, &mut acquisition)
+                .step(&table, &owner, &mut policy)
+                .is_err(),
             "the first admission is refused"
         );
-        assert_eq!(cursor, before, "a refused call moved the cursor");
-        match cursor.step(&table, &mut policy).unwrap() {
+        assert_eq!(position, before, "a refused call moved the cursor");
+        assert!(window.is_none(), "a refused call kept a window");
+        let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
+        match cursor.step(&table, &owner, &mut policy).unwrap() {
             BucketStep::Entry { index: 0, .. } => {}
             _ => panic!("the first bucket holds an entry"),
         }
@@ -535,8 +697,8 @@ mod attribution {
             "the window's credit less the one control inspected"
         );
         assert_eq!(policy.used(), WriteWork::new(1, BUCKET_WINDOW as u64));
-        assert!(cursor.step(&table, &mut policy).is_err());
-        match cursor.step(&table, &mut policy).unwrap() {
+        assert!(cursor.step(&table, &owner, &mut policy).is_err());
+        match cursor.step(&table, &owner, &mut policy).unwrap() {
             BucketStep::Entry { index: 1, .. } => {}
             _ => panic!("the second bucket holds an entry"),
         }
@@ -544,6 +706,207 @@ mod attribution {
             policy.used(),
             WriteWork::new(2, BUCKET_WINDOW as u64),
             "a call within the window admitted its controls again"
+        );
+    }
+
+    /// A call within a running window admits its base value alone, never a
+    /// new window: refused under B, the position, the window's obligation
+    /// (its identity, its acquisition, its origin's family) and its
+    /// remaining credit are unchanged, A's ledgers unchanged and B's empty;
+    /// resumed under B, B admits and consumes the base value alone, one
+    /// value and no control, while the control it inspects is consumed from
+    /// the window's own family, A, whose admissions are unchanged. Families
+    /// of one recording session, so identities are observed. Planted
+    /// control `tests/data/controls/bucket-window-readmitted.patch` admits a
+    /// fresh window at every call and must fail it.
+    #[test]
+    fn a_call_within_a_window_admits_its_base_alone_across_refusal_and_policies() {
+        use crate::bounded::{Capacity, Session};
+        let session = Session::new(Capacity {
+            permits: 16,
+            events: 1024,
+        });
+        let table = dense();
+        let mut a = crate::bounded::Limits::recorded_unlimited(&session);
+        let owner = a.owner().expect("a recorded owner");
+        let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+        match BucketCursor::new(&mut position, &mut window, &mut acquisition)
+            .step(&table, &owner, &mut a)
+            .unwrap()
+        {
+            BucketStep::Entry { index: 0, .. } => {}
+            _ => panic!("the first bucket holds an entry"),
+        }
+        let obligation = |window: &Option<Retained<crate::bounded::Family>>| {
+            window
+                .as_ref()
+                .map(|window| (window.id(), window.acquisition(), window.remaining()))
+        };
+        let opened = obligation(&window).expect("the window is held after its first call");
+        assert_eq!(opened.2, WriteWork::new(0, BUCKET_WINDOW as u64 - 1));
+        let after_first = a.credits();
+
+        let mut b = crate::bounded::Limits::recorded_unlimited(&session).refusing(Some(0));
+        let before = position;
+        assert!(matches!(
+            BucketCursor::new(&mut position, &mut window, &mut acquisition)
+                .step(&table, &owner, &mut b),
+            Err(BoundedError::Refused(_))
+        ));
+        assert_eq!(position, before, "a refused call within the window moved");
+        assert_eq!(
+            obligation(&window),
+            Some(opened),
+            "a refused call within the window changed its obligation"
+        );
+        assert_eq!(a.credits(), after_first, "a refusal under B changed A");
+        assert_eq!(
+            b.credits(),
+            crate::bounded::Credits::default(),
+            "a refused call recorded credit"
+        );
+
+        match BucketCursor::new(&mut position, &mut window, &mut acquisition)
+            .step(&table, &owner, &mut b)
+            .unwrap()
+        {
+            BucketStep::Entry { index: 1, .. } => {}
+            _ => panic!("the second bucket holds an entry"),
+        }
+        let resumed = b.credits();
+        assert_eq!(
+            (resumed.admitted, resumed.consumed, resumed.forfeited),
+            (
+                WriteWork::new(1, 0),
+                WriteWork::new(1, 0),
+                WriteWork::new(0, 0)
+            ),
+            "a call within the window under B admitted other than its base value"
+        );
+        let spent = a.credits();
+        assert_eq!(spent.admitted, after_first.admitted, "A admitted again");
+        assert_eq!(
+            Some(spent.consumed),
+            after_first.consumed.checked_then(WriteWork::new(0, 1)),
+            "the inspected control was not consumed from the window's family"
+        );
+        let (id, acquisition_id, _) = opened;
+        assert_eq!(
+            obligation(&window),
+            Some((
+                id,
+                acquisition_id,
+                WriteWork::new(0, BUCKET_WINDOW as u64 - 2)
+            )),
+            "the window's obligation was replaced"
+        );
+        let (family_a, family_b) = (a.origin().family(), b.origin().family());
+        let (by_a, by_b) = (a.performer(), b.performer());
+        assert_eq!(id.family(), family_a, "the window's origin is not A's");
+        // The cancellation, performed by B: the window's remainder forfeited
+        // into A's family, nothing admitted in its place.
+        BucketCursor::new(&mut position, &mut window, &mut acquisition)
+            .end(by_b, Forfeit::Cancelled);
+        assert!(window.is_none(), "the cancelled window is still held");
+        let remainder = WriteWork::new(0, BUCKET_WINDOW as u64 - 2);
+        drop((a, b, owner));
+        let observed = session.finish().unwrap_or_else(|incomplete| {
+            panic!("the window's recording is incomplete: {incomplete:?}")
+        });
+        use crate::bounded::{Credit, Event};
+        let credits: Vec<_> = observed
+            .iter()
+            .filter_map(|observed| match &observed.event {
+                Event::Credit(credit) => Some((observed.family, observed.by, credit)),
+                _ => None,
+            })
+            .collect();
+        // One held admission, the window's: A's, by A, its identities those
+        // the obligation carries.
+        let holds: Vec<_> = credits
+            .iter()
+            .filter_map(|(family, by, credit)| match credit {
+                Credit::Admit {
+                    work,
+                    held: Some(hold),
+                } => Some((*family, *by, *work, *hold)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            holds.len(),
+            1,
+            "a window admitted more than once: {credits:?}"
+        );
+        let (family, by, work, hold) = holds[0];
+        assert_eq!((family, by), (family_a, by_a), "the window's admission");
+        assert_eq!(work, WriteWork::new(1, BUCKET_WINDOW as u64));
+        assert_eq!(
+            (hold.obligation, hold.id, hold.acquisition, hold.work),
+            (
+                Obligation::BucketWindow,
+                id,
+                acquisition_id,
+                WriteWork::new(0, BUCKET_WINDOW as u64)
+            ),
+            "the window's hold"
+        );
+        // B's base value: an unheld admission into B's family, by B.
+        assert!(
+            credits.iter().any(|(family, by, credit)| {
+                *family == family_b
+                    && *by == by_b
+                    && matches!(credit, Credit::Admit { work, held: None }
+                        if *work == WriteWork::new(1, 0))
+            }),
+            "B's base value was not admitted to B: {credits:?}"
+        );
+        // Each inspected control spent from the window's obligation into
+        // A's family: the first by A, the second by B.
+        let spends: Vec<_> = credits
+            .iter()
+            .filter_map(|(family, by, credit)| match credit {
+                Credit::Spend(settled) if settled.id == id => {
+                    Some((*family, *by, settled.acquisition, settled.work))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spends,
+            [
+                (family_a, by_a, acquisition_id, WriteWork::new(0, 1)),
+                (family_a, by_b, acquisition_id, WriteWork::new(0, 1)),
+            ],
+            "the inspected controls' spends"
+        );
+        // The cancellation: the remainder forfeited Cancelled into A's
+        // family, by B, once.
+        let forfeits: Vec<_> = credits
+            .iter()
+            .filter_map(|(family, by, credit)| match credit {
+                Credit::Forfeit(settled, rule) => Some((
+                    *family,
+                    *by,
+                    settled.id,
+                    settled.acquisition,
+                    settled.work,
+                    *rule,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            forfeits,
+            [(
+                family_a,
+                by_b,
+                id,
+                acquisition_id,
+                remainder,
+                Forfeit::Cancelled
+            )],
+            "the cancellation's forfeit"
         );
     }
 
@@ -555,16 +918,18 @@ mod attribution {
     #[test]
     fn enumeration_completes_at_the_last_entry() {
         let mut policy = crate::bounded::Limits::unlimited();
+        let owner = policy.owner().expect("an ordinary owner");
         let hash = |pair: &(u64, u64)| pair.0;
         let mut first = HashTable::with_capacity(10_000);
         first.insert_unique(0, (0u64, 0u64), hash);
         assert_eq!(first.get_bucket(0), Some(&(0, 0)));
-        let mut cursor = BucketCursor::new();
-        match cursor.step(&first, &mut policy).unwrap() {
+        let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+        let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
+        match cursor.step(&first, &owner, &mut policy).unwrap() {
             BucketStep::Entry { index: 0, .. } => {}
             _ => panic!("the first bucket holds the entry"),
         }
-        match cursor.step(&first, &mut policy).unwrap() {
+        match cursor.step(&first, &owner, &mut policy).unwrap() {
             BucketStep::Complete => {}
             _ => panic!("one entry yielded completes"),
         }
@@ -577,21 +942,24 @@ mod attribution {
         assert_eq!(policy.used(), WriteWork::new(2, BUCKET_WINDOW as u64));
 
         let empty = HashTable::<(u64, u64)>::with_capacity(10_000);
-        let mut cursor = BucketCursor::new();
-        match cursor.step(&empty, &mut policy).unwrap() {
+        let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+        let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
+        match cursor.step(&empty, &owner, &mut policy).unwrap() {
             BucketStep::Complete => {}
             _ => panic!("an empty table completes at once"),
         }
         assert_eq!(cursor.position(), 0);
 
-        let mut short = BucketCursor::new();
+        let mut short = BucketPosition::new();
         short.next = first.num_buckets();
+        let (mut window, mut acquisition) = (None, None);
+        let mut cursor = BucketCursor::new(&mut short, &mut window, &mut acquisition);
         assert!(matches!(
-            short.step(&first, &mut policy),
+            cursor.step(&first, &owner, &mut policy),
             Err(BoundedError::PlanMismatch)
         ));
         assert!(matches!(
-            short.step(&first, &mut policy),
+            cursor.step(&first, &owner, &mut policy),
             Ok(BucketStep::Finished)
         ));
     }

@@ -1,0 +1,15 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -287,6 +287,12 @@
+     }
+ }
+
++impl<A: Allocator> Allocator for Cleanup<'_, A> {
++    fn allocate(&mut self, bytes: u64) -> Result<Self::Permit, Self::Refusal> {
++        self.policy.allocate(bytes)
++    }
++}
++
+ /// Maximum declared synchronous dispatch depth of an admitted stable record.
+ /// This is independent of input depth and checked before allocating the record.
+ pub const MAX_DISPATCH_DEPTH: usize = 64;

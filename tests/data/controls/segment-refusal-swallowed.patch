@@ -1,0 +1,12 @@
+--- src/bounded/encoding/writer.rs
++++ src/bounded/encoding/writer.rs
+@@ -104,7 +104,8 @@
+             .bytes
+             .get(at.source..at.source + count)
+             .ok_or(BoundedError::PlanMismatch)?;
+-        SEGMENT.admit(b, widen(count)?)?;
++        // Planted: a refused segment is emitted anyway.
++        let _ = SEGMENT.admit(b, widen(count)?);
+         at.source += count;
+         at.written += count;
+         Ok(Segment::Bytes(bytes))

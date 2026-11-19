@@ -1,0 +1,10 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -1398,6 +1398,7 @@
+             owner: self.scope.owner(),
+             marker: PhantomData::<(T, fn(T) -> T)>,
+         });
++        with_worklist(|worklist| release_reference(self.scope.scope, worklist));
+     }
+ }
+

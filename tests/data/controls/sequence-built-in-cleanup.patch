@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/in_place/vector.rs
++++ src/bounded/decode/construction/in_place/vector.rs
+@@ -594,6 +594,7 @@
+             state.phase = Phase::Next;
+         }
+-        Phase::Next => {
++        // Planted: a build from cleanup's phase continues as `Next`.
++        Phase::Next | Phase::Reclaim => {
+             // The node holds exactly the elements its count claims: `position`,
+             // the next element's node, is inside the array's subtree exactly
+             // while an element remains. A child beyond the count is refused

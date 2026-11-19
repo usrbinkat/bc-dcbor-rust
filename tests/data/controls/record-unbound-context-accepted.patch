@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place.rs
++++ src/bounded/decode/construction/in_place.rs
+@@ -209,9 +209,6 @@
+     /// places differ: one deterministic refusal, never skipped and never a
+     /// panic.
+     pub(crate) fn verify<R>(self, expected: Assembly<'b, T>) -> Result<(), BoundedError<R>> {
+-        if !(self.bound && expected.bound) {
+-            return Err(BoundedError::PlanMismatch);
+-        }
+         if self.place != expected.place {
+             return Err(BoundedError::PlanMismatch);
+         }

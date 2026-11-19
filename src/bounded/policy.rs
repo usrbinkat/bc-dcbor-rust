@@ -1,15 +1,25 @@
 //! The bounded policy: finite work, requested and live storage, a deterministic
 //! deadline, a fault schedule, and allocation-free observation. Policy
-//! construction allocates one shared counter; call logs allocate only when
-//! enabled with [`Limits::logged`]. Counters measure requested capacities, not
-//! process RSS.
+//! construction allocates one shared counter; a recorded family's history is
+//! its session's, preallocated before the run ([`Limits::recorded`],
+//! [`record`]), and nothing is logged otherwise. Counters measure requested
+//! capacities, not process RSS.
 extern crate alloc;
 use super::boundary::{Boundary, Predicate, Reached};
-use super::{Allocator, Budget, WriteWork};
+use super::{
+    Acquisition, Allocator, Budget, Credit, Effect, Forfeit, Hold, Identity, Origin, Owner,
+    Performer, Settled, WriteWork,
+};
+/// Kani harnesses of credit conservation (register item 4): compiled only by
+/// `cargo kani`.
+#[cfg(kani)]
+mod proofs;
+pub mod record;
 use crate::bounded::decode::construction::TypedPosition;
 use crate::bounded::decode::construction::reclamation::AbortOnUnwind;
 use crate::sync::{AtomicU64, Ordering};
 use alloc::{sync::Arc, vec::Vec};
+use record::{Recording, Session};
 
 /// The quantum of one bounded turn: three values and 64 bytes.
 pub const TURN: WriteWork = WriteWork::new(3, 64);
@@ -25,6 +35,9 @@ pub enum LimitRefusal {
     Deadline,
     /// The fault schedule refused the call with this index.
     Scheduled(usize),
+    /// A recorded family's session has no permit record left for the grant
+    /// ([`record`]): the run is no evidence, and nothing was granted.
+    Unrecorded,
 }
 
 impl core::error::Error for LimitRefusal {}
@@ -36,7 +49,51 @@ impl core::fmt::Display for LimitRefusal {
             Self::Storage => f.write_str("storage limit"),
             Self::Deadline => f.write_str("deadline"),
             Self::Scheduled(index) => write!(f, "scheduled refusal of call {index}"),
+            Self::Unrecorded => f.write_str("recording session exhausted"),
         }
+    }
+}
+
+/// Why a policy's history cannot be read ([`Limits::history`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreadable {
+    /// The family is ordinary: it records nothing.
+    Unrecorded,
+    /// The family's session is no evidence.
+    Session(record::Incomplete),
+}
+
+/// A policy's recorded history counted: its calls, those admitted, those
+/// refused and, of those, the injected. The one derivation of the counts a
+/// history's correspondence with its policy's counters compares
+/// (`dcbor_test_support::history_agrees`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryCounts {
+    pub calls: usize,
+    pub admitted: usize,
+    pub refusals: usize,
+    pub injected: usize,
+}
+
+impl HistoryCounts {
+    /// The counts of `history` ([`Limits::history`]).
+    pub fn of(history: &[(Call, Answer)]) -> Self {
+        let mut counts = Self {
+            calls: history.len(),
+            admitted: 0,
+            refusals: 0,
+            injected: 0,
+        };
+        for (_, answer) in history {
+            match answer {
+                Answer::Refused { injected, .. } => {
+                    counts.refusals += 1;
+                    counts.injected += usize::from(*injected);
+                }
+                Answer::Admitted | Answer::Granted(_) => counts.admitted += 1,
+            }
+        }
+        counts
     }
 }
 
@@ -47,33 +104,264 @@ pub enum Call {
     Allocate(u64),
 }
 
-#[derive(Debug, Default)]
+/// What a policy answered a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// A work call admitted.
+    Admitted,
+    /// An allocation granted: the permit of this identity.
+    Granted(Identity),
+    /// Refused, with the reason, and whether the policy's fault schedule
+    /// injected the refusal.
+    Refused {
+        refusal: LimitRefusal,
+        injected: bool,
+    },
+}
+
+/// One observation of a recorded family ([`record::Session`]), in the
+/// session's one order: the transitions production makes, each published
+/// where it is made. The stream the refinement machine (`tests/refinement`)
+/// checks a recorded run against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// An attempted call and the policy's answer.
+    Call(Call, Answer),
+    /// An admission through the route ([`Budget::admitted`],
+    /// [`Budget::held`]), or a held obligation's settlement into its origin
+    /// ([`super::Origin::settle`]), whoever performs it.
+    Credit(Credit),
+    /// A physical reservation's outcome ([`Budget::effect`]).
+    Effect(Effect),
+    /// A permit divided: the child's identity and the bytes it took.
+    Split {
+        parent: Identity,
+        child: Identity,
+        bytes: u64,
+    },
+    /// A permit's bytes passed to another: the survivor, the retired input
+    /// and the bytes passed.
+    Merge {
+        survivor: Identity,
+        retired: Identity,
+        bytes: u64,
+    },
+    /// A permit's drop performed its release.
+    Released(Identity),
+    /// A custody that owns acquisitions was made ([`Budget::owner`]).
+    Owner(Identity),
+    /// `owner` bound an acquisition ([`Budget::acquisition`]): every
+    /// obligation held for it and the permit granted to it name it.
+    Bound {
+        acquisition: Identity,
+        owner: Identity,
+    },
+    /// `owner`'s acquisition ended ([`super::Acquisition::end`]), published
+    /// by the family that minted it: its holder settled everything it held
+    /// and keeps no capability of it.
+    End {
+        acquisition: Identity,
+        owner: Identity,
+    },
+    /// A record block's permit entered `stage` of its record's lifecycle
+    /// ([`RecordStage`]) under `owner`, the owner whose acquisition granted
+    /// it, published through the permit's own family
+    /// ([`super::Releasing::custody`]).
+    Custody {
+        permit: Identity,
+        owner: Identity,
+        stage: RecordStage,
+    },
+}
+
+/// Where a record block is in its record's lifecycle, the permit's holder
+/// at each stage: granted to an acquisition token, not yet a record
+/// (`Granted`); a record held by its handle (`Handle`); retired into its
+/// scope's queue (`Queued`); taken from the queue by the one cleanup that
+/// reclaims it (`Active`); its cleanup complete, the block's free next
+/// (`Reclaimed`). A permit that is no record block has no stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecordStage {
+    Granted,
+    Handle,
+    Queued,
+    Active,
+    Reclaimed,
+}
+
+impl core::fmt::Debug for Counters {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Counters")
+            .field("live", &self.live)
+            .field("peak", &self.peak)
+            .field("recorded", &self.recording.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
 struct Counters {
     live: AtomicU64,
     peak: AtomicU64,
     release_observer: Option<fn(u64)>,
+    /// The family's part of its recording session, fixed when the family is
+    /// made ([`Limits::recorded`]): `None` for an ordinary family, whose
+    /// permits hold their bytes and whose observations are not recorded.
+    recording: Option<Recording>,
     /// The boundary valuations reached by every policy over this storage,
     /// shared and terminal ones included, one bit per valuation by predicate
     /// ([`Reached`]): set by one relaxed `fetch_or`, which allocates nothing
     /// and cannot unwind, so cleanup and terminal steps record too. Read once
     /// the run is over ([`Limits::reached`]).
     reached: [AtomicU64; Predicate::COUNT],
+    /// The credit ledgers of every policy over this storage, shared and
+    /// terminal ones included ([`Ledgers`]), read once the run is quiescent
+    /// ([`Limits::credits`]).
+    credits: Ledgers,
+}
+
+/// A counter family's credit ledgers: A, C and F in values and bytes, and
+/// the violation flag, each a family atomic, so a terminal policy minted from
+/// a permit's counters records into the ledger its originating policy reads.
+/// Every quantity is updated by its own checked compare-exchange, the values
+/// and bytes of each of A, C and F one at a time, not together: one that does
+/// not fit is left unchanged, while the other quantities of the same event
+/// may have advanced, and the sticky violation flag is set, so the ledger is
+/// no longer claimed conserved ([`Credits::conserved_with`] is false).
+/// Allocation-free and non-unwinding, so cleanup and terminal steps record.
+/// Conservation is read only at quiescence.
+#[derive(Debug, Default)]
+struct Ledgers {
+    admitted: [AtomicU64; 2],
+    consumed: [AtomicU64; 2],
+    forfeited: [AtomicU64; 2],
+    violated: AtomicU64,
+}
+
+impl Ledgers {
+    /// Apply one credit event: the one update rule of every ledger. An
+    /// admission adds its work to A and its unheld part to C; a spend adds
+    /// to C; a forfeit adds to F. An admission holding more than it
+    /// admitted sets the violation flag and changes nothing else. A quantity
+    /// that does not fit is left unchanged and sets the flag, while the
+    /// event's other quantities and ledgers may have advanced.
+    fn record(&self, credit: Credit) {
+        let none = WriteWork::new(0, 0);
+        let (admitted, consumed, forfeited) = match credit {
+            Credit::Admit { work, held } => {
+                let consumed = match held {
+                    None => Some(work),
+                    Some(hold) => less(work, hold.work),
+                };
+                let Some(consumed) = consumed else {
+                    self.violate();
+                    return;
+                };
+                (work, consumed, none)
+            }
+            Credit::Spend(spent) => (none, spent.work, none),
+            Credit::Forfeit(forfeited, _) => (none, none, forfeited.work),
+        };
+        let fitted = [
+            Self::add(&self.admitted, admitted),
+            Self::add(&self.consumed, consumed),
+            Self::add(&self.forfeited, forfeited),
+        ];
+        if fitted.contains(&false) {
+            self.violate();
+        }
+    }
+
+    /// `work` added to a ledger, its values and its bytes each by its own
+    /// checked compare-exchange: a quantity that does not fit is left
+    /// unchanged while the other may have advanced. False when either did
+    /// not fit.
+    fn add(ledger: &[AtomicU64; 2], work: WriteWork) -> bool {
+        let values = Self::add_one(&ledger[0], work.values);
+        let bytes = Self::add_one(&ledger[1], work.bytes);
+        values && bytes
+    }
+
+    fn add_one(ledger: &AtomicU64, amount: u64) -> bool {
+        if amount == 0 {
+            return true;
+        }
+        let mut current = ledger.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return false;
+            };
+            match ledger.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn violate(&self) {
+        self.violated.fetch_or(1, Ordering::AcqRel);
+    }
+
+    /// The ledgers now, as a snapshot.
+    fn snapshot(&self) -> Credits {
+        let read = |ledger: &[AtomicU64; 2]| {
+            WriteWork::new(
+                ledger[0].load(Ordering::Acquire),
+                ledger[1].load(Ordering::Acquire),
+            )
+        };
+        Credits {
+            admitted: read(&self.admitted),
+            consumed: read(&self.consumed),
+            forfeited: read(&self.forfeited),
+            violated: self.violated.load(Ordering::Acquire) != 0,
+        }
+    }
 }
 
 /// Storage admission released when its owning allocation is released. A
 /// reservation may be released on any thread; release is one atomic
 /// subtraction, allocates nothing, and panics on a release it never admitted.
-#[derive(Debug)]
+///
+/// Two words, whatever the family's mode ([`crate::bounded::PERMIT_BYTES`]):
+/// its family's counters, and `word`, read by the family's mode, which is
+/// fixed while the family can issue or hold permits. An ordinary family's
+/// `word` is the full-width requested bytes. A recorded family's is the
+/// index of the permit's record in its session ([`record`]), which holds
+/// its bytes, its identity and its lifecycle; the family is the counters'.
 pub struct Reservation {
     counters: Arc<Counters>,
-    bytes: u64,
+    word: u64,
+}
+
+impl core::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("bytes", &self.bytes())
+            .field("identity", &self.identity())
+            .finish()
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let previous = self.counters.live.fetch_sub(self.bytes, Ordering::AcqRel);
-        assert!(previous >= self.bytes, "reservation released twice");
-        if self.bytes != 0
+        let recording = self.counters.recording.as_ref();
+        // A merged input holds nothing: its bytes passed to the survivor,
+        // and its drop is no release.
+        if recording.is_some_and(|recording| recording.retired(self.word)) {
+            return;
+        }
+        let bytes = self.bytes();
+        let previous = self.counters.live.fetch_sub(bytes, Ordering::AcqRel);
+        assert!(previous >= bytes, "reservation released twice");
+        if let Some(recording) = recording {
+            recording.released(self.word);
+            recording.publish(
+                Performer::None,
+                Event::Released(recording.identity(self.word)),
+            );
+        }
+        if bytes != 0
             && let Some(observer) = self.counters.release_observer
         {
             // A release runs inside cleanup steps, which must not unwind
@@ -81,7 +369,7 @@ impl Drop for Reservation {
             // state recording what it no longer holds. An observer that
             // unwinds aborts the process instead.
             let guard = AbortOnUnwind;
-            observer(self.bytes);
+            observer(bytes);
             core::mem::forget(guard);
         }
     }
@@ -97,6 +385,9 @@ pub enum TransferRefusal {
     Foreign,
     /// The merged size does not fit in `u64`.
     Overflow,
+    /// A recorded family's session has no permit record left for the
+    /// split's child ([`record`]).
+    Unrecorded,
 }
 
 impl core::error::Error for TransferRefusal {}
@@ -109,6 +400,7 @@ impl core::fmt::Display for TransferRefusal {
             }
             Self::Foreign => f.write_str("reservations count against different storage"),
             Self::Overflow => f.write_str("merged reservation exceeds u64"),
+            Self::Unrecorded => f.write_str("recording session exhausted"),
         }
     }
 }
@@ -116,43 +408,207 @@ impl core::fmt::Display for TransferRefusal {
 impl Reservation {
     /// The requested bytes this reservation holds.
     pub fn bytes(&self) -> u64 {
-        self.bytes
+        match &self.counters.recording {
+            None => self.word,
+            Some(recording) => recording.bytes(self.word),
+        }
+    }
+
+    /// This permit's identity: [`Identity::UNOBSERVED`] in an ordinary
+    /// family, its record's in a recorded one.
+    pub fn identity(&self) -> Identity {
+        match &self.counters.recording {
+            None => Identity::UNOBSERVED,
+            Some(recording) => recording.identity(self.word),
+        }
+    }
+
+    /// Publish this record block's entry into `stage` under `owner`
+    /// ([`Event::Custody`]) through its own family's recording, performed by
+    /// no policy: the permit's origin, whichever budget, or none, performs
+    /// the step. An ordinary family records nothing.
+    pub(crate) fn custody(&self, owner: Identity, stage: RecordStage) {
+        if let Some(recording) = &self.counters.recording {
+            recording.publish(
+                Performer::None,
+                Event::Custody {
+                    permit: recording.identity(self.word),
+                    owner,
+                    stage,
+                },
+            );
+        }
+    }
+
+    fn set_bytes(&mut self, bytes: u64) {
+        match &self.counters.recording {
+            None => self.word = bytes,
+            Some(recording) => recording.set_bytes(self.word, bytes),
+        }
     }
 
     /// Move `bytes` of this reservation into a new one over the same storage,
     /// as when one allocation's ownership is divided between two owners. Live
     /// and peak storage are unchanged; each part is released with its own
-    /// owner. A zero-byte split is an owner of nothing.
+    /// owner. A zero-byte split is an owner of nothing, which releases
+    /// nothing. In a recorded family the child's record is reserved before
+    /// the parent changes, and the split is published with both identities
+    /// and the exact bytes; a session with no record left refuses the split,
+    /// nothing changed.
     pub fn split(&mut self, bytes: u64) -> Result<Reservation, TransferRefusal> {
-        let remaining = self
-            .bytes
+        let held = self.bytes();
+        let remaining = held
             .checked_sub(bytes)
             .ok_or(TransferRefusal::Insufficient {
                 requested: bytes,
-                held: self.bytes,
+                held,
             })?;
-        self.bytes = remaining;
+        let word = match &self.counters.recording {
+            None => bytes,
+            Some(recording) => {
+                let (child, id) = recording
+                    .reserve(bytes)
+                    .ok_or(TransferRefusal::Unrecorded)?;
+                recording.commit(child);
+                recording.publish(
+                    Performer::None,
+                    Event::Split {
+                        parent: recording.identity(self.word),
+                        child: id,
+                        bytes,
+                    },
+                );
+                child
+            }
+        };
+        self.set_bytes(remaining);
         Ok(Reservation {
             counters: self.counters.clone(),
-            bytes,
+            word,
         })
     }
 
     /// Take over `other`'s bytes, as when two owners' storage passes to one.
     /// Live and peak storage are unchanged. A refused merge returns `other`
-    /// unchanged with the reason.
+    /// unchanged with the reason. The emptied input releases nothing when it
+    /// drops; in a recorded family its record is retired and the merge is
+    /// published with both identities and the bytes passed, its drop
+    /// publishing no release.
     pub fn merge(&mut self, mut other: Reservation) -> Result<(), (Reservation, TransferRefusal)> {
         if !Arc::ptr_eq(&self.counters, &other.counters) {
             return Err((other, TransferRefusal::Foreign));
         }
-        let Some(bytes) = self.bytes.checked_add(other.bytes) else {
+        let passed = other.bytes();
+        let Some(bytes) = self.bytes().checked_add(passed) else {
             return Err((other, TransferRefusal::Overflow));
         };
-        self.bytes = bytes;
-        // The bytes now belong to this reservation: the emptied one releases
-        // nothing when it drops.
-        other.bytes = 0;
+        self.set_bytes(bytes);
+        other.set_bytes(0);
+        if let Some(recording) = &self.counters.recording {
+            recording.retire(other.word);
+            recording.publish(
+                Performer::None,
+                Event::Merge {
+                    survivor: recording.identity(self.word),
+                    retired: recording.identity(other.word),
+                    bytes: passed,
+                },
+            );
+        }
         Ok(())
+    }
+}
+
+/// A snapshot of a counter family's credit ledgers ([`Limits::credits`]),
+/// from the credit events reported to any of its policies ([`Credit`]):
+/// what was admitted through the route (A), consumed (C) and forfeited (F),
+/// each from its own events, never computed as a remainder. A family is one
+/// [`Limits::new`] and every policy sharing its counters: its
+/// [`Limits::share`]s and every terminal policy minted from its permits.
+/// Held credit (H) is not a policy's: it is the custody of the operation
+/// that admitted it, which reports it as its `held_credit` observation. An
+/// operation's credit is conserved when, over the families that served it,
+/// `A = C + F + H` ([`Self::conserved_with`]).
+///
+/// Each ledger is updated by its own atomic update, not together with the
+/// others: an admission's A and C are two updates. So a snapshot taken while
+/// an operation runs on another thread may hold one and not the other, and
+/// conservation is read only at quiescence: after the operation's `Done`,
+/// or after its terminal drain returns.
+///
+/// Consumed counts work performed and work irrevocably committed to a
+/// granted permit, whose drop performs its release unconditionally; so the
+/// ledgers do not report how much work has physically executed, and no
+/// evidence claim may read them that way.
+///
+/// A quantity whose update does not fit in `u64` is left unchanged while the
+/// event's other quantities and ledgers may have advanced, and an admission
+/// reporting more held than it admitted changes no ledger; both set
+/// [`Self::violated`], sticky, so the ledgers are no longer claimed
+/// conserved. The policy ships, so it never panics.
+///
+/// Credit events are not admission calls ([`Call`]): the admission trace,
+/// and every record taken from it, is unchanged by them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Credits {
+    /// Every admission made through the route.
+    pub admitted: WriteWork,
+    /// The part of each admission not held, and every spend.
+    pub consumed: WriteWork,
+    /// Every forfeit.
+    pub forfeited: WriteWork,
+    /// An update was refused: it did not fit, or held more than admitted.
+    pub violated: bool,
+}
+
+/// `left - right` in both quantities, or none when either falls below zero.
+fn less(left: WriteWork, right: WriteWork) -> Option<WriteWork> {
+    Some(WriteWork::new(
+        left.values.checked_sub(right.values)?,
+        left.bytes.checked_sub(right.bytes)?,
+    ))
+}
+
+impl Credits {
+    /// These ledgers and `other`'s, each summed: the credit of the counter
+    /// families that served one operation, such as fresh policies across
+    /// its turns. `None` when a sum does not fit.
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            admitted: self.admitted.checked_then(other.admitted)?,
+            consumed: self.consumed.checked_then(other.consumed)?,
+            forfeited: self.forfeited.checked_then(other.forfeited)?,
+            violated: self.violated || other.violated,
+        })
+    }
+
+    /// What these ledgers recorded since `earlier`, a snapshot of the same
+    /// family: the credit of one operation on a family that served others
+    /// before it. Summed snapshots prove one operation's conservation only
+    /// when they hold that operation's events alone, so a caller serving
+    /// several operations takes a delta around each. `None` when a ledger
+    /// is below its earlier value, which no snapshot of the same family
+    /// is. The delta is violated when these ledgers are: a violation is
+    /// never attributed away.
+    pub fn checked_sub(self, earlier: Self) -> Option<Self> {
+        Some(Self {
+            admitted: less(self.admitted, earlier.admitted)?,
+            consumed: less(self.consumed, earlier.consumed)?,
+            forfeited: less(self.forfeited, earlier.forfeited)?,
+            violated: self.violated,
+        })
+    }
+
+    /// Whether these ledgers and `held`, the custody's held credit, conserve
+    /// the operation's credit, `A = C + F + H` in values and in bytes, and
+    /// no update was refused. `None` when `C + F + H` does not fit, never a
+    /// wrapped or saturated comparison.
+    pub fn conserved_with(&self, held: WriteWork) -> Option<bool> {
+        let accounted = self
+            .consumed
+            .checked_then(self.forfeited)?
+            .checked_then(held)?;
+        Some(!self.violated && accounted == self.admitted)
     }
 }
 
@@ -173,9 +629,11 @@ pub struct Admission {
 
 /// The most recent admissions in fixed storage, and the first refusal kept
 /// separately so long resumptions cannot overwrite its cause. Recording never
-/// allocates.
+/// allocates. A copy is plain data, kept as a run's diagnostic after its
+/// policy is gone.
+#[derive(Clone)]
 pub struct AdmissionTrace {
-    recent: [Option<Admission>; 32],
+    recent: [Option<Admission>; AdmissionTrace::CAPACITY],
     count: usize,
     first_refusal: Option<Admission>,
     context: Option<TypedPosition<()>>,
@@ -184,7 +642,7 @@ pub struct AdmissionTrace {
 impl AdmissionTrace {
     pub const fn new() -> Self {
         Self {
-            recent: [None; 32],
+            recent: [None; Self::CAPACITY],
             count: 0,
             first_refusal: None,
             context: None,
@@ -209,6 +667,17 @@ impl AdmissionTrace {
         let index = self.count.checked_sub(1)?;
         self.recent[index % self.recent.len()]
     }
+
+    /// The admissions still recorded, oldest first: the last
+    /// [`Self::CAPACITY`] of [`Self::count`]. Reads the fixed storage in
+    /// place; allocates nothing, so an observed window may read it.
+    pub fn recent(&self) -> impl Iterator<Item = Admission> + '_ {
+        (self.count.saturating_sub(self.recent.len())..self.count)
+            .filter_map(|index| self.recent[index % self.recent.len()])
+    }
+
+    /// How many admissions the trace keeps.
+    pub const CAPACITY: usize = 32;
 
     fn record(&mut self, mut event: Admission) {
         event.position = self.context;
@@ -256,19 +725,12 @@ impl core::fmt::Debug for AdmissionTrace {
             "first_refusal={:?}; total_events={}",
             self.first_refusal, self.count
         )?;
-        for index in self.count.saturating_sub(self.recent.len())..self.count {
-            if let Some(event) = self.recent[index % self.recent.len()] {
-                writeln!(
-                    f,
-                    "call={} {:?} -> {:?}; work={:?}; live_peak={:?}; position={:?}",
-                    event.index,
-                    event.call,
-                    event.result,
-                    event.work,
-                    event.storage,
-                    event.position
-                )?;
-            }
+        for event in self.recent() {
+            writeln!(
+                f,
+                "call={} {:?} -> {:?}; work={:?}; live_peak={:?}; position={:?}",
+                event.index, event.call, event.result, event.work, event.storage, event.position
+            )?;
         }
         Ok(())
     }
@@ -305,12 +767,14 @@ pub struct Limits {
     clock: u64,
     deadline: Option<u64>,
     observer: Option<fn(u64)>,
-    logging: bool,
     strict: bool,
     terminal: bool,
-    calls: Vec<Call>,
-    admitted: Vec<Call>,
-    refused_calls: Vec<(usize, LimitRefusal, bool)>,
+    /// This policy's number in its family's recording session, which every
+    /// observation it publishes carries; 0 in an ordinary family.
+    policy: u64,
+    /// The calls of this policy made before the last [`Self::measure`]:
+    /// the reports skip them.
+    measured: usize,
     trace: AdmissionTrace,
 }
 
@@ -322,6 +786,10 @@ impl Limits {
     }
 
     fn with_counters(values: u64, bytes: u64, storage: u64, counters: Arc<Counters>) -> Self {
+        let policy = counters
+            .recording
+            .as_ref()
+            .map_or(0, |recording| recording.policy());
         Self {
             used: WriteWork::default(),
             limit: WriteWork::new(values, bytes),
@@ -344,23 +812,65 @@ impl Limits {
             clock: 0,
             deadline: None,
             observer: None,
-            logging: false,
             strict: false,
             terminal: false,
-            calls: Vec::new(),
-            admitted: Vec::new(),
-            refused_calls: Vec::new(),
+            policy,
+            measured: 0,
             trace: AdmissionTrace::new(),
+        }
+    }
+
+    /// A new family recorded in `session` ([`record`]), with the limits of
+    /// [`Self::new`]: its permits are the session's records, and every
+    /// observation of it, its shares and its terminal policies is published
+    /// into the session's one order. The mode is a fact of the family's
+    /// construction and fixed for its life: no family changes mode.
+    pub fn recorded(values: u64, bytes: u64, storage: u64, session: &Session) -> Self {
+        let counters = Counters {
+            recording: Some(Recording::join(session)),
+            ..Counters::default()
+        };
+        Self::with_counters(values, bytes, storage, Arc::new(counters))
+    }
+
+    /// A new unlimited family recorded in `session` ([`Self::recorded`],
+    /// [`Self::unlimited`]).
+    pub fn recorded_unlimited(session: &Session) -> Self {
+        Self::recorded(u64::MAX, u64::MAX, u64::MAX, session)
+    }
+
+    /// Whether this family is recorded in `session`.
+    pub fn records_in(&self, session: &Session) -> bool {
+        self.counters
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.of(session))
+    }
+
+    /// Publish `event` as this policy's, when its family is recorded.
+    fn publish(&self, event: Event) {
+        if let Some(recording) = &self.counters.recording {
+            recording.publish(self.performer(), event);
+        }
+    }
+
+    /// The family's next identity: [`Identity::UNOBSERVED`] in an ordinary
+    /// family; in a recorded one, refused [`LimitRefusal::Unrecorded`] when
+    /// the session has none left (the session is then, stickily, no
+    /// evidence). A recorded family never yields an unidentified identity.
+    fn mint(&self) -> Result<Identity, LimitRefusal> {
+        match &self.counters.recording {
+            None => Ok(Identity::UNOBSERVED),
+            Some(recording) => recording.mint().ok_or(LimitRefusal::Unrecorded),
         }
     }
 
     /// A fresh policy over the same live storage: its reservations count
     /// against this policy's capacity, peak and live bytes.
     pub fn share(&self) -> Self {
-        let mut shared = Self::new(u64::MAX, u64::MAX, self.storage);
-        shared.counters = self.counters.clone();
+        let mut shared =
+            Self::with_counters(u64::MAX, u64::MAX, self.storage, self.counters.clone());
         shared.observer = self.observer;
-        shared.logging = self.logging;
         shared.strict = self.strict;
         shared
     }
@@ -375,20 +885,6 @@ impl Limits {
         let mut limits = Self::unlimited();
         limits.fresh();
         limits
-    }
-
-    /// Record every attempted and admitted call.
-    pub fn logged(mut self) -> Self {
-        self.logging = true;
-        self
-    }
-
-    /// Reserve room for `additional` logged calls, so that logging inside an
-    /// observed interval performs no allocation.
-    pub fn reserve_log(&mut self, additional: usize) {
-        self.calls.reserve(additional);
-        self.admitted.reserve(additional);
-        self.refused_calls.reserve(additional);
     }
 
     /// Panic when a call follows a refusal that was not cleared with
@@ -566,9 +1062,12 @@ impl Limits {
         self.last_injected = false;
         self.refused = None;
         self.retrying = false;
-        self.calls.clear();
-        self.admitted.clear();
-        self.refused_calls.clear();
+        // Both terms count this policy's slots of one preallocated store,
+        // whose length is a `usize`: their sum fits. An ordinary family has
+        // no history to skip.
+        if self.counters.recording.is_some() {
+            self.measured += self.view().len();
+        }
         self.trace = AdmissionTrace::new();
     }
 
@@ -605,6 +1104,21 @@ impl Limits {
         }))
     }
 
+    /// This policy's counter family's credit ledgers, as a snapshot: what
+    /// the family admitted through the route, consumed and forfeited
+    /// ([`Credits`]). A family is this policy's counters: every
+    /// [`Self::share`] of it and every terminal policy minted from its
+    /// permits records into the same ledger, so a scope drained terminally
+    /// is read here. Fresh policies are families of their own, summed
+    /// ([`Credits::checked_add`]); a family serving several operations is
+    /// read as a delta around each ([`Credits::checked_sub`]). Read at
+    /// quiescence ([`Credits`]). Not reset by [`Self::measure`]: credit held
+    /// across it is spent or forfeited after it. The ledgers count work
+    /// committed, not work physically executed.
+    pub fn credits(&self) -> Credits {
+        self.counters.credits.snapshot()
+    }
+
     /// Cumulative bytes of granted allocation requests.
     pub fn requested_bytes(&self) -> u64 {
         self.requested
@@ -636,9 +1150,85 @@ impl Limits {
         self.injected_refusals
     }
 
-    /// Logged refused callbacks: index, reason, and whether explicitly injected.
-    pub fn refused_calls(&self) -> &[(usize, LimitRefusal, bool)] {
-        &self.refused_calls
+    /// This policy's own calls since construction or the last
+    /// [`Self::measure`], each with its answer, as its recorded family's
+    /// session holds them, the one record of them ([`record`]); refused,
+    /// naming why, for a family that records nothing or a session that
+    /// cannot report them. Never panics, never an empty or short history:
+    /// the one read of a policy's history, which [`Self::view`] asserts.
+    pub fn history(&self) -> Result<Vec<(Call, Answer)>, Unreadable> {
+        let recording = self
+            .counters
+            .recording
+            .as_ref()
+            .ok_or(Unreadable::Unrecorded)?;
+        let events = recording
+            .view(self.performer())
+            .map_err(Unreadable::Session)?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Call(call, answer) => Some((call, answer)),
+                _ => None,
+            })
+            .skip(self.measured)
+            .collect())
+    }
+
+    /// Whether this policy's recorded family's session is still evidence:
+    /// one load of its sticky invalid flag, no history read
+    /// ([`Self::history`] reads it whole). Refused [`Unreadable::Unrecorded`]
+    /// for a family that records nothing, and
+    /// [`Unreadable::Session`]`(`[`record::Incomplete::Exhausted`]`)` once a
+    /// claim was exhausted or an owner of another session was paired with
+    /// it: from then on nothing it records is evidence. A driver checks it
+    /// after a refused turn, so the refusal that preceded the invalidation is
+    /// named rather than masked by a later history read's panic.
+    pub fn evidence(&self) -> Result<(), Unreadable> {
+        match &self.counters.recording {
+            None => Err(Unreadable::Unrecorded),
+            Some(recording) if recording.valid() => Ok(()),
+            Some(_) => Err(Unreadable::Session(record::Incomplete::Exhausted)),
+        }
+    }
+
+    /// What first made this policy's recorded family's session no evidence
+    /// ([`record::Invalidation`]), if anything has: the dimension
+    /// [`Self::evidence`]'s [`record::Incomplete::Exhausted`] does not name.
+    /// `None` for a valid session and for a family that records nothing.
+    pub fn invalidation(&self) -> Option<record::Invalidation> {
+        self.counters
+            .recording
+            .as_ref()
+            .and_then(Recording::invalidation)
+    }
+
+    /// [`Self::history`], asserted: a test instrument's report, read by
+    /// [`Self::calls`], [`Self::admitted_calls`], [`Self::refused_calls`]
+    /// and [`Self::assert_units`].
+    fn view(&self) -> Vec<(Call, Answer)> {
+        self.history()
+            .unwrap_or_else(|unreadable| match unreadable {
+                Unreadable::Unrecorded => {
+                    panic!("this policy records no history; construct it with Limits::recorded")
+                }
+                Unreadable::Session(incomplete) => {
+                    panic!("the recording session is unusable: {incomplete:?}")
+                }
+            })
+    }
+
+    /// Refused calls: index among this policy's calls, reason, and whether
+    /// the fault schedule injected it ([`Self::view`]).
+    pub fn refused_calls(&self) -> Vec<(usize, LimitRefusal, bool)> {
+        self.view()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (_, answer))| match answer {
+                Answer::Refused { refusal, injected } => Some((index, refusal, injected)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The refusal not yet cleared: its call index and reason.
@@ -651,14 +1241,21 @@ impl Limits {
         self.clock
     }
 
-    /// Attempted calls, when logging.
-    pub fn calls(&self) -> &[Call] {
-        &self.calls
+    /// Attempted calls ([`Self::view`]: panics on an unrecorded family).
+    pub fn calls(&self) -> Vec<Call> {
+        self.view().into_iter().map(|(call, _)| call).collect()
     }
 
-    /// Admitted calls, when logging.
-    pub fn admitted(&self) -> &[Call] {
-        &self.admitted
+    /// Admitted calls: admitted work and granted allocations
+    /// ([`Self::view`]). Named apart from the admission observation
+    /// [`Budget::admitted`], which a `&mut Limits` receiver would otherwise
+    /// resolve to first.
+    pub fn admitted_calls(&self) -> Vec<Call> {
+        self.view()
+            .into_iter()
+            .filter(|(_, answer)| !matches!(answer, Answer::Refused { .. }))
+            .map(|(call, _)| call)
+            .collect()
     }
 
     pub fn trace(&self) -> &AdmissionTrace {
@@ -669,19 +1266,40 @@ impl Limits {
         &mut self.trace
     }
 
-    /// Panic unless every logged work call fit in `quantum`.
+    /// Panic unless every recorded work call fit in `quantum`.
+    #[cfg_attr(
+        kani,
+        expect(
+            unused_variables,
+            reason = "Kani's assert! override does not evaluate its message, the only reader of index"
+        )
+    )]
     pub fn assert_units(&self, quantum: WriteWork) {
-        for (index, call) in self.calls.iter().enumerate() {
+        for (index, call) in self.calls().into_iter().enumerate() {
             if let Call::Work { values, bytes } = call {
                 assert!(
-                    *values <= quantum.values && *bytes <= quantum.bytes,
+                    values <= quantum.values && bytes <= quantum.bytes,
                     "indivisible operation {index}: {call:?} exceeds {quantum:?}"
                 );
             }
         }
     }
 
-    fn admit(&mut self, call: Call) -> Result<(), LimitRefusal> {
+    /// The one admission of a call. A granted allocation in a recorded family
+    /// returns its committed record and identity.
+    ///
+    /// A recorded grant claims its record only after the policy's own checks
+    /// have passed and its live capacity is reserved by the one atomic
+    /// check-and-increment, so a refused request never consumes a record:
+    /// a complete session's records are exactly one per grant and per split
+    /// child. When the session has no record or identity left, the reserved
+    /// capacity is subtracted again before anything else changes (no peak,
+    /// requested total, grant or observer effect) and the call is refused
+    /// [`LimitRefusal::Unrecorded`]. Between that reservation and its
+    /// subtraction a concurrent request of the same family may see the
+    /// capacity taken and be refused; that happens only once the session is
+    /// exhausted, when the run is no evidence.
+    fn admit(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
         if self.strict {
             assert!(
                 self.refused.is_none(),
@@ -691,9 +1309,6 @@ impl Limits {
         }
         let index = self.attempts;
         self.attempts += 1;
-        if self.logging {
-            self.calls.push(call);
-        }
         let now = self.clock;
         self.clock = self.clock.saturating_add(1);
         if self.deadline.is_some_and(|deadline| now >= deadline) {
@@ -716,12 +1331,13 @@ impl Limits {
             Call::Work { values, bytes } => {
                 let used = self
                     .used
-                    .then::<()>(WriteWork::new(values, bytes))
-                    .map_err(|_| LimitRefusal::Work)?;
+                    .checked_then(WriteWork::new(values, bytes))
+                    .ok_or(LimitRefusal::Work)?;
                 if !self.limit.covers(&used) {
                     return Err(LimitRefusal::Work);
                 }
                 self.used = used;
+                Ok(None)
             }
             Call::Allocate(bytes) => {
                 let request = self.requests;
@@ -759,37 +1375,66 @@ impl Limits {
                         Err(current) => previous = current,
                     }
                 };
+                let granted = match &self.counters.recording {
+                    None => None,
+                    Some(recording) => match recording.reserve(bytes) {
+                        Some((record, id)) => {
+                            recording.commit(record);
+                            Some((record, id))
+                        }
+                        None => {
+                            self.counters.live.fetch_sub(bytes, Ordering::AcqRel);
+                            return Err(LimitRefusal::Unrecorded);
+                        }
+                    },
+                };
                 self.counters.peak.fetch_max(live, Ordering::AcqRel);
                 self.requested = requested;
+                Ok(granted)
             }
         }
-        if self.logging {
-            self.admitted.push(call);
-        }
-        Ok(())
     }
 
-    fn admit_traced(&mut self, call: Call) -> Result<(), LimitRefusal> {
+    /// The call's answer as an observation: a granted allocation's is
+    /// published by [`Allocator::allocate`] once its permit's identity is
+    /// committed, every other answer here.
+    fn publish_call(&self, call: Call, result: Result<(), LimitRefusal>) {
+        match (call, result) {
+            (Call::Allocate(_), Ok(())) => {}
+            (_, Ok(())) => self.publish(Event::Call(call, Answer::Admitted)),
+            (_, Err(refusal)) => self.publish(Event::Call(
+                call,
+                Answer::Refused {
+                    refusal,
+                    injected: self.last_injected,
+                },
+            )),
+        }
+    }
+
+    fn admit_traced(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
         if self.terminal {
-            return match call {
+            // A terminal policy's calls are cleanup units, published like
+            // any other: publication allocates nothing.
+            let result = match call {
                 Call::Work { .. } => Ok(()),
                 Call::Allocate(_) => Err(LimitRefusal::Storage),
             };
+            self.publish_call(call, result);
+            return result.map(|()| None);
         }
         self.last_injected = false;
-        let result = self.admit(call);
+        let granted = self.admit(call);
+        let result = granted.map(|_| ());
         if let Err(reason) = result {
             self.refusals += 1;
             self.injected_refusals += usize::from(self.last_injected);
-            if self.logging {
-                self.refused_calls
-                    .push((self.attempts - 1, reason, self.last_injected));
-            }
             if matches!(reason, LimitRefusal::Scheduled(_)) {
                 self.scheduled_refusals += 1;
             }
             self.refused.get_or_insert((self.attempts - 1, reason));
         }
+        self.publish_call(call, result);
         self.trace.record(Admission {
             index: self.attempts - 1,
             call,
@@ -798,7 +1443,7 @@ impl Limits {
             storage: (self.live_bytes(), self.peak_bytes()),
             position: None,
         });
-        result
+        granted
     }
 }
 
@@ -811,20 +1456,199 @@ impl Default for Limits {
 impl Budget for Limits {
     type Refusal = LimitRefusal;
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
-        self.admit_traced(Call::Work { values, bytes })
+        self.admit_traced(Call::Work { values, bytes }).map(|_| ())
     }
 
     fn boundary(&mut self, boundary: Boundary) {
         self.counters.reached[boundary.predicate.index()]
             .fetch_or(1u64 << boundary.valuation.index(), Ordering::Relaxed);
     }
+
+    type Origin = Family;
+
+    fn origin(&self) -> Family {
+        Family {
+            counters: self.counters.clone(),
+        }
+    }
+
+    /// Recorded into the family's shared ledgers (`Ledgers::record`), in
+    /// every mode, the terminal one included: checked compare-exchange
+    /// updates of the family atomics; and, in a recorded family, published
+    /// into its session. Both allocate nothing and do not unwind.
+    fn admitted(&mut self, work: WriteWork) {
+        let credit = Credit::Admit { work, held: None };
+        self.counters.credits.record(credit);
+        self.publish(Event::Credit(credit));
+    }
+
+    /// As [`Self::admitted`], the held part's identity minted from the
+    /// family's session; an ordinary family's, or an exhausted session's,
+    /// is [`Identity::UNOBSERVED`].
+    fn identify(&mut self) -> Result<Identity, LimitRefusal> {
+        self.mint()
+    }
+
+    fn held(&mut self, work: WriteWork, hold: Hold) {
+        let credit = Credit::Admit {
+            work,
+            held: Some(hold),
+        };
+        self.counters.credits.record(credit);
+        self.publish(Event::Credit(credit));
+    }
+
+    fn effect(&mut self, effect: Effect) {
+        self.publish(Event::Effect(effect));
+    }
+
+    /// An ordinary family's owner is [`Owner::unobserved`]; a recorded
+    /// family's is minted in its session and published, or refused
+    /// [`LimitRefusal::Unrecorded`] when the session has no identity left
+    /// (the session is then, stickily, no evidence).
+    fn owner(&mut self) -> Result<Owner, LimitRefusal> {
+        let by = self.performer();
+        match &self.counters.recording {
+            None => Ok(Owner::unobserved()),
+            Some(recording) => recording.owner(by).ok_or(LimitRefusal::Unrecorded),
+        }
+    }
+
+    /// [`Self::validate_owner`], then, in a recorded family, the
+    /// acquisition's identity minted and its binding published; refused
+    /// [`LimitRefusal::Unrecorded`] when validation refuses or the session
+    /// has no identity left. An ordinary family's acquisition is
+    /// [`Identity::UNOBSERVED`].
+    fn acquisition(&mut self, owner: &Owner) -> Result<Acquisition<Family>, LimitRefusal> {
+        self.validate_owner(owner)?;
+        let Some(recording) = &self.counters.recording else {
+            // An ordinary family's origin records nothing, and its validated
+            // owner is ordinary.
+            return Acquisition::ordinary(self.origin(), owner).ok_or(LimitRefusal::Unrecorded);
+        };
+        let acquisition = recording.mint().ok_or(LimitRefusal::Unrecorded)?;
+        self.publish(Event::Bound {
+            acquisition,
+            owner: owner.id(),
+        });
+        Acquisition::minted(self.origin(), acquisition, owner).ok_or(LimitRefusal::Unrecorded)
+    }
+
+    /// The one compatibility rule: an ordinary family performs only for an
+    /// ordinary owner, a recorded family only for an owner of its own,
+    /// still valid, session. Every other pairing is refused
+    /// [`LimitRefusal::Unrecorded`] and invalidates, stickily, every
+    /// recording session involved: the family's, and the owner's when the
+    /// family is ordinary or of another session. Accounting is unchanged;
+    /// recording validity becomes sticky-invalid.
+    fn validate_owner(&mut self, owner: &Owner) -> Result<(), LimitRefusal> {
+        let compatible = match &self.counters.recording {
+            None => !owner.recorded_in_any(),
+            Some(recording) => recording.owns(owner) && recording.valid(),
+        };
+        if compatible {
+            return Ok(());
+        }
+        if let Some(recording) = &self.counters.recording {
+            // An owner of this session paired after the session became no
+            // evidence is refused too; its cause stays the first one.
+            recording.invalidate(record::Invalidation::ForeignOwner);
+        }
+        owner.invalidate();
+        Err(LimitRefusal::Unrecorded)
+    }
+
+    /// This policy's number in its recorded family's session; an ordinary
+    /// family's policies perform as no recorded policy.
+    fn performer(&self) -> Performer {
+        if self.counters.recording.is_some() && self.policy != 0 {
+            Performer::Policy(self.policy)
+        } else {
+            Performer::None
+        }
+    }
 }
 
-// SAFETY: constructing this policy only clones an existing Arc. Terminal
-// admissions bypass logging and counters, never refuse work, and reject all
-// allocation requests. Recording a boundary is one relaxed `fetch_or` on the
-// shared counters, allocation-free and non-unwinding. Its fields have
-// allocation-free, non-unwinding drops.
+/// A [`Limits`] family's credit capability ([`Origin`]): the right to
+/// settle held credit into the family's ledgers, and to publish the
+/// settlement into the family's session, and nothing else. It holds a
+/// counted reference to the family's counters, made without admission or
+/// allocation; it is no permit, holds no storage, and no policy is made
+/// from it. Dropping it releases nothing.
+///
+/// It is no [`Budget`]:
+/// ```compile_fail,E0599
+/// use dcbor::bounded::{Budget, Limits};
+/// let family = Limits::unlimited().origin();
+/// let _ = family.traverse(1, 0);
+/// ```
+/// It is no permit, so no terminal policy is minted from it:
+/// ```compile_fail,E0308
+/// use dcbor::bounded::{Budget, Limits, TerminalAllocator};
+/// let family = Limits::unlimited().origin();
+/// let _ = Limits::terminal(&family);
+/// ```
+/// Its counters are unreachable:
+/// ```compile_fail,E0616
+/// use dcbor::bounded::{Budget, Limits};
+/// let family = Limits::unlimited().origin();
+/// let _ = family.counters;
+/// ```
+pub struct Family {
+    counters: Arc<Counters>,
+}
+
+impl Origin for Family {
+    fn family(&self) -> u64 {
+        self.counters
+            .recording
+            .as_ref()
+            .map_or(0, Recording::family)
+    }
+
+    /// One `Ledgers::record`, the one update rule, and in a recorded family
+    /// one publication under its performer: allocation-free, non-unwinding.
+    fn settle(&self, settled: Settled, rule: Option<Forfeit>, by: Performer) {
+        let credit = match rule {
+            None => Credit::Spend(settled),
+            Some(rule) => Credit::Forfeit(settled, rule),
+        };
+        self.counters.credits.record(credit);
+        if let Some(recording) = &self.counters.recording {
+            recording.publish(by, Event::Credit(credit));
+        }
+    }
+
+    /// In a recorded family, one publication under its performer
+    /// ([`Event::End`]), through the family's own recording: the family
+    /// that minted the acquisition, since only its capability reaches here.
+    /// An end naming no acquisition this family minted (unidentified, or of
+    /// another family) is never discarded silently: it invalidates the
+    /// session, stickily, before publishing, so the run is no evidence.
+    /// An unrecorded family publishes nothing.
+    fn end(&self, acquisition: Identity, owner: Identity, by: Performer) {
+        let Some(recording) = &self.counters.recording else {
+            return;
+        };
+        if acquisition == Identity::UNOBSERVED || acquisition.family() != recording.family() {
+            recording.invalidate(record::Invalidation::ForeignAcquisition);
+        }
+        recording.publish(by, Event::End { acquisition, owner });
+    }
+}
+
+// SAFETY: terminal: constructing this policy only clones an existing Arc,
+// which allocates nothing and never unwinds, and its fields have
+// allocation-free, non-unwinding drops. traverse: terminal admissions bypass
+// the policy's limits and counters and never refuse work; recording a
+// boundary is one relaxed `fetch_or` on the shared counters, a credit event
+// checked compare-exchange updates and a `fetch_or` on the same counters, and
+// publishing an observation into a recorded family's session claims a
+// preallocated slot and stores its words (`record`), all allocation-free and
+// non-unwinding, a failed update or an exhausted session setting a flag
+// rather than panicking. allocate: a terminal policy rejects every
+// allocation request, allocating nothing. borrow: the policy holds its own
+// clone of the permit's counters, never a reference to `permit`.
 unsafe impl super::TerminalAllocator for Limits {
     fn terminal(permit: &Reservation) -> Self {
         let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, permit.counters.clone());
@@ -833,17 +1657,38 @@ unsafe impl super::TerminalAllocator for Limits {
     }
 }
 
-impl Allocator for Limits {
+impl super::Releasing for Limits {
     type Permit = Reservation;
+
+    fn permit_identity(permit: &Reservation) -> Identity {
+        permit.identity()
+    }
+
+    fn custody(permit: &Reservation, owner: Identity, stage: RecordStage) {
+        permit.custody(owner, stage);
+    }
+}
+
+impl Allocator for Limits {
+    /// The one admission ([`Self::admit_traced`]) grants or refuses; a
+    /// recorded grant arrives with its committed record and identity. The
+    /// owning permit is made at once, before the allocation observer runs,
+    /// so an observer that unwinds drops a permit that releases what was
+    /// admitted: no admitted storage is ever left without an owner.
     fn allocate(&mut self, bytes: u64) -> Result<Reservation, LimitRefusal> {
-        self.admit_traced(Call::Allocate(bytes))?;
+        let granted = self.admit_traced(Call::Allocate(bytes))?;
+        let word = granted.map_or(bytes, |(index, _)| index);
+        let permit = Reservation {
+            counters: self.counters.clone(),
+            word,
+        };
+        if let Some((_, id)) = granted {
+            self.publish(Event::Call(Call::Allocate(bytes), Answer::Granted(id)));
+        }
         if let Some(observer) = self.observer {
             observer(bytes);
         }
-        Ok(Reservation {
-            counters: self.counters.clone(),
-            bytes,
-        })
+        Ok(permit)
     }
 }
 
@@ -972,6 +1817,329 @@ mod tests {
         );
         assert_eq!(later.allocate(2).map(|permit| permit.bytes()), Ok(2));
         assert_eq!(later.requests(), 2);
+    }
+
+    mod credits {
+        use super::*;
+        use crate::bounded::{BoundedError, Caller, Forfeit, Obligation, Unit};
+
+        const TEN: WriteWork = WriteWork::new(1, 10);
+        const ZERO: WriteWork = WriteWork::new(0, 0);
+
+        /// `work` held for `obligation`, of no recorded identity.
+        fn hold(obligation: Obligation, work: WriteWork) -> Hold {
+            Hold {
+                obligation,
+                work,
+                id: Identity::UNOBSERVED,
+                acquisition: Identity::UNOBSERVED,
+            }
+        }
+
+        /// `work` of `obligation` settled, of no recorded identity.
+        fn settlement(obligation: Obligation, work: WriteWork) -> Settled {
+            Settled {
+                obligation,
+                work,
+                id: Identity::UNOBSERVED,
+                acquisition: Identity::UNOBSERVED,
+                permit: None,
+            }
+        }
+
+        /// An admission of `work`, all of it held for a release.
+        fn held(work: WriteWork) -> Credit {
+            Credit::Admit {
+                work,
+                held: Some(hold(Obligation::Release, work)),
+            }
+        }
+
+        fn consumed(work: WriteWork) -> Credit {
+            Credit::Admit { work, held: None }
+        }
+
+        fn spend(obligation: Obligation, work: WriteWork) -> Credit {
+            Credit::Spend(settlement(obligation, work))
+        }
+
+        fn forfeit(obligation: Obligation, work: WriteWork, rule: Forfeit) -> Credit {
+            Credit::Forfeit(settlement(obligation, work), rule)
+        }
+
+        /// `credit` recorded by `policy` through the production seams: an
+        /// admission through the budget's observations ([`Budget::admitted`],
+        /// [`Budget::held`]), a settlement through the family's origin
+        /// ([`Budget::origin`], [`Origin::settle`]), performed by `policy`.
+        fn record(policy: &mut Limits, credit: Credit) {
+            match credit {
+                Credit::Admit { work, held: None } => policy.admitted(work),
+                Credit::Admit {
+                    work,
+                    held: Some(hold),
+                } => policy.held(work, hold),
+                Credit::Spend(settled) => policy.origin().settle(settled, None, policy.performer()),
+                Credit::Forfeit(settled, rule) => {
+                    policy
+                        .origin()
+                        .settle(settled, Some(rule), policy.performer())
+                }
+            }
+        }
+
+        /// A fresh family that recorded `events`, through the production
+        /// seams ([`record`]).
+        fn family(events: &[Credit]) -> Limits {
+            let mut policy = Limits::unlimited();
+            for &event in events {
+                record(&mut policy, event);
+            }
+            policy
+        }
+
+        /// The ledgers of a fresh family that recorded `events`.
+        fn ledgers(events: &[Credit]) -> Credits {
+            family(events).credits()
+        }
+
+        /// The terminal oracle of one operation: conserved with what its
+        /// custody still holds, and nothing held.
+        fn settled(credits: Credits, held: WriteWork) -> bool {
+            credits.conserved_with(held) == Some(true) && held == ZERO
+        }
+
+        /// Each event moves exactly its own ledgers: an admission A and its
+        /// unheld part C, a spend C, a forfeit F; an admission part held
+        /// conserves only with its custody's held credit beside it.
+        #[test]
+        fn each_event_moves_its_own_ledgers() {
+            let mut policy = family(&[consumed(TEN)]);
+            assert_eq!(
+                policy.credits(),
+                Credits {
+                    admitted: TEN,
+                    consumed: TEN,
+                    ..Credits::default()
+                }
+            );
+            record(
+                &mut policy,
+                Credit::Admit {
+                    work: WriteWork::new(1, 64),
+                    held: Some(hold(Obligation::BucketWindow, WriteWork::new(0, 64))),
+                },
+            );
+            let credits = policy.credits();
+            assert_eq!(credits.admitted, WriteWork::new(2, 74));
+            assert_eq!(credits.consumed, WriteWork::new(2, 10));
+            assert_eq!(credits.conserved_with(WriteWork::new(0, 64)), Some(true));
+            assert_eq!(credits.conserved_with(ZERO), Some(false));
+            record(
+                &mut policy,
+                spend(Obligation::BucketWindow, WriteWork::new(0, 60)),
+            );
+            record(
+                &mut policy,
+                forfeit(
+                    Obligation::BucketWindow,
+                    WriteWork::new(0, 4),
+                    Forfeit::EnumerationComplete,
+                ),
+            );
+            let credits = policy.credits();
+            assert_eq!(credits.consumed, WriteWork::new(2, 70));
+            assert_eq!(credits.forfeited, WriteWork::new(0, 4));
+            assert!(settled(credits, ZERO));
+            assert!(!credits.violated);
+        }
+
+        /// Every policy of one family records into one ledger: a share's
+        /// events and a terminal policy's, minted from a permit the family
+        /// granted, are read through the originating policy; a fresh policy
+        /// is a family of its own.
+        #[test]
+        fn a_family_shares_one_ledger_and_a_fresh_policy_does_not() {
+            let mut origin = Limits::unlimited();
+            record(&mut origin, held(TEN));
+            let mut shared = origin.share();
+            record(
+                &mut shared,
+                spend(Obligation::Release, WriteWork::new(1, 4)),
+            );
+            let permit = origin.allocate(1).expect("an unlimited policy grants");
+            let mut terminal = <Limits as crate::bounded::TerminalAllocator>::terminal(&permit);
+            record(
+                &mut terminal,
+                forfeit(
+                    Obligation::Release,
+                    WriteWork::new(0, 6),
+                    Forfeit::Cancelled,
+                ),
+            );
+            drop(terminal);
+            assert_eq!(
+                origin.credits(),
+                Credits {
+                    admitted: TEN,
+                    consumed: WriteWork::new(1, 4),
+                    forfeited: WriteWork::new(0, 6),
+                    violated: false,
+                }
+            );
+            assert!(settled(origin.credits(), ZERO));
+            assert_eq!(Limits::unlimited().credits(), Credits::default());
+            drop(permit);
+        }
+
+        /// An update that does not fit, and an admission holding more than
+        /// it admitted, change no ledger and set the violation, which
+        /// conservation then refuses; sums, deltas and the conservation
+        /// check refuse what does not fit, at `u64::MAX`.
+        #[test]
+        fn every_ledger_sum_is_checked_at_u64_max() {
+            let full = WriteWork::new(u64::MAX, u64::MAX);
+            let credits = ledgers(&[consumed(full), consumed(TEN)]);
+            assert_eq!((credits.admitted, credits.consumed), (full, full));
+            assert!(credits.violated);
+            assert_eq!(credits.conserved_with(ZERO), Some(false));
+            let spent = ledgers(&[consumed(full), spend(Obligation::Release, TEN)]);
+            assert!(spent.violated && spent.consumed == full);
+            let forfeited = ledgers(&[
+                forfeit(Obligation::Release, full, Forfeit::Cancelled),
+                forfeit(Obligation::Grant, TEN, Forfeit::Cancelled),
+            ]);
+            assert!(forfeited.violated && forfeited.forfeited == full);
+            let overheld = ledgers(&[Credit::Admit {
+                work: TEN,
+                held: Some(hold(Obligation::Grant, WriteWork::new(1, 11))),
+            }]);
+            assert_eq!(overheld.admitted, ZERO, "an overheld admission was applied");
+            assert!(overheld.violated);
+            let whole = ledgers(&[consumed(full)]);
+            assert_eq!(whole.checked_add(ledgers(&[consumed(TEN)])), None);
+            assert_eq!(ledgers(&[consumed(TEN)]).checked_sub(whole), None);
+            assert_eq!(
+                whole.conserved_with(TEN),
+                None,
+                "C + F + H beyond u64 compared"
+            );
+            assert_eq!(
+                whole.checked_sub(whole),
+                Some(Credits::default()),
+                "a delta of nothing"
+            );
+        }
+
+        /// The route reports an admission's disposition only once the policy
+        /// admits it: a refused admission records nothing, an admitted held
+        /// one records A and leaves C to its spend.
+        #[test]
+        fn a_refused_admission_records_no_credit() {
+            let unit = Unit::new(Caller, 1, 10);
+            let owner = Owner::unobserved();
+            let mut refusing = Limits::unlimited().refusing(Some(0));
+            assert!(matches!(
+                unit.admit_held(
+                    &mut refusing,
+                    Obligation::Release,
+                    &owner,
+                    Identity::UNOBSERVED
+                ),
+                Err(BoundedError::Refused(_))
+            ));
+            assert_eq!(refusing.credits(), Credits::default());
+            let retained = unit
+                .admit_held(
+                    &mut refusing,
+                    Obligation::Release,
+                    &owner,
+                    Identity::UNOBSERVED,
+                )
+                .expect("the retry is admitted");
+            assert_eq!(
+                refusing.credits(),
+                Credits {
+                    admitted: TEN,
+                    ..Credits::default()
+                }
+            );
+            assert_eq!(refusing.credits().conserved_with(TEN), Some(true));
+            retained.spend(None, refusing.performer());
+            assert_eq!(refusing.credits().conserved_with(ZERO), Some(true));
+        }
+
+        /// Planted control, "dropped Spend": the custody advanced past its
+        /// grant, so it holds nothing, but the spend was never recorded:
+        /// conservation fails, though nothing is held.
+        #[test]
+        fn a_dropped_spend_fails_conservation() {
+            let honest = ledgers(&[held(TEN), spend(Obligation::Release, TEN)]);
+            assert!(settled(honest, ZERO));
+            let dropped = ledgers(&[held(TEN)]);
+            assert_eq!(dropped.conserved_with(ZERO), Some(false));
+            assert!(!settled(dropped, ZERO));
+        }
+
+        /// Planted control, "lost credit across suspension": a custody whose
+        /// held credit falls across a suspension with no spend or forfeit
+        /// recorded, the observation wrapped to drop it, is refused.
+        #[test]
+        fn credit_lost_across_a_suspension_fails_conservation() {
+            let before = ledgers(&[held(TEN)]);
+            let observed = |held: WriteWork| held;
+            let lost = |_: WriteWork| ZERO;
+            assert_eq!(before.conserved_with(observed(TEN)), Some(true));
+            assert_eq!(before.conserved_with(lost(TEN)), Some(false));
+        }
+
+        /// Planted control, "spend recorded twice": one obligation spent on
+        /// two policy instances, a held credit's spend recorded once per
+        /// policy; the instances' sum is refused.
+        #[test]
+        fn a_spend_recorded_on_two_policies_fails_conservation() {
+            let holder = ledgers(&[held(TEN), spend(Obligation::Release, TEN)]);
+            let resumed = ledgers(&[spend(Obligation::Release, TEN)]);
+            let once = holder
+                .checked_add(Credits::default())
+                .expect("small ledgers sum");
+            assert!(settled(once, ZERO));
+            let twice = holder.checked_add(resumed).expect("small ledgers sum");
+            assert_eq!(twice.conserved_with(ZERO), Some(false));
+        }
+
+        /// Planted control, "obligation left held": a terminal custody
+        /// observation still reporting outstanding credit fails the
+        /// terminal zero-held check, though the ledgers conserve with it.
+        #[test]
+        fn an_obligation_left_held_fails_the_terminal_check() {
+            let credits = ledgers(&[held(TEN)]);
+            assert_eq!(credits.conserved_with(TEN), Some(true));
+            assert!(!settled(credits, TEN));
+        }
+
+        /// Two operations on one policy, the first defective: it spends
+        /// credit it never admitted, while the second still holds credit it
+        /// admitted. The whole snapshot, checked against the first's custody,
+        /// masks the defect; the delta around the first finds it.
+        #[test]
+        fn a_delta_per_operation_finds_what_the_whole_snapshot_masks() {
+            let mut policy = family(&[held(TEN)]);
+            let start = policy.credits();
+            record(&mut policy, spend(Obligation::Release, TEN));
+            let end = policy.credits();
+            // The first operation's custody holds nothing once it ends.
+            assert_eq!(
+                end.conserved_with(ZERO),
+                Some(true),
+                "the whole snapshot masks the defect"
+            );
+            let delta = end.checked_sub(start).expect("a later snapshot");
+            assert_eq!(
+                delta.conserved_with(ZERO),
+                Some(false),
+                "the operation's delta finds it"
+            );
+        }
     }
 
     /// The default policy is unlimited: every quantity's allowance is the

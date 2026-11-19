@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -1368,7 +1368,7 @@
+             // SAFETY: `handle` is never dropped, so its scope reference is read
+             // out exactly once and ended here, inside cleanup: deferred into
+             // the step's worklist, never released in place.
+-            unsafe { ptr::read(&handle.scope) }.defer(cleanup.worklist());
++            drop(unsafe { ptr::read(&handle.scope) });
+         }
+         result
+     }

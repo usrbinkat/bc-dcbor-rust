@@ -1,0 +1,12 @@
+--- src/bounded/decode/comparison.rs
++++ src/bounded/decode/comparison.rs
+@@ -184,7 +184,8 @@
+     let remaining = (!Bound::new(Predicate::Payload, shorter).exceeded(budget, *position))
+         .then(|| shorter - *position)
+         .ok_or(BoundedError::PlanMismatch)?;
+-    let count = Bound::new(Predicate::Quantum, QUANTUM).clamp(budget, remaining);
++    // Planted: a turn compares one pair short of its quantum.
++    let count = Bound::new(Predicate::Quantum, QUANTUM - 1).clamp(budget, remaining);
+     COMPARE.admit(budget, count as u64)?;
+     for _ in 0..count {
+         let ordering = left[*position].cmp(&right[*position]);

@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -206,7 +206,7 @@
+                 }
+             }
+             n => {
+-                for _ in 1..n {
++                for _ in 0..n {
+                     release_reference(block, worklist);
+                 }
+                 deferral(&block).deferred.fetch_sub(n - 1, Ordering::AcqRel);

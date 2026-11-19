@@ -4,15 +4,34 @@ static HEAP: heap::Heap = heap::Heap;
 use dcbor::ByteString;
 use dcbor::bounded::{
     BoundedError, Call, Limits, Step,
-    decode::{DecodeError, Options, construction::DocumentDecoder},
+    decode::{
+        DecodeError, Options,
+        construction::{DecodeOwner, DocumentDecoder},
+    },
 };
 use dcbor_test_support::classes::{self, Class, Classes};
 use dcbor_test_support::pipeline::{Expected, inspect, matrix};
 use dcbor_test_support::rigor::{Progress, Rigor, rigor, sized};
-use dcbor_test_support::{self as support, heap};
+use dcbor_test_support::{
+    self as support, Finding, Holding, Lent, PolicyId, Retirement, heap,
+    pipeline::Unwitnessed,
+};
 
-fn meter() -> Limits {
-    Limits::unlimited().logged().strict()
+/// What the options both inspections parse under.
+const OPTIONS: Options = Options::normalizing(16);
+
+/// The second inspection's parse, held beside the first's live document.
+type Second<'r, 's> = Holding<'r, 's, DocumentDecoder<'static, ByteString, Limits>, Unwitnessed>;
+
+/// What the second inspection did: its turns, the class at each boundary,
+/// the admitted-call count at its cut, whether it published, and whether an
+/// exhausted turn refused its first cleanup unit.
+struct Inspected {
+    turns: usize,
+    classes: Vec<Option<Class>>,
+    cut_at: Option<usize>,
+    published: bool,
+    cancellation_refused: bool,
 }
 
 /// The live first document of [`shared_owner`]: a text of 256 ASCII bytes,
@@ -34,29 +53,86 @@ struct Run {
     cleanup: Vec<Call>,
 }
 
-/// Two inspections in one scope: the first's document held live while the
-/// second parses, cancelled at its `cut`th boundary when one is given.
+/// Two inspections in one scope, one recorded run: the first's document held
+/// live while the second parses, cancelled at its `cut`th boundary when one
+/// is given; the run's finalizer refines the stream once everything is
+/// drained.
 fn shared_owner(cut: Option<usize>) -> Run {
-    const OPTIONS: Options = Options::normalizing(16);
-    let mut m = meter();
-    let mut owner = support::scope(&mut m);
-    let first_wire = first_document();
-    let first = support::copy(&owner, &mut m, &first_wire);
-    let document = support::parse(&mut m, first, OPTIONS).expect("first inspection failed");
-    // 128 combining marks (U+0301) natively, 33 at minimal witness sizes:
-    // the two-byte head the full text reaches is taken by the first
-    // document instead. The reach map runs each test at both sizes and fails
-    // when the minimal run leaves unexecuted any region of this crate the
-    // full run executes (`tests/reach-map.sh`).
-    let source = dcbor::CBOR::from("\u{301}".repeat(sized(128, 33))).to_cbor_data();
-    let second = support::copy(&owner, &mut m, &source);
-    let mut second = DocumentDecoder::parse(second, OPTIONS);
-    // The whole operation, its record's cleanup included, is within its
-    // parse bound, and a cancelled one runs a prefix of its parse, then that
-    // cleanup; the copied input it holds is reclaimed in it too, and that
-    // input's cleanup is accounted by its acquisition's bound, not the
-    // parse's.
-    let len = source.len() as u64;
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let first_wire = first_document();
+        // 128 combining marks (U+0301) natively, 33 at minimal witness
+        // sizes: the two-byte head the full text reaches is taken by the
+        // first document instead. The reach map runs each test at both sizes
+        // and fails when the minimal run leaves unexecuted any region of this
+        // crate the full run executes (`tests/reach-map.sh`).
+        let source = dcbor::CBOR::from("\u{301}".repeat(sized(128, 33))).to_cbor_data();
+        let inspected = run.scoped(policy, &Unwitnessed, |owner| {
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let scope = view.value().get();
+                view.copied(policy, &first_wire, |first| {
+                    first.parse(policy, OPTIONS, |document| {
+                        assert_eq!(document.value().root().encoded(), first_wire);
+                        // The second inspection runs while the first's
+                        // document is held: every turn's checkpoint observes
+                        // the document's custody beside the second's.
+                        let inspected =
+                            document.holding(Lent::new(scope), Retirement::Exhausted, |view| {
+                                view.copied(policy, &source, |second| {
+                                    second.transfer(
+                                        |second| DocumentDecoder::parse(second, OPTIONS),
+                                        Retirement::Stopped,
+                                        |second| inspect_second(second, policy, cut, source.len()),
+                                    )
+                                })
+                            })??;
+                        // The second retired before the first: the first's
+                        // bytes and arena remain readable.
+                        let document = document.value();
+                        document.with_document(|view| {
+                            assert_eq!(view.root().encoded(), first_wire)
+                        });
+                        assert_eq!(document.root().encoded(), first_wire);
+                        assert_eq!(document.bytes(), first_wire);
+                        Ok::<_, Finding>(inspected)
+                    })?
+                })?
+            })
+        })?;
+        assert!(
+            !(cut.is_some() && inspected.published),
+            "a cancelled inspection published"
+        );
+        assert!(
+            cut.is_none() || inspected.cancellation_refused,
+            "an exhausted turn did not refuse the cancelled inspection's first cleanup unit"
+        );
+        let cleanup = run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            inspected
+                .cut_at
+                .map_or_else(Vec::new, |at| m.admitted_calls()[at..].to_vec())
+        });
+        Ok(Run {
+            turns: inspected.turns,
+            classes: inspected.classes,
+            cleanup,
+        })
+    })
+}
+
+/// The second inspection driven through the shared schedule, its boundary
+/// classed before each turn and, at `cut`, cancelled: an exhausted turn
+/// must then refuse its first cleanup unit, and its own cleanup runs to
+/// `Finished`. The bound covers the parse, its record's cleanup included,
+/// and the copied input's cleanup, which its acquisition's bound accounts.
+fn inspect_second(
+    second: &mut Second<'_, '_>,
+    policy: PolicyId,
+    cut: Option<usize>,
+    len: usize,
+) -> Result<Inspected, Finding> {
+    let len = len as u64;
     let bound = support::turns(
         dcbor::bounded::decode::construction::parse_bound::<ByteString, Limits, ()>(len, OPTIONS)
             .expect("the parse bound of an input held in memory fits in u64"),
@@ -64,65 +140,51 @@ fn shared_owner(cut: Option<usize>) -> Run {
         dcbor::bounded::decode::construction::copy_bound::<Limits, ()>(len)
             .expect("the copy bound of an input held in memory fits in u64"),
     );
-    let mut turns = 0;
-    let mut finished = false;
-    let mut cancellation_refused = false;
-    let mut published = None;
-    let mut classes = Vec::new();
-    let mut cut_at = None;
-    for turn in 0..bound {
-        turns += 1;
-        classes.push(classes::parse(&second.position()));
-        if cut == Some(turn) {
-            cut_at = Some(m.admitted().len());
-            second.cancel();
-            // An exhausted turn positively refuses the first cleanup unit.
+    let mut inspected = Inspected {
+        turns: 0,
+        classes: Vec::new(),
+        cut_at: None,
+        published: false,
+        cancellation_refused: false,
+    };
+    let published = second.controlled(
+        policy,
+        bound,
+        Retirement::Published,
+        true,
+        |m, operation, at| {
+            inspected.turns += 1;
+            inspected.classes.push(classes::parse(&operation.position()));
+            if cut == Some(at) {
+                inspected.cut_at = Some(m.admitted_calls().len());
+                operation.cancel();
+                return true;
+            }
+            false
+        },
+        |_| (),
+    )?;
+    inspected.published = published.is_some();
+    if inspected.cut_at.is_some() {
+        // An exhausted turn positively refuses the first cleanup unit.
+        let refused = second.with_policy(policy, |operation, m| {
             m.clear_refusal();
             m.exhaust();
-            cancellation_refused = matches!(
-                support::contracted(&mut m, &mut second),
-                Err(DecodeError::Resource(BoundedError::Refused(_)))
-            );
-        }
-        match support::checked(&mut m, |m| support::contracted(m, &mut second)) {
+            support::contracted(m, operation)
+        });
+        match refused {
+            Err(DecodeError::Resource(BoundedError::Refused(_))) => {
+                inspected.cancellation_refused = true;
+            }
             Ok(Step::Complete(value)) => {
-                support::exhausted(&mut m, &mut second);
-                published = Some(value);
-                finished = true;
-                break;
+                second.holding(value, Retirement::Published, |_| ());
+                inspected.published = true;
             }
-            Ok(Step::Finished) => {
-                support::exhausted(&mut m, &mut second);
-                finished = true;
-                break;
-            }
-            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            _ => panic!("second inspection failed"),
+            _ => {}
         }
-        assert_eq!(document.root().encoded(), first_wire);
+        second.finish(policy, bound, Retirement::Published)?;
     }
-    // B must finish before A is retired. A's bytes and arena remain usable.
-    document.with_document(|view| assert_eq!(view.root().encoded(), first_wire));
-    assert_eq!(document.bytes(), first_wire);
-    let cancelled = cut.is_some();
-    let unexpectedly_published = cancelled && published.is_some();
-    drop(second);
-    drop(published);
-    drop(document);
-    support::drain(&mut owner, &mut m);
-    assert!(
-        finished,
-        "the second inspection exceeded its bound of {bound} turns"
-    );
-    assert!(!unexpectedly_published);
-    assert!(!cancelled || cancellation_refused);
-    assert_eq!(m.live_bytes(), 0);
-    let cleanup = cut_at.map_or_else(Vec::new, |at| m.admitted()[at..].to_vec());
-    Run {
-        turns,
-        classes,
-        cleanup,
-    }
+    Ok(inspected)
 }
 
 /// The second inspection cancelled at its boundaries while the first's
@@ -155,19 +217,53 @@ fn inspection_cancellation_at_every_turn_is_independent_of_live_document() {
 
 #[test]
 fn inspected_input_moves_out_without_copying_and_the_arena_retires() {
-    let mut m = meter();
-    let mut owner = support::scope(&mut m);
-    let wire = [0x82, 0x01, 0x02];
-    let input = support::copy(&owner, &mut m, &wire);
-    let document = support::parse(&mut m, input, Options::quick_only(4)).expect("inspection");
-    let address = document.input().data().as_ptr();
-    assert_eq!(document.root().children().count(), 2);
-    let input = document.into_input();
-    assert_eq!(input.value().data(), wire);
-    assert_eq!(input.value().data().as_ptr(), address, "input was copied");
-    drop(input);
-    support::drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let wire = [0x82, 0x01, 0x02];
+        let options = Options::quick_only(4);
+        let bound = support::turns(
+            dcbor::bounded::decode::construction::parse_bound::<ByteString, Limits, ()>(
+                wire.len() as u64,
+                options,
+            )
+            .expect("the literal's parse bound fits in u64"),
+        );
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                owner.copied(policy, &wire, |input| {
+                    input.transfer(
+                        |input| DocumentDecoder::parse(input, options),
+                        Retirement::Stopped,
+                        |parser| {
+                            parser.drive(policy, bound, Retirement::Published, |document| {
+                                let address = document.value().input().data().as_ptr();
+                                assert_eq!(document.value().root().children().count(), 2);
+                                document.transfer(
+                                    |document| document.into_input(),
+                                    Retirement::Published,
+                                    |input| {
+                                        assert_eq!(input.value().value().data(), wire);
+                                        assert_eq!(
+                                            input.value().value().data().as_ptr(),
+                                            address,
+                                            "input was copied",
+                                        );
+                                    },
+                                );
+                            })
+                        },
+                    )
+                })??;
+                owner.drain(policy)
+            },
+        )?;
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 #[test]

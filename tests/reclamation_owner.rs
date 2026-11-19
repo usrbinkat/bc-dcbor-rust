@@ -19,81 +19,119 @@ mod destination;
 #[path = "reclamation/scoped.rs"]
 mod scoped;
 
-use dcbor::bounded::decode::construction::in_place::Transferable;
+use dcbor::ByteString;
+use dcbor::bounded::decode::construction::in_place::{Transferable, admit};
 use dcbor::bounded::decode::construction::reclamation::{
-    Custody, PeekSlot, Reclaim, Reclaimed, Slot,
+    Cleanup, Custody, PeekSlot, Reclaim, Reclaimed, Slot,
 };
-use dcbor::bounded::decode::construction::{Acquisition, Construction};
+use dcbor::bounded::decode::construction::{
+    Acquisition, Construction, DecodeOwner, OwnedRecord, TypedValue,
+};
 use dcbor::bounded::decode::{DecodeError, Options};
-use dcbor::bounded::{BoundedError, BoundedResult, Budget, Limits, Step};
+use dcbor::bounded::{
+    BoundedError, BoundedResult, Budget, CustodySink, Limits, PermitsObserved, Releasing, Step,
+};
 use std::cell::Cell;
-use support::{document, drain, scope};
+use support::{CustodyBatch, Finding, Lent, Retirement, Stopped, pipeline::Unwitnessed};
 
 thread_local! {
     static CLEANED: Cell<usize> = const { Cell::new(0) };
     static DROPPED: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The policy of these gates: logged and strict.
-fn meter() -> Limits {
-    Limits::unlimited().logged().strict()
-}
-
 /// An operation reports the scope's outstanding records exactly as the
 /// scope's authority counts them (`ScopeRef::outstanding` against
-/// `DecodeOwner::position`, two paths to one count), at every step and
-/// while more than one record is live; and the authority reports the scope
+/// `DecodeOwner::position`, two paths to one count), while it retains the
+/// scope; publication transfers that reference to the output and the
+/// exhausted operation reports zero. The authority reports the scope
 /// closed from the moment shutdown closes its queue, before shutdown can
-/// complete, a published value still live.
+/// complete, a published value still live. The value is held beside the
+/// scope, outside it, so the scope is shut down exclusively while it lives.
 #[test]
 fn an_operation_reports_the_scope_count_and_a_closing_scope_reports_closed() {
     let wire = [0x82, 0x01, 0x02];
-    let mut m = Limits::unlimited();
-    let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
-    let mut operation = Construction::<_, Vec<u64>, Limits>::construct(document);
-    let mut reported = Vec::new();
-    let mut value = None;
-    for _ in 0..support::typed_turns::<Vec<u64>>(wire.len()) {
-        let outstanding = operation.position().outstanding;
-        assert_eq!(
-            outstanding,
-            owner.outstanding(),
-            "the operation's count against the authority's"
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let (reported, open, closing, closed) = run.holding(
+            CustodyBatch::<TypedValue<'static, ByteString, Vec<u64>, Limits>>::slots(1),
+            Retirement::Exhausted,
+            &Unwitnessed,
+            |values| {
+                values.lending(Retirement::Exhausted, Lent::new, |lent| {
+                    let values = lent.value().get();
+                    lent.holding(DecodeOwner::new(), Retirement::Scope, |owner| {
+                        owner.initialize(policy)?;
+                        let reported =
+                            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                                let scope = view.value().get();
+                                view.copied(policy, &wire, |input| {
+                                    input.parse(policy, Options::normalizing(8), |document| {
+                                        document.transfer(
+                                            Construction::<_, Vec<u64>, Limits>::construct,
+                                            Retirement::Stopped,
+                                            |operation| {
+                                                let mut reported = Vec::new();
+                                                operation.drive_observed(
+                                                    policy,
+                                                    support::typed_turns::<Vec<u64>>(wire.len()),
+                                                    Retirement::Published,
+                                                    |_, operation| {
+                                                        let position = operation.position();
+                                                        let outstanding = position.outstanding;
+                                                        assert_eq!(
+                                                            outstanding,
+                                                            if position.finished {
+                                                                0
+                                                            } else {
+                                                                scope.outstanding()
+                                                            },
+                                                            "the operation's count against the \
+                                                         authority's"
+                                                        );
+                                                        reported.push(outstanding);
+                                                    },
+                                                    |value| {
+                                                        assert_eq!(value.value().value(), &[1, 2]);
+                                                        value.deposit(values, 0);
+                                                    },
+                                                )?;
+                                                Ok::<_, Finding>(reported)
+                                            },
+                                        )
+                                    })
+                                })
+                            })???;
+                        // The value holds its record and a scope reference,
+                        // so shutdown can only close the queue and wait.
+                        let (open, closing, closed) = owner.with_policy(policy, |owner, m| {
+                            let open = !owner.position().closed;
+                            m.fresh();
+                            let closing = owner.shutdown_step(m);
+                            (open, closing, owner.position().closed)
+                        });
+                        owner.drawn(values, 0, Retirement::Published, |_| ());
+                        owner.drain(policy)?;
+                        Ok::<_, Finding>((reported, open, closing, closed))
+                    })
+                })
+            },
+        )?;
+        assert!(
+            reported.iter().any(|count| *count >= 2),
+            "no step had more than one record live: {reported:?}"
         );
-        reported.push(outstanding);
-        m.fresh();
-        match operation.step(&mut m) {
-            Ok(Step::Progress) => {}
-            Ok(Step::Complete(built)) => {
-                value = Some(built);
-                break;
-            }
-            // A unit beyond the turn's quantum: the next turn admits it.
-            Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Ok(Step::Finished) => panic!("finished before publishing"),
-            Err(error) => panic!("the vector failed to build: {error:?}"),
-        }
-    }
-    let value = value.expect("the vector published within its turns");
-    assert_eq!(value.value(), &[1, 2]);
-    assert!(
-        reported.iter().any(|count| *count >= 2),
-        "no step had more than one record live: {reported:?}"
-    );
-    // The value holds its record and a scope reference, so shutdown can only
-    // close the queue and wait.
-    assert!(!owner.position().closed, "a scope closed before shutdown");
-    m.fresh();
-    assert_ne!(owner.shutdown_step(&mut m).unwrap(), Reclaimed::Done);
-    assert!(
-        owner.position().closed,
-        "a scope whose shutdown closed its queue reports open"
-    );
-    drop(value);
-    drop(operation);
-    drain(&mut owner, &mut m);
-    assert_eq!(owner.outstanding(), 0);
-    assert_eq!(m.live_bytes(), 0);
+        assert!(open, "a scope closed before shutdown");
+        assert_ne!(
+            closing.map_err(support::failed("the closing shutdown step"))?,
+            Reclaimed::Done
+        );
+        assert!(
+            closed,
+            "a scope whose shutdown closed its queue reports open"
+        );
+        run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+        Ok(())
+    });
 }
 
 /// A built tree's cleanup never takes more calls than its state declares,
@@ -106,52 +144,47 @@ fn an_operation_reports_the_scope_count_and_a_closing_scope_reports_closed() {
 #[cfg(feature = "custom-std-collections")]
 #[test]
 fn a_tree_declares_no_less_cleanup_than_it_takes() {
-    use dcbor::bounded::decode::construction::in_place::{Built, InPlace};
-    use dcbor::bounded::decode::construction::reclamation::Place;
+    use dcbor::bounded::decode::construction::Standalone;
+    use dcbor::bounded::decode::construction::in_place::{Built, InPlace, root_cost};
     use std::collections::BTreeMap;
     use std::mem::MaybeUninit;
-    use std::ptr::NonNull;
     for count in [0u64, 1, 11, 12, 13] {
         let mut symbolic = dcbor::Map::new();
         for n in 0..count {
-            symbolic.insert(n, n);
+            symbolic.insert(n, n).unwrap();
         }
         let wire = dcbor::CBOR::from(symbolic).to_cbor_data();
         let mut parser = Limits::unlimited();
         let document = dcbor::bounded::decode::decode(&wire, 8, &mut parser).unwrap();
         let mut a = Limits::unlimited();
         let mut value = MaybeUninit::<BTreeMap<u64, u64>>::uninit();
-        let mut state = <BTreeMap<u64, u64> as Reclaim<Limits>>::INITIAL;
-        // SAFETY: the test owns the destination and pairs it with its initial
-        // state; every access to either is through this slot for the rest of
-        // the iteration.
-        let mut slot = unsafe { Slot::new(Place::root(NonNull::from(&mut value)), &mut state) };
+        // The tree at the root, through the engine's standalone driver; its
+        // declared cleanup includes the root session's begin unit.
+        let mut driver = Standalone::<BTreeMap<u64, u64>, Limits>::new(&document, &mut value);
         let mut built = false;
-        // The map's own cost bounds its build steps; the unlimited policy
+        // The map's root cost bounds its build steps; the unlimited policy
         // never refuses, so no refusal allowance is added.
         let steps = support::turns(
-            <BTreeMap<u64, u64> as InPlace<Limits>>::COST
+            root_cost(<BTreeMap<u64, u64> as InPlace<Limits>>::COST)
+                .expect("the root cost of a fixture fits in u64")
                 .bound::<()>(wire.len() as u64)
                 .expect("the cost of a fixture fits in u64"),
         );
         for _ in 0..steps {
-            let step = <BTreeMap<u64, u64> as InPlace<Limits>>::build_step(
-                &document,
-                0,
-                slot.reborrow(),
-                &mut a,
-            )
-            .expect("the tree builds");
+            let step = driver.build_step(&mut a).expect("the tree builds");
             if step == Built::Done {
                 built = true;
                 break;
             }
         }
         assert!(built, "a tree of {count} entries was not built");
-        let (place, state) = slot.parts();
-        // SAFETY: construction returned Done, so the map is initialized.
-        assert_eq!(unsafe { place.get(&*state) }.len() as u64, count);
-        let first = <BTreeMap<u64, u64> as Reclaim<Limits>>::remaining(slot.observe());
+        assert_eq!(
+            driver.value().expect("a built tree is readable").len() as u64,
+            count
+        );
+        let first = driver
+            .remaining()
+            .expect("a tree's cleanup count fits in u64");
         let mut declared = first;
         let mut taken = 0u64;
         loop {
@@ -160,15 +193,15 @@ fn a_tree_declares_no_less_cleanup_than_it_takes() {
                 taken <= first,
                 "a tree of {count} entries took more than the {first} calls it declared"
             );
-            let reclaimed =
-                <BTreeMap<u64, u64> as Reclaim<Limits>>::reclaim_step(slot.reborrow(), &mut a)
-                    .unwrap();
+            let reclaimed = driver.reclaim_step(&mut a).unwrap();
             match reclaimed {
                 Reclaimed::Done => break,
                 Reclaimed::Progress => {}
                 Reclaimed::Waiting => panic!("a tree's own cleanup never waits"),
             }
-            let next = <BTreeMap<u64, u64> as Reclaim<Limits>>::remaining(slot.observe());
+            let next = driver
+                .remaining()
+                .expect("a tree's cleanup count fits in u64");
             assert!(
                 next < declared,
                 "a tree of {count} entries declared {next} calls after a call, from {declared}"
@@ -196,24 +229,50 @@ fn refused_allocations_conserve_work<T: Transferable<Limits> + 'static>(
         core::any::type_name::<T>()
     );
     let baseline = support::refusal_matrix(&name, support::rigor::rigor(), |fault| {
-        let mut m = meter();
-        let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-        // Measure construction alone: parsing is setup.
-        m.measure();
-        support::refuse(&mut m, fault.refusal);
-        let mut operation = Construction::<_, T, Limits>::construct(document);
-        let turns = support::allowed(&m, support::typed_turns::<T>(wire.len()));
-        let value = support::drive_faulted(&mut m, &mut operation, turns, fault.cancel)
-            .expect("construction failed");
-        if let Some(value) = &value {
-            inspect(value.value());
-        }
-        let calls = support::RefusalRun::of(&m);
-        drop(value);
-        drop(operation);
-        drain(&mut owner, &mut m);
-        assert_eq!(m.live_bytes(), 0);
-        calls
+        support::recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            let (calls, recorded, read) = run.scoped(policy, &Unwitnessed, |owner| {
+                owner.copied(policy, wire, |input| {
+                    input.parse(policy, Options::normalizing(8), |document| {
+                        // Measure construction alone: parsing is setup.
+                        document.with_policy(policy, |_, m| m.measure());
+                        document.transfer(
+                            Construction::<_, T, Limits>::construct,
+                            Retirement::Stopped,
+                            |operation| {
+                                operation.drive_faulted(
+                                    policy,
+                                    support::typed_turns::<T>(wire.len()),
+                                    Retirement::Published,
+                                    fault,
+                                    |_, _| {},
+                                    |value| inspect(value.value().value()),
+                                )?;
+                                Ok::<_, Finding>(())
+                            },
+                        )
+                    })
+                })???;
+                // Publication retires the publisher. Read its policy through
+                // the surviving scope, before the scope's drain adds calls.
+                // Both snapshots read the same unchanged history.
+                Ok::<_, Finding>(owner.with_policy(policy, |_, m| {
+                    (
+                        support::RefusalRun::of(m),
+                        support::RefusalRun::of(m),
+                        m.calls().len(),
+                    )
+                }))
+            })?;
+            let (by, followed) = run.with_policy(policy, |m| {
+                assert_eq!(m.live_bytes(), 0);
+                (m.performer(), m.calls().len() - read)
+            });
+            // The run read in flight is the session's record of it, followed
+            // by exactly the drain's calls.
+            run.inspect_evidence(move |observed, _| recorded.recorded_in(observed, by, followed));
+            Ok(calls)
+        })
     });
     assert!(
         baseline
@@ -375,8 +434,311 @@ fn every_reducing_binding_is_certified_and_its_transitions_legal() {
     }
 }
 
-/// A container declares no reduction: its observation counts older children
-/// whose custody may differ. Its observation is still complete for custody:
+/// A stabilized text's construction ([`dcbor::StabilizedText`]): its declared
+/// reduction, the text's, and its complete class are certified on every
+/// state it reaches ([`support::uniform`]), and every transition is in its
+/// successor relations, the check's then the text's
+/// ([`support::legality::stabilized`]); it is built, and refused, within
+/// its cost. Texts: empty, one byte, across a copy unit, of multibyte
+/// scalars, an assigned code point of the pinned version (U+1FA8A
+/// TROMBONE, `DerivedAge.txt` line 2106); refused: an unassigned one
+/// (U+0378), and an integer where a text is expected.
+#[test]
+fn a_stabilized_text_is_certified_its_transitions_legal_and_within_its_cost() {
+    use dcbor::{Error, StabilizedText};
+    use support::legality::stabilized;
+    use support::{builds_within_cost, certified, legal, rejects_within_cost, uniform};
+    let text = |text: &str| dcbor::CBOR::from(text).to_cbor_data();
+    let long = "x".repeat(65);
+    let multibyte = "\u{e9}\u{1f600}".repeat(20);
+    let assigned = "\u{1fa8a}";
+    for source in ["", "x", long.as_str(), multibyte.as_str(), assigned] {
+        let wire = text(source);
+        let name = format!("StabilizedText from {wire:02x?}");
+        legal(
+            &name,
+            &uniform::<StabilizedText>(&name, &wire),
+            &stabilized(),
+        );
+        builds_within_cost::<StabilizedText>(&wire, |v| assert_eq!(v.as_str(), source));
+    }
+    // dCBOR accepts U+0378 as text: only the stabilized text refuses it.
+    let unassigned = text("\u{378}");
+    assert_eq!(
+        String::try_from(dcbor::CBOR::try_from_data(&unassigned).unwrap()).unwrap(),
+        "\u{378}"
+    );
+    // Nothing completes from these, so the complete class has no member to
+    // check: the reduction alone is certified.
+    for wire in [unassigned.as_slice(), &[0x07]] {
+        let name = format!("StabilizedText from {wire:02x?}");
+        legal(
+            &name,
+            &certified::<StabilizedText>(&name, wire),
+            &stabilized(),
+        );
+        rejects_within_cost::<StabilizedText>(wire);
+    }
+    let built = constructed::<StabilizedText>(
+        &unassigned,
+        Discipline::Admitted,
+        |error| {
+            matches!(
+                error,
+                DecodeError::Invalid(Error::UnassignedCodePoint(0x378))
+            )
+        },
+        |_| {},
+    );
+    assert!(!built, "U+0378 was built as a stabilized text");
+}
+
+/// How [`constructed`] schedules a construction's turns and its cleanup's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Discipline {
+    /// Every turn admitted as it comes.
+    Admitted,
+    /// Every turn's next admission first refused once, checked to move,
+    /// charge and release nothing ([`support::Holding::repeated`]); the
+    /// cleanup after a refusal under every admission refused once
+    /// ([`support::pipeline::Refusal::Each`]). The run must have refused.
+    RefusedFirst,
+}
+
+/// `T` constructed from the document of `wire` in a scope of a recorded run,
+/// within its construction's bound, scheduled by `discipline`: published,
+/// the held value given to `inspect` and retired as a published handle,
+/// which releases nothing (`true`); or refused with an error `refused`
+/// accepts, its own cleanup then run to `Finished` within the same bound,
+/// the scope holding no record afterwards (`false`). Either way the scope
+/// drains to nothing. Any other stop is the run's finding.
+fn constructed<T>(
+    wire: &[u8],
+    discipline: Discipline,
+    refused: impl Fn(&support::DecodeFailure) -> bool,
+    inspect: impl FnOnce(&TypedValue<'static, ByteString, T, Limits>),
+) -> bool
+where
+    T: dcbor::bounded::decode::construction::in_place::Transferable<Limits> + 'static,
+{
+    let turns = support::typed_turns::<T>(wire.len());
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        let refusals = run.with_policy(policy, |m| m.refusals());
+        let built = run.scoped(policy, &Unwitnessed, |owner| {
+            owner.lending(Retirement::Exhausted, Lent::new, |view| {
+                let scope = view.value().get();
+                view.copied(policy, wire, |input| {
+                    input.parse(policy, Options::normalizing(8), |document| {
+                        document.transfer(
+                            Construction::<_, T, Limits>::construct,
+                            Retirement::Stopped,
+                            |operation| {
+                                let consume = |value: &mut support::Holding<'_, '_, _, _>| {
+                                    inspect(value.value())
+                                };
+                                let driven = match discipline {
+                                    Discipline::Admitted => operation.drive(
+                                        policy,
+                                        turns,
+                                        Retirement::Published,
+                                        consume,
+                                    ),
+                                    Discipline::RefusedFirst => operation.repeated(
+                                        policy,
+                                        turns,
+                                        Retirement::Published,
+                                        1,
+                                        |_, _| {},
+                                        consume,
+                                    ),
+                                };
+                                match driven {
+                                    Ok(()) => Ok(true),
+                                    Err(Stopped::Operation(error)) if refused(&error) => {
+                                        if discipline == Discipline::RefusedFirst {
+                                            operation.with_policy(policy, |_, m| {
+                                                support::refuse(
+                                                    m,
+                                                    support::pipeline::Refusal::Each,
+                                                );
+                                            });
+                                        }
+                                        operation.finish(policy, turns, Retirement::Published)?;
+                                        operation.with_policy(policy, |_, m| {
+                                            m.fail_call(None);
+                                            m.clear_refusal();
+                                        });
+                                        if scope.outstanding() != 0 {
+                                            return Err(Finding::Defect(format!(
+                                                "a refused {} kept {} records",
+                                                core::any::type_name::<T>(),
+                                                scope.outstanding()
+                                            )));
+                                        }
+                                        Ok(false)
+                                    }
+                                    Err(stop) => Err(Finding::Driver(format!(
+                                        "{} from {wire:02x?} stopped as {stop:?}",
+                                        core::any::type_name::<T>()
+                                    ))),
+                                }
+                            },
+                        )
+                    })
+                })
+            })??
+        })?;
+        run.with_policy(policy, |m| {
+            assert_eq!(m.live_bytes(), 0);
+            if discipline == Discipline::RefusedFirst {
+                assert!(m.refusals() > refusals, "no admission was refused");
+            }
+        });
+        Ok(built)
+    })
+}
+
+/// A stabilized text checks every byte of its text exactly once, in windows
+/// of at most a quantum ending on a scalar, before anything is allocated:
+/// its construction admits exactly a `String`'s, and one unit of one value
+/// and the window's bytes per window more. The windows are derived here by
+/// hand from the rule, not from the binding: none for the empty text; one
+/// of 4 bytes for U+1FA8A; 64, 64 and 2 for 130 one-byte scalars; 64 and 16
+/// for 40 two-byte ones; and, for one byte then sixteen four-byte scalars,
+/// 61, the quantum backed off to the scalar boundary below byte 64, then 4.
+/// A text refused for an unassigned code point admits its one window and
+/// allocates nothing; its cleanup is the one unit of a buffer with nothing
+/// installed, one value. Built at the root, its session adds its bind and
+/// begin-cleanup units, one value each (`SESSION_COST`), which the
+/// comparisons with a `String` above cancel. The check's charge witness: a
+/// check that inspected a window without admitting it fails here.
+#[test]
+fn a_stabilized_text_checks_every_byte_once_before_building() {
+    use dcbor::StabilizedText;
+    use dcbor::bounded::WriteWork;
+    let backed_off = format!("x{}", "\u{1fa8a}".repeat(16));
+    let cases = [
+        (String::new(), (0, 0)),
+        ("\u{1fa8a}".to_string(), (1, 4)),
+        ("x".repeat(130), (3, 130)),
+        ("\u{e9}".repeat(40), (2, 80)),
+        (backed_off, (2, 65)),
+    ];
+    for (source, (values, bytes)) in cases {
+        let wire = dcbor::CBOR::from(source.as_str()).to_cbor_data();
+        let stabilized = support::construction::<StabilizedText>(&wire, None, |v| {
+            assert_eq!(v.as_str(), source)
+        });
+        let text = support::construction::<String>(&wire, None, |v| assert_eq!(v, &source));
+        assert_eq!(
+            WriteWork::new(
+                stabilized.used.values - text.used.values,
+                stabilized.used.bytes - text.used.bytes
+            ),
+            WriteWork::new(values, bytes),
+            "the check of {} bytes",
+            source.len()
+        );
+        assert_eq!(stabilized.allocations, text.allocations);
+    }
+    let wire = dcbor::CBOR::from("\u{378}").to_cbor_data();
+    let refused = support::construction::<StabilizedText>(&wire, None, |_| {});
+    assert!(refused.rejected && !refused.built);
+    assert!(
+        refused.allocations.is_empty(),
+        "a refused text allocated {:?}",
+        refused.allocations
+    );
+    // The session's bind unit (1, 0), the one window of U+0378's two bytes
+    // (1, 2), the session's begin-cleanup unit (1, 0), then the buffer's
+    // one cleanup unit with nothing installed (1, 0).
+    assert_eq!(
+        refused.used,
+        WriteWork::new(4, 2),
+        "the bind, the one window of U+0378's two bytes, the begin-cleanup unit, \
+         then one cleanup unit"
+    );
+}
+
+/// A minimal big integer's construction ([`dcbor::MinimalBigInt`]): its
+/// declared reduction, its magnitude's, and its complete class are certified
+/// on every state it reaches ([`support::uniform`]), every transition is in
+/// its successor relations, the sign's then the magnitude's
+/// ([`support::legality::minimal_bigint`]), and it is built within its cost,
+/// its value encoding back to the same bytes. Accepted: plain integers at
+/// both edges of dCBOR's range, the least bignum of each sign, and a bignum
+/// of 70 bytes, across copy units. Refused, each by the unit that writes the
+/// sign, before the binding allocates anything of its own (the document is
+/// parsed by the fixture, outside the measured construction): `c2 41 01` and
+/// `c2 40` (plain values as
+/// bignums), `c2 42 00 01` (a leading zero), the planted control's target
+/// `c2 4a 00 01 00..` (a leading zero outside the range, refused by that rule
+/// alone), another tag, and a text.
+#[test]
+fn a_minimal_big_integer_is_certified_its_transitions_legal_and_within_its_cost() {
+    use dcbor::{Error, MinimalBigInt};
+    use support::legality::minimal_bigint;
+    use support::{builds_within_cost, certified, legal, rejects_within_cost, uniform};
+    let wide = format!("c25846{}{}", "01", "00".repeat(69));
+    let accepted = [
+        "00",
+        "01",
+        "20",
+        "1818",
+        "1bffffffffffffffff",
+        "3b7fffffffffffffff",
+        "c3488000000000000000",
+        "c249010000000000000000",
+        "c349010000000000000000",
+        wide.as_str(),
+    ];
+    for hex in accepted {
+        let wire = hex::decode(hex).unwrap();
+        let name = format!("MinimalBigInt from {hex}");
+        legal(
+            &name,
+            &uniform::<MinimalBigInt>(&name, &wire),
+            &minimal_bigint(),
+        );
+        builds_within_cost::<MinimalBigInt>(&wire, |v| {
+            assert_eq!(dcbor::CBOR::from(v).to_cbor_data(), wire)
+        });
+    }
+    let refused = [
+        "c24101",
+        "c240",
+        "c2420001",
+        "c24a00010000000000000000",
+        "c34a00010000000000000000",
+        "d82a4101",
+        "6131",
+    ];
+    for hex in refused {
+        let wire = hex::decode(hex).unwrap();
+        let name = format!("MinimalBigInt from {hex}");
+        let states = certified::<MinimalBigInt>(&name, &wire);
+        assert!(
+            states.iter().all(|state| state.allocations.is_empty()),
+            "{name}: a refused encoding allocated"
+        );
+        legal(&name, &states, &minimal_bigint());
+        rejects_within_cost::<MinimalBigInt>(&wire);
+    }
+    let built = constructed::<MinimalBigInt>(
+        &hex::decode("c24101").unwrap(),
+        Discipline::Admitted,
+        |error| matches!(error, DecodeError::Invalid(Error::NonCanonicalNumeric)),
+        |_| {},
+    );
+    assert!(!built, "c2 41 01 was built as a minimal big integer");
+}
+
+/// A container's observation counts its older children rather than holding
+/// each whole (the sequence declares a reduction only over elements of a
+/// uniform complete class, certified in `owned_pipeline_matrix.rs`; the
+/// derived field map and enum and the B-tree declare none). Its observation
+/// is still complete for custody:
 /// on every state its construction reaches, two equal observations hold
 /// equal live bytes and clean up identically, unit by unit
 /// ([`support::observation`]); and every transition is in the sequence's
@@ -540,15 +902,17 @@ fn planted_text() -> Vec<u8> {
 #[test]
 #[should_panic(expected = "the class merges states of different custody")]
 fn a_buffer_reduction_merging_payload_custody_is_rejected() {
-    use dcbor::bounded::decode::construction::in_place::BufferClass;
+    use dcbor::bounded::decode::construction::in_place::{BufferClass, stage_class};
     use dcbor::bounded::decode::construction::reclamation::Reduction;
     type State = <String as Reclaim<Limits>>::State;
+    // The root session's class kept; the buffer's planted.
     support::simulation::<String, _>("planted buffer reduction", &planted_text(), |observation| {
-        match <State as Reduction>::class(observation) {
+        let buffer = match <State as Reduction>::class(&observation.inner) {
             BufferClass::Written { .. } => BufferClass::Written { payload: false },
             BufferClass::Freed { .. } => BufferClass::Freed { payload: false },
             class => class,
-        }
+        };
+        (stage_class(observation.stage), buffer)
     });
 }
 
@@ -557,15 +921,19 @@ fn a_buffer_reduction_merging_payload_custody_is_rejected() {
 #[test]
 #[should_panic(expected = "the class merges states of different custody")]
 fn an_optional_reduction_merging_idle_and_live_payloads_is_rejected() {
-    use dcbor::bounded::decode::construction::in_place::OptionalClass;
+    use dcbor::bounded::decode::construction::in_place::{OptionalClass, stage_class};
     use dcbor::bounded::decode::construction::reclamation::Reduction;
     type State = <Option<String> as Reclaim<Limits>>::State;
+    // The root session's class kept; the option's planted.
     support::simulation::<Option<String>, _>(
         "planted optional reduction",
         &planted_text(),
-        |observation| match <State as Reduction>::class(observation) {
-            OptionalClass::Live(_) => OptionalClass::Idle,
-            class => class,
+        |observation| {
+            let option = match <State as Reduction>::class(&observation.inner) {
+                OptionalClass::Live(_) => OptionalClass::Idle,
+                class => class,
+            };
+            (stage_class(observation.stage), option)
         },
     );
 }
@@ -578,14 +946,16 @@ fn an_observation_reporting_a_stale_phase_is_rejected() {
     use dcbor::bounded::decode::construction::in_place::{
         BufferCustody, BufferObservation, BufferPhase,
     };
+    // The root session's stage kept; the buffer's phase planted stale.
     support::observation::<String, _>("planted stale phase", &planted_text(), |observation| {
-        match *observation {
+        let buffer = match observation.inner {
             BufferObservation::Held(custody) => BufferObservation::Held(BufferCustody {
                 phase: BufferPhase::Empty,
                 ..custody
             }),
             unallocated => unallocated,
-        }
+        };
+        (observation.stage, buffer)
     });
 }
 
@@ -615,17 +985,23 @@ fn a_claim_of_a_freed_buffer_is_rejected_by_the_heap_witness() {
 #[test]
 #[should_panic(expected = "is not in the binding's successor relation")]
 fn an_observation_omitting_the_payload_permit_is_rejected() {
-    use dcbor::bounded::decode::construction::in_place::{BufferCustody, BufferObservation};
+    use dcbor::bounded::decode::construction::in_place::{
+        BufferCustody, BufferObservation, SessionObservation,
+    };
     let name = "planted payload omission";
     let states: Vec<_> = support::certified::<String>(name, &planted_text())
         .into_iter()
         .map(|state| {
-            state.project(|observation| match *observation {
-                BufferObservation::Held(custody) => BufferObservation::Held(BufferCustody {
-                    payload: false,
-                    ..custody
-                }),
-                unallocated => unallocated,
+            // The root session's stage kept; the buffer's permit omitted.
+            state.project(|observation| SessionObservation {
+                stage: observation.stage,
+                inner: match observation.inner {
+                    BufferObservation::Held(custody) => BufferObservation::Held(BufferCustody {
+                        payload: false,
+                        ..custody
+                    }),
+                    unallocated => unallocated,
+                },
             })
         })
         .collect();
@@ -636,17 +1012,16 @@ fn an_observation_omitting_the_payload_permit_is_rejected() {
 fn fixed_arrays_construct_in_place_and_reclaim_every_element() {
     // [[1, 2], [3, 24]], independently specified canonical bytes.
     let wire = [0x82, 0x82, 0x01, 0x02, 0x82, 0x03, 0x18, 0x18];
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
-    let output = support::construct::<_, [[u64; 2]; 2]>(&mut m, document)
-        .expect("fixed array construction failed");
-    assert_eq!(output.value(), &[[1, 2], [3, 24]]);
-    assert_eq!(output.bytes(), wire);
-    let held = m.live_bytes();
-    drop(output);
-    assert_eq!(m.live_bytes(), held);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    let built = constructed::<[[u64; 2]; 2]>(
+        &wire,
+        Discipline::Admitted,
+        |_| false,
+        |output| {
+            assert_eq!(output.value(), &[[1, 2], [3, 24]]);
+            assert_eq!(output.bytes(), wire);
+        },
+    );
+    assert!(built, "the fixed arrays were not built");
 }
 
 struct Payload([u8; 192]);
@@ -677,17 +1052,14 @@ unsafe impl Reclaim<Limits> for Payload {
     type State = PayloadState;
     const INITIAL: PayloadState = PayloadState { initialized: 0 };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a custom resource binding admits its own cleanup, as `Reclaim` documents"
-    )]
     fn reclaim_step(
         mut slot: Slot<'_, Self, PayloadState>,
-        a: &mut Limits,
+        cleanup: &mut Cleanup<'_, Limits>,
     ) -> BoundedResult<Reclaimed, Limits> {
         let state = slot.custody();
         let bytes = state.initialized.min(64);
-        a.traverse(1, bytes as u64).map_err(BoundedError::Refused)?;
+        // The one admission route for a binding outside the crate.
+        admit(cleanup, bytes)?;
         state.initialized -= bytes;
         CLEANED.set(CLEANED.get() + bytes);
         Ok(if state.initialized == 0 {
@@ -699,31 +1071,28 @@ unsafe impl Reclaim<Limits> for Payload {
 
     /// One call per 64-byte chunk still initialized, and one for an empty
     /// prefix, whose call reports `Done` at once.
-    fn remaining(mut slot: PeekSlot<'_, Self, PayloadState>) -> u64 {
-        (slot.custody().initialized.div_ceil(64) as u64).max(1)
+    fn remaining(mut slot: PeekSlot<'_, Self, PayloadState>) -> Option<u64> {
+        Some((slot.custody().initialized.div_ceil(64) as u64).max(1))
+    }
+
+    /// Plain bytes: no permit of its own; the record's block is the
+    /// record's to report.
+    fn observe_permits(
+        _: PeekSlot<'_, Self, PayloadState>,
+        _: &mut dyn CustodySink<<Limits as Releasing>::Permit>,
+    ) -> PermitsObserved {
+        PermitsObserved::Complete
     }
 }
 
-/// A payload record with `chunks` admitted 64-byte chunks initialized.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a custom resource binding admits its record's initialization, as \
-              `OwnedRecord::destination` documents"
-)]
-fn payload<'s>(
-    owner: &dcbor::bounded::decode::construction::DecodeOwner<'s, Limits>,
-    m: &mut Limits,
-    chunks: usize,
-) -> (
-    dcbor::bounded::decode::construction::OwnedRecord<'s, Payload, Limits>,
-    usize,
-) {
-    m.fresh();
-    let mut record = support::acquire::<Payload>(owner, m, &mut Acquisition::new());
+/// `chunks` admitted 64-byte chunks of a held payload `record` initialized
+/// under `m`: the address of its construction, zero when no chunk was
+/// written.
+fn fill(record: &mut OwnedRecord<'_, Payload, Limits>, m: &mut Limits, chunks: usize) -> usize {
     let mut construction_address = 0;
     for _ in 0..chunks {
         m.fresh();
-        m.traverse(1, 64).unwrap();
+        admit(m, 64).unwrap();
         let mut slot = record.destination();
         let (place, state) = slot.parts();
         let raw = place.as_ptr(state);
@@ -738,7 +1107,36 @@ fn payload<'s>(
         }
         state.initialized += 64;
     }
-    (record, construction_address)
+    construction_address
+}
+
+/// A payload record acquired in the scope `owner` holds, under `policy`,
+/// `chunks` of it initialized ([`fill`]), for `body`, which holds it as a
+/// published handle: retired to the scope's queue once `body` returns
+/// unless `body` moves it on. The acquisition's stop is the run's finding.
+fn payload<R>(
+    owner: &mut support::Holding<'_, '_, DecodeOwner<'static, Limits>, Unwitnessed>,
+    policy: support::PolicyId,
+    chunks: usize,
+    body: impl FnOnce(
+        &mut support::Holding<'_, '_, OwnedRecord<'static, Payload, Limits>, Unwitnessed>,
+        usize,
+    ) -> R,
+) -> Result<R, Finding> {
+    owner.lending(Retirement::Exhausted, Lent::new, |view| {
+        let scope = view.value().get();
+        view.holding(
+            Acquisition::<Payload, Limits>::new(),
+            Retirement::Stopped,
+            |acquisition| {
+                acquisition.with_policy(policy, |_, m| m.fresh());
+                acquisition.acquire(policy, scope, |record| {
+                    let address = record.with_policy(policy, |record, m| fill(record, m, chunks));
+                    body(record, address)
+                })
+            },
+        )
+    })
 }
 
 #[test]
@@ -751,61 +1149,121 @@ fn stable_publication_and_every_cleanup_admission_refusal() {
         |refuse_at| {
             CLEANED.set(0);
             DROPPED.set(0);
-            let mut m = meter();
-            let mut owner = scope(&mut m);
-            let (record, construction_address) = payload(&owner, &mut m, 3);
-            // SAFETY: all 192 bytes are initialized and tracked; no pointer escapes.
-            let value = unsafe { record.publish() };
-            let published_address = std::ptr::from_ref(value.value()) as usize;
-            assert_eq!(value.value().0, [0x5a; 192]);
-            drop(value);
-            let held = m.live_bytes();
-            assert!(held >= 192);
-            assert_eq!(DROPPED.get(), 0);
-            let refusals = m.refusals();
-            for unit in 0..4 {
-                if unit == refuse_at {
-                    let progress = CLEANED.get();
-                    support::repeated_refusal(
-                        "published payload cleanup",
-                        &mut m,
-                        (progress, 1, held),
-                        3,
-                        |m| {
-                            let result = support::scope_checked(m, &mut owner, |owner, m| {
-                                owner.shutdown_step(m)
-                            })
-                            .map(|_| ());
-                            ((CLEANED.get(), owner.outstanding(), m.live_bytes()), result)
-                        },
-                    );
-                }
-                m.clear_refusal();
-                m.fresh();
-                let result = owner.shutdown_step(&mut m).unwrap();
-                assert_eq!(
-                    result,
-                    if unit == 3 {
-                        Reclaimed::Done
-                    } else {
-                        Reclaimed::Progress
-                    }
-                );
-            }
-            assert_eq!(construction_address, published_address);
-            assert_eq!(m.refusals() - refusals, 3);
-            assert_eq!(CLEANED.get(), 192);
-            assert_eq!(DROPPED.get(), 0);
-            assert_eq!(m.live_bytes(), 0);
-            assert_eq!(owner.outstanding(), 0);
-            m.fresh();
-            assert!(matches!(
-                owner.allocate_step::<Payload>(&mut m, &mut Acquisition::new()),
-                Err(BoundedError::PlanMismatch)
-            ));
-            m.reached()
+            support::recorded_run(|run| {
+                let policy = run.policy(u64::MAX);
+                published_cleanup_under(run, policy, refuse_at)
+            })
         },
     );
+}
+
+/// [`stable_publication_and_every_cleanup_admission_refusal`]'s run under
+/// `policy` of `run`, cleanup unit `refuse_at` refused repeatedly first: the
+/// payload published and retired to the queue, then the scope shut down by
+/// the fixture's own schedule, its authority held by the run throughout.
+/// The boundary valuations it reached, or a driver's stop as the run's
+/// finding.
+fn published_cleanup_under(
+    run: &mut support::RecordedRun,
+    policy: support::PolicyId,
+    refuse_at: usize,
+) -> Result<dcbor::bounded::boundary::Reached, Finding> {
+    run.holding(
+        DecodeOwner::new(),
+        Retirement::Scope,
+        &Unwitnessed,
+        |owner| {
+            owner.initialize(policy)?;
+            let (construction_address, published_address) =
+                payload(owner, policy, 3, |record, construction_address| {
+                    record.transfer(
+                        // SAFETY: all 192 bytes are initialized and tracked; no
+                        // pointer escapes.
+                        |record| unsafe { record.publish() },
+                        Retirement::Published,
+                        |value| {
+                            let payload = value.value().value();
+                            assert_eq!(payload.0, [0x5a; 192]);
+                            (construction_address, std::ptr::from_ref(payload) as usize)
+                        },
+                    )
+                })?;
+            owner.with_policy(policy, |owner, m| {
+                shut_down_refused(owner, m, refuse_at)?;
+                assert_eq!(construction_address, published_address);
+                Ok(m.reached())
+            })
+        },
+    )
+}
+
+/// The shutdown of `owner`, holding the published payload's queued record,
+/// under `m`, its cleanup unit `refuse_at` refused three times in place
+/// first ([`support::repeated_refusal`]): every unit `Progress` until the
+/// fourth, `Done`, which frees the record and the scope; the payload's
+/// destructor never run, every byte of it cleaned, nothing live, and the
+/// closed scope refusing a new acquisition.
+fn shut_down_refused(
+    owner: &mut DecodeOwner<'static, Limits>,
+    m: &mut Limits,
+    refuse_at: usize,
+) -> Result<(), Finding> {
+    let held = m.live_bytes();
+    assert!(held >= 192);
+    assert_eq!(DROPPED.get(), 0);
+    let refusals = m.refusals();
+    for unit in 0..4 {
+        let progress = if unit == refuse_at {
+            support::repeated_refusal(m, owner, 3, unit, |m, owner| {
+                let before = (CLEANED.get(), owner.outstanding(), m.live_bytes());
+                let result = support::scope_checked(m, owner, |owner, m| owner.shutdown_step(m))
+                    .map(|reclaimed| match reclaimed {
+                        Reclaimed::Progress => Step::Progress,
+                        Reclaimed::Waiting | Reclaimed::Done => Step::Complete(reclaimed),
+                    });
+                (
+                    before,
+                    (CLEANED.get(), owner.outstanding(), m.live_bytes()),
+                    (result, None),
+                )
+            })?
+        } else {
+            None
+        };
+        m.clear_refusal();
+        m.fresh();
+        let result = match progress {
+            Some(Step::Progress) => Reclaimed::Progress,
+            Some(Step::Complete(reclaimed)) => reclaimed,
+            Some(Step::Finished) => {
+                return Err(Finding::Driver(
+                    "published payload cleanup finished without completion".to_owned(),
+                ));
+            }
+            None => owner
+                .shutdown_step(m)
+                .map_err(support::failed("payload cleanup"))?,
+        };
+        assert_eq!(
+            result,
+            if unit == 3 {
+                Reclaimed::Done
+            } else {
+                Reclaimed::Progress
+            }
+        );
+    }
+    assert_eq!(m.refusals() - refusals, 3);
+    assert_eq!(CLEANED.get(), 192);
+    assert_eq!(DROPPED.get(), 0);
+    assert_eq!(m.live_bytes(), 0);
+    assert_eq!(owner.outstanding(), 0);
+    m.fresh();
+    assert!(matches!(
+        owner.allocate_step::<Payload>(m, &mut Acquisition::new()),
+        Err(BoundedError::PlanMismatch)
+    ));
+    Ok(())
 }
 
 /// The scope holds a queued record to the cleanup count it declared when its
@@ -815,9 +1273,18 @@ fn stable_publication_and_every_cleanup_admission_refusal() {
 /// record, the second spends its one declared call, the third is refused.
 #[test]
 fn a_record_cleaning_up_beyond_its_declared_count_is_a_defect() {
-    let mut m = meter();
-    let owner = scope(&mut m);
-    let record = support::understated(&owner, &mut m, 2);
+    // An ordinary policy: the defective scope is kept for the process's life
+    // (below), so no run of it reaches the quiescence a recording would be
+    // read at, and the test reads no history.
+    let mut m = Limits::unlimited().strict();
+    let mut owner = DecodeOwner::<'static, Limits>::new();
+    owner
+        .initialize_step(&mut m)
+        .expect("an unlimited scope initializes");
+    let mut record = owner
+        .allocate_step::<support::Understated>(&mut m, &mut Acquisition::new())
+        .expect("an unlimited record acquires");
+    support::understate(&mut record, 2);
     drop(record);
     for step in ["removal", "declared call"] {
         m.fresh();
@@ -848,15 +1315,17 @@ fn a_record_cleaning_up_beyond_its_declared_count_is_a_defect() {
 fn cancellation_reclaims_only_the_initialized_prefix() {
     for chunks in 0..=3 {
         CLEANED.set(0);
-        let mut m = meter();
-        let mut owner = scope(&mut m);
-        let (record, _) = payload(&owner, &mut m, chunks);
-        let held = m.live_bytes();
-        drop(record);
-        assert_eq!(m.live_bytes(), held);
-        drain(&mut owner, &mut m);
-        assert_eq!(CLEANED.get(), chunks * 64);
-        assert_eq!(m.live_bytes(), 0);
+        // The record retires to the queue as a published handle, releasing
+        // nothing; the drain cleans exactly its initialized prefix.
+        support::recorded_run(|run| {
+            let policy = run.policy(u64::MAX);
+            run.scoped(policy, &Unwitnessed, |owner| {
+                payload(owner, policy, chunks, |_, _| ())
+            })?;
+            assert_eq!(CLEANED.get(), chunks * 64);
+            run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
+            Ok(())
+        });
     }
 }
 
@@ -884,65 +1353,120 @@ fn text_build_publication_and_cancellation_keep_per_allocation_custody() {
 /// custody, and the scope's queued cleanup never acquires storage and
 /// recovers everything, all within the decode's bound. The turns
 /// construction took to publish, when it published within `stop`, and the
-/// boundary valuations the run reached.
+/// boundary valuations the run reached. One recorded run, its finalizer
+/// refining the stream.
 fn retired_text(wire: &[u8], stop: usize) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
-    let bound = support::typed_turns::<String>(wire.len());
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-    let mut operation = Construction::<_, String, Limits>::construct(document);
-    let mut output = None;
-    let mut published = None;
-    for turn in 0..stop.min(bound) {
-        match support::checked(&mut m, |m| support::contracted(m, &mut operation)) {
-            Ok(Step::Progress) | Err(DecodeError::Resource(BoundedError::Refused(_))) => {}
-            Ok(Step::Complete(value)) => {
-                support::exhausted(&mut m, &mut operation);
-                assert_eq!(value.value().as_bytes(), &[b'x'; 65]);
-                output = Some(value);
-                published = Some(turn + 1);
-                break;
-            }
-            _ => panic!("construction finished without publishing"),
-        }
-    }
-    let held = m.live_bytes();
-    drop(operation);
-    drop(output);
-    // Handle drops transfer custody; they cannot return any reservations.
-    assert_eq!(m.live_bytes(), held);
-    let mut previous = held;
-    let mut drained = false;
-    for _ in 0..bound {
-        let result =
-            support::scope_checked(&mut m, &mut owner, |owner, m| owner.shutdown_step(m)).unwrap();
-        let live = m.live_bytes();
-        assert!(live <= previous, "reclamation acquired new storage");
-        previous = live;
-        if result == Reclaimed::Done {
-            drained = true;
-            break;
-        }
-    }
-    assert!(drained, "text cleanup exceeded its bound of {bound} turns");
-    assert_eq!(m.live_bytes(), 0);
-    (published, m.reached())
+    retired::<String>(wire, stop, Discipline::Admitted, |value| {
+        assert_eq!(value.as_bytes(), &[b'x'; 65]);
+    })
+}
+
+/// Construct `T` from `wire`, retiring the construction after `stop` turns
+/// ([`support::Holding::controlled`]), a published value given to `inspect`:
+/// the retirements of the stopped construction and of the published value
+/// release nothing, each retirement's rule holding it; then the scope's
+/// queued cleanup recovers everything without acquiring storage, within the
+/// decode's bound, each unit, under [`Discipline::RefusedFirst`], first
+/// refused without release. The turns construction took to publish, when it
+/// published within `stop`, and the boundary valuations the run reached.
+/// One recorded run, its finalizer refining the stream.
+fn retired<T: Transferable<Limits> + 'static>(
+    wire: &[u8],
+    stop: usize,
+    discipline: Discipline,
+    inspect: impl Fn(&T),
+) -> (Option<usize>, dcbor::bounded::boundary::Reached) {
+    let bound = support::typed_turns::<T>(wire.len());
+    support::recorded_run(|run| {
+        let policy = run.policy(u64::MAX);
+        run.holding(
+            DecodeOwner::new(),
+            Retirement::Scope,
+            &Unwitnessed,
+            |owner| {
+                owner.initialize(policy)?;
+                // Retirement of the stopped construction and of a published
+                // value releases nothing: each retirement's rule holds it.
+                let published = owner.copied(policy, wire, |input| {
+                    input.parse(policy, Options::normalizing(8), |document| {
+                        document.transfer(
+                            Construction::<_, T, Limits>::construct,
+                            Retirement::Stopped,
+                            |operation| {
+                                let mut turns = 0;
+                                let published = operation.controlled(
+                                    policy,
+                                    bound,
+                                    Retirement::Published,
+                                    true,
+                                    |_, _, at| {
+                                        turns = at + 1;
+                                        at == stop
+                                    },
+                                    |value| inspect(value.value().value()),
+                                )?;
+                                Ok::<_, Finding>(published.map(|()| turns))
+                            },
+                        )
+                    })
+                })???;
+                owner.with_policy(policy, |owner, m| {
+                    let mut previous = m.live_bytes();
+                    for at in 0..bound {
+                        if discipline == Discipline::RefusedFirst && owner.outstanding() != 0 {
+                            // The unit first refused, without release; a prepaid
+                            // release, which has no admission to refuse, is
+                            // progress that releases.
+                            m.clear_refusal();
+                            m.exhaust();
+                            let held = m.live_bytes();
+                            match owner.shutdown_step(m) {
+                                Err(BoundedError::Refused(_)) => assert_eq!(m.live_bytes(), held),
+                                Ok(Reclaimed::Progress) => assert!(m.live_bytes() < held),
+                                Ok(Reclaimed::Done) => {
+                                    assert_eq!(m.live_bytes(), 0);
+                                    return Ok((published, m.reached()));
+                                }
+                                other => panic!("unexpected cleanup: {other:?}"),
+                            }
+                            m.clear_refusal();
+                        }
+                        let result = support::scheduled_scope(m, owner, at, |owner, m| {
+                            owner.shutdown_step(m)
+                        })?
+                        .map_err(support::failed("the scope's shutdown"))?;
+                        let live = m.live_bytes();
+                        assert!(live <= previous, "reclamation acquired new storage");
+                        previous = live;
+                        if result == Reclaimed::Done {
+                            assert_eq!(m.live_bytes(), 0);
+                            return Ok((published, m.reached()));
+                        }
+                    }
+                    Err(Finding::Driver(format!(
+                        "the cleanup of {} exceeded its bound of {bound} turns",
+                        core::any::type_name::<T>()
+                    )))
+                })
+            },
+        )
+    })
 }
 
 #[test]
 fn nested_vectors_construct_children_in_place_and_reclaim_all_allocations() {
     // [[1, 24], [], [256]], independently specified canonical bytes.
     let wire = [0x83, 0x82, 0x01, 0x18, 0x18, 0x80, 0x81, 0x19, 0x01, 0x00];
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
-    let output = support::construct::<_, Vec<Vec<u64>>>(&mut m, document)
-        .expect("nested construction failed");
-    assert_eq!(output.value(), &[vec![1, 24], vec![], vec![256]]);
-    assert_eq!(output.bytes(), wire);
-    let held = m.live_bytes();
-    drop(output);
-    assert_eq!(m.live_bytes(), held);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    let built = constructed::<Vec<Vec<u64>>>(
+        &wire,
+        Discipline::Admitted,
+        |_| false,
+        |output| {
+            assert_eq!(output.value(), &[vec![1, 24], vec![], vec![256]]);
+            assert_eq!(output.bytes(), wire);
+        },
+    );
+    assert!(built, "the nested vectors were not built");
 }
 
 #[cfg(feature = "derive")]
@@ -952,14 +1476,13 @@ fn derived_newtype_uses_stable_child_construction_and_cleanup() {
     struct Wrapped(Vec<String>);
 
     let wire = [0x82, 0x61, b'a', 0x62, b'b', b'c'];
-    let mut m = meter();
-    let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
-    let output = support::construct::<_, Wrapped>(&mut m, document)
-        .expect("newtype failed its finite completion bound");
-    assert_eq!(output.value().0, ["a", "bc"]);
-    drop(output);
-    drain(&mut owner, &mut m);
-    assert_eq!(m.live_bytes(), 0);
+    let built = constructed::<Wrapped>(
+        &wire,
+        Discipline::Admitted,
+        |_| false,
+        |output| assert_eq!(output.value().0, ["a", "bc"]),
+    );
+    assert!(built, "the newtype was not built");
 }
 
 #[cfg(feature = "derive")]
@@ -975,29 +1498,19 @@ fn named_fields_build_in_wire_order_and_abort_missing_required_fields() {
     // Unknown key 3 is ignored. Declaration order differs from wire order.
     let complete = &[0xa3, 1, 0x61, b'x', 3, 0xf6, 9, 0x81, 7][..];
     let missing = &[0xa1, 1, 0x61, b'x'][..];
+    // The construction's own bound covers it, and its cleanup after the
+    // missing field's rejection.
     for wire in [complete, missing] {
-        let mut m = meter();
-        let (mut owner, document) = document(&mut m, wire, Options::normalizing(8));
-        let mut operation = Construction::<_, Named, Limits>::construct(document);
-        // The construction's own bound covers it, and its cleanup after the
-        // missing field's rejection.
-        let turns = support::typed_turns::<Named>(wire.len());
-        match support::drive_within(&mut m, &mut operation, turns) {
-            Ok(value) => {
-                assert_eq!(wire, complete);
+        let built = constructed::<Named>(
+            wire,
+            Discipline::Admitted,
+            |error| matches!(error, DecodeError::Invalid(dcbor::Error::MissingMapKey)),
+            |value| {
                 assert_eq!(value.value().text, "x");
                 assert_eq!(value.value().numbers, [7]);
-            }
-            Err(DecodeError::Invalid(dcbor::Error::MissingMapKey)) => {
-                assert_eq!(wire, missing);
-                support::finish_within(&mut m, &mut operation, turns);
-                assert_eq!(owner.outstanding(), 0, "failed construction kept records");
-            }
-            Err(error) => panic!("unexpected named-field construction result: {error:?}"),
-        }
-        drop(operation);
-        drain(&mut owner, &mut m);
-        assert_eq!(m.live_bytes(), 0);
+            },
+        );
+        assert_eq!(built, wire == complete, "{wire:02x?}");
     }
 }
 
@@ -1010,30 +1523,22 @@ fn tagged_named_construction_validates_tag_before_initializing_fields() {
         #[cbor(n = 0)]
         number: u64,
     }
+    // The construction's own bound covers it, and its cleanup after the
+    // wrong tag's rejection.
     for tag in [42, 43] {
         let wire = [0xd8, tag, 0xa1, 0, 7];
-        let mut m = meter();
-        let (mut owner, document) = document(&mut m, &wire, Options::normalizing(8));
-        let mut operation = Construction::<_, Tagged, Limits>::construct(document);
-        // The construction's own bound covers it, and its cleanup after the
-        // wrong tag's rejection.
-        let turns = support::typed_turns::<Tagged>(wire.len());
-        match support::drive_within(&mut m, &mut operation, turns) {
-            Ok(value) => {
-                assert_eq!(tag, 42);
-                assert_eq!(value.value().number, 7);
-            }
-            Err(DecodeError::Invalid(dcbor::Error::WrongTag(expected, found))) => {
-                assert_eq!(expected.value(), 42);
-                assert_eq!(found.value(), 43);
-                support::finish_within(&mut m, &mut operation, turns);
-                assert_eq!(owner.outstanding(), 0);
-            }
-            Err(error) => panic!("unexpected tagged construction result: {error:?}"),
-        }
-        drop(operation);
-        drain(&mut owner, &mut m);
-        assert_eq!(owner.outstanding(), 0);
-        assert_eq!(m.live_bytes(), 0);
+        let built = constructed::<Tagged>(
+            &wire,
+            Discipline::Admitted,
+            |error| {
+                matches!(
+                    error,
+                    DecodeError::Invalid(dcbor::Error::WrongTag(expected, found))
+                        if expected.value() == 42 && found.value() == 43
+                )
+            },
+            |value| assert_eq!(value.value().number, 7),
+        );
+        assert_eq!(built, tag == 42, "tag {tag}");
     }
 }

@@ -1,0 +1,11 @@
+--- src/bounded/encoding/buckets.rs
++++ src/bounded/encoding/buckets.rs
+@@ -381,7 +381,7 @@
+         // retry, which admits the controls alone and mints nothing; a
+         // window holding credit with no acquisition is a defect.
+         if self.window.is_none() {
+-            if self.acquisition.is_none() {
++            if true {
+                 *self.acquisition = Some(budget.acquisition(owner).map_err(BoundedError::Refused)?);
+             }
+             let acquisition = self

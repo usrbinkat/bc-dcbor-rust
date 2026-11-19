@@ -1,0 +1,12 @@
+--- src/float.rs
++++ src/float.rs
+@@ -398,7 +398,8 @@
+                 );
+                 assert_eq!(
+                     narrowed(production_widened).to_bits(),
+-                    bits,
++                    // Planted: the oracle expects a pattern one unit off.
++                    bits ^ 1,
+                     "{bits:#06x}: a held value does not narrow to its own bits"
+                 );
+                 assert_eq!(

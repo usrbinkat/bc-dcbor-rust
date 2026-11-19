@@ -1,0 +1,16 @@
+--- src/bounded.rs
++++ src/bounded.rs
+@@ -1835,10 +1835,11 @@
+             };
+             let permit = match allocator.allocate(bytes) {
+                 Ok(permit) => permit,
+-                Err(refusal) => {
++                Err(_) => {
+                     grant.forfeit(Forfeit::AcquisitionRefused, None, by);
+                     release.forfeit(Forfeit::AcquisitionRefused, None, by);
+-                    return Err(BoundedError::Refused(refusal));
++                    // Planted: a refused request is swallowed, nothing grown.
++                    return Ok(());
+                 }
+             };
+             let id = A::permit_identity(&permit);

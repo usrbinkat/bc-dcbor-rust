@@ -5,11 +5,11 @@ use dcbor::{
     walk::{EdgeType, WalkElement},
 };
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     let mut map = Map::new();
-    map.insert("first", "normal");
-    map.insert("second", "abort");
-    map.insert("third", "should_not_see");
+    map.insert("first", "normal")?;
+    map.insert("second", "abort")?;
+    map.insert("third", "should_not_see")?;
     let cbor = CBOR::from(map);
 
     let visit_log = RefCell::new(Vec::<String>::new());
@@ -53,4 +53,5 @@ fn main() {
         "Contains 'should_not_see': {}",
         log_str.contains("should_not_see")
     );
+    Ok(())
 }

@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/in_place/btree.rs
++++ src/bounded/decode/construction/in_place/btree.rs
+@@ -574,7 +574,7 @@
+     unsafe {
+         for arena in (0..ARENAS).rev() {
+             let start = 1 + arena * ARENA_STEPS;
+-            let written = usize::from(initialized.saturating_sub(start).min(ARENA_STEPS));
++            let written = usize::from(initialized.saturating_sub(start).saturating_add(1).min(ARENA_STEPS));
+             match arena {
+                 0 => drop_arena::<usize, A>(addr_of_mut!((*raw).order[0]), written),
+                 1 => drop_arena::<usize, A>(addr_of_mut!((*raw).order[1]), written),

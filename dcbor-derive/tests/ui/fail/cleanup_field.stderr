@@ -1,0 +1,5 @@
+error[E0616]: field `policy` of struct `dcbor::bounded::decode::construction::reclamation::Cleanup` is private
+ --> tests/ui/fail/cleanup_field.rs:8:13
+  |
+8 |     cleanup.policy
+  |             ^^^^^^ private field

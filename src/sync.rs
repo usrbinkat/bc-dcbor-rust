@@ -145,6 +145,20 @@ pub(crate) type Plain<T> = <Shipped as Atomics>::Cell<T>;
 #[cfg(all(test, feature = "std", any(loom, shuttle)))]
 mod models;
 
+/// The thread-locals of the test measurement hooks (the dispatch depth and
+/// the terminal drains a thread has active): std's, or under a checker the
+/// checker's, whose model threads run on one OS thread and so must not share
+/// one std thread-local (loom `src/lib.rs` `thread_local!`, shuttle
+/// `shuttle/src/lib.rs` `thread_local!`, each a per-model-thread `LocalKey`).
+/// Per-thread state only: a quantity shared by every thread of a run is no
+/// thread-local.
+#[cfg(all(test, feature = "std", loom))]
+pub(crate) use loom::thread_local;
+#[cfg(all(test, feature = "std", shuttle, not(loom)))]
+pub(crate) use shuttle::thread_local;
+#[cfg(all(test, feature = "std", not(any(loom, shuttle))))]
+pub(crate) use std::thread_local;
+
 /// A plain value one thread writes and another reads after an atomic
 /// publication orders the two: a queued record's custody and cleanup budget,
 /// written by the retiring thread before its tail swap and read by the

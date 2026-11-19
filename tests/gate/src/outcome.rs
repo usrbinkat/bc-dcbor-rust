@@ -38,12 +38,15 @@ pub enum Outcome {
     /// Anything else: a failed assertion, a panic, a scenario that returned
     /// instead of aborting.
     Failed,
+    /// The build of what would have run failed: a compiler refusal, the
+    /// outcome a planted defect evaluated at compile time must produce.
+    BuildRefused,
     /// The run never started.
     NotRun,
 }
 
 impl Outcome {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Pass,
         Self::BoundRefused,
         Self::StackOverflow,
@@ -53,6 +56,7 @@ impl Outcome {
         Self::MemoryLeaked,
         Self::AbnormalTermination,
         Self::Failed,
+        Self::BuildRefused,
         Self::NotRun,
     ];
 
@@ -68,6 +72,7 @@ impl Outcome {
             Self::MemoryLeaked => "memory_leaked",
             Self::AbnormalTermination => "abnormal_termination",
             Self::Failed => "failed",
+            Self::BuildRefused => "build_refused",
             Self::NotRun => "not_run",
         }
     }
@@ -192,6 +197,30 @@ pub fn executed(log: &str) -> bool {
     })
 }
 
+/// The counts libtest's summary line in `log` reports, `test result: ...`:
+/// passed, failed, ignored. None when no summary line is found.
+fn summary(log: &str) -> Option<(usize, usize, usize)> {
+    log.lines().find_map(|line| {
+        let rest = line
+            .strip_prefix("test result: ok. ")
+            .or_else(|| line.strip_prefix("test result: FAILED. "))?;
+        let mut counts = rest.split("; ").map(|part| {
+            part.split(' ')
+                .next()
+                .and_then(|count| count.parse::<usize>().ok())
+        });
+        Some((counts.next()??, counts.next()??, counts.next()??))
+    })
+}
+
+/// Whether the run whose libtest report is `log` ran exactly one test, not
+/// ignored, to its end: the selection named one test and it executed, so
+/// everything the run printed is that test's. An ignored test, an empty
+/// selection and a process that never reached its summary are not.
+pub fn ran_one(log: &str) -> bool {
+    summary(log).is_some_and(|(passed, failed, ignored)| passed + failed == 1 && ignored == 0)
+}
+
 /// The outcome of a model run under `checker`: a refusal of the bound only
 /// when the checker's own message names it, an overflow only as the
 /// checker's stack allocator ends one.
@@ -254,6 +283,71 @@ pub fn under_cargo(status: i32, log: &str) -> Termination {
                 .and_then(|(signal, _)| signal.parse().ok())
         })
         .map_or(Termination::Exited(status), Termination::Signaled)
+}
+
+/// Kani's report of a build that failed before any harness was checked
+/// (kani-driver 0.68.0 `call_cargo.rs` `run_build`).
+pub const KANI_BUILD_FAILED: &str = "Failed to execute cargo (";
+
+/// The counts Kani's final summary line in `log` reports, `Complete - S
+/// successfully verified harnesses, F failures, T total.`
+/// (kani-driver `harness_runner.rs` `print_final_summary`): verified,
+/// failed, total. None when no summary line is found.
+pub fn kani_summary(log: &str) -> Option<(usize, usize, usize)> {
+    log.lines().find_map(|line| {
+        let rest = line.strip_prefix("Complete - ")?;
+        let (verified, rest) = rest.split_once(" successfully verified harnesses, ")?;
+        let (failed, rest) = rest.split_once(" failures, ")?;
+        let total = rest.strip_suffix(" total.")?;
+        Some((
+            verified.parse().ok()?,
+            failed.parse().ok()?,
+            total.parse().ok()?,
+        ))
+    })
+}
+
+/// Kani's report of a reachable construct it does not model, whose failure
+/// turns every other result undetermined (kani-driver
+/// `cbmc_property_renderer.rs` `format_result`, `postprocess_result`).
+pub const KANI_UNSUPPORTED: &str =
+    "A Rust construct that is not currently supported by Kani was found to be reachable";
+
+/// Kani's report of an unwinding assertion that failed: the bound given did
+/// not cover a loop or recursion, and every other result is undetermined
+/// (the same renderer).
+pub const KANI_UNWINDING: &str = "Verification output shows one or more unwinding failures";
+
+/// The outcome of a Kani run. A fundamental failure is classed first,
+/// whatever else the run reports, since it makes every other result
+/// undetermined: a reachable unsupported construct is `Unsupported`, a
+/// failed unwinding assertion `BoundRefused` (the bound given refused, as a
+/// model checker's is). Then a pass when it exited 0 and its summary
+/// verified every harness it checked, at least one; failed when it exited 1
+/// (Kani's exit on a failing harness) and its summary names a failure; a
+/// refused build when cargo failed before any harness was checked; anything
+/// else failed, a run whose report the judgement then refuses as no one
+/// harness's ([`crate::controls`]). So no intended assertion failure is ever
+/// confused with a construct Kani cannot execute or a bound too short.
+pub fn kani(termination: Termination, log: &str) -> Outcome {
+    if log.contains(KANI_UNSUPPORTED) {
+        return Outcome::Unsupported;
+    }
+    if log.contains(KANI_UNWINDING) {
+        return Outcome::BoundRefused;
+    }
+    let checked = log.contains("Checking harness ");
+    match (termination, kani_summary(log)) {
+        (Termination::Exited(0), Some((verified, 0, total))) if verified == total && total > 0 => {
+            Outcome::Pass
+        }
+        (Termination::Exited(1), Some((_, failed, _))) if failed > 0 => Outcome::Failed,
+        (Termination::Exited(_), None) if !checked && log.contains(KANI_BUILD_FAILED) => {
+            Outcome::BuildRefused
+        }
+        (Termination::Signaled(SIGSEGV), _) => Outcome::Segfault,
+        _ => Outcome::Failed,
+    }
 }
 
 /// The outcome of a native run of `kind`: a test run that passed, or an
@@ -371,6 +465,24 @@ mod tests {
         assert_eq!(Judgement::parse("caught"), None);
     }
 
+    /// One test run to its end, passed or failed, is one; an ignored test,
+    /// an empty selection, two tests and a run without a summary are not.
+    #[test]
+    fn only_a_run_of_exactly_one_executed_test_is_one() {
+        assert!(ran_one(PASSED));
+        assert!(ran_one(
+            "test x ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n"
+        ));
+        assert!(!ran_one(EMPTY));
+        assert!(!ran_one(
+            "test x ... ignored\n\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured\n"
+        ));
+        assert!(!ran_one(
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured\n"
+        ));
+        assert!(!ran_one("thread 'main' panicked\n"));
+    }
+
     #[test]
     fn a_native_run_passes_by_its_kinds_requirement() {
         assert_eq!(
@@ -389,6 +501,54 @@ mod tests {
             native(Kind::Test, Termination::Exited(101), ""),
             Outcome::Failed
         );
+    }
+
+    /// A Kani run is classed by its own summary: every harness verified a
+    /// pass, a failure with Kani's exit 1 failed, a cargo failure before any
+    /// harness a refused build; a summary that disagrees with the exit, or
+    /// none, is no pass.
+    #[test]
+    fn a_kani_run_is_classed_by_its_summary() {
+        let passed = "Checking harness bounded::proofs::x...\nVERIFICATION:- SUCCESSFUL\n\
+                      Manual Harness Summary:\n\
+                      Complete - 1 successfully verified harnesses, 0 failures, 1 total.\n";
+        let failed = "Checking harness bounded::proofs::x...\n\
+                      Manual Harness Summary:\nVerification failed for - bounded::proofs::x\n\
+                      Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n";
+        let exit = Termination::Exited;
+        assert_eq!(kani_summary(passed), Some((1, 0, 1)));
+        assert_eq!(kani(exit(0), passed), Outcome::Pass);
+        assert_eq!(kani(exit(1), failed), Outcome::Failed);
+        assert_eq!(
+            kani(exit(1), passed),
+            Outcome::Failed,
+            "a nonzero exit is no pass"
+        );
+        assert_eq!(
+            kani(exit(0), "Manual Harness Summary:\n"),
+            Outcome::Failed,
+            "no summary is no pass"
+        );
+        let unbuilt = "error[E0308]: mismatched types\n\
+                       error: Failed to execute cargo (exit status: 101). Found 1 compilation errors.\n";
+        assert_eq!(kani(exit(1), unbuilt), Outcome::BuildRefused);
+        assert_eq!(
+            kani(
+                exit(0),
+                "Complete - 0 successfully verified harnesses, 0 failures, 0 total.\n"
+            ),
+            Outcome::Failed,
+            "an empty run verified nothing"
+        );
+        // A fundamental failure is classed before the summary: an
+        // unsupported construct or a short unwind is never an intended
+        // assertion failure, nor a pass.
+        let unsupported = format!(
+            "{failed}** WARNING: {KANI_UNSUPPORTED}. Check the results for more details.\n"
+        );
+        assert_eq!(kani(exit(1), &unsupported), Outcome::Unsupported);
+        let unwound = format!("{passed}[Kani] info: {KANI_UNWINDING}.\n");
+        assert_eq!(kani(exit(0), &unwound), Outcome::BoundRefused);
     }
 
     /// A binary cargo reports killed by a signal ended by that signal; any

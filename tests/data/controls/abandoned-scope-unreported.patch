@@ -1,0 +1,13 @@
+--- src/bounded/decode/construction/reclamation/owned.rs
++++ src/bounded/decode/construction/reclamation/owned.rs
+@@ -1489,7 +1489,9 @@
+         // record (its owner stage made before the handle existed), for the
+         // borrow.
+         let record = unsafe { Record::<T, A>::observe_custody(self.block, sink) };
+-        observed_all([record, self.scope.observe_abandoned(sink)])
++        // Planted: the abandoned scope this handle keeps alive left
++        // unreported.
++        record
+     }
+ }
+

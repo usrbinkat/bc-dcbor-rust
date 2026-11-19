@@ -1,31 +1,31 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@5b9f1198b59bcb31c5c3250b332e7d77590e6306 nixpkgs@3ec636362e1816bc2f0888fa0fa2c69f1bc9e504
-23118	2424	total	published	a full leaf: run allocated
-829726	6600	total	published	a full leaf: run bytes
-23118	1560	total	published	a full leaf: run peak
-23118	0	total	published	a full leaf: run retained
-13514	377	total	published	a full leaf: run values
-24978	2944	total	published	a root over two leaves: run allocated
-901474	7028	total	published	a root over two leaves: run bytes
-24978	2080	total	published	a root over two leaves: run peak
-24978	0	total	published	a root over two leaves: run retained
-14680	412	total	published	a root over two leaves: run values
-2658	448	total	published	empty: run allocated
-40498	506	total	published	empty: run bytes
-2658	448	total	published	empty: run peak
-2658	0	total	published	empty: run retained
-688	27	total	published	empty: run values
-4518	992	total	published	one entry: run allocated
-112246	1672	total	published	one entry: run bytes
-4518	800	total	published	one entry: run peak
-4518	0	total	published	one entry: run retained
-1854	67	total	published	one entry: run values
-50616	4549	total	published	text keys: run allocated
-1447112	9577	total	published	text keys: run bytes
-50616	3376	total	published	text keys: run peak
-50616	0	total	published	text keys: run retained
-23627	505	total	published	text keys: run values
-494628	22752	total	published	two levels: run allocated
-19017844	79962	total	published	two levels: run bytes
-494628	13600	total	published	two levels: run peak
-494628	0	total	published	two levels: run retained
-309095	6033	total	published	two levels: run values
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+23854	3160	total	observed	published	a full leaf: run allocated
+831006	7336	total	observed	published	a full leaf: run bytes
+23854	2296	total	observed	published	a full leaf: run peak
+23854	0	total	observed	published	a full leaf: run retained
+13534	397	total	observed	published	a full leaf: run values
+25714	3680	total	observed	published	a root over two leaves: run allocated
+902754	7764	total	observed	published	a root over two leaves: run bytes
+25714	2816	total	observed	published	a root over two leaves: run peak
+25714	0	total	observed	published	a root over two leaves: run retained
+14700	432	total	observed	published	a root over two leaves: run values
+3394	1184	total	observed	published	empty: run allocated
+41778	1242	total	observed	published	empty: run bytes
+3394	1184	total	observed	published	empty: run peak
+3394	0	total	observed	published	empty: run retained
+708	47	total	observed	published	empty: run values
+5254	1728	total	observed	published	one entry: run allocated
+113526	2408	total	observed	published	one entry: run bytes
+5254	1536	total	observed	published	one entry: run peak
+5254	0	total	observed	published	one entry: run retained
+1874	87	total	observed	published	one entry: run values
+51352	5285	total	observed	published	text keys: run allocated
+1448392	10313	total	observed	published	text keys: run bytes
+51352	4112	total	observed	published	text keys: run peak
+51352	0	total	observed	published	text keys: run retained
+23647	525	total	observed	published	text keys: run values
+495364	23488	total	observed	published	two levels: run allocated
+19019124	80698	total	observed	published	two levels: run bytes
+495364	14336	total	observed	published	two levels: run peak
+495364	0	total	observed	published	two levels: run retained
+309115	6053	total	observed	published	two levels: run values

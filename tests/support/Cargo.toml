@@ -19,6 +19,9 @@ dcbor = { path = "../..", default-features = false }
 # the model-bounds rows the model runner reads.
 dcbor-record = { path = "../record" }
 dcbor-model-bounds = { path = "../model-bounds" }
+# The refinement machine every recorded run's whole session is checked by
+# (`recorded_run`): the one permit, obligation and custody lifecycle.
+dcbor-refinement = { path = "../refinement" }
 
 # The model runner (`model`) configures each checker's model under that
 # checker's cfg, as the library selects its atomics by it; the pins are the

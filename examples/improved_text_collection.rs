@@ -2,12 +2,12 @@ use std::cell::RefCell;
 
 use dcbor::prelude::*;
 
-fn main() {
+fn main() -> dcbor::Result<()> {
     // Create a map with various types
     let mut map = Map::new();
-    map.insert("name", "Alice");
-    map.insert("age", 30);
-    map.insert("nested", vec!["skill1", "skill2"]);
+    map.insert("name", "Alice")?;
+    map.insert("age", 30)?;
+    map.insert("nested", vec!["skill1", "skill2"])?;
     let cbor = CBOR::from(map);
 
     println!("CBOR: {}", cbor.diagnostic_flat());
@@ -45,4 +45,5 @@ fn main() {
     println!("✅ Ergonomic: Simple pattern matching on WalkElement::Single");
     println!("✅ Complete: No manual checking of key-value pairs required");
     println!("✅ Flexible: Both individual elements AND semantic pairs available");
+    Ok(())
 }

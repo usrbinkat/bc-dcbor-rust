@@ -1,0 +1,12 @@
+--- src/bounded/decode/comparison.rs
++++ src/bounded/decode/comparison.rs
+@@ -193,7 +193,8 @@
+             return Ok(Some(ordering));
+         }
+     }
+-    Ok((*position == shorter).then(|| left.len().cmp(&right.len())))
++    // Planted: a key that is a proper prefix of another sorts after it.
++    Ok((*position == shorter).then(|| right.len().cmp(&left.len())))
+ }
+
+ /// Kani harnesses of map-key order (register item 4): compiled only by

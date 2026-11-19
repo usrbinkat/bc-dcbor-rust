@@ -1,0 +1,19 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -920,14 +920,14 @@
+         // What an earlier, refused, entry of this acquisition already
+         // admitted is held in `pending` and never admitted again.
+         let admitted = match *holder {
+-            Some(ticket) => pending.admitted(ticket)?,
++            Some(_) => Admitted::Nothing,
+             None => Admitted::Nothing,
+         };
+         if admitted == Admitted::Nothing {
+             stable::admit_obligation(
+                 pending,
+                 holder,
+-                &[Admitted::Nothing],
++                &[Admitted::Nothing, Admitted::Write, Admitted::Release],
+                 |a, owner, acquisition| {
+                     WRITE.admit_held(a, Self::ARENA_BYTES, Obligation::Grant, owner, acquisition)
+                 },

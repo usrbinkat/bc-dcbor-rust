@@ -297,7 +297,7 @@ fn encode_array() {
 fn encode_heterogenous_array() {
     let array: Vec<CBOR> = vec![1.into(), "Hello".into(), vec![1, 2, 3].into()];
 
-    let cbor: CBOR = array.to_cbor();
+    let cbor: CBOR = array.encode_cbor().unwrap();
     let data = cbor.to_cbor_data();
     let decoded_cbor = CBOR::try_from_data(data).unwrap();
     match decoded_cbor.into_case() {
@@ -324,19 +324,19 @@ fn encode_map() {
     let mut m = Map::new();
     test_cbor(&m, r#"map({})"#, r#"{}"#, "a0");
 
-    m.insert(-1, 3);
-    m.insert(vec![-1], 7);
-    m.insert("z", 4);
-    m.insert(10, 1);
-    m.insert(false, 8);
-    m.insert(100, 2);
-    m.insert("aa", 5);
-    m.insert(vec![100], 6);
+    m.insert(-1, 3).unwrap();
+    m.insert(vec![-1], 7).unwrap();
+    m.insert("z", 4).unwrap();
+    m.insert(10, 1).unwrap();
+    m.insert(false, 8).unwrap();
+    m.insert(100, 2).unwrap();
+    m.insert("aa", 5).unwrap();
+    m.insert(vec![100], 6).unwrap();
     let cbor: CBOR = (&m).into();
     assert_eq!(CBOR::try_from_data(cbor.to_cbor_data()).unwrap(), cbor);
 
-    assert_eq!(m.get::<bool, i32>(false), Some(8));
-    assert_eq!(m.get::<bool, i32>(true), None);
+    assert_eq!(m.get::<bool, i32>(false).unwrap(), Some(8));
+    assert_eq!(m.get::<bool, i32>(true).unwrap(), None);
     assert_eq!(m.extract::<i32, i32>(-1).unwrap(), 3);
     assert_eq!(m.extract::<Vec<i32>, i32>(vec![-1]).unwrap(), 7);
     assert_eq!(m.extract::<&str, i32>("z").unwrap(), 4);
@@ -346,14 +346,14 @@ fn encode_map() {
 #[test]
 fn encode_map_with_map_keys() {
     let mut k1 = Map::new();
-    k1.insert(1, 2);
+    k1.insert(1, 2).unwrap();
 
     let mut k2 = Map::new();
-    k2.insert(3, 4);
+    k2.insert(3, 4).unwrap();
 
     let mut m = Map::new();
-    m.insert(k1, 5);
-    m.insert(k2, 6);
+    m.insert(k1, 5).unwrap();
+    m.insert(k2, 6).unwrap();
     test_cbor(
         m,
         r#"map({0xa10102: (map({0x01: (unsigned(1), unsigned(2))}), unsigned(5)), 0xa10304: (map({0x03: (unsigned(3), unsigned(4))}), unsigned(6))})"#,
@@ -365,8 +365,8 @@ fn encode_map_with_map_keys() {
 #[test]
 fn encode_anders_map() {
     let mut m = Map::new();
-    m.insert(1, 45.7);
-    m.insert(2, "Hi there!");
+    m.insert(1, 45.7).unwrap();
+    m.insert(2, "Hi there!").unwrap();
     assert_eq!(
         Map::cbor_data(&m),
         hex!("a201fb4046d9999999999a0269486920746865726521")
@@ -619,15 +619,19 @@ fn encode_date() {
     )
 }
 
+/// `value` encoded by reference and by value round-trips, and both
+/// encodings agree with its infallible conversion.
 fn test_convert<T>(value: T)
 where
-    T: PartialEq + Clone + Into<CBOR> + TryFrom<CBOR> + fmt::Debug,
+    T: PartialEq + Clone + Into<CBOR> + CBOREncodable + TryFrom<CBOR> + fmt::Debug,
     T::Error: fmt::Debug,
 {
-    let cbor = value.to_cbor();
+    let cbor = value.encode_cbor().unwrap();
+    assert_eq!(cbor, value.clone().into());
     let value2 = cbor.try_into().unwrap();
     assert_eq!(value, value2);
-    let cbor_2 = value.to_cbor();
+    let cbor_2 = value.clone().into_encoded_cbor().unwrap();
+    assert_eq!(cbor_2, value.clone().into());
     let value3 = cbor_2.try_into().unwrap();
     assert_eq!(value, value3);
 }
@@ -648,8 +652,9 @@ fn convert_hash_map() {
     h.insert(1, "A".to_string());
     h.insert(50, "B".to_string());
     h.insert(25, "C".to_string());
-    let m: CBOR = h.to_cbor();
+    let m = h.encode_cbor().unwrap();
     assert_eq!(m.diagnostic(), r#"{1: "A", 25: "C", 50: "B"}"#);
+    assert_eq!(h.clone().into_encoded_cbor().unwrap(), m);
     let h2: HashMap<i32, String> = m.try_into().unwrap();
     assert_eq!(h, h2);
 }
@@ -660,8 +665,9 @@ fn convert_btree_map() {
     h.insert(1, "A".to_string());
     h.insert(50, "B".to_string());
     h.insert(25, "C".to_string());
-    let m: CBOR = h.to_cbor();
+    let m = h.encode_cbor().unwrap();
     assert_eq!(m.diagnostic(), r#"{1: "A", 25: "C", 50: "B"}"#);
+    assert_eq!(h.clone().into_encoded_cbor().unwrap(), m);
     let h2: BTreeMap<i32, String> = m.try_into().unwrap();
     assert_eq!(h, h2);
 }
@@ -669,7 +675,8 @@ fn convert_btree_map() {
 #[test]
 fn convert_vector() {
     let v: Vec<i32> = vec![1, 50, 25];
-    let c: CBOR = v.to_cbor();
+    let c: CBOR = v.encode_cbor().unwrap();
+    assert_eq!(c, CBOR::from(v.clone()));
     assert_eq!(c.diagnostic(), "[1, 50, 25]");
     let v2: Vec<i32> = c.try_into().unwrap();
     assert_eq!(v, v2);
@@ -681,7 +688,8 @@ fn convert_vecdeque() {
     v.push_back(1);
     v.push_back(50);
     v.push_back(25);
-    let c: CBOR = v.to_cbor();
+    let c: CBOR = v.encode_cbor().unwrap();
+    assert_eq!(c, CBOR::from(v.clone()));
     assert_eq!(c.diagnostic(), "[1, 50, 25]");
     let v2: VecDeque<i32> = c.try_into().unwrap();
     assert_eq!(v, v2);
@@ -693,7 +701,9 @@ fn convert_hashset() {
     v.insert(1);
     v.insert(50);
     v.insert(25);
-    let c = v.to_cbor();
+    let c = v.encode_cbor().unwrap();
+    // Sorted by encoding, whatever the set's iteration order.
+    assert_eq!(c.diagnostic(), "[1, 25, 50]");
     let v2: HashSet<i32> = c.try_into().unwrap();
     assert_eq!(v, v2);
 }
@@ -701,7 +711,7 @@ fn convert_hashset() {
 #[test]
 fn usage_test_1() {
     let array = [1000, 2000, 3000];
-    let cbor = array.to_cbor();
+    let cbor = array.encode_cbor().unwrap();
     assert_eq!(cbor.hex(), "831903e81907d0190bb8");
 }
 
@@ -712,4 +722,74 @@ fn usage_test_2() {
     assert_eq!(cbor.diagnostic(), "[1000, 2000, 3000]");
     let array: Vec<u32> = cbor.try_into().unwrap();
     assert_eq!(format!("{:?}", array), "[1000, 2000, 3000]");
+}
+
+// --- The symbolic profile's limits on decoding ---
+
+use dcbor::Error;
+
+/// A zero inside `arrays` one-element arrays: `arrays + 1` frames.
+fn nested(arrays: usize) -> Vec<u8> {
+    let mut data = vec![0x81; arrays];
+    data.push(0x00);
+    data
+}
+
+/// The decoder admits exactly the frames of the symbolic profile
+/// (`dcbor::bounded::SYMBOLIC_DEPTH`): a zero inside 127 arrays, 128 frames,
+/// decodes, and one more array is refused. The bounded encoder agrees on
+/// the same values, so a value is decoded exactly when it is encoded; the
+/// deeper value still serializes symbolically, which applies no profile.
+#[test]
+fn decoding_admits_exactly_the_symbolic_profiles_frames() {
+    use dcbor::bounded::{BoundedError, Limits, SYMBOLIC_DEPTH, encode};
+    assert_eq!(SYMBOLIC_DEPTH, 128);
+    let deepest = CBOR::try_from_data(nested(127)).expect("128 frames decode");
+    assert_eq!(deepest.to_cbor_data(), nested(127));
+    assert!(encode(&deepest, &mut Limits::unlimited()).is_ok());
+    assert!(matches!(
+        CBOR::try_from_data(nested(128)),
+        Err(Error::DepthLimit)
+    ));
+    let deeper = CBOR::from(vec![deepest]);
+    assert_eq!(deeper.to_cbor_data(), nested(128));
+    assert!(matches!(
+        encode(&deeper, &mut Limits::unlimited()),
+        Err(BoundedError::DepthLimit)
+    ));
+}
+
+/// Nesting far past the profile is refused at the profile, on an 8 MiB
+/// thread stack. This is an observed, build-specific witness, not a bound
+/// on stack frames: in the unoptimized test build the decoder's at most
+/// `SYMBOLIC_DEPTH + 1` frames fit in 8 MiB and the test passes, and with
+/// the depth check removed the same build recurses through 100,000 levels
+/// and the process aborts on stack overflow (both seen). A 256 KiB stack
+/// aborted with the depth check in place, so it did not separate the two.
+/// Rust gives no frame-size guarantee; another build or toolchain may need
+/// this stack re-witnessed both ways.
+#[test]
+fn deep_nesting_is_refused_without_exhausting_the_stack() {
+    let refused = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| matches!(CBOR::try_from_data(nested(100_000)), Err(Error::DepthLimit)))
+        .expect("the decoding thread starts")
+        .join()
+        .expect("the decoding thread returns");
+    assert!(refused, "100,001 frames are refused at the profile");
+}
+
+/// A length head no input can hold is refused as an underrun, never
+/// truncated: a byte string of `u64::MAX` bytes, and an array claiming
+/// `u64::MAX` elements, whose storage is reserved for at most what the
+/// input's remaining bytes can hold, so its claim allocates nothing like
+/// its size.
+#[test]
+fn a_length_beyond_the_input_is_an_underrun() {
+    let mut bytes = vec![0x5b];
+    bytes.extend_from_slice(&[0xff; 8]);
+    assert!(matches!(CBOR::try_from_data(&bytes), Err(Error::Underrun)));
+    let mut array = vec![0x9b];
+    array.extend_from_slice(&[0xff; 8]);
+    assert!(matches!(CBOR::try_from_data(&array), Err(Error::Underrun)));
 }

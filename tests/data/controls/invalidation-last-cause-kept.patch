@@ -1,0 +1,15 @@
+--- src/bounded/policy/record.rs
++++ src/bounded/policy/record.rs
+@@ -288,9 +288,9 @@
+ /// Make `store`'s session, stickily, no evidence, for `cause`: the first
+ /// cause is kept, every later one leaves it ([`Invalidation`]).
+ pub(crate) fn exhaust(store: &Shared, cause: Invalidation) {
+-    let _ = store
+-        .invalid
+-        .compare_exchange(0, cause.word(), Ordering::AcqRel, Ordering::Acquire);
++    // Planted: every cause overwrites the one before it, so a later
++    // consequence masks the first cause.
++    store.invalid.store(cause.word(), Ordering::Release);
+ }
+
+ /// What first invalidated `store`'s session, if anything has.

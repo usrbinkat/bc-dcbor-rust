@@ -26,8 +26,8 @@
 //!
 //! // Create a CBOR structure with nested elements
 //! let mut map = Map::new();
-//! map.insert("name", "Alice");
-//! map.insert("numbers", vec![1, 2, 3]);
+//! map.insert("name", "Alice").unwrap();
+//! map.insert("numbers", vec![1, 2, 3]).unwrap();
 //! let cbor = CBOR::from(map);
 //!
 //! // Count the number of elements in the CBOR structure
@@ -219,8 +219,8 @@ impl CBOR {
     ///
     /// // Create a CBOR map for key-value pattern matching
     /// let mut map = Map::new();
-    /// map.insert("name", "Alice");
-    /// map.insert("age", 30);
+    /// map.insert("name", "Alice").unwrap();
+    /// map.insert("age", 30).unwrap();
     /// let cbor = CBOR::from(map);
     ///
     /// // Find specific key-value patterns
@@ -375,8 +375,8 @@ mod tests {
     #[test]
     fn test_walk_map() {
         let mut map = Map::new();
-        map.insert("key1", "value1");
-        map.insert("key2", "value2");
+        map.insert("key1", "value1").unwrap();
+        map.insert("key2", "value2").unwrap();
         let cbor = CBOR::from(map);
 
         let count = RefCell::new(0);
@@ -407,8 +407,8 @@ mod tests {
     #[test]
     fn test_walk_map_with_nested_content() {
         let mut map = Map::new();
-        map.insert("simple", "value");
-        map.insert("nested", vec![1, 2, 3]); // This will cause individual key/value visits
+        map.insert("simple", "value").unwrap();
+        map.insert("nested", vec![1, 2, 3]).unwrap(); // This will cause individual key/value visits
         let cbor = CBOR::from(map);
 
         let count = RefCell::new(0);
@@ -433,8 +433,8 @@ mod tests {
     #[test]
     fn test_walk_key_value_pairs() {
         let mut map = Map::new();
-        map.insert("name", "Alice");
-        map.insert("age", 30);
+        map.insert("name", "Alice").unwrap();
+        map.insert("age", 30).unwrap();
         let cbor = CBOR::from(map);
 
         let key_value_pairs = RefCell::new(Vec::new());
@@ -489,8 +489,8 @@ mod tests {
     fn test_walk_nested_structure() {
         // Create a nested structure: map with array values
         let mut map = Map::new();
-        map.insert("numbers", vec![1, 2, 3]);
-        map.insert("text", "hello");
+        map.insert("numbers", vec![1, 2, 3]).unwrap();
+        map.insert("text", "hello").unwrap();
         let cbor = CBOR::from(map);
 
         let count = RefCell::new(0);
@@ -512,9 +512,9 @@ mod tests {
     fn test_walk_early_termination() {
         // Create a nested structure where we can demonstrate early termination
         let mut map = Map::new();
-        map.insert("should_visit", "yes");
-        map.insert("stop_here", "stop");
-        map.insert("should_not_visit", vec![1, 2, 3]); // This array should not be traversed
+        map.insert("should_visit", "yes").unwrap();
+        map.insert("stop_here", "stop").unwrap();
+        map.insert("should_not_visit", vec![1, 2, 3]).unwrap(); // This array should not be traversed
         let cbor = CBOR::from(map);
 
         let visited = RefCell::new(Vec::new());

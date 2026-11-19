@@ -1,7 +1,6 @@
 #![no_main]
-use dcbor::{CBOR, bounded::Tagged};
+use dcbor::{BigInt, BigUint, CBOR, CBOREncodable, Sign, bounded::Tagged};
 use libfuzzer_sys::fuzz_target;
-use num_bigint::{BigInt, BigUint, Sign};
 use std::collections::BTreeMap;
 
 fuzz_target!(|data: &[u8]| {
@@ -11,7 +10,11 @@ fuzz_target!(|data: &[u8]| {
         .chunks(2)
         .map(|pair| (pair[0], pair.last().copied().unwrap()))
         .collect();
-    let symbolic = CBOR::from(map.clone());
+    // The keys are `u8`, whose canonical encoding is injective in its value:
+    // distinct tree keys never reduce to one, so the encoding cannot refuse.
+    let symbolic = map
+        .encode_cbor()
+        .expect("u8 keys encode injectively into canonical CBOR");
     let expected = symbolic.to_cbor_data();
     dcbor_fuzz::exercise(&map, &expected, schedule);
     dcbor_fuzz::exercise(&symbolic, &expected, schedule);

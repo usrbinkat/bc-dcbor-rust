@@ -25,11 +25,11 @@ macro_rules! cbor_tag {
 }
 
 const_cbor_tag!(1, DATE, "date");
-// Tag value for positive bignums (RFC 8949 §3.4.3).
-#[cfg(feature = "num-bigint")]
+// Tag values for positive and negative bignums (RFC 8949 §3.4.3), in every
+// build: `MinimalBigInt` encodes them without num-bigint. Their registration
+// and summarizers, which decode through num-bigint, are under its feature
+// (`register_tags_in`).
 const_cbor_tag!(2, POSITIVE_BIGNUM, "positive-bignum");
-// Tag value for negative bignums (RFC 8949 §3.4.3).
-#[cfg(feature = "num-bigint")]
 const_cbor_tag!(3, NEGATIVE_BIGNUM, "negative-bignum");
 
 /// Registers this crate's tags in `tags_store`, with their summarizers: the

@@ -1,6 +1,6 @@
 #![cfg(feature = "hashbrown")]
 
-use dcbor::bounded::encoding::buckets::{BucketCursor, BucketStep, Buckets};
+use dcbor::bounded::encoding::buckets::{BucketCursor, BucketPosition, BucketStep, Buckets};
 use dcbor::bounded::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -24,7 +24,7 @@ fn shape(map: &Colliding) -> encoding::Shape {
 /// The complete operation's bound for `map`: its shape's walk, its
 /// preparation and its publication ([`encode_bound`]).
 fn complete_bound(map: &Colliding) -> ResourceBound {
-    encode_bound::<Reservation, LimitRefusal>(shape(map)).unwrap()
+    encode_bound::<Reservation, Family, LimitRefusal>(shape(map)).unwrap()
 }
 
 /// The index of `map`'s last occupied bucket.
@@ -72,9 +72,11 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
     let last = last_occupied(&map);
     // The controls the scan must inspect: every one up to the live entry.
     let scanned = last as u64 + 1;
-    let window = encoding::BUCKET_WINDOW;
+    // The controls one window admits, apart from the cursor's window custody
+    // below.
+    let controls = encoding::BUCKET_WINDOW;
     assert!(
-        last >= window,
+        last >= controls,
         "the live entry lies past the first window, behind erased controls"
     );
 
@@ -93,21 +95,23 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
     // every control up to the entry's window's end admitted once, none of
     // the tail after it.
     let table: &dyn Buckets = &map;
-    let windows = last / window + 1;
+    let windows = last / controls + 1;
     let mut limits = Limits::unlimited();
-    let mut cursor = BucketCursor::new();
+    let owner = limits.owner().expect("an ordinary owner");
+    let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+    let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
     for _ in 1..windows {
         assert!(matches!(
-            cursor.step(table, &mut limits),
+            cursor.step(table, &owner, &mut limits),
             Ok(BucketStep::Vacant { .. })
         ));
     }
     assert!(matches!(
-        cursor.step(table, &mut limits),
+        cursor.step(table, &owner, &mut limits),
         Ok(BucketStep::Entry { index, .. }) if index == last
     ));
     assert!(matches!(
-        cursor.step(table, &mut limits),
+        cursor.step(table, &owner, &mut limits),
         Ok(BucketStep::Complete)
     ));
     assert_eq!(
@@ -117,7 +121,7 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
     );
     assert_eq!(
         limits.used(),
-        WriteWork::new(windows as u64 + 1, (windows * window) as u64),
+        WriteWork::new(windows as u64 + 1, (windows * controls) as u64),
         "a control admitted twice or one inspected unadmitted"
     );
 
@@ -152,9 +156,11 @@ fn erased_controls_before_the_last_entry_remain_in_the_scan_bound() {
         (0, 0, 0)
     );
     let mut limits = Limits::unlimited();
-    let mut cursor = BucketCursor::new();
+    let owner = limits.owner().expect("an ordinary owner");
+    let (mut position, mut window, mut acquisition) = (BucketPosition::new(), None, None);
+    let mut cursor = BucketCursor::new(&mut position, &mut window, &mut acquisition);
     assert!(matches!(
-        cursor.step(&empty as &dyn Buckets, &mut limits),
+        cursor.step(&empty as &dyn Buckets, &owner, &mut limits),
         Ok(BucketStep::Complete)
     ));
     assert_eq!(

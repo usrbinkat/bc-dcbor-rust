@@ -1,0 +1,12 @@
+--- dcbor-derive/src/cddl.rs
++++ dcbor-derive/src/cddl.rs
+@@ -112,7 +112,8 @@
+         _ => unreachable!("a validated schema's shape is its input's"),
+     };
+     let expression = match schema.tag {
+-        Some(tag) => quote!(dcbor::cddl::tagged(#tag, &(#untagged))),
++        // Planted: a tagged type's rule rendered without its tag.
++        Some(_) => untagged,
+         None => untagged,
+     };
+     let mut generics = schema.input.generics.clone();
