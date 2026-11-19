@@ -282,8 +282,10 @@ rule.
 Each is an exact `-p0` diff against the source it plants into, applied to a copy of a clean commit,
 never to the checkout: a change to those lines makes it fail to apply, and the gate fails. The model
 checkers' controls run in the concurrency gate (`tests/concurrency-models.sh`,
-`gate models control`). The native and Miri controls run in `tests/controls.sh`, in the shell of the
-toolchain channel their row names (a Miri control's is nightly, whose toolchain carries Miri): red
+`gate models control`). The native, Miri and Kani controls run in `tests/controls.sh CHANNEL`, the
+channel named, never inferred, and refused in a shell that cannot serve it: a native or Miri
+control in the shell of the toolchain channel its row names (a Miri control's is nightly, whose
+toolchain carries Miri), a Kani control under `kani` in any shell carrying `cargo kani`: red
 with the diff applied, then green with it reversed in the same copy, the copy's digest required to
 change with the diff and to read back equal once it is reversed (`gate control evidence`). A Miri
 control's test runs under the Miri gate's own command and its model's flags (`tests/gate-common.sh`,

@@ -14,16 +14,19 @@
 #
 # The model checkers' controls are the concurrency gate's
 # (tests/concurrency-models.sh). Each control names the toolchain channel
-# its suite runs under; this script runs the controls of the channel of the
-# shell it runs in, so a control blessed on stable is run from the stable
-# shell, and a Miri control, Miri being a nightly component, from the
-# nightly one. A Kani control (runner `kani`, one proof harness checked
-# alone) runs from the proof shell, whose channel is `kani`: Kani pins its
-# own toolchain, so that shell is told apart by `cargo kani` on its PATH,
-# never by its compiler's release; the gate tool builds and checks it
-# (`control run`, tests/gate/src/controls.rs) as it does a native one.
+# its suite runs under, and this script runs the controls of the one channel
+# named on its command line, never inferred: every development shell carries
+# `cargo kani` (flake.nix, `maintenance`), so one shell serves its compiler's
+# channel and Kani's. A native or Miri control runs under `nightly` or
+# `stable`, refused unless this shell's compiler is that channel's release:
+# a control blessed on stable from the stable shell, a Miri control, Miri
+# being a nightly component, from the nightly one. A Kani control (runner
+# `kani`, one proof harness checked alone) runs under `kani`, refused unless
+# `cargo kani` is on PATH; Kani pins its own toolchain, and the gate tool
+# builds and checks it (`control run`, tests/gate/src/controls.rs) as it
+# does a native one.
 #
-# Usage: tests/controls.sh
+# Usage: tests/controls.sh {nightly|stable|kani}
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
@@ -35,21 +38,36 @@ for tool in cargo rustc patch time sha256sum git tar find xargs; do
 		exit 127
 	fi
 done
-if (($# != 0)); then
-	echo "usage: tests/controls.sh" >&2
+if (($# != 1)); then
+	echo "usage: tests/controls.sh {nightly|stable|kani}" >&2
 	exit 2
 fi
+channel="$1"
+release="$(rustc -V)" || exit 2
+case "$channel" in
+nightly | stable)
+	served=stable
+	if [[ "$release" == *nightly* ]]; then
+		served=nightly
+	fi
+	if [[ "$channel" != "$served" ]]; then
+		printf 'channel %s: this shell compiles with %s, a %s release\n' "$channel" "$release" "$served" >&2
+		exit 2
+	fi
+	;;
+kani)
+	if ! command -v cargo-kani >/dev/null; then
+		echo "channel kani: cargo kani is not on PATH; run in a development shell" >&2
+		exit 2
+	fi
+	;;
+*)
+	echo "usage: tests/controls.sh {nightly|stable|kani}" >&2
+	exit 2
+	;;
+esac
 gate_prepare || exit 2
 miri_models || exit 2
-release="$(rustc -V)" || exit 2
-if command -v cargo-kani >/dev/null; then
-	channel=kani
-else
-	case "$release" in
-	*nightly*) channel=nightly ;;
-	*) channel=stable ;;
-	esac
-fi
 logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls log directory}/controls-$channel}"
 mkdir -p "$logs" || exit 2
 

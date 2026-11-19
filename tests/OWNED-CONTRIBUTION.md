@@ -84,14 +84,16 @@ nix develop .#custom-std -c env DCBOR_REACH_DIR=<reach directory> MIRI_LOG_DIR=<
 
 Run the planted controls at a clean commit, each on a copy of it, never the
 checkout (`tests/data/controls/controls.tsv`, `tests/data/README.md`, Planted
-controls): the native and Miri controls in the shell of the toolchain
-channel their row names (Miri's is the nightly fork shell), red with the
-diff applied and green again with it reversed in the same copy; the model
-checkers' controls in the concurrency gate:
+controls): each toolchain channel named on the command line, the native and
+Miri controls in the shell of the channel their row names (Miri's is the
+nightly fork shell), the Kani controls in any shell carrying `cargo kani`,
+red with the diff applied and green again with it reversed in the same copy;
+the model checkers' controls in the concurrency gate:
 
 ```sh
-nix develop .#custom-std -c env CONTROL_LOG_DIR=<log directory> bash tests/controls.sh
-nix develop .#stable -c env CONTROL_LOG_DIR=<log directory> bash tests/controls.sh
+nix develop .#custom-std -c env CONTROL_LOG_DIR=<log directory> bash tests/controls.sh nightly
+nix develop .#stable -c env CONTROL_LOG_DIR=<log directory> bash tests/controls.sh stable
+nix develop .#custom-std -c env CONTROL_LOG_DIR=<log directory> bash tests/controls.sh kani
 nix develop .#custom-std -c env CONCURRENCY_LOG_DIR=<log directory> bash tests/concurrency-models.sh gate
 ```
 
