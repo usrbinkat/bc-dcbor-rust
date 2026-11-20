@@ -186,8 +186,10 @@ fn running(pid: u32) -> std::io::Result<bool> {
 fn reading_stdin(pid: u32) -> std::io::Result<bool> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/syscall"))?;
     let mut fields = text.split_whitespace();
-    Ok(fields.next().and_then(|number| number.parse::<i64>().ok())
-        == Some(i64::from(libc::SYS_read))
+    Ok(fields
+        .next()
+        .and_then(|number| number.parse::<libc::c_long>().ok())
+        == Some(libc::SYS_read)
         && fields.next() == Some("0x0"))
 }
 
