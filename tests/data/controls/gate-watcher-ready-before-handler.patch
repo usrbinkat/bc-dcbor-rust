@@ -1,0 +1,12 @@
+--- tests/gate-common.sh
++++ tests/gate-common.sh
+@@ -43,8 +43,8 @@
+ 				sleep 1
+ 				kill -KILL 0
+ 			}
+-			trap stop_group TERM INT HUP
+ 			printf '%s\n' ready
++			trap stop_group TERM INT HUP
+ 			while read -r parent < <(ps -o ppid= -p "$$") && [[ "$parent" == "$supervisor" ]]; do
+ 				sleep 1
+ 			done

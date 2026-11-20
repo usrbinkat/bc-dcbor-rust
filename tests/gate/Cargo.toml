@@ -43,5 +43,11 @@ serde_json = "1"
 # holds one syn.
 syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 
+[dev-dependencies]
+# `setsid(2)`, which the launcher tests call in each fixture's child before
+# it execs (`tests/launchers.rs`, `HoldingGate::start`): every fixture runs in
+# a session of its own, observed by its members, with no host program.
+libc = "0.2"
+
 [lints]
 workspace = true

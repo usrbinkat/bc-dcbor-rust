@@ -562,8 +562,24 @@ consumption, watcher handler installation, readiness publication, and workload e
 Bash DEBUG tracing pauses the boundary process with SIGSTOP; the test observes its stopped state
 before signaling the supervisor and resuming the boundary process. The copied supervisor source is
 unchanged. Every boundary requires no workload PID recorded yet; a missing boundary fails
-qualification rather than counting as a successful interruption. The unowned control is registered
-against each of the three tests. Process inspection propagates unexpected errors instead of treating
+qualification rather than counting as a successful interruption. At the watcher and readiness
+boundaries the gate is positively observed waiting for readiness (`awaiting_readiness`): its
+leader, the held watcher's parent, sleeps in read(2) on standard input (`/proc/PID/syscall`, which
+reports `running` for any runnable task, so an unscheduled gate is never taken for a blocked one),
+and that standard input is the pipe the held watcher's standard output writes; a gate that records
+work first fails at once. `a_gate_starts_its_work_once_its_watcher_is_ready` makes the same
+observation, then releases the watcher and requires the gate to start its work and exit normally
+with nothing left running. The unowned control is registered against each of the three
+interruption tests. Narrower controls each remove one mechanism:
+`gate-watcher-parent-unwatched.patch` makes the watcher loop without reading its gate's parent, so
+a supervisor killed by SIGKILL leaves the group running, refused by
+`a_stopped_gate_leaves_no_process_running`; `gate-watcher-ready-before-handler.patch` publishes
+readiness before the watcher installs its handler, and `gate-readiness-wait-bypassed.patch` makes
+the gate skip the readiness read, so in both the gate starts its work while the watcher is held at
+its handler installation, refused by `a_gate_starts_its_work_once_its_watcher_is_ready`. The
+fixture's session is created by
+`setsid(2)` in the spawned child before it execs bash (`libc`, a dev-dependency), with no host
+program. Process inspection propagates unexpected errors instead of treating
 them as absence. Cleanup rescans and kills remaining fixture processes until the supervisor is
 reaped and no live fixture process remains, with a bounded deadline; cleanup failure fails the test
 or is reported alongside an existing panic. `gate-process-group-uncalled.patch` drops the call from

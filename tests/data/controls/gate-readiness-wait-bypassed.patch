@@ -1,0 +1,11 @@
+--- tests/gate-common.sh
++++ tests/gate-common.sh
+@@ -36,7 +36,7 @@
+ 		local ready
+ 		# EOF before readiness refuses the launch. The pipe handshake does
+ 		# not depend on the caller's inherited signal dispositions.
+-		IFS= read -r ready < <(
++		ready=ready; : < <(
+ 			stop_group() {
+ 				trap '' TERM INT HUP
+ 				kill -TERM 0

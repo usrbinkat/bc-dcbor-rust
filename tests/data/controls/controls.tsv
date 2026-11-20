@@ -616,6 +616,15 @@ session-storage-built-per-element	tests/data/controls/session-storage-built-per-
 gate-process-group-unowned	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_stopped_gate_leaves_no_process_running	-	failed	a gate stopped by SIGTERM left
 gate-process-group-unowned-nested	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_stopped_gate_ends_the_gates_it_started	-	failed	a nested gate stopped by SIG
 gate-process-group-unowned-starting	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_gate_stopped_while_it_starts_leaves_no_process_running	-	failed	a gate stopped while starting by SIG
+# A watcher that never reads its gate's parent (tests/gate-common.sh,
+# `own_process_group`): a supervisor killed outright leaves the group running.
+gate-watcher-parent-unwatched	tests/data/controls/gate-watcher-parent-unwatched.patch	native	nightly	dcbor-gate	-	launchers	a_stopped_gate_leaves_no_process_running	-	failed	a gate stopped by SIGKILL left
+# A watcher that announces readiness before installing its handler: the gate
+# starts its work while the watcher can still be ended without escalating.
+gate-watcher-ready-before-handler	tests/data/controls/gate-watcher-ready-before-handler.patch	native	nightly	dcbor-gate	-	launchers	a_gate_starts_its_work_once_its_watcher_is_ready	-	failed	a gate held at watcher passed readiness while its watcher was held
+# A gate that never waits for its watcher's readiness (tests/gate-common.sh,
+# `own_process_group`): it starts its work while the watcher is held.
+gate-readiness-wait-bypassed	tests/data/controls/gate-readiness-wait-bypassed.patch	native	nightly	dcbor-gate	-	launchers	a_gate_starts_its_work_once_its_watcher_is_ready	-	failed	a gate held at watcher passed readiness while its watcher was held
 # A gate that never calls `own_process_group` (tests/controls.sh): the
 # census of the gates names it.
 gate-process-group-uncalled	tests/data/controls/gate-process-group-uncalled.patch	native	nightly	dcbor-gate	-	launchers	every_gate_owns_its_process_group	-	failed	gates owning no process group

@@ -455,6 +455,7 @@ dependencies = [
  "dcbor-model-bounds",
  "dcbor-record",
  "dcbor-refinement",
+ "libc",
  "serde",
  "serde_json",
  "syn 2.0.119",

@@ -3,6 +3,7 @@
 //! the programs it launches replaced by recorders.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -131,25 +132,42 @@ while [[ ! -e release ]]; do sleep 0.05; done
 exit 0
 "#;
 
+/// A process's state, parent and session: proc_pid_stat(5) fields 3, 4 and
+/// 6, which the ptrace access check does not suppress.
+struct Stat {
+    state: char,
+    parent: u32,
+    session: u32,
+}
+
+impl Stat {
+    fn running(&self) -> bool {
+        !matches!(self.state, 'Z' | 'X' | 'x')
+    }
+}
+
 /// Read the kernel's process state; disappearance is distinct from an
 /// unreadable or malformed record.
-fn process_state(pid: u32) -> std::io::Result<Option<(char, u32)>> {
+fn process_state(pid: u32) -> std::io::Result<Option<Stat>> {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat
             .rsplit_once(") ")
             .and_then(|(_, fields)| {
-                // proc_pid_stat(5): state, parent, group, session. These
-                // fields are not suppressed by the ptrace access check.
                 let mut fields = fields.split_whitespace();
-                let state = fields.next()?;
-                let mut chars = state.chars();
-                let state = chars.next()?;
+                let mut state = fields.next()?.chars();
+                let (state, None) = (state.next()?, state.next()) else {
+                    return None;
+                };
+                let parent = fields.next()?.parse().ok()?;
                 fields.next()?.parse::<u32>().ok()?;
-                fields.next()?.parse::<u32>().ok()?;
-                let session = fields.next()?.parse::<u32>().ok()?;
-                (chars.next().is_none() && "RSDZTtXxKWPI".contains(state))
-                    .then_some(Some((state, session)))
+                let session = fields.next()?.parse().ok()?;
+                "RSDZTtXxKWPI".contains(state).then_some(Stat {
+                    state,
+                    parent,
+                    session,
+                })
             })
+            .map(Some)
             .ok_or_else(|| std::io::Error::other(format!("invalid /proc/{pid}/stat"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -157,10 +175,20 @@ fn process_state(pid: u32) -> std::io::Result<Option<(char, u32)>> {
 }
 
 fn running(pid: u32) -> std::io::Result<bool> {
-    Ok(!matches!(
-        process_state(pid)?,
-        None | Some(('Z' | 'X' | 'x', _))
-    ))
+    Ok(process_state(pid)?.is_some_and(|stat| stat.running()))
+}
+
+/// Whether `pid` sleeps in read(2) on its standard input: the system call
+/// and first argument a blocked task reports (proc_pid_syscall(5)). A
+/// runnable task reports `running` instead, so an unscheduled process is
+/// never taken for a blocked one. Reading it requires ptrace attach access,
+/// which the test process, an ancestor of every fixture process, holds.
+fn reading_stdin(pid: u32) -> std::io::Result<bool> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/syscall"))?;
+    let mut fields = text.split_whitespace();
+    Ok(fields.next().and_then(|number| number.parse::<i64>().ok())
+        == Some(i64::from(libc::SYS_read))
+        && fields.next() == Some("0x0"))
 }
 
 /// All live members of the fixture's session, including nested groups and
@@ -177,9 +205,7 @@ fn running_in(session: u32) -> std::io::Result<Vec<u32>> {
         else {
             continue;
         };
-        if process_state(pid)?
-            .is_some_and(|(state, member)| member == session && !matches!(state, 'Z' | 'X' | 'x'))
-        {
+        if process_state(pid)?.is_some_and(|stat| stat.session == session && stat.running()) {
             found.push(pid);
         }
     }
@@ -212,12 +238,8 @@ impl HoldingGate {
         )
         .unwrap();
         scratch.executable("tests/hold.sh", HOLDING_GATE);
-        // The spawned process inherits the test's process group, so it is
-        // not a group leader: setsid execs bash without forking. Its PID
-        // identifies the session inherited by every fixture descendant.
-        let mut command = Command::new("setsid");
+        let mut command = Command::new("bash");
         command
-            .arg("bash")
             .arg("tests/hold.sh")
             .current_dir(&scratch.0)
             .env_remove("DCBOR_GATE_SUPERVISOR")
@@ -229,6 +251,21 @@ impl HoldingGate {
             .stderr(Stdio::null());
         for (name, value) in environment {
             command.env(name, value);
+        }
+        // The child, a fresh fork in the test's process group and so no
+        // group leader, starts a session of its own before it execs bash:
+        // its PID is the session every fixture descendant inherits, nested
+        // groups and reparented processes included.
+        // SAFETY: `setsid(2)` is async-signal-safe (signal-safety(7)) and
+        // touches no memory the parent shares; its failure fails the spawn.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
         }
         let root = std::fs::canonicalize(&scratch.0).unwrap();
         Self {
@@ -266,17 +303,20 @@ impl HoldingGate {
 
     /// The boundary is reached only once its reporting process is stopped.
     /// Recording its PID alone is insufficient: SIGCONT could otherwise
-    /// arrive before SIGSTOP and leave the fixture suspended.
-    fn boundary(&mut self, phase: &str, action: &str) -> u32 {
+    /// arrive before SIGSTOP and leave the fixture suspended. `qualifying`
+    /// names the case a missing boundary leaves unqualified.
+    fn boundary(&mut self, phase: &str, qualifying: &str) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match std::fs::read_to_string(self.root.join("boundary")) {
                 Ok(text) => {
                     if let Ok(pid) = text.trim().parse::<u32>() {
                         match process_state(pid) {
-                            Ok(Some(('T', session))) if session == self.supervisor.id() => {
-                                return pid;
-                            }
+                            Ok(Some(Stat {
+                                state: 'T',
+                                session,
+                                ..
+                            })) if session == self.supervisor.id() => return pid,
                             Ok(_) => {}
                             Err(error) => panic!("inspect {phase} boundary process: {error}"),
                         }
@@ -287,7 +327,45 @@ impl HoldingGate {
             }
             assert!(
                 self.supervisor.try_wait().unwrap().is_none() && Instant::now() < deadline,
-                "a gate stopped while starting by SIG{action} cannot be qualified: {phase} boundary was not reached"
+                "{qualifying} cannot be qualified: {phase} boundary was not reached"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A gate whose watcher is held at `phase`, before its handler is
+    /// installed or before readiness is published, waits for readiness: its
+    /// leader, the held watcher's parent, is observed asleep in read(2) on
+    /// its standard input ([`reading_stdin`]), the pipe the watcher's
+    /// standard output writes. A leader past readiness never blocks on that
+    /// pipe again and records its work, which fails at once.
+    fn awaiting_readiness(&self, watcher: u32, phase: &str) {
+        let leader = process_state(watcher)
+            .expect("inspect the held watcher")
+            .expect("the held watcher is running")
+            .parent;
+        let pipe = std::fs::read_link(format!("/proc/{watcher}/fd/1"))
+            .expect("read the held watcher's standard output");
+        assert!(
+            pipe.to_str().is_some_and(|name| name.starts_with("pipe:")),
+            "the held watcher writes {}, not the readiness pipe",
+            pipe.display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pids = self.pids();
+            assert!(
+                pids.is_empty(),
+                "a gate held at {phase} passed readiness while its watcher was held: it recorded {pids:?}"
+            );
+            let input = std::fs::read_link(format!("/proc/{leader}/fd/0"))
+                .expect("read the leader's standard input");
+            if input == pipe && reading_stdin(leader).expect("inspect the leader's system call") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a gate held at {phase} was never observed waiting on its watcher's readiness"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -439,7 +517,13 @@ fn a_gate_stopped_while_it_starts_leaves_no_process_running() {
                         ("HOLD_PHASE", phase),
                     ],
                 );
-                let paused = gate.boundary(phase, action);
+                let paused = gate.boundary(
+                    phase,
+                    &format!("a gate stopped while starting by SIG{action}"),
+                );
+                if matches!(phase, "watcher" | "readiness") {
+                    gate.awaiting_readiness(paused, phase);
+                }
                 assert!(
                     gate.pids().is_empty(),
                     "work started before release of the {phase} startup boundary"
@@ -463,6 +547,33 @@ fn a_gate_stopped_while_it_starts_leaves_no_process_running() {
                 );
             }
         }
+    }
+}
+
+/// A gate whose watcher is held before installing its handler, or before
+/// publishing readiness, waits on that watcher ([`HoldingGate::awaiting_readiness`]);
+/// released, the watcher publishes readiness, and the gate starts its work
+/// and exits normally with nothing left running.
+#[test]
+fn a_gate_starts_its_work_once_its_watcher_is_ready() {
+    for phase in ["watcher", "readiness"] {
+        let scratch = Scratch::new(&format!("process-group-ready-{phase}"));
+        let mut gate = HoldingGate::start(&scratch, &[("HOLD_PHASE", phase)]);
+        let watcher = gate.boundary(phase, "a gate released by its watcher");
+        gate.awaiting_readiness(watcher, phase);
+        let resumed = signal("CONT", &watcher.to_string()).unwrap();
+        assert!(resumed.success(), "resume the {phase} watcher {watcher}");
+        let pids = gate.started(4);
+        std::fs::write(scratch.0.join("release"), "").unwrap();
+        let (status, left) = gate.stopped();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "a gate released at {phase} did not exit normally: {status:?}"
+        );
+        assert!(
+            left.is_empty(),
+            "a gate released at {phase} left {left:?} of {pids:?} running"
+        );
     }
 }
 
