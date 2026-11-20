@@ -1,0 +1,11 @@
+--- src/bounded/policy/record.rs
++++ src/bounded/policy/record.rs
+@@ -225,7 +225,7 @@
+ }
+
+ /// A permit record's lifecycle.
+-const VOID: u64 = 0;
++const VOID: u64 = 4;
+ // A session's permit records are allocated zeroed (`zeroed`): the all-zero
+ // record must be a void one.
+ const _: () = assert!(VOID == 0, "a zeroed permit record is VOID");

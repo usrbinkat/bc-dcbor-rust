@@ -172,7 +172,12 @@ of two, never below the default (`support::measured`, private to the support cra
 integration test can size a recording by hand); an overflowing count is refused. Apart from a
 budget, a recording is never enlarged: a pipeline schedule states no capacity, and the one public
 sizing, `support::recorded_run_short`, only shrinks the default, to witness a recording's
-exhaustion. The default is defined once, by the library (`Capacity::DEFAULT`), and
+exhaustion. A session's permit records and event slots are one zeroed allocation each
+(`policy/record.rs`, `zeroed`): every field is a `core` `AtomicU64` of 0 and a void record's state is
+0, so no element is built one by one and the allocator's pages are written only as observations
+are published, natively and under Miri; a model checker's build (`loom`, `shuttle`), whose atomics
+carry state of their own, constructs each element. The default is defined once, by the library
+(`Capacity::DEFAULT`), and
 `support::CAPACITY` names it: the library's own unit tests, which cannot reach the support crate,
 record into the same default. A capacity is stated only by the budget authority (`measured`,
 `MEASURING`) or where the size is what its test checks (a boundary bounded by its slot count, an
@@ -506,7 +511,9 @@ record within the default. `budget-absent-record-measured.patch` reads a checked
 record as its recording run; `a_checked_family_requires_its_complete_record` requires an absent or
 incomplete record refused outside the recording run. `recording-capacity-hand-sized.patch` sizes the
 stable-storage tests' session by hand inside a local macro; the sizing census requires that macro
-named outside the exact-size table.
+named outside the exact-size table. `zeroed-record-not-void.patch` gives a void permit record a
+nonzero state; the assertion beside `VOID` refuses the build, naming
+`a zeroed permit record is VOID`.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both

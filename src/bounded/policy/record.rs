@@ -226,6 +226,9 @@ struct PermitRecord {
 
 /// A permit record's lifecycle.
 const VOID: u64 = 0;
+// A session's permit records are allocated zeroed (`zeroed`): the all-zero
+// record must be a void one.
+const _: () = assert!(VOID == 0, "a zeroed permit record is VOID");
 const LIVE: u64 = 1;
 const RETIRED: u64 = 2;
 const RELEASED: u64 = 3;
@@ -338,6 +341,33 @@ fn invalidation(store: &Shared) -> Option<Invalidation> {
     Invalidation::of(store.invalid.load(Ordering::Acquire))
 }
 
+/// `len` values each equal to `make()`, allocated whole: a session's permit
+/// records or its slots. The shipped build allocates them zeroed in one
+/// request: `core`'s `AtomicU64` has the in-memory representation of `u64`,
+/// so the all-zero bytes are `AtomicU64::new(0)`; the allocator's zeroed
+/// pages are written only as observations are published, and no element is
+/// constructed one by one, natively or under Miri. A model checker's atomics
+/// (`loom`, `shuttle`) carry state of their own that no zero pattern holds,
+/// so those builds construct each element with `make`.
+///
+/// # Safety
+/// The all-zero byte pattern of `T` is a valid `T` equal to `make()`'s.
+#[cfg(not(any(loom, shuttle)))]
+unsafe fn zeroed<T>(len: usize, _make: impl FnMut() -> T) -> Box<[T]> {
+    // SAFETY: forwarded from the caller: all-zero bytes are a valid `T`.
+    unsafe { Box::<[T]>::new_zeroed_slice(len).assume_init() }
+}
+
+/// [`zeroed`] under a model checker: each element constructed with `make`.
+///
+/// # Safety
+/// None beyond `make`'s own; declared `unsafe` to share the shipped build's
+/// signature.
+#[cfg(any(loom, shuttle))]
+unsafe fn zeroed<T>(len: usize, make: impl FnMut() -> T) -> Box<[T]> {
+    core::iter::repeat_with(make).take(len).collect()
+}
+
 /// `index`, a claimed slot or record index, as a slice index. Every index
 /// passed here was claimed below a slice's length, which is a `usize`, so it
 /// fits; none is ever truncated.
@@ -369,26 +399,28 @@ impl core::fmt::Debug for Session {
 
 impl Session {
     /// A session able to observe `capacity` completely: all of its storage
-    /// is allocated here.
+    /// is allocated here, before anything is observed.
     pub fn new(capacity: Capacity) -> Self {
-        let permits = (0..capacity.permits)
-            .map(|_| PermitRecord {
+        // SAFETY: every field of a permit record is an `AtomicU64` made with
+        // 0, `VOID` included (`VOID` is 0): the all-zero record.
+        let permits = unsafe {
+            zeroed(capacity.permits, || PermitRecord {
                 bytes: AtomicU64::new(0),
                 sequence: AtomicU64::new(0),
                 family: AtomicU64::new(0),
                 state: AtomicU64::new(VOID),
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let slots = (0..capacity.events)
-            .map(|_| Slot {
+        };
+        // SAFETY: every field of a slot, each word included, is an
+        // `AtomicU64` made with 0: the all-zero slot.
+        let slots = unsafe {
+            zeroed(capacity.events, || Slot {
                 ready: AtomicU64::new(0),
                 family: AtomicU64::new(0),
                 by: AtomicU64::new(0),
                 words: core::array::from_fn(|_| AtomicU64::new(0)),
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        };
         Self {
             store: Arc::new(Store {
                 families: AtomicU64::new(0),
