@@ -162,9 +162,10 @@ btree-prefix-arena-overdropped	tests/data/controls/btree-prefix-arena-overdroppe
 # A block's acquisition admitting its write again on a retry: the resumed
 # entry, its write and release held, reads them as not yet admitted and
 # admits the write once more (its hold then refused), which the composite
-# S2 witness reports at A's admitted ledger after the first refused request,
+# S2 witness reports at A's admitted ledger at the first retry, request 1
+# (request 0 is the first entry, with nothing yet admitted to admit again),
 # before the call's own result (stable.rs, acquire).
-pending-readmit-on-refusal	tests/data/controls/pending-readmit-on-refusal.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s2_a_refused_block_acquisition_admits_its_write_and_release_once	-	failed	A across refused request 0: admitted
+pending-readmit-on-refusal	tests/data/controls/pending-readmit-on-refusal.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s2_a_refused_block_acquisition_admits_its_write_and_release_once	-	failed	A across refused request 1: admitted
 # Cleanup entry spending a held grant instead of forfeiting it: the grant's
 # work is consumed in A's ledger where cancellation requires its forfeiture,
 # which S4 reports at A's consumed ledger on the cancel path
@@ -172,11 +173,13 @@ pending-readmit-on-refusal	tests/data/controls/pending-readmit-on-refusal.patch	
 pending-settle-wrong-disposition	tests/data/controls/pending-settle-wrong-disposition.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s4_cancel_and_drop_forfeit_into_the_admitting_families	-	failed	A, cancel under D: consumed
 # The origin every held admission stores made a detached family: the
 # obligation admitted under A carries an origin, and so an identity, of no
-# family of the session, and its settlements reach no family's ledger. S1
-# reports it at A's held obligations, read by identity from the pending's
-# slots, before any settlement (policy.rs, Limits::origin, which
-# `admit_held_at` stores).
-pending-settle-wrong-origin	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s1_a_release_refused_under_a_is_admitted_once_under_b	-	failed	A after the refusal: held, observed in the slots
+# family of the session, and its settlements reach no family's ledger
+# (policy.rs, Limits::origin, which `admit_held_at` stores). The acquisition
+# keeps its minting family's origin (Limits::acquisition), which
+# `Acquisition::minted` requires, so the defect reaches the obligations it
+# is about. S1 reports it at A's held obligations once B's resume holds the
+# release, read by identity from the pending's slots, before any settlement.
+pending-settle-wrong-origin	tests/data/controls/pending-settle-wrong-origin.patch	native	nightly	dcbor	all	lib	bounded::decode::construction::stable::tests::s1_a_release_refused_under_a_is_admitted_once_under_b	-	failed	A after the resume: held, observed in the slots
 # The same detached origin, through the four-family provenance cases of the
 # decode scope's token and authority (reclamation/owned.rs): the grant's
 # write admitted under a, its release under b, the storage under c, the
@@ -298,7 +301,7 @@ storage-tenant-short-of-peak	tests/data/controls/storage-tenant-short-of-peak.pa
 # (policy/record.rs, `exhaust`): concurrent workers over one exhausted pool
 # then name the foreign pairings that follow the exhaustion, which the
 # concurrent integrity witness names (tests/support/lifecycle.rs).
-invalidation-last-cause-kept	tests/data/controls/invalidation-last-cause-kept.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::concurrent_workers_each_name_the_first_invalidation	-	failed	a worker named another first cause
+invalidation-last-cause-kept	tests/data/controls/invalidation-last-cause-kept.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::concurrent_workers_each_name_the_first_invalidation	-	failed	a worker returned another stop than the loss by Permits
 # A body's finding returned past the recorded run's finalization
 # (tests/support/lifecycle.rs, `recorded_run_with`): the driver's stop
 # reaches the caller alone, the session never finished and its refusal never
@@ -308,9 +311,10 @@ recording-loss-skips-finalization	tests/data/controls/recording-loss-skips-final
 # `lost`): a grant refused unrecorded once the permit records ran out
 # reaches the caller as the operation's own refusal, its cause lost, which
 # the permit-exhaustion witness names; a copy outgrowing its event slots
-# completes with no stop at all, which the event-slot witness names.
+# returns no loss by Events (its checkpoints, refused as no evidence, end it
+# as a defect instead), which the event-slot witness names.
 driver-evidence-unchecked	tests/data/controls/driver-evidence-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_permit_records	-	failed	the stop returned is not the recording's loss by Permits
-driver-evidence-unchecked-events	tests/data/controls/driver-evidence-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots	-	failed	the body returned the driver's stop
+driver-evidence-unchecked-events	tests/data/controls/driver-evidence-unchecked.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots	-	failed	the stop returned is not the recording's loss by Events
 # A fixture runner returning a lost recording alone (native_harness.rs,
 # `every_fixture`): the failures found before the loss are dropped, which the
 # aggregation witness names across its joined workers.
@@ -548,12 +552,15 @@ window-traversal-skips-part	tests/data/controls/window-traversal-skips-part.patc
 window-end-before-settlement	tests/data/controls/window-end-before-settlement.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::window_custody_is_whole_and_closed_in_order_at_every_relocation_boundary	-	failed	an acquisition ended before every credit was settled
 window-end-omitted	tests/data/controls/window-end-omitted.patch	native	nightly	dcbor	all	lib	bounded::encoding::bound_tests::window_custody_is_whole_and_closed_in_order_at_every_relocation_boundary	-	failed	each acquisition ended once
 window-remint-on-retry	tests/data/controls/window-remint-on-retry.patch	native	nightly	dcbor	all	held_credit	preparation_repeated_refusal_admits_the_window_exactly_once	-	failed	refusal replaced the credit-free acquisition
-window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly	dcbor	all	held_credit	preparation_continues_a_window_across_families	-	failed	the run's recording does not refine the protocol
+window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly	dcbor	all	held_credit	preparation_continues_a_window_across_families	-	failed	does not refine the protocol
 # A retired record linked into the scope queue with its custody still
-# `Handle` (reclamation.rs, `Reclaimer::enqueue`): a stopped decoder's records
-# stay handles in the queue, which the retirement orchestration's comparison
-# names for the stopped value (tests/support lifecycle.rs, `retired`).
-retirement-record-left-unqueued	tests/data/controls/retirement-record-left-unqueued.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_stopped_decoder_queues_every_record_it_held	-	failed	the value's Handle record
+# `Handle` (reclamation.rs, `Reclaimer::enqueue`): the queue's removal
+# requires every record it takes to be `Queued` (`Reclaimer::step`), so the
+# stopped decoder's drain refuses the first record it removes, before the
+# retirement orchestration's own comparison is reached; the drop's terminal
+# drain refuses it again during the unwind, which aborts the test's process
+# (judged by its one started test, `controls::alone`).
+retirement-record-left-unqueued	tests/data/controls/retirement-record-left-unqueued.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_stopped_decoder_queues_every_record_it_held	-	abnormal_termination	custody.get() == Holder::Queued
 # A standalone consumer's unwind bypassing the held cleanup schedule:
 # its initialized destination outlives finalization, which the unwind
 # witness refuses independently of the original consumer panic.

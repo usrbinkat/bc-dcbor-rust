@@ -490,12 +490,23 @@ mod tests {
     /// derivation; loom's overflow is no shuttle's.
     #[test]
     fn any_other_failure_ends_the_derivation() {
-        let refused = derive(Checker::Loom, false, 4096, |_, _| ran(Outcome::Failed))
-            .expect_err("a failing model was derived");
-        assert!(
-            refused.contains("neither its bound nor its stack"),
-            "{refused}"
-        );
+        for checker in [Checker::Loom, Checker::Shuttle] {
+            for outcome in [Outcome::Failed, Outcome::AbnormalTermination] {
+                for sized in [false, true] {
+                    let mut calls = 0;
+                    let refused = derive(checker, sized, 4096, |_, _| {
+                        calls += 1;
+                        ran(outcome)
+                    })
+                    .expect_err("a failing model was derived");
+                    assert!(
+                        refused.contains("neither its bound nor its stack"),
+                        "{refused}"
+                    );
+                    assert_eq!(calls, 1, "a defect caused a bound or stack retry");
+                }
+            }
+        }
         let refused = derive(Checker::Shuttle, true, 4096, |_, _| {
             ran(Outcome::StackOverflow)
         })
@@ -593,14 +604,16 @@ mod tests {
             .iter()
             .map(|planned| row_of(planned, planned.expected))
             .collect();
-        rows[1].outcome = Outcome::Failed;
-        let faults = verdict(&listed(), &bounds(), &rows);
-        assert!(
-            faults
-                .iter()
-                .any(|fault| fault.contains("where only bound_refused")),
-            "{faults:#?}"
-        );
+        for outcome in [Outcome::Failed, Outcome::AbnormalTermination] {
+            rows[1].outcome = outcome;
+            let faults = verdict(&listed(), &bounds(), &rows);
+            assert!(
+                faults
+                    .iter()
+                    .any(|fault| fault.contains("where only bound_refused")),
+                "{faults:#?}"
+            );
+        }
         rows[1].outcome = Outcome::BoundRefused;
         let mut raised = rows[0].clone();
         raised.bound = Some(1000);

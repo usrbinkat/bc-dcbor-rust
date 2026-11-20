@@ -863,6 +863,118 @@ esac
     assert_eq!(status.code(), Some(0), "{report}");
 }
 
+/// Budget recording requires exactly one receipt in each phase, including
+/// when multiple receipts share libtest's output line. The fixture gate
+/// accepts the test outcome so receipt validation is exercised independently.
+#[test]
+fn budget_recording_requires_one_receipt_in_each_phase() {
+    let scratch = Scratch::new("budget-receipts");
+    std::fs::copy(
+        tests().join("record-evidence.sh"),
+        scratch.0.join("tests/record-evidence.sh"),
+    )
+    .unwrap();
+    scratch.executable(
+        "tests/gate-common.sh",
+        r#"own_process_group() { :; }
+gate_prepare() { confined=(); }
+gate() {
+    case "$1" in
+    variants) printf 'std\tfixture\n' ;;
+    budgets) printf 'fixture.txt\tstd\tfixture\tone\tfast\twitness\n' ;;
+    classify) echo pass ;;
+    current) printf 'current\n' >>"$CALLS" ;;
+    *) return 2 ;;
+    esac
+}
+"#,
+    );
+    scratch.executable(
+        "bin/cargo",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ -v DCBOR_RECORD_BUDGETS ]]; then
+    [[ "$DCBOR_RECORD_BUDGETS" == fixture.txt ]] || exit 2
+    phase=record
+else
+    phase=check
+fi
+printf '%s\n' "$phase" >>"$CALLS"
+if [[ "$phase" == "$RECEIPT_PHASE" ]]; then
+    printf '%s\n' "$RECEIPT"
+else
+    printf 'test one ... budget finalized: fixture.txt\n'
+fi
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        scratch.0.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let calls = scratch.0.join("calls");
+    for phase in ["record", "check"] {
+        for (receipt, accepted) in [
+            ("test one ... budget finalized: fixture.txt", true),
+            ("test one ... ok", false),
+            ("budget finalized: other.txt", false),
+            (
+                "budget finalized: fixture.txt\nbudget finalized: fixture.txt",
+                false,
+            ),
+            (
+                "budget finalized: fixture.txt budget finalized: fixture.txt",
+                false,
+            ),
+            (
+                "budget finalized: other.txt budget finalized: fixture.txt",
+                false,
+            ),
+        ] {
+            std::fs::write(&calls, "").unwrap();
+            let output = Command::new("bash")
+                .args(["tests/record-evidence.sh", "record-budgets"])
+                .current_dir(&scratch.0)
+                .env("PATH", &path)
+                .env("TMPDIR", &scratch.0)
+                .env("DCBOR_CONFIGURATION", "fixture")
+                .env("DCBOR_RIGOR", "fast")
+                .env("DCBOR_RECORD_BUDGETS", "inherited-must-be-cleared")
+                .env("CALLS", &calls)
+                .env("RECEIPT_PHASE", phase)
+                .env("RECEIPT", receipt)
+                .output()
+                .unwrap();
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "{phase}, receipt {receipt:?}: {report}"
+            );
+            let expected = if accepted || phase == "check" {
+                "record\ncurrent\ncheck\n"
+            } else {
+                "record\n"
+            };
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                expected,
+                "{phase}, receipt {receipt:?}: {report}"
+            );
+            if !accepted {
+                assert!(
+                    report.contains("expected fixture.txt alone"),
+                    "receipt rejected for another reason: {report}"
+                );
+            }
+        }
+    }
+}
+
 /// Every shell script of the repository's `tests` and `fuzz` directories,
 /// by path.
 fn scripts() -> Vec<PathBuf> {

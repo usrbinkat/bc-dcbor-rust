@@ -66,12 +66,12 @@ pub struct RecordState {
 }
 
 /// An acquisition, keyed by its identity: the owner that bound it
-/// (`Event::Bound`), kept after its end for attribution, and whether it is
-/// still active (bound and not yet ended, `Event::End`).
+/// (`Event::Bound`), kept after its end for attribution. Whether it is
+/// still active (bound and not yet ended, `Event::End`) is the machine's
+/// set of unended acquisitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcquisitionState {
     pub owner: Identity,
-    pub active: bool,
 }
 
 /// One family's ledgers, from the events it published.

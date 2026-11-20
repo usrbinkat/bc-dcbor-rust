@@ -151,9 +151,10 @@ fn node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding() {
         let turns = report.boundaries.len();
         eprintln!(
             "[node occupancy boundaries] {count} entries padded by {padding}: {} events, {} \
-             permit records, {turns} turns",
+             permit records, {turns} turns, {:?}",
             report.observed.len(),
             counts(&report.observed).permits,
+            report.phases,
         );
     }
     budgets.finish();
@@ -665,9 +666,10 @@ fn tree_construction_is_complete_and_its_transitions_legal() {
             assert_eq!(map.len(), count, "{count} entries")
         });
         eprintln!(
-            "[tree construction] {count} integer entries: {} events, {} permit records",
+            "[tree construction] {count} integer entries: {} events, {} permit records, {:?}",
             built.observed.len(),
-            counts(&built.observed).permits
+            counts(&built.observed).permits,
+            built.phases,
         );
         legal(&name, &[built], &tree(written(), written()));
     }

@@ -1,12 +1,12 @@
 --- tests/resumable/native_schedules.rs
 +++ tests/resumable/native_schedules.rs
-@@ -404,7 +404,8 @@
-     // records), so the tenant's release is what lets the same decode finish.
+@@ -500,7 +500,8 @@
      // The unobstructed decode's peak establishes it; a pool short of the
      // decode's peak could never complete it, whatever is released.
--    const QUARTER: usize = 32 * 1024;
-+    // Planted: the original tenant of 4 KiB, short of the decode's peak.
-+    const QUARTER: usize = 1024;
-     let tenant = 4 * QUARTER as u64;
+     const QUARTER: usize = 32 * 1024;
+-    let tenant = 4 * QUARTER as u64;
++    // Planted: the pool sized for a tenant of 4 KiB, short of the decode's peak.
++    let tenant = 4 * 1024_u64;
      let capacity = held + tenant;
      assert!(
+         capacity >= peak,

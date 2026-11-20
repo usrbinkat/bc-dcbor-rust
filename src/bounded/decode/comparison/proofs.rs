@@ -44,10 +44,16 @@
 //!   completes, and is finished.
 //!
 //! The loop over a turn's pairs runs at most 64 times, the reference's over
-//! a key at most [`SPAN`] = 67 times and the turns at most three: the
-//! longest is the reference's, `kani::unwind(68)`, its 67 iterations and its
-//! exit. Status: written and unverified until the gate runs them. Compiled
-//! only under `cfg(kani)`.
+//! a key at most [`SPAN`] = 67 times: the longest is the reference's,
+//! `kani::unwind(68)`, its 67 iterations and its exit; the short domain's
+//! loops run at most [`SHORT`] + 1 times, `kani::unwind(6)`. A whole
+//! comparison is driven for a constant [`TURNS`] turns, the reference
+//! schedule's most for keys of [`SPAN`] bytes, never an open loop to
+//! completion: with the driver bounded only by the unwinding bound, a
+//! retained run of the long domain expanded the driver 58 times and the pair
+//! loop 118 times, to its 67th iteration each, without finishing symbolic
+//! execution in 30 minutes. Status: written and unverified until the gate
+//! runs them. Compiled only under `cfg(kani)`.
 
 use core::cmp::Ordering;
 
@@ -100,20 +106,36 @@ fn schedule(shorter: usize, differ: usize) -> (WriteWork, usize) {
     (WriteWork::new(turns as u64, authorized as u64), examined)
 }
 
+/// The most turns a comparison of keys of at most [`SPAN`] bytes takes, by
+/// the reference schedule ([`schedule`]): one per window of the shorter key,
+/// `ceil(SPAN / WINDOW)`.
+const TURNS: usize = SPAN.div_ceil(WINDOW);
+
 /// One run of a comparison, driven to its result under one unrefusing
-/// budget: the order, the pairs examined, and the work admitted; then the
-/// next step, which must be `Finished` and admit nothing.
+/// budget within [`TURNS`] turns: the order, the pairs examined, and the
+/// work admitted; then the next step, which must be `Finished` and admit
+/// nothing. A comparison not complete within its turns fails the harness.
+/// The driving loop runs a constant number of times, so its expansion is
+/// those turns, each one window of [`super::compare_step`], whatever the
+/// harness's unwinding bound.
 fn compared(left: &[u8], right: &[u8]) -> (Ordering, usize, WriteWork) {
     let mut budget = Counting::new(false);
     let mut comparison = KeyComparison::new(left, right);
-    let ordering = loop {
+    let mut completed = None;
+    for _ in 0..TURNS {
         match comparison.step(&mut budget) {
             Ok(Step::Progress) => {}
-            Ok(Step::Complete(ordering)) => break ordering,
+            Ok(Step::Complete(ordering)) => {
+                completed = Some(ordering);
+                break;
+            }
             Ok(Step::Finished) | Err(_) => {
                 panic!("a comparison of in-bounds keys under an unrefusing budget completes")
             }
         }
+    }
+    let Some(ordering) = completed else {
+        panic!("a comparison of keys of at most SPAN bytes completes within its turns")
     };
     let (admitted, attempts) = (budget.admitted, budget.attempts);
     assert!(
@@ -153,8 +175,13 @@ fn agrees(left: &[u8], right: &[u8]) {
 }
 
 /// Every pair of keys of at most [`SHORT`] bytes, every byte any value.
+/// Its loops run at most `SHORT + 1` times (a turn's pairs, the
+/// reference's scan and the slices' own comparison, each over the shorter
+/// key, and the one turn and the finished step): `kani::unwind(SHORT + 2)`,
+/// its unwinding assertions enabled, so a bound short of a reachable
+/// iteration fails the harness, never passes it.
 #[kani::proof]
-#[kani::unwind(68)]
+#[kani::unwind(6)]
 fn short_keys_compare_in_canonical_order() {
     let left: [u8; SHORT] = kani::any();
     let right: [u8; SHORT] = kani::any();

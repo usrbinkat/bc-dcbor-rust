@@ -2,6 +2,7 @@
 //! subsequent checkpoint stores only positional edits. Replay reconstructs
 //! one checkpoint at a time, preserving traversal order and duplicate items.
 
+use crate::machine::Checkpoints;
 use crate::{Checkpoint, Custody, Hold, Identity, Reported};
 
 /// A contiguous replacement between an unchanged prefix and suffix.
@@ -227,22 +228,19 @@ impl History {
 
     /// Reconstruct history in its original order with one working snapshot.
     pub fn iter(&self) -> impl Iterator<Item = Checkpoint> + Clone + '_ {
-        self.deltas.iter().scan(
-            Checkpoint {
-                boundary: 0,
-                custody: Vec::new(),
-            },
-            |checkpoint, delta| {
-                delta.apply(checkpoint);
-                Some(checkpoint.clone())
-            },
-        )
+        let mut replay = Replay::new(&self.deltas);
+        std::iter::from_fn(move || replay.advance().cloned())
     }
 
     /// A checkpoint by its stable ordinal, reconstructed without retaining
     /// the preceding snapshots.
     pub fn get(&self, index: usize) -> Option<Checkpoint> {
-        self.iter().nth(index)
+        self.deltas.get(index)?;
+        let mut replay = Replay::new(&self.deltas[..=index]);
+        for _ in 0..index {
+            replay.advance()?;
+        }
+        replay.advance().cloned()
     }
 
     /// Materialize the history for a serialized trace's owned [`crate::Run`].
@@ -252,9 +250,47 @@ impl History {
     }
 
     /// The same replay and exact divergence rules as [`crate::settled`],
-    /// with snapshots reconstructed only while they are checked.
+    /// each checkpoint reconstructed in one working snapshot as the replay
+    /// reaches it and lent to the check ([`Replay`]), never copied.
     pub fn settled(&self, observed: &[crate::Observed]) -> Result<(), crate::Divergence> {
-        crate::machine::settled_iter(observed, self.iter())
+        crate::machine::settled_with(observed, &mut Replay::new(&self.deltas))
+    }
+}
+
+/// A history's checkpoints as one replay reads them
+/// ([`crate::machine::Checkpoints`]): each boundary from its delta, and each
+/// checkpoint the working snapshot after its delta is applied, lent until
+/// the next.
+#[derive(Clone)]
+struct Replay<'h> {
+    deltas: &'h [Delta],
+    next: usize,
+    working: Checkpoint,
+}
+
+impl<'h> Replay<'h> {
+    fn new(deltas: &'h [Delta]) -> Self {
+        Self {
+            deltas,
+            next: 0,
+            working: Checkpoint {
+                boundary: 0,
+                custody: Vec::new(),
+            },
+        }
+    }
+}
+
+impl Checkpoints for Replay<'_> {
+    fn boundaries(&self) -> Vec<usize> {
+        self.deltas.iter().map(|delta| delta.boundary).collect()
+    }
+
+    fn advance(&mut self) -> Option<&Checkpoint> {
+        let delta = self.deltas.get(self.next)?;
+        self.next += 1;
+        delta.apply(&mut self.working);
+        Some(&self.working)
     }
 }
 
@@ -262,6 +298,21 @@ impl History {
 mod tests {
     use super::*;
     use crate::{Event, Obligation, Observed, Performer, RecordStage, WriteWork};
+
+    /// The lending path and the owned API preserve the original snapshots,
+    /// including malformed custody; reading boundaries does not consume one.
+    fn assert_replay(history: &History, expected: &[Checkpoint]) {
+        let mut replay = Replay::new(&history.deltas);
+        let boundaries: Vec<usize> = expected.iter().map(|point| point.boundary).collect();
+        assert_eq!(replay.boundaries(), boundaries);
+        for checkpoint in expected {
+            assert_eq!(replay.advance(), Some(checkpoint));
+            assert_eq!(replay.boundaries(), boundaries);
+        }
+        assert_eq!(replay.advance(), None);
+        assert_eq!(replay.advance(), None);
+        assert_eq!(history.to_vec(), expected);
+    }
 
     fn group(n: u64) -> Custody {
         Custody {
@@ -303,7 +354,7 @@ mod tests {
             history.push(checkpoint.clone());
             expected.push(checkpoint);
         }
-        assert_eq!(history.to_vec(), expected);
+        assert_replay(&history, &expected);
         for (index, checkpoint) in expected.iter().enumerate() {
             assert_eq!(history.get(index).as_ref(), Some(checkpoint));
         }
@@ -390,11 +441,7 @@ mod tests {
                     .any(|(a, b)| a.owner == b.owner && a.held != b.held)),
             "no checkpoint changed a held obligation"
         );
-        assert_eq!(
-            history.to_vec(),
-            expected,
-            "reconstructed checkpoints differ from the checkpoints pushed"
-        );
+        assert_replay(&history, &expected);
     }
 
     #[test]

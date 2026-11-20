@@ -225,6 +225,25 @@ allocations the heap observer holds whole, observed only across the pushes; thei
 equal `History::retained_bytes`, every checkpoint must reconstruct exactly, the storage must be
 within the changes, and dropping the history must release every byte.
 
+Every turn of a recorded driver collects the whole custody it holds and every checkpoint is replayed
+through the machine, so a run's cost grows with its turns times its live custody. The replay reads
+each checkpoint's boundary from its delta and lends each reconstructed checkpoint to the machine
+(`machine::Checkpoints`, `history.rs` `Replay`), never a copy per checkpoint. The machine indexes
+what it holds live (unended acquisitions, obligations still holding work, by identity and by
+acquisition, and live permits), so a checkpoint, an acquisition's end and quiescence read the
+custody held there, not every identity the session ever minted; the first divergence each rule
+names is unchanged (`tests/refinement/src/tests.rs`). The refinement and support crates build
+optimized in the dev profile (`Cargo.toml`, `[profile.dev.package.*]`, only `opt-level`), debug
+assertions and overflow checks kept; the library under test keeps its own profile. Each recorded
+run reports where its time went (`support::Phases`: the body and within it each custody
+collection and checkpoint stored, the finalization and within it the correspondence, the session's
+finish, the refinement replay and the storage bound, and the evidence inspections), timed to a
+stage's unwind and printed on standard error by a run that fails; the B-tree families print them per
+fixture. They are wall-clock diagnostics: no record, receipt or decision reads them. Measured at
+exhaustive rigor and minimal witnesses on the uncommitted tree, the 143-entry occupancy round trip
+(31,007 turns) took 129.6 s in the debug build, 93.6 s of it in replay and 32.1 s in collection,
+and 11.8 s with both crates optimized (replay 4.6 s, collection 6.0 s).
+
 ### Matrix cost evidence
 
 The same recording command also records matrix costs for both rigor layers and all four feature
@@ -744,18 +763,20 @@ finish is refused live: it must fail naming `the run's recording is no evidence:
 `a plan record, cut None: the run's recording is no evidence: Live(6)`; green with the patch
 reversed.
 
-`storage-tenant-short-of-peak.patch` restores the storage-resumption fixture's tenant to 4 KiB
-(`tests/resumable/native_schedules.rs`). Released, it leaves the blocked decode short of its peak,
-so no release lets the same decode finish; the fixture's capacity check against the unobstructed
-decode's measured peak must refuse it first, naming `cannot hold the decode's peak`. Seen red:
-`the pool of 69877 bytes cannot hold the decode's peak of 133733`; green with the patch reversed.
+`storage-tenant-short-of-peak.patch` sizes the storage-resumption fixture's pool for a tenant of
+4 KiB (`tests/resumable/native_schedules.rs`, the `tenant` bytes the capacity is computed from; the
+tenant the fixture occupies stays its typed 128 KiB, `Tenant<{ 32 * 1024 }>`). Released, it leaves
+the blocked decode short of its peak, so no release lets the same decode finish; the fixture's
+capacity check against the unobstructed decode's measured peak must refuse it first, naming
+`cannot hold the decode's peak`. Seen red: `the pool of 69901 bytes cannot hold the decode's peak of
+133893`; green with the patch reversed.
 
 `invalidation-last-cause-kept.patch` makes a session's invalidation keep its last cause instead of
 its first (`src/bounded/policy/record.rs`, `exhaust`). Four workers over one pool of eight permit
 records then report the foreign pairings that follow the exhaustion, and
 `concurrent_workers_each_name_the_first_invalidation` (`tests/support/lifecycle.rs`) must fail
-naming `a worker named another first cause`. Seen red: workers and the finalization named
-`ForeignOwner`; green with the patch reversed.
+naming `a worker returned another stop than the loss by Permits`. Seen red: workers and the
+finalization named `ForeignOwner`; green with the patch reversed.
 
 `recording-loss-skips-finalization.patch` makes the recorded run's finalizer
 (`tests/support/lifecycle.rs`, `recorded_run_with`) panic with the body's finding before it reaches
@@ -771,9 +792,13 @@ records ran out then reaches the caller as the operation's own refusal, its caus
 `a_driver_stops_at_the_turn_its_recording_runs_out_of_permit_records` must fail naming
 `the stop returned is not the recording's loss by Permits`. Seen red: the body returned
 `Driver("the operation failed: Refused(Unrecorded)")`. The event-slot witness is refused by the same
-plant, every driver's turn reading through `lost`: the copy outgrowing its slots completes with no
-stop, and `a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots` must fail naming
-`the body returned the driver's stop`. Seen red; both green with the patch reversed.
+plant, every driver's turn reading through `lost`: the copy outgrowing its slots returns no loss by
+`Events`, its checkpoints refused as no evidence (`a checkpoint's recording is no evidence:
+Exhausted`) and its turn observation failing as a defect, and
+`a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots` must fail naming
+`the stop returned is not the recording's loss by Events`. Seen red: the stop returned was
+`Defect("Some(\"Progress\"); driver diagnostic: turn observation panicked: ...")`; both green with
+the patch reversed.
 
 `btree-arena-owners-undropped.patch` makes a whole B-tree's cleanup
 (`src/bounded/decode/construction/in_place/btree/cleanup.rs`, `ReleaseArenas`) free its metadata
@@ -860,24 +885,42 @@ exercises it:
 - `window-wrong-origin.patch` gives a window's credit the performing budget's origin at every spend
   (`buckets.rs`, `BucketCursor::step`). `preparation_continues_a_window_across_families` settles
   under a third family. Its spends then carry an identity of that family, which the refinement
-  machine refuses at finalization: the run must fail naming
-  `the run's recording does not refine the protocol`.
+  machine refuses at finalization: the run must fail naming `does not refine the protocol`, the
+  machine's refusal in both finalization reports (`settled`'s, and `describe`'s when the run also
+  recorded defects, here its checkpoints' `DuplicateBound`). Seen red: `observation 247: obligation
+  4.1 was never admitted`.
 
 `retirement-record-left-unqueued.patch` links a retired record into the scope queue without moving
 its custody from `Handle` to `Queued` or publishing the `Queued` custody event (`reclamation.rs`,
-`Reclaimer::enqueue`). The queue then reports the record's permit at stage `Handle`.
-`a_stopped_decoder_queues_every_record_it_held` (the support crate's `lifecycle.rs` tests) steps a
-typed decode until it holds records of its own beside its input's, retires it as
-`Retirement::Stopped` through the one orchestration, and must fail naming
-`the value's Handle record`: the comparison, scoped to the permits the stopped decoder itself
-reported, requires every `Handle` record it held to be `Queued` afterwards.
+`Reclaimer::enqueue`). `a_stopped_decoder_queues_every_record_it_held` (the support crate's
+`lifecycle.rs` tests) steps a typed decode until it holds records of its own beside its input's and
+retires it as `Retirement::Stopped` through the one orchestration. The queue's removal requires
+every record it takes to be `Queued` (`Reclaimer::step`), so the stopped decoder's drain refuses
+the first record it removes, before the orchestration's own comparison of the stopped decoder's
+`Handle` records is reached; the terminal drain the drop runs refuses it again during the unwind,
+which aborts the test's process. The run must end `abnormal_termination`, naming
+`custody.get() == Holder::Queued`. A test process killed by SIGABRT is that outcome wherever it is
+classified (`outcome::native`, and `outcome::model` for every signal but loom's named stack
+overflow, which delegates to it), never an ordinary `failed`; every caller that requires a pass
+(the Miri gate's native baseline, the reach map, the budget recorder) refuses it as before. An
+aborted process prints no libtest summary, so its report is judged its one test's only when the
+abort is classified so and libtest selected and started exactly that test (`controls::alone`); a
+run ended by any other signal or exit without a summary is no refusal, and restored-green still
+requires a completed summary (`controls::restored`). Seen red: signal 6, the assertion reported
+twice.
 
 The five `pending-settle-wrong-origin-*` rows run the same patch as `pending-settle-wrong-origin`
 through the decode scope's four-family provenance cases (`reclamation/owned.rs`): the grant's write
 admitted under a, its release under b, its storage under c, its cleanup under d. Every settlement
 lands in a detached family, so a's ledgers record no consumption or forfeit, which each case's
-per-family check names first. A defect settling into the performing policy's family cannot be
-planted: held credit owns its origin and no settlement path receives a budget's origin.
+per-family check names first. The patch detaches the origin held admissions store
+(`Limits::origin`, which `admit_held_at` keeps) and leaves each acquisition its minting family's
+origin (`Limits::acquisition`): `Acquisition::minted` refuses an origin of another family than the
+identity it mints, so a patch detaching both is refused at the first bind (`Refused(Unrecorded)`)
+and never reaches the obligations the control is about. S1 then names
+`A after the resume: held, observed in the slots`. A defect settling into the performing policy's
+family cannot be planted: held credit owns its origin and no settlement path receives a budget's
+origin.
 
 The proof controls plant defects of the numeric reduction, the head writer and parser, the scalar
 profile and the key comparison (register item 4). Each is refused by a Kani harness that states its
@@ -932,6 +975,18 @@ of a value it refuses (`UnusedData`) remains part of the checked code.
 `decode-scalar-reaches-item-arm.patch` decodes an unsigned head through the tagged-item arm,
 refused by the stub's check. No proof is established until the harness produces a successful
 verdict.
+
+The key comparison harnesses (`bounded/decode/comparison/proofs.rs`) drive a whole comparison for a
+constant number of turns, the reference schedule's most for keys of at most 67 bytes
+(`TURNS = ceil(67 / 64)`), and fail if it has not completed by then: driven by an open loop to
+completion, bounded only by `kani::unwind(68)`, a retained run of the long-key harness expanded the
+driver 58 times and the turn's pair loop (`comparison.rs`, `compare_step`) 118 times, to its 67th
+iteration each, and did not finish symbolic execution in 30 minutes. The short-key harness, keys of
+at most four bytes, takes `kani::unwind(6)`, its loops' most iterations and their exits; its
+unwinding assertions stay enabled, so a bound short of a reachable iteration fails it. Measured on
+the uncommitted change: the long-key harness verified, 0 of 623 checks failed (5 unreachable), 14.4 s
+of symbolic execution and 67.7 s of verification; the short-key harness, 0 of 597 (2 unreachable),
+15.2 s.
 
 The binary32 test runs the run's layer's domain (`DCBOR_RIGOR`): every pattern under `exhaustive`,
 which `run_tests.sh` runs once optimized, and the reduction rules' edges under `fast` (`float.rs`,

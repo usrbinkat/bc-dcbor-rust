@@ -292,6 +292,24 @@ impl Origin for Ledger {
 /// The families of the conservation model.
 const FAMILIES: usize = 2;
 
+/// A family's ledgers before any event: every component zero, unviolated,
+/// `Ledgers::default()` as a constant initializer.
+const fn fresh() -> Ledgers {
+    use super::AtomicU64;
+    Ledgers {
+        admitted: [AtomicU64::new(0), AtomicU64::new(0)],
+        consumed: [AtomicU64::new(0), AtomicU64::new(0)],
+        forfeited: [AtomicU64::new(0), AtomicU64::new(0)],
+        violated: AtomicU64::new(0),
+    }
+}
+
+/// The families' ledgers have static storage so origins can retain them
+/// without a heap allocation. Updates still use production's
+/// [`Ledgers::record`] and its compare-exchange loop; the harness's unwinding
+/// assertions must establish that the loop fits its bound.
+static LEDGERS: [Ledgers; FAMILIES] = [fresh(), fresh()];
+
 /// Conservation over legal transitions: every sequence of at most
 /// [`EVENTS`] legal steps over [`FAMILIES`] families (an admission, held or
 /// not, into any family; a spend or forfeit of any outstanding obligation,
@@ -303,10 +321,9 @@ const FAMILIES: usize = 2;
 #[kani::unwind(5)]
 fn legal_transitions_conserve_every_family() {
     // Origins outlive their custodies, as a family's counters outlive every
-    // obligation admitted through them: leaked for the harness's run (the
-    // Kani build links `std`, `tests/gate/src/proofs.rs` `FEATURES`).
-    let ledgers: [&'static Ledgers; FAMILIES] =
-        core::array::from_fn(|_| &*std::boxed::Box::leak(std::boxed::Box::new(Ledgers::default())));
+    // obligation admitted through them: the families' typed static ledgers
+    // ([`LEDGERS`]), each zero when the harness starts.
+    let ledgers: [&'static Ledgers; FAMILIES] = [&LEDGERS[0], &LEDGERS[1]];
     // The model's outstanding obligations: family, remaining work, and the
     // production custody holding it.
     let mut outstanding: [Option<(usize, WriteWork, Retained<Ledger>)>; EVENTS] =

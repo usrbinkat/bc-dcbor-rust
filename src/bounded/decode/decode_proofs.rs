@@ -72,7 +72,7 @@
 //! (`float.rs` tests, `float/proofs.rs` "The `half` conversion").
 //! Compiled only under `cfg(kani)`.
 
-use super::super::proof_budget::Counting;
+use super::super::proof_budget::{Counting, decode_bound_at};
 use super::{BoundedError, DecodeError, Options, TextPolicy, decode_bound_with, decode_with};
 
 /// The longest input of the domain.
@@ -111,7 +111,9 @@ fn the_decode_bound_covers_every_input() {
         },
     };
     let input = &bytes[..length];
-    let bound = decode_bound_with::<()>(length as u64, options).expect("the domain's bound fits");
+    let bound = decode_bound_at(length, options, INPUT, DEPTH, |size, case| {
+        decode_bound_with::<()>(size, case).expect("the domain's bound fits")
+    });
     let mut policy = Counting::scheduled(any_index(), any_index());
     let decoded = decode_with(input, options, &mut policy);
     let retained = policy.live();

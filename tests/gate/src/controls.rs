@@ -480,12 +480,23 @@ fn started_alone(report: &str, test: &str) -> bool {
 }
 
 /// Whether `report` is the one selected test's own: a native run executed
-/// exactly one test ([`outcome::ran_one`]), a Miri run selected and started
-/// exactly its one test ([`started_alone`]); a model control's run is one
-/// model's process already.
+/// exactly one test ([`outcome::ran_one`]), or, when its process ended
+/// by SIGABRT before libtest printed a summary, selected and started exactly its one test
+/// ([`started_alone`]); a Miri run selected and started exactly its one test;
+/// a model control's run is one model's process already.
 fn alone(control: &Control, report: &str, outcome: Outcome) -> bool {
     match control.runner {
-        Runner::Native => outcome::ran_one(report),
+        Runner::Native => {
+            if report.lines().any(|line| line.starts_with("test result: ")) {
+                outcome::ran_one(report)
+            } else {
+                outcome == Outcome::AbnormalTermination
+                    && control
+                        .test
+                        .as_deref()
+                        .is_some_and(|test| started_alone(report, test))
+            }
+        }
         Runner::Miri(_) => control
             .test
             .as_deref()
@@ -739,7 +750,7 @@ mod kani_tests {
     fn a_kani_refusal_is_judged_by_its_one_harness() {
         let control = &parse(&row("kani", "-", "lib")).unwrap()[0];
         let report = format!(
-            "Checking harness {HARNESS}...\nFailed Checks: a planted failure\nVERIFICATION:- FAILED\n\
+            "Checking harness {HARNESS}...\n ** 1 of 3 failed\nFailed Checks: a planted failure\nVERIFICATION:- FAILED\n\
              Manual Harness Summary:\nVerification failed for - {HARNESS}\n\
              Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n"
         );

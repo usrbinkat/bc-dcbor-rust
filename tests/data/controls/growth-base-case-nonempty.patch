@@ -1,7 +1,7 @@
 --- src/bounded/growth_proofs.rs
 +++ src/bounded/growth_proofs.rs
-@@ -93,7 +93,12 @@
- /// The closed form after `k` growths (the module's "The invariant").
+@@ -130,7 +130,12 @@
+ /// growth count, each at a constant capacity").
  fn closed(k: u128, size: u128) -> State {
      if k == 0 {
 -        return EMPTY;

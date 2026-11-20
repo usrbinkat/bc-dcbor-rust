@@ -28,39 +28,17 @@
 //!
 //! # Unwind
 //!
-//! The longest loop is this harness's step loop: one admitted unit or more
-//! per step, each of at least one value or a request whose release was
-//! admitted as a value (`ResourceBound::steps`, `bounded.rs`:2166-2172), so
-//! at most the bound's values, and the two refused calls. At [`INPUT`] = 4,
-//! depth 2, normalizing (the most), `retained_decode_bound`'s values
-//! (`cursor.rs` `RetainedTerms::of`, :189-338), every unit one value but
-//! the ordering's `MARK` (3) and `COMPOSE` (2):
+//! The driver uses [`crate::bounded::ResourceBound::steps`], the sum of
+//! admitted values and allocated bytes, plus the two refused calls. Values
+//! alone do not bound this loop: a step can make an allocation request
+//! without admitting a value. The driver stops at its outcome, which can
+//! precede that conservative limit.
 //!
-//! - heads 9 (`header::heads_work`, four acquisitions and five
-//!   validations); interpretation 4; UTF-8 4; completion 4; attach 4;
-//! - the arena of 5 nodes, two growths, 4 relocated: 4 pushes, 4, 8 writes,
-//!   4 releases, 20; the stack of 3 frames, one growth: 4 pushes, 4 writes,
-//!   2 releases, 10;
-//! - keys 3 (`COMPARE.covering(8, 2)`); publication 2;
-//! - cleanup 32: the input as one text drained (22: one node, the worst
-//!   four-byte text's two arenas of six parts, 19, and two characters)
-//!   larger than as nodes (16), the arena's and the stack's cleanups 2 each,
-//!   the stack drained 3, three transitions;
-//! - one undecided text (4 / 3): its normalizer initialized, 38
-//!   (`TextContinuation` `INIT_STEPS`, `text_cursor/initialization.rs`:9-10);
-//!   the normalizations 238 (`text_cursor::normalizations` of the worst
-//!   four-byte shape, six parts, two scalars, four combining in two sorted
-//!   runs, twelve part bytes: its terms 186, the arenas apart 52); the text
-//!   check 2.
-//!
-//! Together 370; the string's own terms 5 (inspection 1, release 1, two
-//! copies, publication 1; `StringTerms::of`, string_cursor.rs:360-382): 375.
-//! The other loops reached are shorter: the copy's boundary back-off, at
-//! most three (string_cursor.rs:304); the parse's own head, text and
-//! completion loops, at most the input's bytes and frames; the normalizer's
-//! ordering tables of sixteen counters (`text_cursor/ordering.rs`:51); the
-//! growths, at most two; the places' folds, at most 13. `kani::unwind(378)`:
-//! 375 steps, the two refused calls and the exit.
+//! `kani::unwind(378)` is a separate verification limit, not a derivation
+//! from the bound's values. Its enabled unwinding assertions must establish
+//! that every reachable loop, including the driver and cleanup, fits this
+//! limit over the whole domain. A reachable iteration beyond it fails
+//! verification; the harness does not assume early completion.
 //!
 //! # The `half` conversion
 //!
@@ -74,7 +52,7 @@
 //! binary16 pattern, natively and under Miri (`float.rs` tests). Compiled
 //! only under `cfg(kani)`.
 
-use super::super::super::proof_budget::{Counting, Permit};
+use super::super::super::proof_budget::{Counting, Permit, decode_bound_at};
 use super::{BoundedError, DecodeError, Options, Step, StringDecoder, TextPolicy, string_bound};
 
 /// The longest input of the domain.
@@ -115,8 +93,9 @@ fn the_string_bound_covers_every_input() {
         },
     };
     let input = &bytes[..length];
-    let bound =
-        string_bound::<Permit, (), ()>(length as u64, options).expect("the domain's bound fits");
+    let bound = decode_bound_at(length, options, INPUT, DEPTH, |size, case| {
+        string_bound::<Permit, (), ()>(size, case).expect("the domain's bound fits")
+    });
     let steps = bound.steps::<()>().expect("the domain's steps fit");
     let mut policy = Counting::scheduled(any_index(), any_index());
     let mut decoder = StringDecoder::<Permit, ()>::new(input, options);

@@ -2,7 +2,6 @@
 //! each the production transition it records (the crate's documentation),
 //! and the driver's marks checked against the state they reach.
 
-use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
@@ -78,12 +77,27 @@ struct Machine {
     /// Every identity minted: owners, acquisitions, obligations, permits.
     minted: BTreeSet<Identity>,
     owners: BTreeSet<Identity>,
-    /// Each acquisition, the owner that bound it and whether it is active:
-    /// an ended one is kept, for its permits' attribution and so its
-    /// identity is never bound or ended again.
+    /// Each acquisition and the owner that bound it: an ended one is kept,
+    /// for its permits' attribution and so its identity is never bound or
+    /// ended again.
     acquisitions: BTreeMap<Identity, AcquisitionState>,
     obligations: BTreeMap<Identity, Held>,
     permits: BTreeMap<Identity, Permit>,
+    /// The acquisitions of [`Self::acquisitions`] bound and not yet ended,
+    /// by identity: the one record of an acquisition's activity, which a
+    /// checkpoint and quiescence read without walking every acquisition the
+    /// session ever bound.
+    unended: BTreeSet<Identity>,
+    /// The obligations of [`Self::obligations`] still holding work, by
+    /// identity, and the same obligations by the acquisition each was
+    /// admitted for: what a checkpoint, an acquisition's end and quiescence
+    /// read, so none walks every obligation the session ever admitted.
+    outstanding: BTreeSet<Identity>,
+    outstanding_by: BTreeMap<Identity, BTreeSet<Identity>>,
+    /// The permits of [`Self::permits`] still live, by identity: what a
+    /// checkpoint reads, so it costs the custody live there, not every
+    /// permit the session ever granted.
+    live: BTreeSet<Identity>,
     ledgers: BTreeMap<u64, Ledger>,
     /// Each performer's admitted work call awaiting its admission.
     admitting: BTreeMap<u64, WriteWork>,
@@ -103,6 +117,10 @@ impl Machine {
             acquisitions: BTreeMap::new(),
             obligations: BTreeMap::new(),
             permits: BTreeMap::new(),
+            unended: BTreeSet::new(),
+            outstanding: BTreeSet::new(),
+            outstanding_by: BTreeMap::new(),
+            live: BTreeSet::new(),
             ledgers: BTreeMap::new(),
             admitting: BTreeMap::new(),
             refusal: None,
@@ -152,7 +170,41 @@ impl Machine {
     fn update(&mut self, permit: Identity, change: impl FnOnce(&mut Permit)) {
         if let Some(record) = self.permits.get_mut(&permit) {
             change(record);
+            if record.life == Life::Live {
+                self.live.insert(permit);
+            } else {
+                self.live.remove(&permit);
+            }
         }
+    }
+
+    /// A fresh permit `record` under `permit`, indexed live when it is.
+    fn grant(&mut self, permit: Identity, record: Permit) {
+        if record.life == Life::Live {
+            self.live.insert(permit);
+        }
+        self.permits.insert(permit, record);
+    }
+
+    /// Obligation `id` stored as `held`: indexed outstanding, under its
+    /// acquisition, while it holds work, and no longer once it holds none.
+    fn hold(&mut self, id: Identity, held: Held) {
+        if held.remaining == WriteWork::default() {
+            self.outstanding.remove(&id);
+            if let Some(obligations) = self.outstanding_by.get_mut(&held.acquisition) {
+                obligations.remove(&id);
+                if obligations.is_empty() {
+                    self.outstanding_by.remove(&held.acquisition);
+                }
+            }
+        } else {
+            self.outstanding.insert(id);
+            self.outstanding_by
+                .entry(held.acquisition)
+                .or_default()
+                .insert(id);
+        }
+        self.obligations.insert(id, held);
     }
 
     /// Advance the state by one observation, every rule its transition
@@ -182,7 +234,7 @@ impl Machine {
                 let unheld = less(work, hold.work).ok_or(Rule::Overheld)?;
                 self.active(hold.acquisition)?;
                 self.mint(hold.id, publisher)?;
-                self.obligations.insert(
+                self.hold(
                     hold.id,
                     Held {
                         obligation: hold.obligation,
@@ -234,7 +286,7 @@ impl Machine {
                         to: RecordStage::Granted,
                     });
                 }
-                self.permits.insert(
+                self.grant(
                     child,
                     Permit {
                         bytes,
@@ -329,13 +381,9 @@ impl Machine {
                     return Err(Rule::UnknownOwner(owner));
                 }
                 self.mint(acquisition, publisher)?;
-                self.acquisitions.insert(
-                    acquisition,
-                    AcquisitionState {
-                        owner,
-                        active: true,
-                    },
-                );
+                self.acquisitions
+                    .insert(acquisition, AcquisitionState { owner });
+                self.unended.insert(acquisition);
                 Ok(())
             }
             Event::End { acquisition, owner } => self.end(publisher, acquisition, owner),
@@ -354,7 +402,7 @@ impl Machine {
             .acquisitions
             .get(&acquisition)
             .ok_or(Rule::UnknownAcquisition(acquisition))?;
-        if !state.active {
+        if !self.unended.contains(&acquisition) {
             return Err(Rule::AcquisitionEnded(acquisition));
         }
         Ok(state)
@@ -380,17 +428,19 @@ impl Machine {
                 named: owner,
             });
         }
-        if let Some((&obligation, _)) = self.obligations.iter().find(|(_, held)| {
-            held.acquisition == acquisition && held.remaining != WriteWork::default()
-        }) {
+        // The least identity among the obligations admitted for this
+        // acquisition still holding work.
+        if let Some(&obligation) = self
+            .outstanding_by
+            .get(&acquisition)
+            .and_then(BTreeSet::first)
+        {
             return Err(Rule::EndOutstanding {
                 acquisition,
                 obligation,
             });
         }
-        if let Some(state) = self.acquisitions.get_mut(&acquisition) {
-            state.active = false;
-        }
+        self.unended.remove(&acquisition);
         Ok(())
     }
 
@@ -482,7 +532,7 @@ impl Machine {
             (Call::Allocate(bytes), Answer::Granted(permit)) => {
                 self.refusal = None;
                 self.mint(permit, publisher)?;
-                self.permits.insert(
+                self.grant(
                     permit,
                     Permit {
                         bytes,
@@ -596,9 +646,7 @@ impl Machine {
             }
             (Obligation::Grant, Some(_), None) => {}
         }
-        if let Some(entry) = self.obligations.get_mut(&id) {
-            entry.remaining = remaining;
-        }
+        self.hold(id, Held { remaining, ..held });
         let ledger = self.ledger(publisher);
         match rule {
             None => ledger.consumed = sum(ledger.consumed, settled.work)?,
@@ -651,14 +699,14 @@ impl Machine {
     /// and whose block is not yet freed (the one unit that does both).
     fn mid_step(&self) -> bool {
         !self.admitting.is_empty()
-            || self.permits.values().any(|permit| {
-                permit.life == Life::Live
-                    && (permit.outcome == Some(Outcome::Failed)
-                        || permit
-                            .record
-                            .is_some_and(|state| state.stage == RecordStage::Reclaimed)
-                        || (permit.source == Source::Granted
-                            && (permit.acquisition.is_none() || permit.outcome.is_none())))
+            || self.live.iter().any(|id| {
+                let permit = &self.permits[id];
+                permit.outcome == Some(Outcome::Failed)
+                    || permit
+                        .record
+                        .is_some_and(|state| state.stage == RecordStage::Reclaimed)
+                    || (permit.source == Source::Granted
+                        && (permit.acquisition.is_none() || permit.outcome.is_none()))
             })
     }
 
@@ -671,14 +719,12 @@ impl Machine {
     /// at a quiescent point is unpaid.
     fn custody(&self) -> Result<BTreeMap<Identity, Expected>, Rule> {
         let mut expected: BTreeMap<Identity, Expected> = BTreeMap::new();
-        for (&acquisition, state) in &self.acquisitions {
-            if state.active {
-                expected
-                    .entry(state.owner)
-                    .or_default()
-                    .bound
-                    .insert(acquisition);
-            }
+        for &acquisition in &self.unended {
+            expected
+                .entry(self.acquisitions[&acquisition].owner)
+                .or_default()
+                .bound
+                .insert(acquisition);
         }
         let owner_of = |acquisition: Identity| {
             self.acquisitions
@@ -686,26 +732,24 @@ impl Machine {
                 .map(|state| state.owner)
                 .ok_or(Rule::UnknownAcquisition(acquisition))
         };
-        for (&id, obligation) in &self.obligations {
-            if obligation.remaining != WriteWork::default() {
-                let owner = owner_of(obligation.acquisition)?;
-                expected
-                    .entry(owner)
-                    .or_default()
-                    .held
-                    .insert(id, *obligation);
-            }
+        for &id in &self.outstanding {
+            let obligation = self.obligations[&id];
+            let owner = owner_of(obligation.acquisition)?;
+            expected
+                .entry(owner)
+                .or_default()
+                .held
+                .insert(id, obligation);
         }
-        for (&id, permit) in &self.permits {
-            if permit.life == Life::Live {
-                let acquisition = permit.acquisition.ok_or(Rule::Unpaid(id))?;
-                let owner = owner_of(acquisition)?;
-                expected
-                    .entry(owner)
-                    .or_default()
-                    .permits
-                    .insert(id, permit.record.map(|state| state.stage));
-            }
+        for &id in &self.live {
+            let permit = &self.permits[&id];
+            let acquisition = permit.acquisition.ok_or(Rule::Unpaid(id))?;
+            let owner = owner_of(acquisition)?;
+            expected
+                .entry(owner)
+                .or_default()
+                .permits
+                .insert(id, permit.record.map(|state| state.stage));
         }
         Ok(expected)
     }
@@ -756,7 +800,7 @@ impl Machine {
                         bound: state.owner,
                     });
                 }
-                if !state.active {
+                if !self.unended.contains(&acquisition) {
                     return Err(Rule::StaleBinding { owner, acquisition });
                 }
                 bound.remove(&acquisition);
@@ -891,14 +935,10 @@ impl Machine {
                 }
             }
         }
-        if let Some((&id, _)) = self
-            .obligations
-            .iter()
-            .find(|(_, held)| held.remaining != WriteWork::default())
-        {
+        if let Some(&id) = self.outstanding.first() {
             return Err(Rule::Outstanding(id));
         }
-        if let Some((&acquisition, _)) = self.acquisitions.iter().find(|(_, state)| state.active) {
+        if let Some(&acquisition) = self.unended.first() {
             return Err(Rule::Unended(acquisition));
         }
         Ok(())
@@ -911,6 +951,46 @@ impl Machine {
             (None, Some(_)) => Some(End::Published),
             _ => None,
         }
+    }
+}
+
+/// The checkpoints one replay checks, in their order ([`replay`]): every
+/// checkpoint's boundary, read once to place the marks, then each
+/// checkpoint lent as the replay reaches its boundary, valid until the next
+/// one is taken. A source reconstructing its checkpoints
+/// ([`crate::History`]) keeps one working snapshot and lends it, never a
+/// copy per checkpoint.
+pub(crate) trait Checkpoints {
+    /// Every checkpoint's boundary, in order.
+    fn boundaries(&self) -> Vec<usize>;
+    /// The next checkpoint, or none past the last.
+    fn advance(&mut self) -> Option<&Checkpoint>;
+}
+
+/// Checkpoints held whole, in order ([`check`], [`settled`]).
+struct Whole<'c> {
+    all: &'c [Checkpoint],
+    next: usize,
+}
+
+impl<'c> Whole<'c> {
+    fn new(all: &'c [Checkpoint]) -> Self {
+        Self { all, next: 0 }
+    }
+}
+
+impl Checkpoints for Whole<'_> {
+    fn boundaries(&self) -> Vec<usize> {
+        self.all
+            .iter()
+            .map(|checkpoint| checkpoint.boundary)
+            .collect()
+    }
+
+    fn advance(&mut self) -> Option<&Checkpoint> {
+        let checkpoint = self.all.get(self.next)?;
+        self.next += 1;
+        Some(checkpoint)
     }
 }
 
@@ -927,22 +1007,17 @@ enum Mark<'r> {
 /// Checkpoints are given in order and refused out of it; cleaning and
 /// publication are merged in by boundary. Marks add checks; their absence
 /// relaxes none. The machine reached, or the first divergence.
-fn replay<C: Borrow<Checkpoint>>(
+fn replay(
     observed: &[Observed],
-    checkpoints: impl Iterator<Item = C> + Clone,
+    checkpoints: &mut impl Checkpoints,
     cleaning: Option<(usize, Cause)>,
     published: Option<&Publication>,
 ) -> Result<Machine, Divergence> {
     let mut marks: Vec<(usize, At, Mark<'_>)> = checkpoints
-        .clone()
+        .boundaries()
+        .into_iter()
         .enumerate()
-        .map(|(index, checkpoint)| {
-            (
-                checkpoint.borrow().boundary,
-                At::Checkpoint(index),
-                Mark::Checkpoint,
-            )
-        })
+        .map(|(index, boundary)| (boundary, At::Checkpoint(index), Mark::Checkpoint))
         .collect();
     let mut previous = 0;
     for &(boundary, at, _) in &marks {
@@ -981,7 +1056,6 @@ fn replay<C: Borrow<Checkpoint>>(
         }
         Ok(())
     };
-    let mut checkpoints = checkpoints;
     for (boundary, at, mark) in marks {
         if boundary > observed.len() {
             return Err(Divergence {
@@ -996,9 +1070,8 @@ fn replay<C: Borrow<Checkpoint>>(
         let result = match mark {
             Mark::Checkpoint => machine.checkpoint(
                 &checkpoints
-                    .next()
+                    .advance()
                     .expect("each checkpoint has one mark")
-                    .borrow()
                     .custody,
             ),
             Mark::Cleaning(cause) => machine.clean(cause),
@@ -1019,7 +1092,7 @@ fn replay<C: Borrow<Checkpoint>>(
 pub fn check(run: &Run) -> Result<(), Divergence> {
     let machine = replay(
         &run.observed,
-        run.checkpoints.iter(),
+        &mut Whole::new(&run.checkpoints),
         run.cleaning,
         run.published.as_ref(),
     )?;
@@ -1052,12 +1125,14 @@ pub fn evidence(run: &Run) -> Result<Evidence, Divergence> {
 /// reaches. What every recorded test's evidence is checked by
 /// (`tests/support/lifecycle.rs`, `recorded_run`).
 pub fn settled(observed: &[Observed], checkpoints: &[Checkpoint]) -> Result<(), Divergence> {
-    settled_iter(observed, checkpoints.iter())
+    settled_with(observed, &mut Whole::new(checkpoints))
 }
 
-pub(super) fn settled_iter<C: Borrow<Checkpoint>>(
+/// [`settled`] over any checkpoint source ([`Checkpoints`]): the one
+/// session check, a stored history's included ([`crate::History::settled`]).
+pub(crate) fn settled_with(
     observed: &[Observed],
-    checkpoints: impl Iterator<Item = C> + Clone,
+    checkpoints: &mut impl Checkpoints,
 ) -> Result<(), Divergence> {
     replay(observed, checkpoints, None, None).map(|_| ())
 }

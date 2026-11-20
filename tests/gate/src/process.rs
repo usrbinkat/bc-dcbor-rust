@@ -101,6 +101,33 @@ fn isolate(command: &mut Command, names: impl IntoIterator<Item = std::ffi::OsSt
     }
 }
 
+/// The diagnostics of a `cargo ... --message-format json` build: every
+/// compiler message's rendered text, in the order cargo printed them
+/// (`reason` `compiler-message`, `message.rendered`, on standard output),
+/// then cargo's own standard error. With a JSON message format the
+/// compiler's errors and warnings are on standard output only; standard
+/// error holds cargo's progress and its summary (`could not compile ...`).
+/// The one report of a build, the log a refused build is judged by.
+fn build_report(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut report = String::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-message" {
+            continue;
+        }
+        if let Some(rendered) = message["message"]["rendered"].as_str() {
+            report.push_str(rendered);
+            if !rendered.ends_with('\n') {
+                report.push('\n');
+            }
+        }
+    }
+    report.push_str(&String::from_utf8_lossy(stderr));
+    report
+}
+
 /// The RUSTFLAGS of `checker`'s build, the caller's own before them.
 pub fn flags(checker: Checker) -> String {
     let own = std::env::var("RUSTFLAGS").unwrap_or_default();
@@ -109,9 +136,9 @@ pub fn flags(checker: Checker) -> String {
 
 /// Build `checker`'s test binaries of `root`, in release with every
 /// feature, in its own target directory (each cfg rebuilds the library),
-/// logging to `log`: the executable of each target holding models
-/// ([`dcbor_model_bounds::targets`]). A build that fails returns its log's
-/// contents.
+/// logging its diagnostics to `log` ([`build_report`]): the executable of
+/// each target holding models ([`dcbor_model_bounds::targets`]). A build
+/// that fails returns its log's contents.
 pub fn build(
     root: &Path,
     checker: Checker,
@@ -135,10 +162,10 @@ pub fn build(
         .args(["--no-run", "--message-format", "json"])
         .output()
         .map_err(|error| format!("cargo: {error}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    std::fs::write(log, &stderr).map_err(|error| format!("{}: {error}", log.display()))?;
+    let report = build_report(&output.stdout, &output.stderr);
+    std::fs::write(log, &report).map_err(|error| format!("{}: {error}", log.display()))?;
     if !output.status.success() {
-        return Err(stderr);
+        return Err(report);
     }
     let mut executables = BTreeMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -182,7 +209,9 @@ pub fn build(
 /// Build the test target `target` (`lib`, or an integration test binary) of
 /// `package` in `root`, with `features` (`all`, a comma-separated list, or
 /// none for the package's defaults), into `target_dir`, logging the build's
-/// diagnostics to `log`. Its test executable ([`crate::reach::executable`]),
+/// diagnostics to `log` ([`build_report`]: the compiler's own messages,
+/// which a refused build's judgement reads, then cargo's standard error).
+/// Its test executable ([`crate::reach::executable`]),
 /// or, when the build failed, its log: a compiler refusal is what a run
 /// produced, not a failure of the gate. Colour is off (`TERM=dumb`), so a
 /// report is read as its text.
@@ -218,10 +247,10 @@ pub fn build_target(
         .args(["--no-run", "--message-format", "json"])
         .output()
         .map_err(|error| format!("cargo: {error}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    std::fs::write(log, &stderr).map_err(|error| format!("{}: {error}", log.display()))?;
+    let report = build_report(&output.stdout, &output.stderr);
+    std::fs::write(log, &report).map_err(|error| format!("{}: {error}", log.display()))?;
     if !output.status.success() {
-        return Ok(Err(stderr));
+        return Ok(Err(report));
     }
     crate::reach::executable(&String::from_utf8_lossy(&output.stdout))
         .map(|found| Ok(PathBuf::from(found)))
@@ -867,6 +896,57 @@ mod tests {
                 "a report disagreeing with GNU time's status supplied {termination:?}: {text:?}"
             );
         }
+    }
+
+    /// A refused build's report holds the compiler's own diagnostic: under
+    /// `--message-format json` rustc's messages reach cargo's standard
+    /// output only, each wrapped as a `compiler-message`, while standard
+    /// error holds cargo's summary. The diagnostic here is rustc's own,
+    /// produced by compiling a use of a moved value, wrapped as cargo wraps
+    /// it; the report must hold its rendered text, then the summary.
+    #[test]
+    fn a_refused_build_reports_the_compilers_diagnostic() {
+        let directory =
+            std::env::temp_dir().join(format!("dcbor-gate-build-report-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("moved.rs");
+        std::fs::write(
+            &source,
+            "pub fn twice() { let held = String::new(); drop(held); drop(held); }\n",
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(rustc)
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--error-format",
+                "json",
+            ])
+            .arg("--out-dir")
+            .arg(&directory)
+            .arg(&source)
+            .env("TERM", "dumb")
+            .output()
+            .expect("run rustc");
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(!compiled.status.success(), "the moved value compiled");
+        let stdout: String = String::from_utf8_lossy(&compiled.stderr)
+            .lines()
+            .map(|message| format!("{{\"reason\":\"compiler-message\",\"message\":{message}}}\n"))
+            .collect();
+        let summary = "error: could not compile `moved` (lib) due to 1 previous error\n";
+        let report = super::build_report(stdout.as_bytes(), summary.as_bytes());
+        assert!(
+            report.contains("use of moved value"),
+            "a refused build's report lost the compiler's diagnostic: {report}"
+        );
+        assert!(
+            report.ends_with(summary),
+            "a refused build's report lost cargo's summary: {report}"
+        );
     }
 
     #[test]

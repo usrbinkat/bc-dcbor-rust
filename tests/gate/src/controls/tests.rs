@@ -225,6 +225,50 @@ fn every_other_run_is_no_refusal() {
     );
 }
 
+/// A native run its one test's failure aborted: libtest selected and started
+/// the one test, which panicked, and a second panic during the unwind (a
+/// production assertion in a cleanup path the drop runs) aborted the
+/// process before libtest printed any summary.
+const ABORTED: &str = "\nrunning 1 test\ntest a::b ... \nthread 'a::b' panicked at src/x.rs:1:1:\nboom\n\nthread 'a::b' panicked at src/x.rs:1:1:\nboom\n";
+
+/// A native control refused by its own test, whose process then aborted
+/// with no summary, is judged by that test's report: libtest selected and
+/// started exactly its one test, as a Miri run undefined behavior ends is
+/// judged; another selection or another started test is not its own.
+#[test]
+fn a_native_refusal_that_aborts_is_judged_by_its_one_started_test() {
+    let control = one(&NATIVE.replace("\tfailed\t", "\tabnormal_termination\t"));
+    let aborted = outcome::native(
+        Kind::Test,
+        outcome::Termination::Signaled(outcome::SIGABRT),
+        ABORTED,
+    );
+    assert_eq!(judge(&control, aborted, ABORTED), Ok(()));
+    let two = ABORTED.replace("running 1 test", "running 2 tests");
+    let both = judge(&control, aborted, &two).expect_err("two selected");
+    assert!(both.contains("exactly its one test"), "{both}");
+    let other = ABORTED.replace("test a::b ...", "test a::c ...");
+    let elsewhere = judge(&control, aborted, &other).expect_err("another test");
+    assert!(elsewhere.contains("exactly its one test"), "{elsewhere}");
+    assert!(
+        restored(&control, Outcome::Pass, ABORTED).is_err(),
+        "start-only evidence cannot qualify restored-green"
+    );
+    let failed = one(NATIVE);
+    for ending in [
+        outcome::Termination::Exited(0),
+        outcome::Termination::Exited(101),
+        outcome::Termination::Signaled(9),
+        outcome::Termination::Signaled(15),
+    ] {
+        let classified = outcome::native(Kind::Test, ending, ABORTED);
+        assert!(
+            judge(&failed, classified, ABORTED).is_err(),
+            "a non-abort without a summary qualified a refusal: {ending:?}"
+        );
+    }
+}
+
 /// A Miri run that undefined behavior ended: libtest selected and started
 /// the one test, and the interpreter's report follows, with no summary.
 const UNDEFINED: &str = "running 1 test\ntest a::b ... error: Undefined Behavior: reading memory at alloc1[0x0..0x8], but memory is uninitialized\n";

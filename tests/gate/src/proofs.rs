@@ -168,6 +168,8 @@ pub fn harnesses(src: &Path) -> Result<BTreeSet<String>, String> {
 /// Each harness a run's report checked, in order, with its outcome: the
 /// block its `Checking harness` line opens classed by Kani's own report
 /// ([`outcome::kani`]'s fundamental failures, then its verification line).
+/// A failed verification requires a positive, consistent property summary;
+/// a failure label alone supplies no verdict.
 /// Refused when a block never reaches its verification line, or when the
 /// final summary disagrees with the blocks.
 pub fn checked(report: &str) -> Result<Vec<(String, Outcome)>, String> {
@@ -194,7 +196,13 @@ pub fn checked(report: &str) -> Result<Vec<(String, Outcome)>, String> {
             .filter_map(|line| line.strip_prefix("VERIFICATION:- "));
         let reported = match (verification.next(), verification.next()) {
             (Some("SUCCESSFUL"), None) => Outcome::Pass,
-            (Some("FAILED"), None) => Outcome::Failed,
+            (Some("FAILED"), None) => {
+                if failed_properties(block) {
+                    Outcome::Failed
+                } else {
+                    Outcome::NoVerdict
+                }
+            }
             (None, _) => {
                 return Err(format!(
                     "harness {name}: its block reports no verification result"
@@ -232,6 +240,53 @@ pub fn checked(report: &str) -> Result<Vec<(String, Outcome)>, String> {
         ));
     }
     Ok(results)
+}
+
+/// Positive failure evidence from Kani's property summary, which its
+/// renderer emits in both regular and terse output before the verification
+/// result. A harness-level failure count is not a property verdict.
+fn failed_properties(block: &[&str]) -> bool {
+    let mut summaries = block
+        .iter()
+        .take_while(|line| !line.starts_with("VERIFICATION:- "))
+        .filter_map(|line| line.trim().strip_prefix("** "))
+        .filter(|line| line.contains(" failed"));
+    let Some(summary) = summaries.next() else {
+        return false;
+    };
+    if summaries.next().is_some() {
+        return false;
+    }
+    let Some((counts, suffix)) = summary.split_once(" failed") else {
+        return false;
+    };
+    let unreachable = if suffix.is_empty() {
+        0
+    } else {
+        let Some(statuses) = suffix
+            .strip_prefix(" (")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        // Undetermined checks cannot establish a complete failure verdict.
+        // The renderer can also report unreachable checks, which are valid.
+        let Some(unreachable) = statuses.strip_suffix(" unreachable") else {
+            return false;
+        };
+        let Ok(unreachable) = unreachable.parse::<usize>() else {
+            return false;
+        };
+        unreachable
+    };
+    let Some((failed, total)) = counts.split_once(" of ") else {
+        return false;
+    };
+    matches!(
+        (failed.parse::<usize>(), total.parse::<usize>()),
+        (Ok(failed), Ok(total))
+            if failed > 0 && failed <= total && unreachable <= total - failed
+    )
 }
 
 /// The proof suite's rows from a run's `report` that ended in
@@ -341,9 +396,55 @@ mod tests {
     }
 
     fn block(name: &str, result: &str) -> String {
+        let failed = usize::from(result == "FAILED");
         format!(
-            "Checking harness {name}...\nRESULTS:\nSUMMARY:\n ** 0 of 3 failed\n\nVERIFICATION:- {result}\n"
+            "Checking harness {name}...\nRESULTS:\nSUMMARY:\n ** {failed} of 3 failed\n\nVERIFICATION:- {result}\n"
         )
+    }
+
+    #[test]
+    fn failure_requires_a_completed_positive_property_summary() {
+        for properties in [
+            "",
+            " ** 0 of 3 failed\n",
+            " ** 4 of 3 failed\n",
+            " ** 1 of 3 failed\n ** 1 of 3 failed\n",
+            " ** 1 of 3 failed (1 undetermined)\n",
+            " ** 1 of 3 failed trailing text\n",
+            " ** 1 of 3 failed (3 unreachable)\n",
+            " ** invalid of 3 failed\n",
+            " - Status: FAILURE\n",
+        ] {
+            let report = format!(
+                "Checking harness x...\n{properties}VERIFICATION:- FAILED\n{}",
+                summary(0, 1)
+            );
+            assert_eq!(
+                checked(&report).unwrap(),
+                [("x".to_string(), Outcome::NoVerdict)],
+                "{report}"
+            );
+        }
+        let late = format!(
+            "Checking harness x...\nVERIFICATION:- FAILED\n ** 1 of 3 failed\n{}",
+            summary(0, 1)
+        );
+        assert_eq!(
+            checked(&late).unwrap(),
+            [("x".to_string(), Outcome::NoVerdict)],
+            "property evidence after the verdict is not its summary"
+        );
+        for properties in [" ** 1 of 3 failed\n", " ** 1 of 3 failed (1 unreachable)\n"] {
+            let report = format!(
+                "Checking harness x...\n{properties}VERIFICATION:- FAILED\n{}",
+                summary(0, 1)
+            );
+            assert_eq!(
+                checked(&report).unwrap(),
+                [("x".to_string(), Outcome::Failed)],
+                "{report}"
+            );
+        }
     }
 
     fn summary(verified: usize, failed: usize) -> String {

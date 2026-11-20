@@ -45,6 +45,19 @@ unexpected_cfgs = { level = "deny", check-cfg = [
 ] }
 unused_must_use = "deny"
 
+# The refinement machine (tests/refinement) replays every recorded run's
+# stream and checks each of its checkpoints against the custody it reaches,
+# and the support crate's collector (tests/support, `Collector`) gathers
+# every checkpoint's custody: each one's non-generic code compiled once in
+# its own crate, optimized, its checks run as written, debug assertions and
+# overflow checks kept (only the optimization level is set). The library
+# under test, whose builds the Miri gate and the reach map read, is untouched.
+[profile.dev.package.dcbor-refinement]
+opt-level = 3
+
+[profile.dev.package.dcbor-test-support]
+opt-level = 3
+
 [package]
 name = "dcbor"
 version = "0.25.2"

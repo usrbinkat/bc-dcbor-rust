@@ -47,11 +47,12 @@
 //! (`bounded.rs`:1799); the output's `resize` (writer.rs:275), one
 //! iteration per byte, at most [`OWNED_BYTES`]; `encode_into`'s segment loop
 //! (:190), at most `ceil(OWNED_BYTES / 64) + 2 GAPS + 1` = 7; the places'
-//! fold, 5. The longest, 66: `kani::unwind(67)`.
+//! fold, 5; and the bound's selection over every encoded length
+//! ([`bound_at`]), 67. The longest, 67: `kani::unwind(68)`.
 //!
 //! Compiled only under `cfg(kani)`.
 
-use super::super::super::proof_budget::{Counting, Permit};
+use super::super::super::proof_budget::{Counting, Permit, bound_at};
 use super::*;
 
 /// The most plan bytes of the domain: past two quanta.
@@ -139,7 +140,7 @@ fn any_index() -> Option<u64> {
 /// write returns its refusal and retains nothing; nothing is held once the
 /// result drops.
 #[kani::proof]
-#[kani::unwind(67)]
+#[kani::unwind(68)]
 fn the_owned_emission_bound_covers_every_owned_write() {
     let length: usize = kani::any();
     kani::assume(length <= OWNED_BYTES);
@@ -181,7 +182,9 @@ fn the_owned_emission_bound_covers_every_owned_write() {
         bytes_owner: None,
         holes_owner: None,
     };
-    let bound = owned_emit_bound::<Permit, ()>(len as u64).expect("the domain's bound fits");
+    let bound = bound_at(len, OWNED_BYTES, |size| {
+        owned_emit_bound::<Permit, ()>(size).expect("the domain's bound fits")
+    });
     let mut policy = Counting::scheduled(any_index(), any_index());
     let written = plan.encode_owned(&mut policy);
     let retained = policy.live();

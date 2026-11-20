@@ -154,7 +154,7 @@ impl Budgets {
         self.measure(
             key,
             |capacity| crate::recorded_evidence(capacity, crate::ExpectedVerdict::Accepted, body),
-            |(_, observed)| observed,
+            |(_, observed, _)| observed,
         )
         .0
     }
@@ -351,7 +351,7 @@ mod tests {
                 Ok(())
             })
         }
-        let (_, observed) =
+        let (_, observed, _) =
             crate::recorded_evidence(MEASURING, crate::ExpectedVerdict::Accepted, outgrowing);
         let measurement = counts(&observed);
         drop(observed);

@@ -49,6 +49,156 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
+
+/// Where one recorded run's time went ([`recorded_evidence`]), by the stages
+/// of the one recorded-run pipeline. Wall-clock diagnostics of where a run's
+/// cost lies: no check, budget receipt or qualification decision reads them.
+///
+/// The stages nest; a stage's time includes every stage listed under it:
+///
+/// - `total`: the whole run, from its session's construction through its
+///   finalization and its fixture's evidence inspections;
+///   - `body`: the fixture's body, every production step with its turn and
+///     contract checks and its checkpoints;
+///     - `collect` (`collections` of them): each custody traversal
+///       collected ([`collected`]), every checkpoint's and every
+///       retirement's;
+///     - `push` (`checkpoints` of them): each checkpoint stored
+///       ([`refinement::History::push`], in [`capture_collected`]);
+///   - `finalization`: the run's one ending ([`concluded`]), its policies'
+///     destruction included;
+///     - `correspondence`: each policy's history read against its counters
+///       ([`correspondence`]);
+///     - `finish`: the session finished ([`dcbor::bounded::Session::finish`]);
+///     - `refine`: the stream and every checkpoint replayed through the
+///       refinement machine ([`refine`]);
+///     - `storage`: the checkpoints' storage bound
+///       ([`refinement::History::storage`]);
+///   - `inspect`: the fixture's evidence inspections
+///     ([`RecordedRun::inspect_evidence`]).
+///
+/// What `total` holds beyond `body`, `finalization` and `inspect` is the
+/// session's construction and the run's own bookkeeping. A stage that
+/// unwinds is timed and counted to its unwind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Phases {
+    pub total: Duration,
+    pub body: Duration,
+    pub collections: usize,
+    pub collect: Duration,
+    pub checkpoints: usize,
+    pub push: Duration,
+    pub finalization: Duration,
+    pub correspondence: Duration,
+    pub finish: Duration,
+    pub refine: Duration,
+    pub storage: Duration,
+    pub inspect: Duration,
+}
+
+impl Phases {
+    /// No time spent, nothing counted.
+    pub const ZERO: Self = Self {
+        total: Duration::ZERO,
+        body: Duration::ZERO,
+        collections: 0,
+        collect: Duration::ZERO,
+        checkpoints: 0,
+        push: Duration::ZERO,
+        finalization: Duration::ZERO,
+        correspondence: Duration::ZERO,
+        finish: Duration::ZERO,
+        refine: Duration::ZERO,
+        storage: Duration::ZERO,
+        inspect: Duration::ZERO,
+    };
+}
+
+thread_local! {
+    /// The phases of the recorded run this thread is running
+    /// ([`Measuring`]); a run's stages all run on the thread that runs it.
+    static PHASES: std::cell::Cell<Phases> = const { std::cell::Cell::new(Phases::ZERO) };
+}
+
+/// One stage being timed ([`spent`]): its time and count are added to this
+/// thread's run when it is dropped, at the stage's return or its unwind.
+struct Spending {
+    stage: fn(&mut Phases) -> &mut Duration,
+    count: Option<fn(&mut Phases) -> &mut usize>,
+    started: Instant,
+}
+
+impl Drop for Spending {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        PHASES.with(|phases| {
+            let mut now = phases.get();
+            *(self.stage)(&mut now) += elapsed;
+            if let Some(count) = self.count {
+                *count(&mut now) += 1;
+            }
+            phases.set(now);
+        });
+    }
+}
+
+/// `work` timed into the stage `stage` selects of this thread's run, counted
+/// by the counter `count` selects when it names one, whether `work` returns
+/// or unwinds.
+fn spent<R>(
+    stage: fn(&mut Phases) -> &mut Duration,
+    count: Option<fn(&mut Phases) -> &mut usize>,
+    work: impl FnOnce() -> R,
+) -> R {
+    let _spending = Spending {
+        stage,
+        count,
+        started: Instant::now(),
+    };
+    work()
+}
+
+/// One recorded run's measurement: this thread's phases begun at zero, the
+/// enclosing run's (a recorded run nested in another's body) kept and
+/// restored when it ends, however it ends. A run whose finalization or
+/// inspection unwinds (a failed run) reports what it measured on standard
+/// error as it unwinds, beside the failure the unwind carries.
+struct Measuring {
+    enclosing: Phases,
+    started: Instant,
+}
+
+impl Measuring {
+    fn begin() -> Self {
+        Self {
+            enclosing: PHASES.with(|phases| phases.replace(Phases::ZERO)),
+            started: Instant::now(),
+        }
+    }
+
+    /// The phases measured since [`Self::begin`], `total` the time since it.
+    fn measured(&self) -> Phases {
+        Phases {
+            total: self.started.elapsed(),
+            ..PHASES.with(std::cell::Cell::get)
+        }
+    }
+
+    /// The run's phases, its measurement ended.
+    fn end(self) -> Phases {
+        self.measured()
+    }
+}
+
+impl Drop for Measuring {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("[recorded run] failed; phases: {:?}", self.measured());
+        }
+        PHASES.with(|phases| phases.set(self.enclosing));
+    }
+}
 
 /// Emergency bound for generic external `Resumable` bindings and a scope's
 /// whole drain, whose public contracts expose no total bound: a `Reclaim`
@@ -161,7 +311,11 @@ fn refine(
     observed: &[Observed],
     checkpoints: &refinement::History,
 ) -> Result<(), refinement::Divergence> {
-    checkpoints.settled(observed)
+    spent(
+        |phases| &mut phases.refine,
+        None,
+        || checkpoints.settled(observed),
+    )
 }
 
 /// `session` finished once nothing that can publish into it lives, and,
@@ -173,14 +327,14 @@ fn refine(
 /// consumers' ([`settled`], [`describe`]).
 fn finalize(session: Recording, checkpoints: &refinement::History) -> Finalized {
     let cause = session.invalidation();
-    match session.finish() {
+    match spent(|phases| &mut phases.finish, None, || session.finish()) {
         Err(incomplete) => Finalized::Refused(incomplete, cause),
         Ok(observed) => {
             let verdict = refine(&observed, checkpoints);
             Finalized::Finished {
                 observed,
                 verdict,
-                storage: checkpoints.storage(),
+                storage: spent(|phases| &mut phases.storage, None, || checkpoints.storage()),
             }
         }
     }
@@ -2782,10 +2936,16 @@ fn capture_collected(
     match session.boundary() {
         Ok(boundary) => {
             let id = CheckpointId(checkpoints.len());
-            checkpoints.push(refinement::Checkpoint {
-                boundary: boundary.get(),
-                custody: custody.clone(),
-            });
+            spent(
+                |phases| &mut phases.push,
+                Some(|phases| &mut phases.checkpoints),
+                || {
+                    checkpoints.push(refinement::Checkpoint {
+                        boundary: boundary.get(),
+                        custody: custody.clone(),
+                    });
+                },
+            );
             Some((id, custody))
         }
         Err(incomplete) => {
@@ -2811,6 +2971,17 @@ pub fn collect(
 /// [`collect`], with each record block held in another record's payload
 /// ([`Collected`]): the one collection, the retirement comparison's.
 fn collected(
+    observe: impl FnOnce(&mut dyn CustodySink<Permit>) -> PermitsObserved,
+) -> Result<Collected, Unobserved> {
+    spent(
+        |phases| &mut phases.collect,
+        Some(|phases| &mut phases.collections),
+        || collection(observe),
+    )
+}
+
+/// The one collection ([`collected`]), untimed.
+fn collection(
     observe: impl FnOnce(&mut dyn CustodySink<Permit>) -> PermitsObserved,
 ) -> Result<Collected, Unobserved> {
     let mut collector = Collector {
@@ -3515,13 +3686,15 @@ fn recorded_run_with<R>(
     recorded_evidence(capacity, expected, body).0
 }
 
-/// Execute and finalize once, returning detached results beside accepted evidence.
-/// Drivers attach that evidence to their reports only after all mandatory checks.
+/// Execute and finalize once, returning detached results beside accepted
+/// evidence and where the run's time went ([`Phases`]). Drivers attach that
+/// evidence to their reports only after all mandatory checks.
 fn recorded_evidence<R>(
     capacity: Capacity,
     expected: ExpectedVerdict,
     body: impl FnOnce(&mut RecordedRun) -> Result<R, Finding>,
-) -> (R, Vec<Observed>) {
+) -> (R, Vec<Observed>, Phases) {
+    let measuring = Measuring::begin();
     let mut run = RecordedRun {
         session: Recording::new(capacity),
         policies: Vec::new(),
@@ -3529,8 +3702,14 @@ fn recorded_evidence<R>(
         inspections: Vec::new(),
         defects: Vec::new(),
     };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut run)))
-        .unwrap_or_else(|payload| Err(Finding::Defect(panic_report(payload.as_ref()))));
+    let result = spent(
+        |phases| &mut phases.body,
+        None,
+        || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut run)))
+                .unwrap_or_else(|payload| Err(Finding::Defect(panic_report(payload.as_ref()))))
+        },
+    );
     let RecordedRun {
         session,
         policies,
@@ -3539,12 +3718,22 @@ fn recorded_evidence<R>(
         mut defects,
     } = run;
     let result = result.map_err(|finding| defects.push(finding));
-    let observed = concluded(session, policies, &checkpoints, &defects, expected);
-    for inspect in inspections {
-        inspect(&observed, &checkpoints);
-    }
+    let observed = spent(
+        |phases| &mut phases.finalization,
+        None,
+        || concluded(session, policies, &checkpoints, &defects, expected),
+    );
+    spent(
+        |phases| &mut phases.inspect,
+        None,
+        || {
+            for inspect in inspections {
+                inspect(&observed, &checkpoints);
+            }
+        },
+    );
     match result {
-        Ok(result) => (result, observed),
+        Ok(result) => (result, observed, measuring.end()),
         Err(()) => unreachable!("the finalization refuses a run holding a finding"),
     }
 }
@@ -3586,15 +3775,21 @@ fn concluded(
     defects: &[Finding],
     expected: ExpectedVerdict,
 ) -> Vec<Observed> {
-    let mismatches: Vec<String> = policies
-        .iter()
-        .enumerate()
-        .filter_map(|(index, policy)| {
-            correspondence(policy)
-                .err()
-                .map(|finding| format!("policy {index}: {finding}"))
-        })
-        .collect();
+    let mismatches: Vec<String> = spent(
+        |phases| &mut phases.correspondence,
+        None,
+        || {
+            policies
+                .iter()
+                .enumerate()
+                .filter_map(|(index, policy)| {
+                    correspondence(policy)
+                        .err()
+                        .map(|finding| format!("policy {index}: {finding}"))
+                })
+                .collect()
+        },
+    );
     drop(policies);
     if !defects.is_empty() || !mismatches.is_empty() {
         let finalized = describe(&finalize(session, checkpoints));
@@ -3806,6 +4001,8 @@ pub struct Constructed<O> {
     /// the driver and the policy are gone, and refined: every observation in
     /// its one order, the stream the refinement machine accepted.
     pub observed: Vec<Observed>,
+    /// Where the run's time went ([`Phases`]).
+    pub phases: Phases,
 }
 
 impl<O> Constructed<O> {
@@ -3855,6 +4052,7 @@ impl<O> Constructed<O> {
                 })
                 .collect(),
             observed: self.observed,
+            phases: self.phases,
         }
     }
 }
@@ -3972,7 +4170,7 @@ fn construction_under<T: InPlace<Limits>>(
         "the observed construction witnesses physical storage: install heap::Heap as the \
          binary's global allocator"
     );
-    let ((mut constructed, accounting), observed) = recorded_evidence(
+    let ((mut constructed, accounting), observed, phases) = recorded_evidence(
         capacity,
         ExpectedVerdict::Accepted,
         |run| {
@@ -4265,6 +4463,7 @@ fn construction_under<T: InPlace<Limits>>(
                                     performer: dcbor::bounded::Budget::performer(m),
                                     snapshots,
                                     observed: Vec::new(),
+                                    phases: Phases::ZERO,
                                 },
                                 accounting,
                             ))
@@ -4276,6 +4475,7 @@ fn construction_under<T: InPlace<Limits>>(
         },
     );
     constructed.observed = observed;
+    constructed.phases = phases;
     (constructed, accounting)
 }
 
@@ -8139,6 +8339,12 @@ mod tests {
                 })
             });
         }
+        // The storage bound first: it reads the history's own capacities, not
+        // the observer, so a history storing unchanged custody is refused by
+        // it even where its allocations outgrow what the observer records.
+        if let Err(excess) = history.storage() {
+            panic!("checkpoint history stores unchanged custody: {excess}");
+        }
         let retained = observation.snapshot();
         assert!(
             !retained.overflow,
@@ -8154,9 +8360,6 @@ mod tests {
             expected,
             "reconstructed checkpoints differ from the checkpoints pushed"
         );
-        if let Err(excess) = history.storage() {
-            panic!("checkpoint history stores unchanged custody: {excess}");
-        }
         drop(history);
         assert_eq!(observation.snapshot().live, 0, "checkpoint storage leaked");
     }
@@ -8176,6 +8379,78 @@ mod tests {
             stats.zeroed, 2,
             "a session's records and slots are not each one zeroed allocation: {stats:?}"
         );
+    }
+
+    /// A stage that unwinds is timed to its unwind and counted ([`spent`]):
+    /// a custody traversal that panics is no stage the run's phases lose.
+    #[test]
+    fn an_unwinding_stage_is_timed_and_counted() {
+        let measuring = Measuring::begin();
+        let unwound = std::panic::catch_unwind(|| {
+            spent(
+                |phases| &mut phases.collect,
+                Some(|phases| &mut phases.collections),
+                || {
+                    std::thread::sleep(Duration::from_millis(2));
+                    panic!("planted stage unwind")
+                },
+            )
+        });
+        assert!(unwound.is_err(), "the planted stage returned");
+        let phases = measuring.end();
+        assert_eq!(phases.collections, 1, "an unwound stage was not counted");
+        assert!(
+            phases.collect >= Duration::from_millis(2),
+            "an unwound stage's time was lost: {phases:?}"
+        );
+    }
+
+    /// A run's phases nest as [`Phases`] states, each stage within the one
+    /// it is listed under; a recorded run nested in another's body measures
+    /// its own stages alone, and the enclosing run's are restored when it
+    /// ends, by its return or by its failure.
+    #[test]
+    fn a_runs_phases_nest_and_a_nested_run_restores_the_enclosing_one() {
+        let checkpoint = |run: &mut RecordedRun| run.checkpoint(|_| PermitsObserved::Complete);
+        let mut nested = None;
+        let ((), _, outer) = recorded_evidence(CAPACITY, ExpectedVerdict::Accepted, |run| {
+            checkpoint(run);
+            let ((), _, inner) = recorded_evidence(CAPACITY, ExpectedVerdict::Accepted, |run| {
+                checkpoint(run);
+                checkpoint(run);
+                Ok(())
+            });
+            nested = Some(inner);
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recorded_evidence(CAPACITY, ExpectedVerdict::Accepted, |run| {
+                    checkpoint(run);
+                    run.defect("planted finding".to_string());
+                    Ok(())
+                })
+            }));
+            assert!(failed.is_err(), "a run holding a finding finished");
+            Ok(())
+        });
+        let inner = nested.expect("the nested run returned");
+        assert_eq!(
+            (inner.collections, inner.checkpoints),
+            (2, 2),
+            "the nested run measured another run's stages: {inner:?}"
+        );
+        assert_eq!(
+            (outer.collections, outer.checkpoints),
+            (1, 1),
+            "a nested run's stages, returned or failed, leaked into the enclosing run's: {outer:?}"
+        );
+        for phases in [outer, inner] {
+            assert!(
+                phases.body >= phases.collect + phases.push
+                    && phases.finalization
+                        >= phases.correspondence + phases.finish + phases.refine + phases.storage
+                    && phases.total >= phases.body + phases.finalization + phases.inspect,
+                "a stage outlasted the stage it is within: {phases:?}"
+            );
+        }
     }
 
     struct AllocatingObserver;
@@ -10827,6 +11102,8 @@ pub mod pipeline {
         /// of every family in its one order, drops and terminal settlements
         /// included, the stream the refinement machine accepted.
         pub observed: Vec<Observed>,
+        /// Where the run's time went ([`Phases`]).
+        pub phases: Phases,
     }
 
     impl Report {
@@ -10905,7 +11182,7 @@ pub mod pipeline {
         ) -> Reached,
     ) -> Report {
         let stop = schedule.stop;
-        let (mut report, observed) =
+        let (mut report, observed, phases) =
             recorded_evidence(capacity, ExpectedVerdict::Accepted, |run| {
                 let policy = run.witnessed_policy::<P>();
                 let heap = P::begin(None);
@@ -11001,9 +11278,11 @@ pub mod pipeline {
                     drain_attempt,
                     reached: valuations,
                     observed: Vec::new(),
+                    phases: Phases::ZERO,
                 })
             });
         report.observed = observed;
+        report.phases = phases;
         report
     }
 

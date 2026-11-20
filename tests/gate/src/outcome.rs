@@ -234,7 +234,8 @@ pub fn ran_one(log: &str) -> bool {
 
 /// The outcome of a model run under `checker`: a refusal of the bound only
 /// when the checker's own message names it, an overflow only as the
-/// checker's stack allocator ends one.
+/// checker's stack allocator ends one. Other signals use the native test
+/// classifier, so an abort has one classification across native runners.
 pub fn model(checker: Checker, termination: Termination, log: &str) -> Outcome {
     match termination {
         Termination::Signaled(SIGABRT)
@@ -242,8 +243,7 @@ pub fn model(checker: Checker, termination: Termination, log: &str) -> Outcome {
         {
             Outcome::StackOverflow
         }
-        Termination::Signaled(SIGSEGV) => Outcome::Segfault,
-        Termination::Signaled(_) => Outcome::Failed,
+        Termination::Signaled(_) => native(Kind::Test, termination, log),
         Termination::Exited(0) if executed(log) => Outcome::Pass,
         Termination::Exited(_) if log.contains(bound_refusal(checker)) => Outcome::BoundRefused,
         Termination::Exited(_) => Outcome::Failed,
@@ -398,6 +398,12 @@ pub fn kani(termination: Termination, log: &str) -> Outcome {
     if results.is_empty() {
         return Outcome::NoVerdict;
     }
+    if results
+        .iter()
+        .any(|(_, result)| *result == Outcome::NoVerdict)
+    {
+        return Outcome::NoVerdict;
+    }
     match termination {
         Termination::Exited(0) if results.iter().all(|(_, result)| *result == Outcome::Pass) => {
             Outcome::Pass
@@ -414,6 +420,7 @@ pub fn kani(termination: Termination, log: &str) -> Outcome {
 pub fn native(kind: Kind, termination: Termination, log: &str) -> Outcome {
     match (kind, termination) {
         (Kind::Abort, Termination::Signaled(SIGABRT)) => Outcome::Pass,
+        (Kind::Test, Termination::Signaled(SIGABRT)) => Outcome::AbnormalTermination,
         (Kind::Test, Termination::Exited(0)) if executed(log) => Outcome::Pass,
         (_, Termination::Signaled(SIGSEGV)) => Outcome::Segfault,
         _ => Outcome::Failed,
@@ -435,6 +442,9 @@ pub(crate) mod fixtures {
                 "CBMC appears to have run out of memory. You may want to rerun your proof in an environment with additional memory or use stubbing to reduce the size of the code the verifier reasons about.\n",
             ),
             ("CBMC failed with status 6", ""),
+            ("", ""),
+            ("checker stopped without usable results", ""),
+            (" ** 1 of 3 failed\nCBMC failed", ""),
             (
                 "CBMC did not finish reporting its results (exit status 6)",
                 "CBMC's output ended before its overall verification status, so the results it reported may be incomplete and were not used.\n",
@@ -499,9 +509,26 @@ mod tests {
             model(Checker::Loom, Termination::Signaled(SIGABRT), &overflowed),
             Outcome::StackOverflow
         );
+        for checker in [Checker::Loom, Checker::Shuttle] {
+            assert_eq!(
+                model(checker, Termination::Signaled(SIGABRT), "abort"),
+                Outcome::AbnormalTermination,
+                "{checker}: an unnamed abort is not an ordinary test failure"
+            );
+            assert_eq!(
+                model(checker, Termination::Signaled(9), "abort"),
+                Outcome::Failed,
+                "{checker}: SIGKILL is not an abort"
+            );
+        }
         assert_eq!(
-            model(Checker::Loom, Termination::Signaled(SIGABRT), "abort"),
-            Outcome::Failed
+            model(
+                Checker::Shuttle,
+                Termination::Signaled(SIGABRT),
+                &overflowed
+            ),
+            Outcome::AbnormalTermination,
+            "loom's stack diagnostic does not identify a shuttle stack overflow"
         );
         assert_eq!(
             model(Checker::Shuttle, Termination::Signaled(SIGSEGV), ""),
@@ -595,6 +622,16 @@ mod tests {
             native(Kind::Test, Termination::Exited(101), ""),
             Outcome::Failed
         );
+        assert_eq!(
+            native(Kind::Test, Termination::Signaled(SIGABRT), ""),
+            Outcome::AbnormalTermination,
+            "an abort remains distinct from an ordinary failed test"
+        );
+        assert_eq!(
+            native(Kind::Test, Termination::Signaled(9), ""),
+            Outcome::Failed,
+            "SIGKILL is not evidence of an abort"
+        );
     }
 
     /// A Kani run is classed by its own summary: every harness verified a
@@ -606,13 +643,22 @@ mod tests {
         let passed = "Checking harness bounded::proofs::x...\nVERIFICATION:- SUCCESSFUL\n\
                       Manual Harness Summary:\n\
                       Complete - 1 successfully verified harnesses, 0 failures, 1 total.\n";
-        let failed = "Checking harness bounded::proofs::x...\nVERIFICATION:- FAILED\n\
+        let failed = "Checking harness bounded::proofs::x...\n ** 1 of 3 failed\nVERIFICATION:- FAILED\n\
                       Manual Harness Summary:\nVerification failed for - bounded::proofs::x\n\
                       Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n";
         let exit = Termination::Exited;
         assert_eq!(kani_summary(passed), Some((1, 0, 1)));
         assert_eq!(kani(exit(0), passed), Outcome::Pass);
         assert_eq!(kani(exit(1), failed), Outcome::Failed);
+        let mixed = format!(
+            "Checking harness other...\nVERIFICATION:- FAILED\n{}",
+            failed.replace("1 failures, 1 total", "2 failures, 2 total")
+        );
+        assert_eq!(
+            kani(exit(1), &mixed),
+            Outcome::NoVerdict,
+            "a real failure must not mask another harness without a verdict"
+        );
         assert_eq!(
             kani(exit(1), passed),
             Outcome::NoVerdict,
