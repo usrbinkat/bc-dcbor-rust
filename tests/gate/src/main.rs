@@ -44,11 +44,13 @@
 //!                   is checked complete against the diffs under ROOT;
 //!                   status 1, each fault named, when it is not
 //!                   (`controls::read`)
-//!   control run red|green ROOT TARGET LOGS NAME RUNNER
+//!   control run baseline|red|green ROOT TARGET LOGS NAME RUNNER
 //!                   the control NAME of RUNNER, `native` (its test, built
 //!                   into TARGET from the copy ROOT and run alone) or `kani`
 //!                   (its harness, checked alone by `cargo kani`, its
-//!                   artifacts in TARGET), its diff applied (red: the
+//!                   artifacts in TARGET), a Kani control's harness before
+//!                   its diff is applied (baseline: it must verify,
+//!                   `controls::verified`), its diff applied (red: the
 //!                   run must refuse it by its own rule, `controls::judge`)
 //!                   or reversed (green: `controls::restored`); the judgement
 //!                   written to LOGS/NAME/SIDE.judged and the run's row to
@@ -62,10 +64,11 @@
 //!                   judgement and row written to its directory under LOGS
 //!                   (`controls::directory`); status 1 unless it held
 //!   control evidence ROOT LOGS CHANNEL
-//!                   every control of CHANNEL that runs one test, natively or
-//!                   under a Miri model, seen red, then green again in the
-//!                   same copy, its source digests changed by the diff and
-//!                   restored (`controls::evidence`)
+//!                   every control of CHANNEL that runs one test, natively,
+//!                   under a Miri model or under Kani, a Kani control's
+//!                   harness verified unmutated first, seen red, then green
+//!                   again in the same copy, its source digests changed by
+//!                   the diff and restored (`controls::evidence`)
 //!   classify RUNNER KIND STATUS LOG
 //!                   the outcome of a run of KIND (`test`, `race` or
 //!                   `abort`) that exited with STATUS as a shell reports it,
@@ -180,7 +183,7 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      models evidence ROOT PAGE LOGS | \
                      models control ROOT LOGS NAME CHECKER | \
                      control list ROOT CHANNEL RUNNER... | \
-                     control run red|green ROOT TARGET LOGS NAME native|kani | \
+                     control run baseline|red|green ROOT TARGET LOGS NAME native|kani | \
                      control judge red|green ROOT LOGS NAME RUNNER OUTCOME LOG | \
                      control evidence ROOT LOGS CHANNEL | \
                      classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs ROOT TARGET LOGS | \
@@ -530,10 +533,11 @@ fn control(
 }
 
 /// One run of the control `name` of `runner` in the copy `root`, `side`
-/// `red` (its diff applied) or `green` (reversed): built and run here, a
-/// native test or a Kani harness (`controls::observe`), then judged and
-/// recorded ([`judged`]). The runner is named, never inferred: a name may be
-/// a control under more than one runner.
+/// `baseline` (a Kani control's harness before its diff is applied), `red`
+/// (its diff applied) or `green` (reversed): built and run here, a native
+/// test or a Kani harness (`controls::observe`), then judged and recorded
+/// ([`judged`]). The runner is named, never inferred: a name may be a
+/// control under more than one runner.
 fn control_run(
     side: &str,
     root: &Path,
@@ -590,9 +594,10 @@ fn control_judge(
 }
 
 /// The judgement of one run of `control` that ended in `outcome` with
-/// `report`, `side` `red` (its diff applied: refused by its own rule,
-/// `controls::judge`) or `green` (reversed: `controls::restored`): written to
-/// `directory/SIDE.judged`, and the run's results row to
+/// `report`, `side` `baseline` (a Kani control's harness before its diff:
+/// verified, `controls::verified`), `red` (its diff applied: refused by its
+/// own rule, `controls::judge`) or `green` (reversed: `controls::restored`):
+/// written to `directory/SIDE.judged`, and the run's results row to
 /// `directory/SIDE.tsv` under the identity the script wrote there. The one
 /// record of every control run of one test, native or under Miri.
 fn judged(
@@ -604,6 +609,11 @@ fn judged(
     configuration: &str,
 ) -> Result<ExitCode, Broken> {
     let (judged, purpose, expected) = match side {
+        "baseline" => (
+            controls::verified(control, outcome, report),
+            Purpose::Normal,
+            Some(Outcome::Pass),
+        ),
         "red" => (
             controls::judge(control, outcome, report),
             Purpose::Control,
@@ -614,12 +624,13 @@ fn judged(
             Purpose::Normal,
             Some(Outcome::Pass),
         ),
-        other => return Err(Broken(format!("no side {other}; red or green"))),
+        other => return Err(Broken(format!("no side {other}; baseline, red or green"))),
     };
-    let written = match &judged {
-        Ok(()) if side == "red" => "refused".to_string(),
-        Ok(()) => "restored".to_string(),
-        Err(fault) => fault.clone(),
+    let written = match (&judged, side) {
+        (Ok(()), "baseline") => "verified".to_string(),
+        (Ok(()), "red") => "refused".to_string(),
+        (Ok(()), _) => "restored".to_string(),
+        (Err(fault), _) => fault.clone(),
     };
     write(
         &directory.join(format!("{side}.judged")),

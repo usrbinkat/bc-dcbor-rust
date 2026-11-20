@@ -398,8 +398,9 @@ fn a_record_of_another_identity_under_a_staged_name_is_a_collision() {
     assert_eq!(repository.snapshot(), before);
 }
 
-/// A leg is run with its mode, projection, directory and layer set, and
-/// none of the other recording modes, nor minimal witnesses, inherited.
+/// A leg is run as a workload, by the launcher it is given, with its mode,
+/// projection, directory and layer set, and none of the other recording
+/// modes, nor minimal witnesses, inherited.
 #[test]
 fn a_leg_inherits_no_other_recording_mode() {
     let directory = Path::new("/staged");
@@ -411,7 +412,16 @@ fn a_leg_inherits_no_other_recording_mode() {
         directory,
         log,
     };
-    let command = command(Path::new("/repo"), &leg);
+    let command = command(
+        &crate::process::Workload::at("/repo/tests/workload.sh"),
+        Path::new("/repo"),
+        &leg,
+    );
+    assert_eq!(
+        command.get_program(),
+        "/repo/tests/workload.sh",
+        "a leg is launched outside the workload launcher"
+    );
     let environment: BTreeMap<String, Option<String>> = command
         .get_envs()
         .map(|(name, value)| {
@@ -446,6 +456,7 @@ fn a_leg_inherits_no_other_recording_mode() {
     assert_eq!(
         arguments,
         [
+            "cargo",
             "test",
             "-p",
             "dcbor",

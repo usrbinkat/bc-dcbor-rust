@@ -1,0 +1,11 @@
+--- tests/gate-common.sh
++++ tests/gate-common.sh
+@@ -100,7 +100,7 @@
+ 	}
+ 	export DCBOR_GATE_MEMORY="$memory"
+ 	export DCBOR_GATE_WORKLOAD="$PWD/tests/workload.sh"
+-	confined=("$DCBOR_GATE_WORKLOAD")
++	confined=()
+ }
+
+ # The memory cap of each workload's scope (`gate_confinement`), on standard

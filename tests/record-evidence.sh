@@ -80,19 +80,36 @@ record-costs)
 esac
 
 # The recording budgets (tests/gate, `budgets`, from the record crate's one
-# inventory): each record recorded by its family's own test with
-# DCBOR_RECORD_BUDGETS naming that record alone, its currency checked, then
-# the same test run with recording disabled against the record just
-# published. Each run's whole output is kept under TMPDIR, judged by the
-# gate's one classifier, and required to name the record it finalized
-# exactly once.
+# inventory) of this run's layer (DCBOR_RIGOR): each record recorded by its
+# family's own test with DCBOR_RECORD_BUDGETS naming that record alone, its
+# currency checked, then the same test run with recording disabled against
+# the record just published. Each run's whole output is kept under TMPDIR,
+# judged by the gate's one classifier, and required to name the record it
+# finalized exactly once. One run records one layer, so the exhaustive
+# layer's records are recorded only where its execution is authorized; the
+# inventory is held by both layers' runs together. `record-budgets` exits
+# after its layer; the evidence gate (`gate evidence`, which `check` and
+# `record` reach below) refuses any record of the inventory missing.
 if [[ "$mode" == record || "$mode" == record-budgets ]]; then
 	budget_logs="$(mktemp -d "${TMPDIR:?required: budget execution logs}/dcbor-budgets.XXXXXXXX")"
 	echo "budget execution logs: $budget_logs"
+	# `record` runs the family's test with DCBOR_RECORD_BUDGETS naming its one
+	# record; `check` runs it with the variable removed outright, so the check
+	# reads the record just published (compiled in again: the support crate's
+	# build reruns on any change under tests/data/budgets) and never records.
 	budget_run() {
 		local phase="$1"
 		local log="$budget_logs/$name.$phase.log"
-		cargo test -p dcbor --no-default-features --features "$projection" \
+		local recording
+		case "$phase" in
+		record) recording=(env "DCBOR_RECORD_BUDGETS=$name") ;;
+		check) recording=(env -u DCBOR_RECORD_BUDGETS) ;;
+		*)
+			echo "no budget phase $phase; record or check" >&2
+			exit 2
+			;;
+		esac
+		"${recording[@]}" "${confined[@]}" cargo test -p dcbor --no-default-features --features "$projection" \
 			--test "$target" "$test" -- --exact --nocapture 2>&1 | tee "$log"
 		local outcome
 		outcome="$(gate classify cargo test 0 "$log")"
@@ -100,15 +117,17 @@ if [[ "$mode" == record || "$mode" == record-budgets ]]; then
 			echo "$name: $phase did not execute a passing test ($outcome)" >&2
 			exit 1
 		}
-		local line receipts=0
+		# Every receipt the run printed, whichever record it names (`budget
+		# finalized: RECORD`, after libtest's `test NAME ... ` prefix when it
+		# shares that line): exactly one, and it is this record's.
+		local line finalized=()
 		while IFS= read -r line; do
-			if [[ "$line" == "budget finalized: $name" ||
-				"$line" == "test $test ... budget finalized: $name" ]]; then
-				receipts=$((receipts + 1))
+			if [[ "$line" == *"budget finalized: "* ]]; then
+				finalized+=("${line##*budget finalized: }")
 			fi
 		done <"$log"
-		[[ "$receipts" == 1 ]] || {
-			echo "$name: $phase finalized $receipts families, expected one" >&2
+		[[ "${#finalized[@]}" == 1 && "${finalized[0]}" == "$name" ]] || {
+			echo "$name: $phase finalized ${#finalized[@]} families (${finalized[*]}), expected $name alone" >&2
 			exit 1
 		}
 	}
@@ -117,13 +136,23 @@ if [[ "$mode" == record || "$mode" == record-budgets ]]; then
 		echo "the gate names no budget family" >&2
 		exit 2
 	}
+	selected=0
+	inventoried=0
 	while IFS=$'\t' read -r name projection target test rigor witness; do
-		DCBOR_RECORD_BUDGETS="$name" DCBOR_RIGOR="$rigor" DCBOR_WITNESS="$witness" \
+		inventoried=$((inventoried + 1))
+		[[ "$rigor" == "$DCBOR_RIGOR" ]] || continue
+		selected=$((selected + 1))
+		DCBOR_RIGOR="$rigor" DCBOR_WITNESS="$witness" \
 			budget_run record
 		gate current "tests/data/budgets/$name"
 		DCBOR_RIGOR="$rigor" DCBOR_WITNESS="$witness" \
 			budget_run check
 	done <<<"$budgets"
+	((selected > 0)) || {
+		echo "the budget inventory holds no selection of the $DCBOR_RIGOR layer" >&2
+		exit 2
+	}
+	echo "budgets recorded and checked: $selected of $inventoried, the $DCBOR_RIGOR layer's"
 	if [[ "$mode" == record-budgets ]]; then
 		exit 0
 	fi
@@ -132,9 +161,9 @@ fi
 if [[ "$mode" == record ]]; then
 	for index in "${!suffixes[@]}"; do
 		echo "record evidence: ${suffixes[index]:-default}, rigor=$DCBOR_RIGOR"
-		DCBOR_RECORD_FACTORS=1 cargo test -p dcbor --no-default-features \
+		DCBOR_RECORD_FACTORS=1 "${confined[@]}" cargo test -p dcbor --no-default-features \
 			--features "${features[index]}" --lib
-		DCBOR_RECORD_TRACES=1 cargo test -p dcbor --no-default-features \
+		DCBOR_RECORD_TRACES=1 "${confined[@]}" cargo test -p dcbor --no-default-features \
 			--features "${features[index]}" --test resumable_contract \
 			every_baseline_admits_exactly_its_recorded_calls -- --nocapture
 	done

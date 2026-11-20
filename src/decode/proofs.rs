@@ -31,19 +31,55 @@
 //! their own float and simple-value checks are not covered here.
 //!
 //! The scalar harness uses symbolic bytes and input length, restricting only
-//! the head's major type to unsigned, negative or simple. It has no
-//! enumeration loop. `kani::unwind(1)` keeps speculative container paths
-//! short; unwinding assertions must establish that no reachable execution
-//! needs more iterations or recursive calls. The returned decoded
-//! value is forgotten because this property checks acceptance, not
-//! destruction; internal decoder cleanup remains part of the checked code.
-//! The range rule's harness reaches no loop (`kani::unwind(1)`).
-//! Compiled only under `cfg(kani)`.
+//! the head's major type to unsigned, negative or simple. CBMC's symbolic
+//! execution does not prune the decoder's dispatch on the major type by that
+//! assumption: run whole, it expanded the byte-string, text, array, map and
+//! tagged arms, their recursion, the values they build and their
+//! destruction (B-tree traversal and teardown, vector growth, key encoding,
+//! UTF-8 and NFC checks), until CBMC exhausted the host's memory, for an
+//! input domain none of them is in. Those five arms are functions of their
+//! own (`super::decode_byte_string`, `decode_text`, `decode_array`,
+//! `decode_map`, `decode_tagged`), and the harness replaces each with a stub
+//! that fails a `kani::assert` and ends the path ([`no_bytes_or_text`],
+//! [`no_items`]): a successful verdict is also the proof that no input of the
+//! scalar domain reaches any of them, and an input that did would fail the
+//! harness, never pass it. With no arm of items reachable there is no
+//! recursion and no loop: `kani::unwind(1)`, its unwinding assertions
+//! enabled. The returned decoded value is forgotten because this property
+//! checks acceptance, not destruction; the decoder's own cleanup of a value
+//! it refuses (`UnusedData`) remains part of the checked code. The range
+//! rule's harness reaches no loop (`kani::unwind(1)`). Compiled only under
+//! `cfg(kani)`.
 
 use super::{decode_cbor, negative, parse_header_varint};
-use crate::Error;
 use crate::float::{Numeric, reference};
 use crate::varint::{MAX_HEAD_LEN, MajorType};
+use crate::{CBOR, Error};
+
+/// The arm of byte strings or texts (`super::decode_byte_string`,
+/// `super::decode_text`) in the scalar harness: reaching it fails the
+/// harness ([`arm_reached`]).
+fn no_bytes_or_text(_: &[u8], _: u64, _: usize) -> crate::Result<(CBOR, usize)> {
+    arm_reached()
+}
+
+/// The arm of arrays, maps or tagged items (`super::decode_array`,
+/// `super::decode_map`, `super::decode_tagged`) in the scalar harness:
+/// reaching it fails the harness ([`arm_reached`]).
+fn no_items(_: &[u8], _: u64, _: usize, _: usize) -> crate::Result<(CBOR, usize)> {
+    arm_reached()
+}
+
+/// A failed check that a scalar head reached an arm of bytes, text or items,
+/// then the end of that path: nothing after it is executed.
+fn arm_reached() -> crate::Result<(CBOR, usize)> {
+    kani::assert(
+        false,
+        "a scalar head reached the decoder's arm of bytes, text or items",
+    );
+    kani::assume(false);
+    Err(Error::Underrun)
+}
 
 /// The integer-wire range rule over every `u64` argument, against the
 /// reference stated in `i128` arithmetic, where no value overflows: a
@@ -73,11 +109,20 @@ fn the_negative_range_rule_is_exact() {
 /// [`MAX_HEAD_LEN`] bytes, any bytes, is accepted exactly as the reference
 /// states. The `half` conversion the float heads reach is stubbed with its
 /// contract, discharged natively and exhaustively (`float/proofs.rs`, "The
-/// `half` conversion").
+/// `half` conversion"); the decoder's arms of bytes, text and items are
+/// stubbed with a failed check, so they are checked unreachable here.
 #[kani::proof]
 #[kani::unwind(1)]
 #[kani::stub(crate::float::narrowed, crate::float::proofs::from_f64_contract)]
 #[kani::stub(crate::float::widened, crate::float::proofs::to_f64_contract)]
+#[kani::stub(
+    crate::decode::decode_byte_string,
+    crate::decode::proofs::no_bytes_or_text
+)]
+#[kani::stub(crate::decode::decode_text, crate::decode::proofs::no_bytes_or_text)]
+#[kani::stub(crate::decode::decode_array, crate::decode::proofs::no_items)]
+#[kani::stub(crate::decode::decode_map, crate::decode::proofs::no_items)]
+#[kani::stub(crate::decode::decode_tagged, crate::decode::proofs::no_items)]
 fn a_scalar_item_is_accepted_exactly_in_the_profile() {
     let bytes: [u8; MAX_HEAD_LEN] = kani::any();
     let major = bytes[0] >> 5;

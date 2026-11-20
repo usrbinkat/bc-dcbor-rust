@@ -1,6 +1,6 @@
 --- src/decode.rs
 +++ src/decode.rs
-@@ -217,7 +217,10 @@
+@@ -171,7 +171,10 @@
              _ => match value {
                  20 => Ok((CBOR::r#false(), header_varint_len)),
                  21 => Ok((CBOR::r#true(), header_varint_len)),

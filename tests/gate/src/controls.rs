@@ -557,6 +557,30 @@ pub fn restored(control: &Control, outcome: Outcome, report: &str) -> Result<(),
     }
 }
 
+/// Whether a run of the Kani `control`'s harness in its copy before the diff
+/// is applied verified it: the harness checked alone and passed. A control
+/// planted into a harness with no verdict on the unmutated commit (no
+/// result, a timeout, a solver out of memory: `NoVerdict`; a failure; an
+/// unsupported construct or a short bound) shows nothing of its defect, so
+/// its red side is never run ([`evidence`] requires this baseline).
+pub fn verified(control: &Control, outcome: Outcome, report: &str) -> Result<(), String> {
+    if control.runner != Runner::Kani {
+        return Err(format!(
+            "{}: a {} control has no baseline side; a Kani control's does",
+            control.name,
+            control.runner.name()
+        ));
+    }
+    if outcome == Outcome::Pass && alone(control, report, outcome) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: the unmutated harness did not verify alone ({outcome}), so no control is run against it",
+            control.name
+        ))
+    }
+}
+
 /// One run of the native `control` in the copy `root`: its target built into
 /// `target_dir`, its one test run alone, logged under `logs` by `side`. Its
 /// outcome and report: a refused build's log, or the run's.
@@ -609,7 +633,8 @@ pub fn directory(logs: &Path, control: &Control) -> std::path::PathBuf {
 
 /// The evidence of every control of `toolchain` under `logs` that runs one
 /// test (native, or under a Miri model), one directory per control written
-/// by `tests/controls.sh` ([`directory`]): its red judgement and its
+/// by `tests/controls.sh` ([`directory`]): a Kani control's harness verified
+/// on the unmutated copy first ([`verified`]), its red judgement and its
 /// restored judgement each passed, and the copy's source digest changed by
 /// the diff and equal again once it was reversed.
 pub fn evidence(controls: &[Control], logs: &Path, toolchain: &str) -> Vec<String> {
@@ -623,6 +648,16 @@ pub fn evidence(controls: &[Control], logs: &Path, toolchain: &str) -> Vec<Strin
         let read = |file: &str| {
             std::fs::read_to_string(directory.join(file)).map(|text| text.trim().to_string())
         };
+        if control.runner == Runner::Kani {
+            match read("baseline.judged") {
+                Ok(baseline) if baseline == "verified" => {}
+                Ok(baseline) => faults.push(format!("{label}: no verified baseline: {baseline}")),
+                Err(_) => faults.push(format!(
+                    "{label}: its harness never ran unmutated ({})",
+                    directory.display()
+                )),
+            }
+        }
         match (read("red.judged"), read("green.judged")) {
             (Ok(red), Ok(green)) => {
                 if red != "refused" {
@@ -727,6 +762,39 @@ mod kani_tests {
         assert!(restored(control, Outcome::Pass, &two).is_err());
         assert!(judge(control, Outcome::Failed, &passed).is_err());
         assert!(restored(control, Outcome::Pass, &report).is_err());
+        // The baseline: the unmutated harness verified alone, and only then;
+        // a run with no verdict, a failure, or another harness's report
+        // blocks the control before its diff is applied.
+        assert_eq!(verified(control, Outcome::Pass, &passed), Ok(()));
+        for (outcome, text) in [
+            (Outcome::Failed, &report),
+            (Outcome::Pass, &two),
+            (Outcome::Pass, &report),
+        ] {
+            assert!(
+                verified(control, outcome, text).is_err(),
+                "a baseline was verified by {outcome}: {text}"
+            );
+        }
+        for block in outcome::fixtures::kani_no_verdict_blocks(HARNESS) {
+            let incomplete = format!(
+                "{block}Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n"
+            );
+            for classified in [Outcome::Pass, Outcome::NoVerdict, Outcome::Failed] {
+                assert!(
+                    verified(control, classified, &incomplete)
+                        .is_err_and(|fault| fault.contains("did not verify")),
+                    "a harness without a verdict was taken for a verified baseline"
+                );
+            }
+        }
+        let mut native = control.clone();
+        native.runner = Runner::Native;
+        assert!(
+            verified(&native, Outcome::Pass, &passed)
+                .is_err_and(|fault| fault.contains("has no baseline side")),
+            "a native control was given a baseline side"
+        );
         for block in outcome::fixtures::kani_no_verdict_blocks(HARNESS) {
             let incomplete = format!(
                 "{block}Failed Checks: a planted failure\n\
@@ -739,5 +807,45 @@ mod kani_tests {
                 );
             }
         }
+    }
+
+    /// A Kani control's evidence requires its harness verified on the
+    /// unmutated copy (`baseline.judged`, `verified`) beside its red and green
+    /// judgements: one seen red and green with no baseline, or with a
+    /// baseline that recorded no verdict, is no evidence.
+    #[test]
+    fn a_kani_control_is_evidence_only_over_a_verified_baseline() {
+        let control = parse(&row("kani", "-", "lib")).unwrap();
+        let logs = std::env::temp_dir().join(format!("dcbor-kani-baseline-{}", std::process::id()));
+        let at = directory(&logs, &control[0]);
+        std::fs::create_dir_all(&at).expect("a fixture directory");
+        let write = |file: &str, text: &str| std::fs::write(at.join(file), text).unwrap();
+        write("red.judged", "refused\n");
+        write("green.judged", "restored\n");
+        write("before.sha256", "a\n");
+        write("planted.sha256", "b\n");
+        write("after.sha256", "a\n");
+        let unbased = evidence(&control, &logs, KANI_TOOLCHAIN);
+        assert!(
+            unbased
+                .iter()
+                .any(|fault| fault.contains("never ran unmutated")),
+            "a Kani control without a baseline was evidence: {unbased:#?}"
+        );
+        write(
+            "baseline.judged",
+            "x: the unmutated harness did not verify alone (no_verdict), so no control is run against it\n",
+        );
+        let inconclusive = evidence(&control, &logs, KANI_TOOLCHAIN);
+        assert!(
+            inconclusive
+                .iter()
+                .any(|fault| fault.contains("no verified baseline")),
+            "a Kani control without a baseline was evidence: {inconclusive:#?}"
+        );
+        write("baseline.judged", "verified\n");
+        let based = evidence(&control, &logs, KANI_TOOLCHAIN);
+        std::fs::remove_dir_all(&logs).expect("the fixture removed");
+        assert_eq!(based, Vec::<String>::new());
     }
 }

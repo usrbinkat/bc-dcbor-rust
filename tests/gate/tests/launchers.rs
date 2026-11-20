@@ -103,6 +103,14 @@ fn the_contribution_gate_forwards_a_reused_run_and_its_failure() {
 /// Each process appends its identifier to `pids`. With `HOLD_NESTED=1` it
 /// also starts a gate of its own, as a gate runs another (the mutation
 /// campaign its Miri judge), which records its four processes beside these.
+/// With `HOLD_ALLOCATE=1` it then runs, as a workload of the gate's
+/// (`confined`, tests/gate-common.sh `gate_confinement`), a child that
+/// records its own scope's cgroup, `memory.max`, `memory.swap.max` and
+/// `OOMPolicy` and `oom_kill` count in `confinement`, leaves a holder
+/// process in the scope (its PID in `holder`) to keep the scope's cgroup
+/// for an outside reader, and then doubles a string toward 256 MiB, as a
+/// runaway checker grows; the gate records the workload's exit status in
+/// `allocated` before it waits to be released.
 const HOLDING_GATE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -128,6 +136,20 @@ sleep 600 &
 printf '%s\n' "$!" >>pids
 bash -c 'sleep 600 & printf "%s\n%s\n" "$$" "$!" >>pids; wait' &
 if [[ "${HOLD_NESTED:-0}" == 1 ]]; then HOLD_NESTED=0 bash tests/hold.sh & fi
+if [[ "${HOLD_ALLOCATE:-0}" == 1 ]]; then
+    grown=0
+    "${confined[@]}" bash -c '
+        sleep 600 &
+        printf "%s\n" "$!" >holder
+        cg="$(cut -d: -f3 /proc/self/cgroup)"
+        printf "%s\n%s\n%s\n%s\n%s\n" "$cg" "$(cat "/sys/fs/cgroup$cg/memory.max")" \
+            "$(cat "/sys/fs/cgroup$cg/memory.swap.max")" \
+            "$(systemctl --user show "${cg##*/}" --property=OOMPolicy --value)" \
+            "$(grep "^oom_kill " "/sys/fs/cgroup$cg/memory.events")" >confinement
+        grown=a
+        while ((${#grown} < 268435456)); do grown+=$grown; done' || grown=$?
+    printf '%s\n' "$grown" >allocated
+fi
 while [[ ! -e release ]]; do sleep 0.05; done
 exit 0
 "#;
@@ -147,7 +169,10 @@ impl Stat {
 }
 
 /// Read the kernel's process state; disappearance is distinct from an
-/// unreadable or malformed record.
+/// unreadable or malformed record. A process gone before its record is
+/// opened is `NotFound`; one that exits while its record is read fails the
+/// read with `ESRCH` (proc_pid_stat reads a released task): both are its
+/// disappearance.
 fn process_state(pid: u32) -> std::io::Result<Option<Stat>> {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat
@@ -169,7 +194,12 @@ fn process_state(pid: u32) -> std::io::Result<Option<Stat>> {
             })
             .map(Some)
             .ok_or_else(|| std::io::Error::other(format!("invalid /proc/{pid}/stat"))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
@@ -239,12 +269,19 @@ impl HoldingGate {
             scratch.0.join("tests/gate-common.sh"),
         )
         .unwrap();
+        scratch.executable(
+            "tests/workload.sh",
+            &std::fs::read_to_string(tests().join("workload.sh")).unwrap(),
+        );
         scratch.executable("tests/hold.sh", HOLDING_GATE);
         let mut command = Command::new("bash");
         command
             .arg("tests/hold.sh")
             .current_dir(&scratch.0)
             .env_remove("DCBOR_GATE_SUPERVISOR")
+            .env_remove("DCBOR_GATE_MEMORY")
+            .env_remove("DCBOR_GATE_WORKLOAD")
+            .env_remove("HOLD_ALLOCATE")
             .env_remove("HOLD_IGNORE_TERM")
             .env_remove("HOLD_NESTED")
             .env_remove("HOLD_PHASE")
@@ -579,6 +616,102 @@ fn a_gate_starts_its_work_once_its_watcher_is_ready() {
     }
 }
 
+/// A gate's workload runs confined (tests/gate-common.sh,
+/// `gate_confinement`; tests/workload.sh): in a transient scope of its own,
+/// apart from the gate's own cgroup, capped at `DCBOR_GATE_MEMORY` with no
+/// swap. A workload growing past the cap is killed by the kernel among the
+/// workload scope's processes alone, so the gate, outside that scope, runs
+/// to its end whatever the kernel chooses inside it. The kill is observed
+/// from outside: the kernel's `oom_kill` count of the workload's scope,
+/// kept by a holder process the workload leaves in it, is read at 1 where
+/// the workload read 0 before growing. The scope's `OOMPolicy` is read, not
+/// observed: systemd applies it after the fact and under `continue` records
+/// nothing; it only keeps systemd from ending the rest of the workload's
+/// tree, every process of which remains an eligible victim.
+#[test]
+fn a_gate_survives_its_workload_killed_for_memory() {
+    const CAP: u64 = 64 << 20;
+    let scratch = Scratch::new("process-group-confined");
+    let mut gate = HoldingGate::start(
+        &scratch,
+        &[("DCBOR_GATE_MEMORY", "64M"), ("HOLD_ALLOCATE", "1")],
+    );
+    let pids = gate.started(4);
+    let leader = pids[0];
+    let allocated = scratch.0.join("allocated");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let grown = loop {
+        match std::fs::read_to_string(&allocated) {
+            Ok(text) if text.ends_with('\n') => break text.trim().to_string(),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read {}: {error}", allocated.display()),
+        }
+        let status = gate.supervisor.try_wait().unwrap();
+        assert!(
+            status.is_none() && Instant::now() < deadline,
+            "a gate whose workload exceeded its memory cap did not run to its end: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let membership = std::fs::read_to_string(format!("/proc/{leader}/cgroup"))
+        .expect("read the gate's cgroup membership");
+    let own = membership
+        .trim()
+        .strip_prefix("0::")
+        .expect("a cgroup v2 membership");
+    let report = std::fs::read_to_string(scratch.0.join("confinement"))
+        .expect("the workload reported its confinement");
+    let lines: Vec<&str> = report.lines().collect();
+    let [scope, max, swap, policy, before] = lines[..] else {
+        panic!("the workload reported {report:?}");
+    };
+    assert!(
+        scope != own && scope.ends_with(".scope"),
+        "a gate's workload ran in the gate's own cgroup {own}: {scope}"
+    );
+    assert_eq!(
+        max,
+        CAP.to_string(),
+        "a gate's workload is not capped at DCBOR_GATE_MEMORY"
+    );
+    assert_eq!(swap, "0", "a gate's workload may swap");
+    assert_eq!(
+        policy, "continue",
+        "a workload's scope does not continue past an out-of-memory kill"
+    );
+    // The kernel's own count, read outside the scope while the holder keeps
+    // its cgroup: the grown process's SIGKILL was the scope's OOM kill.
+    let events = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/memory.events"))
+        .expect("read the workload scope's memory events while its holder keeps it");
+    let after: Vec<&str> = events
+        .lines()
+        .filter(|line| line.starts_with("oom_kill "))
+        .collect();
+    assert_eq!(
+        (before, after.as_slice()),
+        ("oom_kill 0", ["oom_kill 1"].as_slice()),
+        "the kernel did not kill the grown workload inside its scope for memory"
+    );
+    assert_eq!(
+        grown, "137",
+        "a workload past the gate's memory cap was not killed inside its scope"
+    );
+    let holder = std::fs::read_to_string(scratch.0.join("holder")).unwrap();
+    let ended = signal("KILL", holder.trim()).unwrap();
+    assert!(ended.success(), "end the workload scope's holder {holder}");
+    std::fs::write(scratch.0.join("release"), "").unwrap();
+    let (status, left) = gate.stopped();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "a gate whose workload exceeded its memory cap did not run to its end: {status:?}"
+    );
+    assert!(
+        left.is_empty(),
+        "a gate whose workload was killed left {left:?} of {pids:?} running"
+    );
+}
+
 /// A supervised launch whose parent is already gone must not become a new
 /// top-level supervisor and start the workload.
 #[test]
@@ -592,12 +725,147 @@ fn an_orphaned_supervised_launch_starts_no_work() {
     assert!(gate.pids().is_empty(), "an orphaned launch started work");
 }
 
-/// Every script that sources the gates' common definitions owns its process
-/// group: `own_process_group "$@"` on the line after the `source`. A gate
-/// that does not leaves every process it started running when it is
-/// stopped.
+/// The control runner's order for a Kani control (tests/controls.sh): its
+/// harness is checked on the unmutated copy first, and only a verified
+/// baseline lets the diff be planted and the red and green sides run; a
+/// baseline that did not verify fails the control by name with neither run.
+/// The committed script runs in a scratch repository of one file and one
+/// Kani control, its own ownership, confinement, clean-commit check,
+/// preflight and copies real; the gate tool, recording each side it is
+/// asked to run and failing the baseline as told, and the toolchain are
+/// recorders.
 #[test]
-fn every_gate_owns_its_process_group() {
+fn a_kani_control_runs_only_over_a_verified_baseline() {
+    const GATE: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GATE_CALLS"
+case "$1" in
+unicode-version) echo 17.0.0 ;;
+dcbor-draft) echo draft ;;
+miri) echo stacked ;;
+control)
+	case "$2" in
+	list) printf 'x\ttests/data/controls/x.patch\tkani\tkani\tdcbor\t-\tlib\ta::h\t-\tfailed\tp\n' ;;
+	run) if [[ "$3" == baseline ]]; then exit "$BASELINE_EXIT"; fi ;;
+	evidence) ;;
+	*) exit 2 ;;
+	esac
+	;;
+*) exit 2 ;;
+esac
+"#;
+    const RUSTC: &str = "#!/bin/sh\n\
+        case \"$*\" in\n\
+        -vV) printf 'rustc 0.0.0-fixture\\nhost: fixturehost\\n' ;;\n\
+        '--print sysroot') echo /fixture/sysroot ;;\n\
+        *) echo rustc 0.0.0-fixture ;;\n\
+        esac\n";
+    let scratch = Scratch::new("controls-baseline");
+    let repo = scratch.0.join("repo");
+    let write = |relative: &str, text: &str, mode: u32| {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    for script in ["controls.sh", "gate-common.sh", "workload.sh"] {
+        write(
+            &format!("tests/{script}"),
+            &std::fs::read_to_string(tests().join(script)).unwrap(),
+            0o755,
+        );
+    }
+    write(".gitignore", "target/\n", 0o644);
+    write("file.txt", "a\nb\nd\n", 0o644);
+    write(
+        "tests/data/controls/x.patch",
+        "--- file.txt\n+++ file.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n",
+        0o644,
+    );
+    write("target/gate-tool/fixturehost/debug/gate", GATE, 0o755);
+    scratch.executable("bin/cargo", "#!/bin/sh\nexit 0\n");
+    scratch.executable("bin/cargo-kani", "#!/bin/sh\nexit 0\n");
+    scratch.executable("bin/rustc", RUSTC);
+    let git = |arguments: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@localhost",
+            ])
+            .args(arguments)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    let path = format!(
+        "{}:{}",
+        scratch.0.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let run = |baseline: &str| {
+        let calls = scratch.0.join(format!("calls-{baseline}"));
+        let output = Command::new("bash")
+            .args(["tests/controls.sh", "kani"])
+            .current_dir(&repo)
+            .env("PATH", &path)
+            .env("DCBOR_CONFIGURATION", "fixture")
+            .env("CONTROL_LOG_DIR", repo.join("target/logs").join(baseline))
+            .env("GATE_CALLS", &calls)
+            .env("BASELINE_EXIT", baseline)
+            .env_remove("DCBOR_GATE_SUPERVISOR")
+            .env_remove("DCBOR_GATE_MEMORY")
+            .env_remove("DCBOR_GATE_WORKLOAD")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        let sides: Vec<String> = recorded
+            .lines()
+            .filter(|line| line.starts_with("control run "))
+            .filter_map(|line| line.split_whitespace().nth(2).map(str::to_string))
+            .collect();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status, sides, report)
+    };
+    let (status, sides, report) = run("1");
+    assert_eq!(
+        sides,
+        ["baseline"],
+        "a Kani control's red side ran over a baseline that did not verify: {sides:?}\n{report}"
+    );
+    assert!(
+        report
+            .contains("FAIL x-kani: the unmutated harness did not verify; the control is not run"),
+        "a baseline that did not verify was not named: {report}"
+    );
+    assert_eq!(status.code(), Some(1), "{report}");
+    let (status, sides, report) = run("0");
+    assert_eq!(
+        sides,
+        ["baseline", "red", "green"],
+        "a verified baseline was not followed by the control's red and green sides: {report}"
+    );
+    assert!(
+        report.contains("PASS x-kani: the unmutated harness verified"),
+        "{report}"
+    );
+    assert_eq!(status.code(), Some(0), "{report}");
+}
+
+/// Every shell script of the repository's `tests` and `fuzz` directories,
+/// by path.
+fn scripts() -> Vec<PathBuf> {
     let root = tests().join("..");
     let mut scripts = Vec::new();
     for directory in ["tests", "fuzz"] {
@@ -609,6 +877,16 @@ fn every_gate_owns_its_process_group() {
         }
     }
     scripts.sort();
+    scripts
+}
+
+/// Every script that sources the gates' common definitions owns its process
+/// group: `own_process_group "$@"` on the line after the `source`. A gate
+/// that does not leaves every process it started running when it is
+/// stopped.
+#[test]
+fn every_gate_owns_its_process_group() {
+    let scripts = scripts();
     let mut gates = Vec::new();
     let mut unowned = Vec::new();
     for path in &scripts {
@@ -628,5 +906,61 @@ fn every_gate_owns_its_process_group() {
     assert!(
         unowned.is_empty(),
         "gates owning no process group: {unowned:?}"
+    );
+}
+
+/// A regression check of the gates' workload launches, of limited
+/// coverage: each line of a gate, or of the gates' common definitions,
+/// holding one of the literal workload spellings below (a cargo test,
+/// build, run, Miri or fuzz command, a mutation campaign, a coverage tool)
+/// holds the `confined` prefix (tests/gate-common.sh, `gate_confinement`).
+/// It parses no shell: another spelling, a program named by a variable, a
+/// command split across lines or a second command on a confined line
+/// escapes it. The gate tool's classifier argument `gate classify cargo
+/// KIND`, which names a kind of run and runs nothing, is not taken for one.
+/// The gate tool's runs are confined by `process::Workload`.
+#[test]
+fn every_gate_workload_is_confined() {
+    const WORKLOADS: [&str; 9] = [
+        "cargo test",
+        "cargo build",
+        "cargo run",
+        "cargo miri",
+        "cargo fuzz build",
+        "cargo fuzz run",
+        "cargo-mutants mutants",
+        "llvm-profdata\" merge",
+        "llvm-cov\" export",
+    ];
+    let mut checked = 0;
+    let mut unconfined = Vec::new();
+    for path in scripts() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let common = path.ends_with("tests/gate-common.sh");
+        if !common
+            && !text
+                .lines()
+                .any(|line| line.trim() == "source tests/gate-common.sh")
+        {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            let code = line.trim();
+            let launched = code.replace("gate classify cargo", "gate classify");
+            if code.starts_with('#')
+                || !WORKLOADS.iter().any(|workload| launched.contains(workload))
+            {
+                continue;
+            }
+            checked += 1;
+            if !code.contains("\"${confined[@]}\"") {
+                unconfined.push(format!("{}:{}: {code}", path.display(), index + 1));
+            }
+        }
+    }
+    assert!(checked > 0, "no gate runs a workload");
+    assert!(
+        unconfined.is_empty(),
+        "gate workloads launched unconfined: {unconfined:#?}"
     );
 }

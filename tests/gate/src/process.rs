@@ -1,8 +1,11 @@
 //! Running what the gates judge: each checker build's test binaries, each
 //! model's test a process of its own, its environment exactly the declared
-//! inputs, its termination, log and measurement kept.
+//! inputs, its termination, log and measurement kept. Every run is a
+//! workload ([`workload`]): confined to a memory-capped scope of its own,
+//! while the gate tool recording its judgement stays outside.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,14 +21,69 @@ const DESCRIBE: &str = "DCBOR_MODEL_DESCRIBE";
 const SCHEDULES: &str = "DCBOR_MODEL_SCHEDULES";
 const DESCRIPTION: &str = "DCBOR_MODEL";
 
-/// A command whose environment holds nothing a model run may not read: no
-/// `LOOM_*`, `SHUTTLE_*`, or `DCBOR_RECORD_*` variable, backtraces off,
-/// no model value. Control runs cannot inherit permission to rewrite evidence.
-fn controlled(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(program);
+/// The workload launcher a gate exports (tests/gate-common.sh,
+/// `gate_confinement`): tests/workload.sh, the one confinement of every
+/// workload, which reads the cap from `DCBOR_GATE_MEMORY`.
+const WORKLOAD: &str = "DCBOR_GATE_WORKLOAD";
+
+/// The workload launcher: tests/workload.sh, which runs its command in a
+/// transient scope of its own of the user's systemd manager, its memory
+/// capped with no swap, exec'd in place so the command's exit status or
+/// signal is the launch's. The gate tool, which waits for each workload and
+/// records its judgement, stays outside the scope: an out-of-memory kill
+/// chooses its victim among the workload's processes alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workload(std::ffi::OsString);
+
+impl Workload {
+    /// The launcher the gate running this tool exported ([`WORKLOAD`]);
+    /// refused when no gate defined its confinement.
+    pub fn exported() -> Result<Self, String> {
+        std::env::var_os(WORKLOAD).map(Self).ok_or_else(|| {
+            format!(
+                "{WORKLOAD} is unset: run the gate tool from a gate (tests/gate-common.sh, gate_confinement)"
+            )
+        })
+    }
+
+    /// The launcher at `path`.
+    pub fn at(path: impl Into<std::ffi::OsString>) -> Self {
+        Self(path.into())
+    }
+
+    /// `program` launched as a workload.
+    pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
+        let mut command = Command::new(&self.0);
+        command.arg(program);
+        command
+    }
+
+    /// The launcher itself, for a measuring parent outside the workload's
+    /// scope that runs it as its command ([`run_once`]).
+    pub fn launcher(&self) -> &OsStr {
+        &self.0
+    }
+}
+
+/// `program` launched as a workload by the exported launcher
+/// ([`Workload::exported`]).
+pub fn workload(program: impl AsRef<OsStr>) -> Result<Command, String> {
+    Ok(Workload::exported()?.command(program))
+}
+
+/// `command` with an environment that holds nothing a model run may not
+/// read: no `LOOM_*`, `SHUTTLE_*`, or `DCBOR_RECORD_*` variable, backtraces
+/// off, no model value. Control runs cannot inherit permission to rewrite
+/// evidence.
+fn isolated(mut command: Command) -> Command {
     isolate(&mut command, std::env::vars_os().map(|(name, _)| name));
     command.env("RUST_BACKTRACE", "0");
     command
+}
+
+/// `program` launched as an isolated ([`isolated`]) workload ([`workload`]).
+fn controlled(program: impl AsRef<OsStr>) -> Result<Command, String> {
+    Ok(isolated(workload(program)?))
 }
 
 /// Clear inherited execution and publication permissions before a run adds
@@ -60,7 +118,7 @@ pub fn build(
     log: &Path,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let targets = dcbor_model_bounds::targets();
-    let mut command = controlled("cargo");
+    let mut command = controlled("cargo")?;
     command
         .current_dir(root)
         .env("RUSTFLAGS", flags(checker))
@@ -136,7 +194,7 @@ pub fn build_target(
     target_dir: &Path,
     log: &Path,
 ) -> Result<Result<PathBuf, String>, String> {
-    let mut command = controlled("cargo");
+    let mut command = controlled("cargo")?;
     command
         .current_dir(root)
         .env("CARGO_TARGET_DIR", target_dir)
@@ -180,8 +238,16 @@ pub fn run_test(
 ) -> Result<(Termination, String), String> {
     let mut environment = environment.to_vec();
     environment.push(("TERM", "dumb".to_string()));
-    let (termination, text, _, _) = run_once(executable, test, &environment, log)?;
-    Ok((termination, text))
+    // A control's judgement reads its termination and log, not its
+    // measurement, which is no part of a control's evidence; a run whose
+    // test's termination is unavailable is not judged.
+    let measured = run_once(&Workload::exported()?, executable, test, &environment, log)?;
+    Ok((
+        measured
+            .termination
+            .map_err(|error| format!("{test}: {error}"))?,
+        measured.text,
+    ))
 }
 
 /// One `cargo kani` run of harness `harness` alone in `root`
@@ -222,7 +288,7 @@ fn kani(
     let error = file
         .try_clone()
         .map_err(|error| format!("{}: {error}", log.display()))?;
-    let status = controlled("cargo")
+    let status = controlled("cargo")?
         .current_dir(root)
         .env("TERM", "dumb")
         .args(crate::proofs::arguments())
@@ -247,7 +313,7 @@ fn kani(
 
 /// The models of `checker` the `target` binary `executable` lists.
 pub fn list(checker: Checker, target: &str, executable: &Path) -> Result<Vec<Listed>, String> {
-    let output = controlled(executable)
+    let output = controlled(executable)?
         .args(["--list", "--format", "terse"])
         .output()
         .map_err(|error| format!("{}: {error}", executable.display()))?;
@@ -270,24 +336,133 @@ pub fn list(checker: Checker, target: &str, executable: &Path) -> Result<Vec<Lis
         .collect())
 }
 
+/// What GNU time measured of a run: its peak resident kilobytes and wall
+/// seconds, each read from time's report and validated (`%M %e`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Measurement {
+    peak_kb: u64,
+    seconds: String,
+}
+
+/// A measured run: how its child, the test, ended when GNU time's report
+/// establishes it, its log's text, and its measurement, or why each is
+/// unavailable. GNU time's own status (the wrapper's) is named in each such
+/// error and never presented as the child's termination.
+#[derive(Debug)]
+struct Measured {
+    termination: Result<Termination, String>,
+    text: String,
+    measurement: Result<Measurement, String>,
+}
+
+/// GNU time's report (`report`, the `-o` file of `-f '%M %e'`), as GNU time
+/// 1.10 writes it: at most one line naming how its command ended
+/// (`Command terminated by signal N`, `Command exited with non-zero status
+/// N`, none for an exit of 0), then the measurement, a peak of resident
+/// kilobytes and the elapsed seconds. The child's termination is the
+/// report's, and only when time's own status (`wrapper`) agrees with it
+/// (128 + N for a signal, N for an exit); the measurement only when its
+/// line is exactly two validated values. GNU time always writes that line,
+/// so a report whose measurement line is malformed is no report of time's,
+/// and establishes no termination either. Anything else is the error that
+/// says so.
+fn report(
+    report: &str,
+    wrapper: std::process::ExitStatus,
+) -> (Result<Termination, String>, Result<Measurement, String>) {
+    let lines: Vec<&str> = report.lines().collect();
+    let (ending, measured) = match lines[..] {
+        [measured] => (None, measured),
+        [ending, measured] => (Some(ending), measured),
+        _ => {
+            let error = format!("not a GNU time report: {report:?}");
+            return (Err(error.clone()), Err(error));
+        }
+    };
+    let measurement = measured
+        .split_once(' ')
+        .and_then(|(peak, seconds)| {
+            let peak_kb = peak.parse::<u64>().ok()?;
+            let elapsed = seconds.parse::<f64>().ok()?;
+            (seconds
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                && elapsed.is_finite())
+            .then(|| Measurement {
+                peak_kb,
+                seconds: seconds.to_string(),
+            })
+        })
+        .ok_or_else(|| format!("not a measurement of peak kilobytes and seconds: {measured:?}"));
+    if let Err(error) = &measurement {
+        return (Err(error.clone()), measurement);
+    }
+    // A signal is one Linux delivers (1 to SIGRTMAX, 64), a non-zero exit
+    // one wait(2) reports (1 to 255); any other number is no ending.
+    let parsed = match ending {
+        None => Ok(Termination::Exited(0)),
+        Some(line) => line
+            .strip_prefix("Command terminated by signal ")
+            .and_then(|number| number.parse::<i32>().ok())
+            .filter(|signal| (1..=64).contains(signal))
+            .map(Termination::Signaled)
+            .or_else(|| {
+                line.strip_prefix("Command exited with non-zero status ")
+                    .and_then(|number| number.parse::<i32>().ok())
+                    .filter(|code| (1..=255).contains(code))
+                    .map(Termination::Exited)
+            })
+            .ok_or_else(|| format!("not GNU time's report of an ending: {line:?}")),
+    };
+    let termination = parsed.and_then(|termination| {
+        // GNU time exits 128 + N for its command's signal N, N for its exit N.
+        let expected = match termination {
+            Termination::Signaled(signal) => 128_i32.checked_add(signal),
+            Termination::Exited(code) => Some(code),
+        };
+        if expected.is_some() && wrapper.code() == expected {
+            Ok(termination)
+        } else {
+            Err(format!(
+                "GNU time reported {termination:?} but itself ended with {wrapper}"
+            ))
+        }
+    });
+    (termination, measurement)
+}
+
 /// One run of `listed`'s test in `executable`, its own process, with
-/// `environment` its model variables, logged to `log`: its termination as
-/// GNU time reports it, with its peak resident kilobytes and wall seconds.
+/// `environment` its model variables, logged to `log`: its termination, its
+/// log, and GNU time's measurement or the error reading it.
+///
+/// GNU time is the workload launcher's parent, outside the workload's scope
+/// (`time LAUNCHER EXECUTABLE ...`), so an out-of-memory kill inside the
+/// scope never takes the measuring process or this recorder. Its child is
+/// one process through an exec chain: the launcher's bash, `systemd-run`
+/// registering the scope over D-Bus, then the test. The peak is that
+/// process's maximum resident size over the whole chain (the test's, unless
+/// the chain's setup exceeded it) and the wall seconds include the scope's
+/// registration, so neither is the test's alone. The test's termination and
+/// measurement are read from time's report ([`report`]); a report missing,
+/// unreadable or malformed leaves each unavailable, its error naming time's
+/// own status, which is kept beside them and never taken for the test's.
 fn run_once(
+    workload: &Workload,
     executable: &Path,
     test: &str,
     environment: &[(&str, String)],
     log: &Path,
-) -> Result<(Termination, String, Option<String>, Option<u64>), String> {
+) -> Result<Measured, String> {
     let measure = log.with_extension("measure");
     let file = std::fs::File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
     let error = file
         .try_clone()
         .map_err(|error| format!("{}: {error}", log.display()))?;
-    let mut command = controlled("time");
+    let mut command = isolated(Command::new("time"));
     command
         .args(["-f", "%M %e", "-o"])
         .arg(&measure)
+        .arg(workload.launcher())
         .arg(executable)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .stdout(file)
@@ -295,27 +470,27 @@ fn run_once(
     for (name, value) in environment {
         command.env(name, value);
     }
-    let status = command.status().map_err(|error| format!("time: {error}"))?;
-    let measured = std::fs::read_to_string(&measure).unwrap_or_default();
-    // GNU time names a signal that ended its command, then reports the
-    // measurement on its last line.
-    let signal = measured.lines().find_map(|line| {
-        line.strip_prefix("Command terminated by signal ")
-            .and_then(|number| number.trim().parse::<i32>().ok())
-    });
-    let termination = match signal {
-        Some(signal) => Termination::Signaled(signal),
-        None => Termination::Exited(status.code().unwrap_or(-1)),
+    let wrapper = command.status().map_err(|error| format!("time: {error}"))?;
+    // Every unavailability names the report and GNU time's own status
+    // (`exit status: N`, `signal: N`), which is never the test's.
+    let located = |error: String| {
+        format!(
+            "{}: {error}; GNU time ended with {wrapper}",
+            measure.display()
+        )
     };
-    let (peak, seconds) = measured
-        .lines()
-        .last()
-        .and_then(|line| line.split_once(' '))
-        .map_or((None, None), |(peak, seconds)| {
-            (peak.parse().ok(), Some(seconds.to_string()))
-        });
-    let text = std::fs::read_to_string(log).unwrap_or_default();
-    Ok((termination, text, seconds, peak))
+    let (termination, measurement) = match std::fs::read_to_string(&measure) {
+        Ok(text) => report(&text, wrapper),
+        Err(error) => (Err(error.to_string()), Err(error.to_string())),
+    };
+    let text =
+        std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    Ok(Measured {
+        termination: termination
+            .map_err(|error| located(format!("{error}; the test's termination is unavailable"))),
+        text,
+        measurement: measurement.map_err(located),
+    })
 }
 
 /// The value a run printed after `marker` and a tab, on the first line that
@@ -334,12 +509,17 @@ fn marked<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 
 /// Whether `listed` runs on a sized stack, by its runner's own description.
 pub fn sized(executable: &Path, listed: &Listed, log: &Path) -> Result<bool, String> {
-    let (termination, text, _, _) = run_once(
+    // A description is read from its log; its measurement is no part of it.
+    let Measured {
+        termination, text, ..
+    } = run_once(
+        &Workload::exported()?,
         executable,
         &listed.test,
         &[(DESCRIBE, "1".to_string())],
         log,
     )?;
+    let termination = termination.map_err(|error| format!("{}: {error}", listed.test))?;
     match (termination, marked(&text, DESCRIPTION)) {
         (Termination::Exited(0), Some("sized")) => Ok(true),
         (Termination::Exited(0), Some("unsized")) => Ok(false),
@@ -367,8 +547,28 @@ pub fn run(
     if let Some(stack) = stack {
         environment.push((STACK, stack.to_string()));
     }
-    let (termination, text, seconds, peak_kb) =
-        run_once(executable, &listed.test, &environment, log)?;
+    let Measured {
+        termination,
+        text,
+        measurement,
+        ..
+    } = run_once(
+        &Workload::exported()?,
+        executable,
+        &listed.test,
+        &environment,
+        log,
+    )?;
+    let termination = termination.map_err(|error| format!("{}: {error}", listed.test))?;
+    // A model run's row records its measurement: a run without one is
+    // refused, its termination named beside the reason.
+    let Measurement { peak_kb, seconds } = measurement.map_err(|error| {
+        format!(
+            "{}: ended {termination:?}, its measurement unavailable: {error}",
+            listed.test
+        )
+    })?;
+    let (peak_kb, seconds) = (Some(peak_kb), Some(seconds));
     let schedules = marked(&text, SCHEDULES).and_then(|count| count.parse().ok());
     Ok(Ran {
         outcome: outcome::model(listed.checker, termination, &text),
@@ -380,7 +580,259 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTION, SCHEDULES, isolate, marked};
+    use super::{DESCRIPTION, SCHEDULES, Workload, isolate, marked};
+
+    /// The cgroup v2 path of the process whose `/proc/PID/cgroup` is `text`.
+    fn cgroup(text: &str) -> String {
+        text.trim()
+            .strip_prefix("0::")
+            .expect("a cgroup v2 membership")
+            .to_string()
+    }
+
+    /// A workload launched by the repository's launcher (tests/workload.sh)
+    /// runs in a scope of its own, apart from its caller's cgroup, capped at
+    /// DCBOR_GATE_MEMORY with no swap, and its exit status and terminating
+    /// signal are the launch's own, which every run's classification reads.
+    #[test]
+    fn a_workload_runs_capped_apart_from_its_caller() {
+        use std::os::unix::process::ExitStatusExt;
+        let launcher =
+            Workload::at(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workload.sh"));
+        let caller = cgroup(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
+        let output = launcher
+            .command("sh")
+            .env("DCBOR_GATE_MEMORY", "64M")
+            .args([
+                "-c",
+                r#"cg="$(cut -d: -f3 /proc/self/cgroup)"; printf '%s\n%s\n%s\n' "$cg" "$(cat "/sys/fs/cgroup$cg/memory.max")" "$(cat "/sys/fs/cgroup$cg/memory.swap.max")""#,
+            ])
+            .output()
+            .expect("launch the workload");
+        assert!(output.status.success(), "{output:?}");
+        let report = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        let [scope, max, swap] = lines[..] else {
+            panic!("the workload reported {report:?}");
+        };
+        assert!(
+            scope != caller && scope.ends_with(".scope"),
+            "a workload ran in its caller's cgroup {caller}: {scope}"
+        );
+        assert_eq!(
+            max,
+            (64_u64 << 20).to_string(),
+            "a workload's scope is not capped"
+        );
+        assert_eq!(swap, "0", "a workload's scope may swap");
+        let signalled = launcher
+            .command("sh")
+            .env("DCBOR_GATE_MEMORY", "64M")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            signalled.signal(),
+            Some(15),
+            "a workload's terminating signal was not its launch's"
+        );
+    }
+
+    /// The recording path of every measured run ([`super::run_once`]): GNU
+    /// time, in the caller's cgroup, is the parent of the process the
+    /// launcher execs into the test inside the workload's scope, so the
+    /// measuring process is never in the kill domain; the run keeps its
+    /// measurement and the test's own termination, an exit status or the
+    /// signal that killed it.
+    #[test]
+    fn a_measured_run_records_how_its_confined_test_ended() {
+        use crate::outcome::Termination;
+        let directory =
+            std::env::temp_dir().join(format!("dcbor-gate-measured-run-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("test.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             case \"$DCBOR_TEST_END\" in exit) exit 7 ;; kill) kill -KILL $$ ;; esac\n\
+             cut -d: -f3 /proc/self/cgroup\n\
+             cut -d: -f3 /proc/$PPID/cgroup\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let launcher =
+            Workload::at(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workload.sh"));
+        let caller = cgroup(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
+        let run = |end: &str| {
+            super::run_once(
+                &launcher,
+                &script,
+                "t",
+                &[
+                    ("DCBOR_GATE_MEMORY", "64M".to_string()),
+                    ("DCBOR_TEST_END", end.to_string()),
+                ],
+                &directory.join(format!("{end}.log")),
+            )
+            .expect("record the run")
+        };
+        let super::Measured {
+            termination,
+            text,
+            measurement,
+            ..
+        } = run("report");
+        assert_eq!(termination, Ok(Termination::Exited(0)), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let [test, parent] = lines[..] else {
+            panic!("the test reported {text:?}");
+        };
+        assert!(
+            test != caller && test.ends_with(".scope"),
+            "a measured test ran in its caller's cgroup {caller}: {test}"
+        );
+        assert_eq!(parent, caller, "GNU time ran inside the workload's scope");
+        assert!(
+            measurement
+                .as_ref()
+                .is_ok_and(|measured| measured.peak_kb > 0),
+            "a measured run lost its measurement: {measurement:?}"
+        );
+        assert_eq!(
+            run("exit").termination,
+            Ok(Termination::Exited(7)),
+            "a measured run lost its test's exit status"
+        );
+        let killed = run("kill");
+        assert_eq!(
+            killed.termination,
+            Ok(Termination::Signaled(9)),
+            "a measured run lost the signal that killed its test"
+        );
+        assert!(
+            killed.measurement.is_ok(),
+            "a killed run lost its measurement: {:?}",
+            killed.measurement
+        );
+        // An unreadable report: GNU time cannot open a directory as its
+        // report, exits 125 and runs nothing. Its status is named; neither
+        // the test's termination nor a measurement is made of it.
+        std::fs::create_dir_all(directory.join("unreadable.measure")).unwrap();
+        let unreadable = run("unreadable");
+        assert!(
+            unreadable
+                .termination
+                .as_ref()
+                .is_err_and(|error| error.contains("unavailable")
+                    && error.contains("GNU time ended with exit status: 125")),
+            "GNU time's status was taken for the test's termination: {unreadable:?}"
+        );
+        assert!(
+            unreadable.measurement.is_err(),
+            "an unreadable report supplied a measurement: {unreadable:?}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// GNU time's report ([`super::report`]) is read exactly as GNU time 1.10
+    /// writes it, each form observed: a measurement alone for an exit of 0;
+    /// `Command exited with non-zero status N` (time exiting N) or `Command
+    /// terminated by signal N` (time exiting 128 + N) before it. A report
+    /// that is missing a part, has another line, holds an invalid value or
+    /// disagrees with time's own status supplies neither a termination nor a
+    /// measurement it cannot establish.
+    #[test]
+    fn a_measurement_report_is_read_exactly() {
+        use super::{Measurement, report};
+        use crate::outcome::Termination;
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let measured = Ok(Measurement {
+            peak_kb: 3476,
+            seconds: "0.00".to_string(),
+        });
+        assert_eq!(
+            report("3476 0.00\n", exited(0)),
+            (Ok(Termination::Exited(0)), measured.clone())
+        );
+        assert_eq!(
+            report(
+                "Command exited with non-zero status 7\n3476 0.00\n",
+                exited(7)
+            ),
+            (Ok(Termination::Exited(7)), measured.clone())
+        );
+        assert_eq!(
+            report("Command terminated by signal 9\n3476 0.00\n", exited(137)),
+            (Ok(Termination::Signaled(9)), measured.clone())
+        );
+        for (text, wrapper) in [
+            ("", exited(0)),
+            ("garbage nonsense\n", exited(0)),
+            ("3476\n", exited(0)),
+            ("Command terminated by signal 9\n", exited(137)),
+            (
+                "Command terminated by signal 9\nCommand exited with non-zero status 7\n3476 0.00\n",
+                exited(137),
+            ),
+        ] {
+            let (termination, measurement) = report(text, wrapper);
+            assert!(
+                termination.is_err() && measurement.is_err(),
+                "a malformed report supplied {termination:?}, {measurement:?}: {text:?}"
+            );
+        }
+        for measurement in [
+            "-5 0.00",
+            "3476 nonsense",
+            "3476 inf",
+            "3476 0.00 1",
+            "x 0.00",
+        ] {
+            let (termination, measured) = report(&format!("{measurement}\n"), exited(0));
+            assert!(
+                measured.is_err() && termination.is_err(),
+                "an invalid measurement supplied {termination:?}, {measured:?}: {measurement:?}"
+            );
+        }
+        for (text, wrapper) in [
+            ("Command terminated by signal 9\n3476 0.00\n", exited(0)),
+            (
+                "Command exited with non-zero status 7\n3476 0.00\n",
+                exited(125),
+            ),
+            ("3476 0.00\n", exited(125)),
+            (
+                "Command exited with non-zero status 0\n3476 0.00\n",
+                exited(0),
+            ),
+            (
+                "Command exited with non-zero status 256\n3476 0.00\n",
+                exited(0),
+            ),
+            (
+                "Command exited with non-zero status -1\n3476 0.00\n",
+                exited(255),
+            ),
+            ("Command terminated by signal x\n3476 0.00\n", exited(137)),
+            ("Command terminated by signal 0\n3476 0.00\n", exited(128)),
+            ("Command terminated by signal 65\n3476 0.00\n", exited(193)),
+            ("Command terminated by signal -1\n3476 0.00\n", exited(127)),
+            (
+                "Command terminated by signal 2147483647\n3476 0.00\n",
+                exited(0),
+            ),
+        ] {
+            let (termination, _) = report(text, wrapper);
+            assert!(
+                termination.is_err(),
+                "a report disagreeing with GNU time's status supplied {termination:?}: {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn controls_cannot_inherit_recording_authorization() {

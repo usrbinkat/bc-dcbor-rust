@@ -1,0 +1,11 @@
+--- tests/miri-owned.sh
++++ tests/miri-owned.sh
+@@ -275,7 +275,7 @@
+ 	shift
+ 	case "$kind" in
+ 	test | race)
+-		"${confined[@]}" cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1
++		cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1
+ 		status=$?
+ 		outcome="$(gate classify cargo "$kind" "$status" "$logs/$base-native.log")" || return 2
+ 		[[ "$outcome" == pass ]]

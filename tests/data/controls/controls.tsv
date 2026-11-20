@@ -416,6 +416,11 @@ head-shortest-one-late	tests/data/controls/head-shortest-one-late.patch	kani	kan
 head-parser-accepts-nonshortest	tests/data/controls/head-parser-accepts-nonshortest.patch	kani	kani	dcbor	-	lib	varint::proofs::the_decoders_accept_only_the_heads_the_writer_writes	-	failed	an accepted head is the one the writer writes
 decode-negative-range-widened	tests/data/controls/decode-negative-range-widened.patch	kani	kani	dcbor	-	lib	decode::proofs::the_negative_range_rule_is_exact	-	failed	an argument beyond the range is refused OutOfRange, and only such
 decode-simple-undefined-accepted	tests/data/controls/decode-simple-undefined-accepted.patch	kani	kani	dcbor	-	lib	decode::proofs::a_scalar_item_is_accepted_exactly_in_the_profile	-	failed	a scalar item is accepted exactly when its value is in the dCBOR profile
+# An unsigned head decoded through the tagged-item arm (src/decode.rs,
+# `decode_cbor_internal`): the scalar harness's stub of that arm
+# (decode/proofs.rs, `arm_reached`) fails, so its unreachability is checked,
+# never assumed.
+decode-scalar-reaches-item-arm	tests/data/controls/decode-scalar-reaches-item-arm.patch	kani	kani	dcbor	-	lib	decode::proofs::a_scalar_item_is_accepted_exactly_in_the_profile	-	failed	a scalar head reached the decoder's arm of bytes, text or items
 float-canonical-nan-payload-changed	tests/data/controls/float-canonical-nan-payload-changed.patch	kani	kani	dcbor	-	lib	float::proofs::the_implementation_names_the_specified_nan	-	failed	the implementation's canonical NaN is the specified 7e00
 key-prefix-order-reversed	tests/data/controls/key-prefix-order-reversed.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::short_keys_compare_in_canonical_order	-	failed	two keys compare in the bytewise lexicographic order of their encodings
 key-window-undercharged	tests/data/controls/key-window-undercharged.patch	kani	kani	dcbor	-	lib	bounded::decode::comparison::proofs::short_keys_compare_in_canonical_order	-	failed	a comparison admits one value and its whole window per turn, before the window
@@ -625,6 +630,21 @@ gate-watcher-ready-before-handler	tests/data/controls/gate-watcher-ready-before-
 # A gate that never waits for its watcher's readiness (tests/gate-common.sh,
 # `own_process_group`): it starts its work while the watcher is held.
 gate-readiness-wait-bypassed	tests/data/controls/gate-readiness-wait-bypassed.patch	native	nightly	dcbor-gate	-	launchers	a_gate_starts_its_work_once_its_watcher_is_ready	-	failed	a gate held at watcher passed readiness while its watcher was held
+# A gate whose script workloads run unconfined (tests/gate-common.sh,
+# `gate_confinement`, an empty prefix): a runaway workload runs in the
+# gate's own cgroup, its memory the host's to exhaust.
+gate-memory-unconfined	tests/data/controls/gate-memory-unconfined.patch	native	nightly	dcbor-gate	-	launchers	a_gate_survives_its_workload_killed_for_memory	-	failed	a gate's workload ran in the gate's own cgroup
+# A workload scope stopped by an out-of-memory kill inside it
+# (tests/workload.sh, OOMPolicy=stop): the rest of the workload's tree
+# (kani-driver after its CBMC) is ended before it reports the kill.
+gate-oom-stops-scope	tests/data/controls/gate-oom-stops-scope.patch	native	nightly	dcbor-gate	-	launchers	a_gate_survives_its_workload_killed_for_memory	-	failed	a workload's scope does not continue past an out-of-memory kill
+# The gate tool's runs launched outside the workload launcher
+# (tests/gate/src/process.rs, `Workload::command`): a Kani run's CBMC
+# shares the judging gate tool's cgroup, uncapped.
+gate-workload-unconfined	tests/data/controls/gate-workload-unconfined.patch	native	nightly	dcbor-gate	-	lib	process::tests::a_workload_runs_capped_apart_from_its_caller	-	failed	a workload ran in its caller's cgroup
+# A gate script workload without the `confined` prefix
+# (tests/miri-owned.sh, a native baseline run): the census names it.
+gate-workload-census-unconfined	tests/data/controls/gate-workload-census-unconfined.patch	native	nightly	dcbor-gate	-	launchers	every_gate_workload_is_confined	-	failed	gate workloads launched unconfined
 # A gate that never calls `own_process_group` (tests/controls.sh): the
 # census of the gates names it.
 gate-process-group-uncalled	tests/data/controls/gate-process-group-uncalled.patch	native	nightly	dcbor-gate	-	launchers	every_gate_owns_its_process_group	-	failed	gates owning no process group
@@ -634,3 +654,13 @@ gate-process-group-uncalled	tests/data/controls/gate-process-group-uncalled.patc
 # a verdict would pass as a control's refusal.
 kani-no-verdict-judged-failed	tests/data/controls/kani-no-verdict-judged-failed.patch	native	nightly	dcbor-gate	-	lib	outcome::tests::a_kani_run_is_classed_by_its_summary	-	failed	a CBMC run without results was judged a verdict
 kani-no-verdict-judged-failed-harness	tests/data/controls/kani-no-verdict-judged-failed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_harness_unchecked_or_misreported_is_named	-	failed	a harness whose CBMC run produced no results was given a verdict
+# A Kani control's baseline judged verified whatever its run showed
+# (tests/gate/src/controls.rs, `verified`): a control is planted into a
+# harness with no verdict on the commit.
+kani-baseline-no-verdict-accepted	tests/data/controls/kani-baseline-no-verdict-accepted.patch	native	nightly	dcbor-gate	-	lib	controls::kani_tests::a_kani_refusal_is_judged_by_its_one_harness	-	failed	a baseline was verified by
+# Kani controls' evidence without their baselines (tests/gate/src/controls.rs,
+# `evidence`): a control seen red and green over an unverified harness counts.
+kani-control-baseline-unrequired	tests/data/controls/kani-control-baseline-unrequired.patch	native	nightly	dcbor-gate	-	lib	controls::kani_tests::a_kani_control_is_evidence_only_over_a_verified_baseline	-	failed	a Kani control without a baseline was evidence
+# A Kani control whose baseline did not verify still planted and run
+# (tests/controls.sh): its red side runs over a harness with no verdict.
+kani-baseline-not-blocking	tests/data/controls/kani-baseline-not-blocking.patch	native	nightly	dcbor-gate	-	launchers	a_kani_control_runs_only_over_a_verified_baseline	-	failed	a Kani control's red side ran over a baseline that did not verify

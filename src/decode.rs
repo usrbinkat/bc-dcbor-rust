@@ -147,57 +147,11 @@ fn decode_cbor_internal(data: &[u8], depth: usize) -> Result<(CBOR, usize)> {
             negative(value)?;
             Ok((CBORCase::Negative(value).into(), header_varint_len))
         }
-        MajorType::ByteString => {
-            // A length beyond the address space exceeds any input.
-            let data_len = usize::try_from(value).map_err(|_| Error::Underrun)?;
-            let bytes = parse_bytes(&data[header_varint_len..], data_len)?
-                .to_vec()
-                .into();
-            Ok((
-                CBORCase::ByteString(bytes).into(),
-                header_varint_len + data_len,
-            ))
-        }
-        MajorType::Text => {
-            let data_len = usize::try_from(value).map_err(|_| Error::Underrun)?;
-            let buf = parse_bytes(&data[header_varint_len..], data_len)?;
-            let string = str::from_utf8(buf)?;
-            if !is_nfc(string) {
-                return Err(Error::NonCanonicalString);
-            }
-            Ok((string.into(), header_varint_len + data_len))
-        }
-        MajorType::Array => {
-            let count = usize::try_from(value).map_err(|_| Error::Underrun)?;
-            let mut pos = header_varint_len;
-            // Every element takes at least one byte of the input, so the
-            // reservation is at most the input's remaining length, whatever
-            // count the head claims.
-            let mut items = Vec::with_capacity(count.min(data.len() - header_varint_len));
-            for _ in 0..count {
-                let (item, item_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
-                items.push(item);
-                pos += item_len;
-            }
-            Ok((items.into(), pos))
-        }
-        MajorType::Map => {
-            let mut pos = header_varint_len;
-            let mut map = Map::new();
-            for _ in 0..value {
-                let (key, key_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
-                pos += key_len;
-                let (value, value_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
-                pos += value_len;
-                map.insert_next(key, value)?;
-            }
-            Ok((map.into(), pos))
-        }
-        MajorType::Tagged => {
-            let (item, item_len) = decode_cbor_internal(&data[header_varint_len..], depth + 1)?;
-            let tagged = CBOR::to_tagged_value(value, item);
-            Ok((tagged, header_varint_len + item_len))
-        }
+        MajorType::ByteString => decode_byte_string(data, value, header_varint_len),
+        MajorType::Text => decode_text(data, value, header_varint_len),
+        MajorType::Array => decode_array(data, value, header_varint_len, depth),
+        MajorType::Map => decode_map(data, value, header_varint_len, depth),
+        MajorType::Tagged => decode_tagged(data, value, header_varint_len, depth),
         MajorType::Simple => match header_varint_len {
             3 => {
                 let f = f16::from_bits(value as u16);
@@ -222,6 +176,69 @@ fn decode_cbor_internal(data: &[u8], depth: usize) -> Result<(CBOR, usize)> {
             },
         },
     }
+}
+
+// The item arms of `decode_cbor_internal` whose item holds bytes, text or
+// further items, each given the input `data` from the head, the head's
+// `argument` and its length `head`, the recursive ones the frame `depth` of
+// the head too: the item and its encoded length. A scalar item reaches none
+// of them, which the scalar profile harness checks (`decode::proofs`).
+
+/// A byte string of `argument` bytes after the head.
+fn decode_byte_string(data: &[u8], argument: u64, head: usize) -> Result<(CBOR, usize)> {
+    // A length beyond the address space exceeds any input.
+    let data_len = usize::try_from(argument).map_err(|_| Error::Underrun)?;
+    let bytes = parse_bytes(&data[head..], data_len)?.to_vec().into();
+    Ok((CBORCase::ByteString(bytes).into(), head + data_len))
+}
+
+/// A text of `argument` bytes after the head, valid UTF-8 in NFC.
+fn decode_text(data: &[u8], argument: u64, head: usize) -> Result<(CBOR, usize)> {
+    let data_len = usize::try_from(argument).map_err(|_| Error::Underrun)?;
+    let buf = parse_bytes(&data[head..], data_len)?;
+    let string = str::from_utf8(buf)?;
+    if !is_nfc(string) {
+        return Err(Error::NonCanonicalString);
+    }
+    Ok((string.into(), head + data_len))
+}
+
+/// An array of `argument` items, each decoded one frame deeper.
+fn decode_array(data: &[u8], argument: u64, head: usize, depth: usize) -> Result<(CBOR, usize)> {
+    let count = usize::try_from(argument).map_err(|_| Error::Underrun)?;
+    let mut pos = head;
+    // Every element takes at least one byte of the input, so the
+    // reservation is at most the input's remaining length, whatever
+    // count the head claims.
+    let mut items = Vec::with_capacity(count.min(data.len() - head));
+    for _ in 0..count {
+        let (item, item_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
+        items.push(item);
+        pos += item_len;
+    }
+    Ok((items.into(), pos))
+}
+
+/// A map of `argument` entries, each key and value decoded one frame deeper,
+/// the keys in strictly increasing canonical order (`Map::insert_next`).
+fn decode_map(data: &[u8], argument: u64, head: usize, depth: usize) -> Result<(CBOR, usize)> {
+    let mut pos = head;
+    let mut map = Map::new();
+    for _ in 0..argument {
+        let (key, key_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
+        pos += key_len;
+        let (value, value_len) = decode_cbor_internal(&data[pos..], depth + 1)?;
+        pos += value_len;
+        map.insert_next(key, value)?;
+    }
+    Ok((map.into(), pos))
+}
+
+/// The item tagged `argument`, decoded one frame deeper.
+fn decode_tagged(data: &[u8], argument: u64, head: usize, depth: usize) -> Result<(CBOR, usize)> {
+    let (item, item_len) = decode_cbor_internal(&data[head..], depth + 1)?;
+    let tagged = CBOR::to_tagged_value(argument, item);
+    Ok((tagged, head + item_len))
 }
 
 /// Kani harnesses of the checks a scalar item meets after its head (register

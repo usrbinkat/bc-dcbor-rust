@@ -195,13 +195,16 @@ plan and the verdict) is the gate tool's (`tests/gate`, `domains` and
 Cargo-mutants uses copied build directories and the active Cargo wrapper.
 Each layer first requires a successful unmutated baseline.
 
-Each layer runs in its own scope of the user's systemd manager, capped at
-`DCBOR_MUTATION_MEMORY` (default `48G`) with no swap and
-`OOMPolicy=continue`: a mutant that turns a bounded loop into unbounded
-allocation has its test killed inside the scope, recorded as a failed
-test, while the campaign and every other session keep running. A host
-without a running user manager is refused; the campaign never runs
-uncapped. The cap applied is written to `containment.txt` in the logs.
+Each layer's cargo-mutants, like every workload a gate runs
+(`tests/gate-common.sh`, `gate_confinement`; `tests/workload.sh`), runs in
+its own scope of the user's systemd manager, capped at `DCBOR_GATE_MEMORY`
+(default `48G`) with no swap and `OOMPolicy=continue`, and each Miri gate
+the campaign runs confines its own workloads: a mutant that turns a
+bounded loop into unbounded allocation has its test killed inside the
+scope, recorded as a failed test, while the campaign, outside every
+workload's scope, and every other session keep running. A host without a
+running user manager is refused; no workload runs uncapped. The cap
+applied is written to `containment.txt` in the logs.
 
 `TMPDIR` is required: the campaign's log directory. Logs, source hashes,
 mutant diffs, outcomes and each domain's `comparison.json` are retained

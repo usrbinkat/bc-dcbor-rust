@@ -59,7 +59,7 @@ unset DCBOR_RECORD_FACTORS DCBOR_RECORD_TRACES DCBOR_COST_MODE DCBOR_COST_DIRECT
 printf 'Campaign identity: %s\n' "$(cat "$logs/identity.txt")"
 date -u >"$logs/started.txt"
 
-if cargo fuzz build >"$logs/build.log" 2>&1; then
+if "${confined[@]}" cargo fuzz build >"$logs/build.log" 2>&1; then
 	unchanged
 	printf 'BUILD PASS\n' >>"$logs/results.txt"
 else
@@ -71,7 +71,7 @@ fi
 
 while read -r target max_len; do
 	printf 'Running %s (%ss); log: %s/%s.log\n' "$target" "$seconds" "$logs" "$target"
-	if cargo fuzz run "$target" -- \
+	if "${confined[@]}" cargo fuzz run "$target" -- \
 		-seed="$seed" -max_total_time="$seconds" -max_len="$max_len" \
 		-timeout=30 -rss_limit_mb=4096 -print_final_stats=1 \
 		>"$logs/$target.log" 2>&1; then

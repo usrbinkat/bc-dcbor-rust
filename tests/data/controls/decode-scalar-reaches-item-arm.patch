@@ -1,0 +1,11 @@
+--- src/decode.rs
++++ src/decode.rs
+@@ -142,7 +142,7 @@
+     }
+     let (major_type, value, header_varint_len) = parse_header_varint(data)?;
+     match major_type {
+-        MajorType::Unsigned => Ok((CBORCase::Unsigned(value).into(), header_varint_len)),
++        MajorType::Unsigned => decode_tagged(data, value, header_varint_len, depth),
+         MajorType::Negative => {
+             negative(value)?;
+             Ok((CBORCase::Negative(value).into(), header_varint_len))

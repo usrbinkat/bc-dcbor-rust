@@ -1,0 +1,7 @@
+--- tests/workload.sh
++++ tests/workload.sh
+@@ -19,3 +19,3 @@
+ exec systemd-run --user --scope --quiet --collect \
+-	--property=MemoryMax="$DCBOR_GATE_MEMORY" --property=MemorySwapMax=0 --property=OOMPolicy=continue \
++	--property=MemoryMax="$DCBOR_GATE_MEMORY" --property=MemorySwapMax=0 --property=OOMPolicy=stop \
+ 	-- "$@"

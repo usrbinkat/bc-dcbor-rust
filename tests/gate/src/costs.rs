@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::process::Workload;
 use crate::records::{self, VARIANTS};
 
 /// What a run does with the cost evidence.
@@ -188,9 +189,11 @@ fn check_manifest(
 
 /// The command that runs `leg` in the repository `root`: every test target,
 /// single-threaded, its records checked against or staged in the leg's
-/// directory, nothing of [`UNINHERITED`] inherited.
-pub fn command(root: &Path, leg: &Leg<'_>) -> Command {
-    let mut command = Command::new("cargo");
+/// directory, nothing of [`UNINHERITED`] inherited, launched by `workload`
+/// ([`Workload`]): the staging, completion and publication of [`costs`]
+/// stay outside the leg's memory-capped scope.
+pub fn command(workload: &Workload, root: &Path, leg: &Leg<'_>) -> Command {
+    let mut command = workload.command("cargo");
     command
         .current_dir(root)
         .args([
@@ -212,14 +215,16 @@ pub fn command(root: &Path, leg: &Leg<'_>) -> Command {
     command
 }
 
-/// Run `leg` in `root`, its output to its log: whether it passed.
+/// Run `leg` in `root` as a workload of the exported launcher
+/// ([`Workload::exported`]), its output to its log: whether it passed.
 pub fn run(root: &Path, leg: &Leg<'_>) -> Result<bool, String> {
+    let workload = Workload::exported()?;
     let log = std::fs::File::create(leg.log)
         .map_err(|error| format!("{}: {error}", leg.log.display()))?;
     let errors = log
         .try_clone()
         .map_err(|error| format!("{}: {error}", leg.log.display()))?;
-    command(root, leg)
+    command(&workload, root, leg)
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(errors)

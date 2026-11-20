@@ -275,7 +275,7 @@ native_run() {
 	shift
 	case "$kind" in
 	test | race)
-		cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1
+		"${confined[@]}" cargo test "$@" -- --exact "${listed[@]}" --nocapture --test-threads=1 >"$logs/$base-native.log" 2>&1
 		status=$?
 		outcome="$(gate classify cargo "$kind" "$status" "$logs/$base-native.log")" || return 2
 		[[ "$outcome" == pass ]]
@@ -284,7 +284,7 @@ native_run() {
 		local index=0 name
 		: >"$logs/$base-native.log"
 		for name in "${listed[@]}"; do
-			cargo test "$@" -- --ignored --exact "$name" --nocapture --test-threads=1 \
+			"${confined[@]}" cargo test "$@" -- --ignored --exact "$name" --nocapture --test-threads=1 \
 				>"$logs/$base-native-$index.log" 2>&1
 			status=$?
 			cat "$logs/$base-native-$index.log" >>"$logs/$base-native.log"

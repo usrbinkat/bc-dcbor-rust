@@ -17,7 +17,7 @@ source tests/gate-common.sh
 own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 : "${TMPDIR:?required: the campaign log directory}"
-for tool in cargo rustc cargo-mutants cargo-llvm-cov patch time systemd-run systemctl sha256sum git tar; do
+for tool in cargo rustc cargo-mutants cargo-llvm-cov patch time sha256sum git tar; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'Mutation prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
 		exit 127
@@ -26,29 +26,17 @@ done
 gate_prepare
 miri_models
 # A mutant can turn a bounded loop into unbounded allocation (one grew a
-# test binary past 110 GB). Each layer runs in its own memory-capped scope
-# of the user's systemd manager: the kernel kills the runaway test inside
-# the scope, which cargo-mutants records as a failed test, and
-# OOMPolicy=continue keeps the campaign and every other session running.
-# The cap is the host's to choose; there is no uncapped fallback.
-: "${DCBOR_MUTATION_MEMORY:=48G}"
-case "$(systemctl --user is-system-running 2>/dev/null || true)" in
-running | degraded) ;;
-*)
-	printf 'Mutation containment needs a running user systemd manager (systemctl --user).\n' >&2
-	exit 1
-	;;
-esac
-contained=(systemd-run --user --scope --quiet --collect
-	--property=MemoryMax="$DCBOR_MUTATION_MEMORY"
-	--property=MemorySwapMax=0
-	--property=OOMPolicy=continue
-	--)
+# test binary past 110 GB). Each layer's cargo-mutants runs as a workload
+# (tests/gate-common.sh, `gate_confinement`), in a memory-capped scope of
+# its own, and each Miri gate the campaign runs confines its own workloads:
+# the kernel kills the runaway test inside its scope, which cargo-mutants
+# records as a failed test, while the campaign and every other session
+# keep running.
 logs="$(mktemp -d "$TMPDIR/dcbor-mutations.XXXXXX")"
 printf 'Mutation evidence logs: %s\n' "$logs"
 clean_commit "$logs" || exit 1
 printf '%s\n' "$DCBOR_CONFIGURATION" >"$logs/configuration.txt"
-printf 'memory cap per layer: %s, no swap\n' "$DCBOR_MUTATION_MEMORY" | tee "$logs/containment.txt"
+printf 'memory cap per workload: %s, no swap\n' "$DCBOR_GATE_MEMORY" | tee "$logs/containment.txt"
 export CARGO
 CARGO="$(command -v cargo)"
 # Invoke the subcommand directly so CARGO remains the active shell's wrapper,
@@ -103,7 +91,7 @@ for domain in "${domains[@]}"; do
 	mkdir -p "$logs/$domain"
 	for layer in fast exhaustive; do
 		status=0
-		DCBOR_RIGOR="$layer" "${contained[@]}" cargo-mutants mutants --no-config "${features[@]}" \
+		DCBOR_RIGOR="$layer" "${confined[@]}" cargo-mutants mutants --no-config "${features[@]}" \
 			--no-shuffle --mutate-unsafe=true --cargo-arg=--offline "${filters[@]}" \
 			--output "$logs/$domain/$layer" \
 			-- "${tests[@]}" >"$logs/$domain/$layer.log" 2>&1 || status=$?
@@ -132,7 +120,7 @@ DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" tests/reach-map.sh >"$lo
 	cat "$logs/reach.log"
 	exit 1
 }
-DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" MIRI_LOG_DIR="$logs/miri-baseline" "${contained[@]}" tests/miri-owned.sh \
+DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" MIRI_LOG_DIR="$logs/miri-baseline" tests/miri-owned.sh \
 	>"$logs/miri-baseline.log" 2>&1 || {
 	cat "$logs/miri-baseline.log"
 	exit 1
@@ -142,7 +130,7 @@ verdict=0
 for domain in "${domains[@]}"; do
 	gate mutation miri-plan "$logs/$domain/comparison.json" \
 		"$logs/$domain/fast/mutants.out" "$logs/source.sha256" "$logs/reach" "$logs/$domain/miri-plan"
-	DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" "${contained[@]}" tests/miri-owned.sh --judge \
+	DCBOR_RIGOR="$miri_rigor" DCBOR_REACH_DIR="$logs/reach" tests/miri-owned.sh --judge \
 		"$logs/$domain/miri-plan/plan.tsv" "$logs/$domain/miri" "$logs/miri-baseline" \
 		>"$logs/$domain/miri.log" 2>&1 || {
 		cat "$logs/$domain/miri.log"

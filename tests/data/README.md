@@ -142,8 +142,11 @@ A recording budget is the observation storage a fixture whose recording outgrows
 capacity (`support::CAPACITY`) was measured to need: the session preallocated before the fixture
 runs, never an expected accounting total. No test states one; each is a row of its family's record.
 
-`bash tests/record-evidence.sh record-budgets` records every budget record, then checks each with
-recording disabled. `gate budgets` names every record to hold, one line each: its file name, its
+`bash tests/record-evidence.sh record-budgets` records every budget record of the run's layer
+(`DCBOR_RIGOR`, `fast` unless set), then checks each with recording disabled, and reports how many of
+the inventory it recorded; the exhaustive layer's records are recorded by a run with
+`DCBOR_RIGOR=exhaustive` where that layer's execution is authorized, and the inventory is held only
+by both runs together. `gate budgets` names every record to hold, one line each: its file name, its
 projection's features, its test target and exact test, and its rigor layer and witness size. That
 list is `dcbor_record::budgets::inventory`: every family of `budgets/families.rs` in every variant
 it is compiled in (`dcbor_record::VARIANTS`; a family of the forked collections in the custom-std
@@ -544,6 +547,60 @@ SIGTERM and escalates to SIGKILL after one second, including for descendants tha
 The single-use launch marker is consumed before work starts, and an orphaned supervised launch exits
 without starting work (`an_orphaned_supervised_launch_starts_no_work`). The supervisor installs its
 signal handler before spawning and retains an early stop until the child's PID is available.
+Every workload a gate runs (each cargo test, build, run, Miri, Kani, fuzz and mutation command, the
+coverage tools, the gate tool's own builds, test, model and proof runs) is launched by the one
+workload launcher, `tests/workload.sh`, in a transient scope of its own of the user's systemd
+manager (`systemd-run --scope`, which execs the workload in place, keeping its PID, parent, group,
+session and exit status or signal), capped at `DCBOR_GATE_MEMORY` (default `48G`, `gate_memory`)
+with no swap and `OOMPolicy=continue`. Scripts start each workload with the `confined` prefix
+(`gate_confinement`); the gate tool launches each run through `process::Workload`, the launcher
+the gate exports. The gate's own processes (its supervisor, watcher and script, and the gate tool
+waiting on a run to record its judgement) stay outside every workload's scope, so a memory-cgroup
+kill chooses its victim among the workload's processes alone: the recorder survives a runaway
+checker whatever the kernel chooses inside the scope. A run so killed is classified as it ended (a
+Kani harness whose CBMC is killed reports no results, `NoVerdict`); without a running user manager
+no gate starts. `a_gate_survives_its_workload_killed_for_memory` runs a gate whose workload, capped
+at 64 MiB, doubles a string toward 256 MiB: it requires the workload's scope apart from the gate's
+own cgroup, its `memory.max` and a `memory.swap.max` of 0, its `OOMPolicy` read back as `continue`
+(read, not observed: systemd applies it after the kill and records nothing under `continue`; it
+only keeps systemd from ending the rest of the workload's tree, every process of which, a
+kani-driver as much as its CBMC, remains an eligible victim, so nothing relies on a survivor's
+report), the kernel's `oom_kill` count of the workload's scope read from outside as 1 where the
+workload read 0 before it grew (a holder process the workload leaves in its scope keeps the scope's
+cgroup until it is read; the holder is itself an eligible victim, and were it killed the scope's
+cgroup would be gone and the outside read would fail the test, never pass it), the
+grown process ended by SIGKILL (status 137), and the gate then released to a successful exit with
+nothing left running. `a_workload_runs_capped_apart_from_its_caller` (tests/gate, `process`)
+requires the same of a run the gate tool launches, and its terminating signal passed through;
+`a_measured_run_records_how_its_confined_test_ended` requires of the measured runs (`run_once`,
+every native control's and model's test) GNU time in the caller's cgroup as the parent of the
+process the launcher execs into the test inside the workload's scope, the measurement kept, and
+the test's exit status and killing signal recorded as the run's termination. The test's
+termination and measurement are read from time's report (`process::report`, the forms GNU time
+1.10 writes): the termination only from a well-formed report whose ending line names a signal of 1
+to 64 or an exit of 1 to 255 (none for an exit of 0) and agrees with time's own status (128 + N,
+computed checked, for a signal; N for an exit); the measurement only from a line of a validated
+peak and seconds. A report missing, unreadable (time exits 125 and runs nothing) or malformed
+leaves both unavailable; a well-formed report that disagrees with time's status leaves the
+termination unavailable and keeps its measurement. Every such error names time's own status,
+which is never taken for the test's; a control's or model's run whose test termination is
+unavailable is not judged, and a model run without its measurement is refused.
+`a_measurement_report_is_read_exactly` covers each form and each defect, out-of-range and
+overflowing numbers among them; the measured-run test covers an unreadable report through GNU time
+itself. The measurement is of that one
+process over its exec chain (the launcher's bash, `systemd-run` registering the scope, then the
+test): its peak resident size is the chain's maximum and its seconds include the scope's
+registration, neither the test's alone.
+`every_gate_workload_is_confined` is a regression check of limited coverage: a line of a gate or
+of the common definitions holding one of nine literal workload spellings (`cargo test`, `cargo
+build`, `cargo run`, `cargo miri`, `cargo fuzz build`, `cargo fuzz run`, `cargo-mutants mutants`
+and the two coverage tools) must hold the `confined` prefix. It parses no shell: another spelling,
+a program named by a variable, a command split across lines, or a second command on a confined
+line escapes it. The confinement of each execution site is what the launch-path tests above
+establish. `gate-memory-unconfined.patch` empties the prefix,
+`gate-oom-stops-scope.patch` sets `OOMPolicy=stop`, `gate-workload-unconfined.patch` launches the
+gate tool's runs without the launcher, and `gate-workload-census-unconfined.patch` drops the prefix
+from one Miri gate baseline run; each is refused by its test.
 `gate-process-group-unowned.patch` makes the gate own no group;
 `a_stopped_gate_leaves_no_process_running` (tests/gate, `launchers`) stops a gate holding a child
 and a grandchild by SIGTERM, SIGINT, SIGHUP and SIGKILL and requires none left running. It also
@@ -818,7 +875,15 @@ independently of the implementation (`float-canonical-nan-payload-changed`), the
 resumed turn's first pair left uncompared, refused by the long-key harness
 (`key-resumed-pair-skipped`), and `undefined` (simple 23) decoded as `null`, refused by the scalar
 profile harness (`decode-simple-undefined-accepted`). A Kani control is judged by the one harness
-its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`).
+its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`). Before its diff is
+applied, `tests/controls.sh` checks that harness on the unmutated copy (`gate control run
+baseline`): it must verify alone (`controls::verified`), or the control is failed by name, its red
+and green sides never run, since a planted defect in a harness with no verdict on the commit (no
+results, the timeout, CBMC out of memory, a failure, a short bound) shows nothing of the defect.
+`controls::evidence` requires each Kani control's `baseline.judged` to read `verified` beside its
+red and green judgements. `kani-control-baseline-unrequired.patch` drops that requirement, refused
+by `a_kani_control_is_evidence_only_over_a_verified_baseline`; `kani-baseline-no-verdict-accepted.patch`
+accepts a baseline of any outcome, refused by `a_kani_refusal_is_judged_by_its_one_harness`.
 
 Every Kani run, a control's and the proof suite's, bounds each harness's CBMC run
 (`tests/gate/src/proofs.rs`, `HARNESS_TIMEOUT`, `--harness-timeout 30m` under
@@ -833,11 +898,20 @@ explicit no-results report as Kani counts it; `a_kani_run_is_classed_by_its_summ
 `every_harness_unchecked_or_misreported_is_named` require each report kani-driver renders for one,
 in 0.68.0 and on main, classed as no verdict. The scalar profile harness checks symbolic bytes and
 input length, restricting only the head's major type to unsigned, negative or simple (0, 1, 7).
-There is no enumeration loop requiring a larger global unwind bound. Its bound of 1 limits
-speculative container paths; enabled unwinding assertions must establish that no reachable execution
-needs more iterations or recursive calls. The harness forgets the returned decoded value because
-this property checks acceptance, not destruction; cleanup within the decoder remains part of the
-checked code. No proof is established until the harness produces a successful verdict.
+CBMC's symbolic execution does not prune the decoder's dispatch on the major type by that
+assumption: run whole, it expanded the byte-string, text, array, map and tagged arms, their
+recursion, and the values they build and destroy (in the retained trace, B-tree traversal and
+teardown, vector growth and release, key encoding, UTF-8 and NFC checks far outnumber the scalar
+arms), until CBMC held 118 GB and the host ran out of memory. Those five arms are functions of
+their own in `src/decode.rs`, behavior unchanged, and the harness replaces each with a stub that
+fails a check and ends the path (`decode/proofs.rs`, `arm_reached`): a successful verdict is also
+the proof that no scalar input reaches any of them. With them unreachable there is no recursion and
+no loop: an unwind bound of 1, its unwinding assertions enabled. The harness forgets the returned
+decoded value because this property checks acceptance, not destruction; the decoder's own cleanup
+of a value it refuses (`UnusedData`) remains part of the checked code.
+`decode-scalar-reaches-item-arm.patch` decodes an unsigned head through the tagged-item arm,
+refused by the stub's check. No proof is established until the harness produces a successful
+verdict.
 
 The binary32 test runs the run's layer's domain (`DCBOR_RIGOR`): every pattern under `exhaustive`,
 which `run_tests.sh` runs once optimized, and the reduction rules' edges under `fast` (`float.rs`,

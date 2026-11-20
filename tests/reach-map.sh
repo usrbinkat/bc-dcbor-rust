@@ -92,7 +92,7 @@ echo "identity: $(cat "$out/identity.txt")"
 # package's feature table as Cargo resolves it, implicit features of its
 # optional dependencies included, against which the index requires each
 # predicate to hold in some build the gates make (tests/gate, `cfgs`).
-DCBOR_UNSAFE_CENSUS="$out/census.txt" cargo test --all-features --test unsafe_census -- \
+DCBOR_UNSAFE_CENSUS="$out/census.txt" "${confined[@]}" cargo test --all-features --test unsafe_census -- \
 	--exact every_unsafe_trust_boundary_of_this_crate_is_found >"$out/census.log" 2>&1 || {
 	cat "$out/census.log"
 	exit 1
@@ -171,15 +171,15 @@ reach_test() {
 	# log as it runs (tests/support/rigor.rs `Progress`).
 	event "START $base $test $sizes ($raw/$index.log)"
 	status=0
-	DCBOR_WITNESS="$sizes" LLVM_PROFILE_FILE="$raw/$index-%p%c.profraw" "$exe" "${select[@]}" \
+	DCBOR_WITNESS="$sizes" LLVM_PROFILE_FILE="$raw/$index-%p%c.profraw" "${confined[@]}" "$exe" "${select[@]}" \
 		--nocapture --test-threads=1 >"$raw/$index.log" 2>&1 || status=$?
 	outcome="$(gate classify binary "$kind" "$status" "$raw/$index.log")"
 	if [[ "$outcome" != pass ]]; then
 		event "FAIL $base $test $sizes: $outcome, status $status, instrumented ($((SECONDS - started))s, $raw/$index.log)"
 		exit 1
 	fi
-	"$tools/llvm-profdata" merge -sparse "$raw/$index"-*.profraw -o "$raw/$index.profdata"
-	"$tools/llvm-cov" export -format=text -instr-profile="$raw/$index.profdata" "$exe" >"$raw/$index.export.json"
+	"${confined[@]}" "$tools/llvm-profdata" merge -sparse "$raw/$index"-*.profraw -o "$raw/$index.profdata"
+	"${confined[@]}" "$tools/llvm-cov" export -format=text -instr-profile="$raw/$index.profdata" "$exe" >"$raw/$index.export.json"
 	gate reach regions "$PWD" "$raw/$index.export.json" >"$out/$reach/$base/$index.json"
 	rm -f "$raw/$index"-*.profraw "$raw/$index.export.json"
 	event "DONE $base $test $sizes ($((SECONDS - started))s)"
@@ -191,7 +191,7 @@ reach_suite() {
 	local base="$2" kind="$4" exe index test started=$SECONDS
 	shift 5
 	event "BUILD $base ($out/$base.build.log)"
-	if ! cargo test "$@" --no-run --message-format=json >"$out/$base.build.json" 2>>"$out/$base.build.log" ||
+	if ! "${confined[@]}" cargo test "$@" --no-run --message-format=json >"$out/$base.build.json" 2>>"$out/$base.build.log" ||
 		! exe="$(gate reach executable "$out/$base.build.json")"; then
 		event "FAIL $base: the instrumented binary could not be built ($out/$base.build.log)"
 		exit 1
@@ -207,7 +207,7 @@ reach_suite() {
 	# Every function the binary instruments, executed or not, from the
 	# profile of its first test: the census's coverage target is checked
 	# against them.
-	"$tools/llvm-cov" export -format=text -instr-profile="$out/raw/$base/minimal/0.profdata" "$exe" \
+	"${confined[@]}" "$tools/llvm-cov" export -format=text -instr-profile="$out/raw/$base/minimal/0.profdata" "$exe" \
 		>"$out/raw/$base/functions.export.json"
 	gate reach functions "$PWD" "$out/raw/$base/functions.export.json" >"$out/functions/$base.json"
 	rm -f "$out/raw/$base/functions.export.json"

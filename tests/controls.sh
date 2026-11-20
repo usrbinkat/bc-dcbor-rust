@@ -183,6 +183,22 @@ for line in "${controls[@]}"; do
 	cp "$logs/identity.txt" "$directory/identity.txt"
 	copy_of "$copy" "$commit" || exit 2
 	tree_digest "$copy" >"$directory/before.sha256" || exit 2
+	# A Kani control's harness must verify on the unmutated commit first
+	# (`controls::verified`): a planted defect in a harness with no verdict
+	# (`NoVerdict`, a failure, a short bound) shows nothing, so its red side is
+	# never run. The baseline writes no source; the copy's digest after the
+	# diff is reversed is still compared with the digest before it.
+	if [[ "$runner" == kani ]]; then
+		event "START $run baseline ($directory)"
+		if control_side baseline "$copy" "$directory"; then
+			event "PASS $run: the unmutated harness verified"
+		else
+			event "FAIL $run: the unmutated harness did not verify; the control is not run ($directory/baseline.judged)"
+			status=1
+			rm -rf "$copy"
+			continue
+		fi
+	fi
 	if ! apply_diff "$diff" "$copy"; then
 		event "FAIL $run: the diff does not apply: $diff"
 		status=1

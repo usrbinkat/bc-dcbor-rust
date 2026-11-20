@@ -1,0 +1,14 @@
+--- tests/gate/src/process.rs
++++ tests/gate/src/process.rs
+@@ -53,9 +53,8 @@
+
+     /// `program` launched as a workload.
+     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
+-        let mut command = Command::new(&self.0);
+-        command.arg(program);
+-        command
++        let _ = &self.0;
++        Command::new(program)
+     }
+
+     /// The launcher itself, for a measuring parent outside the workload's

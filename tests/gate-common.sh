@@ -24,6 +24,9 @@
 #   is no longer its supervisor: the supervisor was killed outright
 #   (SIGKILL, which no trap sees). The watcher survives SIGTERM long enough
 #   to escalate to SIGKILL after one second, including for resistant children.
+# - before the gate starts work it defines its workloads' confinement
+#   (`gate_confinement`): each checker, test and build it runs is confined
+#   to a memory-capped scope of its own, the gate itself never.
 #
 # The launch marker is consumed before starting work. A marked child whose
 # parent already died exits instead of starting another supervisor. Nested
@@ -51,6 +54,7 @@ own_process_group() {
 			stop_group
 		) || exit 1
 		[[ "$ready" == ready ]] || exit 1
+		gate_confinement || exit 2
 		return 0
 	fi
 	local script leader="" status stopping=0
@@ -70,6 +74,55 @@ own_process_group() {
 	done
 	kill -TERM -- "-$leader" 2>/dev/null || :
 	exit "$status"
+}
+
+# Every workload a gate runs (a checker, a test binary, a build: each cargo,
+# cargo-miri, cargo-kani, cargo-mutants, cargo-fuzz and profile run) is
+# confined to a memory-capped scope of its own by the one workload launcher,
+# tests/workload.sh, which execs it in place, so it keeps its PID, parent,
+# group and session (termination is forwarded to it as to any of the
+# gate's group) and its exit status or signal. The gate's own processes
+# (its supervisor, watcher, script and the gate tool judging the run) stay
+# outside every workload's scope: a memory-cgroup OOM chooses its victim
+# only among the workload's processes, so the recorder survives a runaway
+# checker by construction, whatever the kernel chooses inside the scope.
+# Defines the prefix array `confined`, which every workload command of a
+# script starts with, and exports the cap (DCBOR_GATE_MEMORY) and the
+# launcher (DCBOR_GATE_WORKLOAD), by which the gate tool launches each run
+# it judges (tests/gate, `process::workload`). Called by
+# `own_process_group` before work starts.
+gate_confinement() {
+	local memory
+	memory="$(gate_memory)" || return 1
+	[[ -x "$PWD/tests/workload.sh" ]] || {
+		printf 'gate confinement needs the workload launcher %s\n' "$PWD/tests/workload.sh" >&2
+		return 1
+	}
+	export DCBOR_GATE_MEMORY="$memory"
+	export DCBOR_GATE_WORKLOAD="$PWD/tests/workload.sh"
+	confined=("$DCBOR_GATE_WORKLOAD")
+}
+
+# The memory cap of each workload's scope (`gate_confinement`), on standard
+# output: DCBOR_GATE_MEMORY, a systemd byte size, `48G` unless the host sets
+# one. Refused, with no gate started, when the user's systemd manager that
+# enforces it is not running or its programs are not on PATH.
+gate_memory() {
+	local tool
+	for tool in systemd-run systemctl; do
+		if ! command -v "$tool" >/dev/null; then
+			printf 'gate confinement needs %s on PATH, a program of the host systemd manager.\n' "$tool" >&2
+			return 1
+		fi
+	done
+	case "$(systemctl --user is-system-running 2>/dev/null || true)" in
+	running | degraded) ;;
+	*)
+		printf 'gate confinement needs a running user systemd manager (systemctl --user).\n' >&2
+		return 1
+		;;
+	esac
+	printf '%s\n' "${DCBOR_GATE_MEMORY:-48G}"
 }
 
 # Every input a gate's evidence depends on, one digest line each: the whole
@@ -307,7 +360,7 @@ gate_prepare() {
 	host="$(rustc -vV | sed -n 's/^host: //p')" || return 2
 	[[ -n "$host" ]] || return 2
 	env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u DCBOR_PROFILER \
-		cargo build --quiet --package dcbor-gate --bin gate --target "$host" --target-dir "$target" </dev/null ||
+		"${confined[@]}" cargo build --quiet --package dcbor-gate --bin gate --target "$host" --target-dir "$target" </dev/null ||
 		return 2
 	GATE_BINARY="$target/$host/debug/gate"
 }
@@ -339,18 +392,19 @@ miri_prepare() {
 	toolchain="$(basename "$(rustc --print sysroot)")" || return 1
 	MIRI_TARGET_DIR="$PWD/target/miri-toolchains/$toolchain"
 	export MIRI_SYSROOT="$MIRI_TARGET_DIR/sysroot"
-	cargo miri setup
+	"${confined[@]}" cargo miri setup
 }
 
 # The command every Miri run of the gates starts with, into the array
-# `miri_cmd`: `cargo miri test` with the toolchain's own build cache
-# (`--target-dir`, to which cargo-miri appends `miri`: util.rs
-# `get_target_dir`). An array, not a function, so a run can be timed by GNU
-# `time`, which executes programs. Refused before `miri_prepare`.
+# `miri_cmd`: `cargo miri test`, confined (`gate_confinement`), with the
+# toolchain's own build cache (`--target-dir`, to which cargo-miri appends
+# `miri`: util.rs `get_target_dir`). An array, not a function, so a run can
+# be timed by GNU `time`, which executes programs. Refused before
+# `miri_prepare`.
 miri_command() {
 	: "${MIRI_TARGET_DIR:?call miri_prepare before running Miri}"
 	: "${MIRI_SYSROOT:?call miri_prepare before running Miri}"
-	miri_cmd=(cargo miri test --target-dir "$MIRI_TARGET_DIR")
+	miri_cmd=("${confined[@]}" cargo miri test --target-dir "$MIRI_TARGET_DIR")
 }
 
 # The MIRIFLAGS of model `$1`, strict provenance included, the caller's own
@@ -360,7 +414,7 @@ miri_flags() {
 	stacked) printf '%s %s' "$MIRI_STRICT" "${MIRIFLAGS:-}" ;;
 	tree) printf '%s -Zmiri-tree-borrows %s' "$MIRI_STRICT" "${MIRIFLAGS:-}" ;;
 	*)
-		printf 'unknown Miri model: %s; the models are those `gate miri models` lists, each with its flags here\n' "$1" >&2
+		printf 'unknown Miri model: %s; the models are those the gate tool lists (gate miri models), each with its flags here\n' "$1" >&2
 		return 2
 		;;
 	esac

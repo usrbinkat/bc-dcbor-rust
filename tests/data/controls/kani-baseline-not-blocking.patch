@@ -1,0 +1,11 @@
+--- tests/controls.sh
++++ tests/controls.sh
+@@ -195,8 +195,6 @@
+ 		else
+ 			event "FAIL $run: the unmutated harness did not verify; the control is not run ($directory/baseline.judged)"
+ 			status=1
+-			rm -rf "$copy"
+-			continue
+ 		fi
+ 	fi
+ 	if ! apply_diff "$diff" "$copy"; then

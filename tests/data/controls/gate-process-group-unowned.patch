@@ -1,6 +1,6 @@
 --- tests/gate-common.sh
 +++ tests/gate-common.sh
-@@ -30,6 +30,7 @@
+@@ -33,6 +33,7 @@
  # gates inherit no marker and create their own supervisor and group.
  own_process_group() {
  	local supervisor="${DCBOR_GATE_SUPERVISOR:-}" parent

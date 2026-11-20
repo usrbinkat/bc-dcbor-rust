@@ -63,14 +63,14 @@ finished() {
 	printf 'EXIT %s\n' "$status" >>"$logs/results.txt"
 }
 trap finished EXIT
-cargo build --locked --release --example codec_profile --example reclamation_profile >"$logs/build.log" 2>&1
+"${confined[@]}" cargo build --locked --release --example codec_profile --example reclamation_profile >"$logs/build.log" 2>&1
 unchanged
 for worker in "${workers[@]}"; do
 	for fixture in ascii combining; do
 		for storage in private shared; do
 			for process in 1 2 3; do
 				name="$worker-$fixture-$storage-$process"
-				cargo run --locked --quiet --release --example codec_profile -- "$worker" "$operations" "$repetitions" "$fixture" "$storage" >"$logs/$name.tsv" 2>"$logs/$name.stderr"
+				"${confined[@]}" cargo run --locked --quiet --release --example codec_profile -- "$worker" "$operations" "$repetitions" "$fixture" "$storage" >"$logs/$name.tsv" 2>"$logs/$name.stderr"
 				unchanged
 				printf 'PASS %s\n' "$name" >>"$logs/results.txt"
 			done
@@ -81,7 +81,7 @@ for batch in 1 16 64; do
 	for service in 0 1 8; do
 		for process in 1 2 3; do
 			name="reclamation-$batch-$service-$process"
-			cargo run --locked --quiet --release --example reclamation_profile -- "$operations" "$batch" "$service" "$repetitions" >"$logs/$name.tsv" 2>"$logs/$name.stderr"
+			"${confined[@]}" cargo run --locked --quiet --release --example reclamation_profile -- "$operations" "$batch" "$service" "$repetitions" >"$logs/$name.tsv" 2>"$logs/$name.stderr"
 			unchanged
 			printf 'PASS %s\n' "$name" >>"$logs/results.txt"
 		done

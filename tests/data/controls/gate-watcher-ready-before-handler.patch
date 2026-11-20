@@ -1,6 +1,6 @@
 --- tests/gate-common.sh
 +++ tests/gate-common.sh
-@@ -43,8 +43,8 @@
+@@ -46,8 +46,8 @@
  				sleep 1
  				kill -KILL 0
  			}
