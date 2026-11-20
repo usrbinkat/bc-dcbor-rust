@@ -339,9 +339,9 @@ pub fn list(checker: Checker, target: &str, executable: &Path) -> Result<Vec<Lis
 /// What GNU time measured of a run: its peak resident kilobytes and wall
 /// seconds, each read from time's report and validated (`%M %e`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Measurement {
-    peak_kb: u64,
-    seconds: String,
+pub(crate) struct Measurement {
+    pub(crate) peak_kb: u64,
+    pub(crate) seconds: String,
 }
 
 /// A measured run: how its child, the test, ended when GNU time's report
@@ -369,6 +369,28 @@ struct Measured {
 fn report(
     report: &str,
     wrapper: std::process::ExitStatus,
+) -> (Result<Termination, String>, Result<Measurement, String>) {
+    let (parsed, measurement) = time_report(report);
+    let termination = parsed.and_then(|termination| {
+        let expected = match termination {
+            Termination::Signaled(signal) => 128_i32.checked_add(signal),
+            Termination::Exited(code) => Some(code),
+        };
+        if expected.is_some() && wrapper.code() == expected {
+            Ok(termination)
+        } else {
+            Err(format!(
+                "GNU time reported {termination:?} but itself ended with {wrapper}"
+            ))
+        }
+    });
+    (termination, measurement)
+}
+
+/// Parse the complete GNU time report without inventing a wrapper status.
+/// Callers with a status additionally check agreement through [`report`].
+pub(crate) fn time_report(
+    report: &str,
 ) -> (Result<Termination, String>, Result<Measurement, String>) {
     let lines: Vec<&str> = report.lines().collect();
     let (ending, measured) = match lines[..] {
@@ -414,21 +436,7 @@ fn report(
             })
             .ok_or_else(|| format!("not GNU time's report of an ending: {line:?}")),
     };
-    let termination = parsed.and_then(|termination| {
-        // GNU time exits 128 + N for its command's signal N, N for its exit N.
-        let expected = match termination {
-            Termination::Signaled(signal) => 128_i32.checked_add(signal),
-            Termination::Exited(code) => Some(code),
-        };
-        if expected.is_some() && wrapper.code() == expected {
-            Ok(termination)
-        } else {
-            Err(format!(
-                "GNU time reported {termination:?} but itself ended with {wrapper}"
-            ))
-        }
-    });
-    (termination, measurement)
+    (parsed, measurement)
 }
 
 /// One run of `listed`'s test in `executable`, its own process, with
@@ -446,6 +454,9 @@ fn report(
 /// measurement are read from time's report ([`report`]); a report missing,
 /// unreadable or malformed leaves each unavailable, its error naming time's
 /// own status, which is kept beside them and never taken for the test's.
+/// The exact libtest selection must acknowledge its start in the log before
+/// the exec chain's termination is attributed to it. Failure before that
+/// acknowledgement leaves termination unavailable, including early signals.
 fn run_once(
     workload: &Workload,
     executable: &Path,
@@ -485,6 +496,17 @@ fn run_once(
     };
     let text =
         std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    // GNU time observes the launcher too. Only libtest's acknowledgement of
+    // this exact selection establishes that execution reached the test.
+    // A process dying before that acknowledgement has unavailable termination.
+    let started = format!("test {test} ... ");
+    let termination = termination.and_then(|ending| {
+        if text.lines().any(|line| line.starts_with(&started)) {
+            Ok(ending)
+        } else {
+            Err(format!("no execution acknowledgement for test {test:?}"))
+        }
+    });
     Ok(Measured {
         termination: termination
             .map_err(|error| located(format!("{error}; the test's termination is unavailable"))),
@@ -654,6 +676,7 @@ mod tests {
         std::fs::write(
             &script,
             "#!/bin/sh\n\
+             printf 'test t ... \\n'\n\
              case \"$DCBOR_TEST_END\" in exit) exit 7 ;; kill) kill -KILL $$ ;; esac\n\
              cut -d: -f3 /proc/self/cgroup\n\
              cut -d: -f3 /proc/$PPID/cgroup\n",
@@ -679,6 +702,18 @@ mod tests {
             )
             .expect("record the run")
         };
+        let missing = super::run_once(
+            &launcher,
+            &directory.join("nonexistent"),
+            "t",
+            &[("DCBOR_GATE_MEMORY", "64M".to_string())],
+            &directory.join("missing.log"),
+        )
+        .expect("retain failed launch evidence");
+        assert!(
+            missing.termination.is_err(),
+            "launcher became test: {missing:?}"
+        );
         let super::Measured {
             termination,
             text,
@@ -686,7 +721,7 @@ mod tests {
             ..
         } = run("report");
         assert_eq!(termination, Ok(Termination::Exited(0)), "{text}");
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
         let [test, parent] = lines[..] else {
             panic!("the test reported {text:?}");
         };

@@ -94,22 +94,17 @@ pub(crate) fn verdict_at(path: &Path) -> Result<Outcome, String> {
 }
 
 /// The wall seconds and peak kilobytes GNU time wrote at `path`, none for a
-/// run that never started. A process killed by a signal has GNU time write
-/// the signal first; the measurement is always its last line.
+/// missing report. Validate the complete report with the measured native
+/// runner's parser; these files do not retain GNU time's wrapper status.
 fn measured(path: &Path) -> Result<(Option<String>, Option<u64>), String> {
     let Some(text) = read(path)? else {
         return Ok((None, None));
     };
-    let last = text.lines().last().unwrap_or_default();
-    match last.split_once(' ') {
-        Some((peak, seconds)) if !seconds.contains(' ') => {
-            let peak = peak
-                .parse()
-                .map_err(|_| format!("{}: no peak kilobytes in {last:?}", path.display()))?;
-            Ok((Some(seconds.to_string()), Some(peak)))
-        }
-        _ => Err(format!("{}: no measurement in {last:?}", path.display())),
-    }
+    let (ending, measurement) = crate::process::time_report(&text);
+    let located = |error| format!("{}: no measurement: {error}", path.display());
+    ending.map_err(located)?;
+    let measurement = measurement.map_err(located)?;
+    Ok((Some(measurement.seconds), Some(measurement.peak_kb)))
 }
 
 fn seed_of(text: &str, at: &Path) -> Result<Option<u64>, String> {
@@ -396,6 +391,16 @@ mod tests {
                 .contains("b.runs: missing")
         );
         write(&root.join("b.runs"), "t\t-\n");
+        for text in [
+            "1 nonsense\n",
+            "1 inf\n",
+            "unexpected\n1 2\n",
+            "Command terminated by signal 0\n1 2\n",
+            "extra\nCommand terminated by signal 9\n1 2\n",
+        ] {
+            write(&root.join("b-stacked/0.measure"), text);
+            assert!(results(&root, &["stacked"]).is_err(), "accepted {text:?}");
+        }
         write(&root.join("b-stacked/0.measure"), "garbage\n");
         assert!(
             results(&root, &["stacked"])
