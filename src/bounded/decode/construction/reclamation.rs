@@ -91,14 +91,14 @@ pub struct Cleanup<'a, A: Allocator> {
     depth: Depth,
 }
 
-// The build's threads' own locals ([`crate::sync::thread_local`]), as the
+// The build's threads' own locals ([`crate::sync::thread_locals`]), as the
 // nesting hooks' (`owned`): a model thread's dispatch level is its own.
 #[cfg(all(test, feature = "std"))]
-crate::sync::thread_local! {
+crate::sync::thread_locals! {
     /// The deepest dispatch level entered on this thread since the last
     /// [`deepest_reached`]: the measurement the declaration census reads.
     /// Test builds only; no shipped code keeps it.
-    static DEEPEST: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static DEEPEST: core::cell::Cell<usize> = core::cell::Cell::new(0);
 }
 
 /// The deepest dispatch level `run` enters on this thread, construction and

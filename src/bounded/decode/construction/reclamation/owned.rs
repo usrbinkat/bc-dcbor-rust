@@ -508,19 +508,19 @@ fn drain_terminally<A: crate::bounded::TerminalAllocator>(
     core::mem::forget(guard);
 }
 
-// The build's threads' own locals ([`crate::sync::thread_local`]): under a
+// The build's threads' own locals ([`crate::sync::thread_locals`]): under a
 // checker its model threads share one OS thread, so a std local would count
 // another model thread's drain as nested in this one's.
 #[cfg(all(test, feature = "std"))]
-crate::sync::thread_local! {
+crate::sync::thread_locals! {
     /// The terminal drains active on this thread and the most ever nested
     /// since the last [`drains_nested`]: the measurement of the worklist's
     /// claim that a drain never runs inside another. Test builds only; no
     /// shipped code keeps it.
-    static DRAINS: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+    static DRAINS: core::cell::Cell<(usize, usize)> = core::cell::Cell::new((0, 0));
     /// The nesting oracle disarmed, while a witness measures the nesting
     /// itself and reports it as its own finding ([`drains_nested`]).
-    static NESTING_DISARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static NESTING_DISARMED: core::cell::Cell<bool> = core::cell::Cell::new(false);
 }
 
 /// The most terminal drains `run` nests on this thread at once, the nesting

@@ -159,6 +159,27 @@ pub(crate) use shuttle::thread_local;
 #[cfg(all(test, feature = "std", not(any(loom, shuttle))))]
 pub(crate) use std::thread_local;
 
+/// The measurement hooks' thread-locals ([`thread_local`]), each declared as
+/// `static NAME: TYPE = INIT;`: initialized in a `const` block where the
+/// build's `thread_local!` takes one (std's and shuttle's), and by the plain
+/// expression under loom, whose `thread_local!` matches an expression alone
+/// (loom 0.7 `src/lib.rs`, `$init:expr`).
+#[cfg(all(test, feature = "std"))]
+macro_rules! thread_locals {
+    ($($(#[$attr:meta])* static $name:ident: $ty:ty = $init:expr;)*) => {
+        #[cfg(not(loom))]
+        crate::sync::thread_local! {
+            $($(#[$attr])* static $name: $ty = const { $init };)*
+        }
+        #[cfg(loom)]
+        crate::sync::thread_local! {
+            $($(#[$attr])* static $name: $ty = $init;)*
+        }
+    };
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) use thread_locals;
+
 /// A plain value one thread writes and another reads after an atomic
 /// publication orders the two: a queued record's custody and cleanup budget,
 /// written by the retiring thread before its tail swap and read by the
