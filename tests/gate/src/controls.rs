@@ -195,7 +195,12 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
         let runner = Runner::parse(runner)
             .ok_or_else(|| format!("{TABLE}:{line}: {}", Runner::unknown(runner)))?;
         let expected = Outcome::parse(expected)
-            .filter(|outcome| *outcome != Outcome::Pass && *outcome != Outcome::NotRun)
+            .filter(|outcome| {
+                !matches!(
+                    outcome,
+                    Outcome::Pass | Outcome::NotRun | Outcome::NoVerdict
+                )
+            })
             .ok_or_else(|| format!("{TABLE}:{line}: {expected:?} is no refusal outcome"))?;
         let control = Control {
             name: name.to_string(),
@@ -478,7 +483,7 @@ fn started_alone(report: &str, test: &str) -> bool {
 /// exactly one test ([`outcome::ran_one`]), a Miri run selected and started
 /// exactly its one test ([`started_alone`]); a model control's run is one
 /// model's process already.
-fn alone(control: &Control, report: &str) -> bool {
+fn alone(control: &Control, report: &str, outcome: Outcome) -> bool {
     match control.runner {
         Runner::Native => outcome::ran_one(report),
         Runner::Miri(_) => control
@@ -488,22 +493,17 @@ fn alone(control: &Control, report: &str) -> bool {
         Runner::Kani => control
             .test
             .as_deref()
-            .is_some_and(|harness| checked_alone(report, harness)),
+            .is_some_and(|harness| checked_alone(report, harness, outcome)),
         Runner::Model(_) => true,
     }
 }
 
-/// Whether a Kani run's `report` is its one harness's: exactly one
-/// `Checking harness NAME...` line, naming `harness` whole, and a summary of
-/// one harness in total (kani-driver `harness_runner.rs`, `check_harness`
-/// and `print_final_summary`; one thread, so no `Thread N: ` prefix).
-fn checked_alone(report: &str, harness: &str) -> bool {
-    let checked: Vec<&str> = report
-        .lines()
-        .filter(|line| line.starts_with("Checking harness "))
-        .collect();
-    checked == [format!("Checking harness {harness}...").as_str()]
-        && outcome::kani_summary(report).is_some_and(|(_, _, total)| total == 1)
+/// Whether the shared proof parser finds exactly the selected harness and
+/// its reported outcome agrees with the classified run.
+fn checked_alone(report: &str, harness: &str, outcome: Outcome) -> bool {
+    crate::proofs::checked(report).is_ok_and(|checked| {
+        matches!(checked.as_slice(), [(name, result)] if name == harness && *result == outcome)
+    })
 }
 
 /// Whether a run of `control` with its diff applied refused it by its own
@@ -512,13 +512,13 @@ fn checked_alone(report: &str, harness: &str) -> bool {
 /// build; and the pattern in that run's own report, or in its fixture's
 /// block. Every other run is a fault naming why.
 pub fn judge(control: &Control, outcome: Outcome, report: &str) -> Result<(), String> {
-    if outcome != control.expected {
+    if outcome == Outcome::NoVerdict || outcome != control.expected {
         return Err(format!(
             "{}: {outcome}, where the planted defect's refusal is {}",
             control.name, control.expected
         ));
     }
-    if outcome != Outcome::BuildRefused && !alone(control, report) {
+    if outcome != Outcome::BuildRefused && !alone(control, report, outcome) {
         return Err(format!(
             "{}: the run did not execute exactly its one test, so its report is not that test's",
             control.name
@@ -544,7 +544,7 @@ pub fn judge(control: &Control, outcome: Outcome, report: &str) -> Result<(), St
 /// (a passing run prints libtest's summary either way).
 pub fn restored(control: &Control, outcome: Outcome, report: &str) -> Result<(), String> {
     let one = match control.runner {
-        Runner::Kani => alone(control, report),
+        Runner::Kani => alone(control, report, outcome),
         Runner::Native | Runner::Miri(_) | Runner::Model(_) => outcome::ran_one(report),
     };
     if outcome == Outcome::Pass && one {
@@ -678,6 +678,13 @@ mod kani_tests {
         let parsed = parse(&row("kani", "-", "lib")).expect("a Kani row parses");
         assert_eq!(parsed[0].runner, Runner::Kani);
         assert_eq!(parsed[0].render(), row("kani", "-", "lib"));
+        let inconclusive = row("kani", "-", "lib").replace("\tfailed\t", "\tno_verdict\t");
+        assert!(
+            parse(&inconclusive)
+                .unwrap_err()
+                .contains("is no refusal outcome"),
+            "an inconclusive run cannot be a control's expected refusal"
+        );
         for wrong in [
             row("nightly", "-", "lib"),
             row("kani", "all", "lib"),
@@ -697,7 +704,7 @@ mod kani_tests {
     fn a_kani_refusal_is_judged_by_its_one_harness() {
         let control = &parse(&row("kani", "-", "lib")).unwrap()[0];
         let report = format!(
-            "Checking harness {HARNESS}...\nFailed Checks: a planted failure\n\
+            "Checking harness {HARNESS}...\nFailed Checks: a planted failure\nVERIFICATION:- FAILED\n\
              Manual Harness Summary:\nVerification failed for - {HARNESS}\n\
              Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n"
         );
@@ -713,10 +720,24 @@ mod kani_tests {
             "refused by another rule"
         );
         let passed = format!(
-            "Checking harness {HARNESS}...\nManual Harness Summary:\n\
+            "Checking harness {HARNESS}...\nVERIFICATION:- SUCCESSFUL\nManual Harness Summary:\n\
              Complete - 1 successfully verified harnesses, 0 failures, 1 total.\n"
         );
         assert_eq!(restored(control, Outcome::Pass, &passed), Ok(()));
         assert!(restored(control, Outcome::Pass, &two).is_err());
+        assert!(judge(control, Outcome::Failed, &passed).is_err());
+        assert!(restored(control, Outcome::Pass, &report).is_err());
+        for block in outcome::fixtures::kani_no_verdict_blocks(HARNESS) {
+            let incomplete = format!(
+                "{block}Failed Checks: a planted failure\n\
+                 Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n"
+            );
+            for classified in [Outcome::Failed, Outcome::NoVerdict] {
+                assert!(
+                    judge(control, classified, &incomplete).is_err(),
+                    "a control accepted a no-verdict report as its refusal"
+                );
+            }
+        }
     }
 }

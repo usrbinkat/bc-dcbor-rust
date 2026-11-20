@@ -14,6 +14,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 : "${TMPDIR:?required: the campaign log directory}"
 for tool in cargo rustc cargo-mutants cargo-llvm-cov patch time systemd-run systemctl sha256sum git tar; do

@@ -50,11 +50,22 @@ pub const NAMES: &[&str] = &["kani", "debug_assertions"];
 /// adapters with (`src/float/proofs.rs`, `src/decode/proofs.rs`). Without it
 /// the build refuses every stub ("Using the stub attribute requires
 /// activating the unstable `stubbing` feature"). Kani 0.68.0's `-Z,
-/// --unstable` list names it (`cargo kani --help`).
-pub const UNSTABLE: &[&str] = &["-Z", "stubbing"];
+/// --unstable` list names it (`cargo kani --help`). `unstable-options`, for
+/// [`HARNESS_TIMEOUT`], which Kani 0.68.0 accepts only with it
+/// (kani-driver `args/mod.rs`, `harness-timeout`).
+pub const UNSTABLE: &[&str] = &["-Z", "stubbing", "-Z", "unstable-options"];
+
+/// The bound on each harness's CBMC run (kani-driver 0.68.0 `call_cbmc.rs`
+/// `run_cbmc_piped`: the run is killed when it is reached). A harness that
+/// reaches it ends without a verdict ([`Outcome::NoVerdict`]), never a pass
+/// nor a refusal, so a symbolic execution that does not terminate fails its
+/// run instead of holding the gate. This operational deadline does not
+/// establish a proof bound or turn an incomplete check into evidence.
+pub const HARNESS_TIMEOUT: &[&str] = &["--harness-timeout", "30m"];
 
 /// The `cargo` arguments that make the build and run every harness in it:
-/// the package's library alone, under [`FEATURES`], with [`UNSTABLE`]. Each
+/// the package's library alone, under [`FEATURES`], with [`UNSTABLE`] and
+/// [`HARNESS_TIMEOUT`]. Each
 /// option is one `cargo kani` declares (kani-driver/src/args/cargo.rs:
 /// `--package`, and `--no-default-features`, `--features` in
 /// `CargoCommonArgs`; `--lib` in `CargoTargetArgs`, which with `--lib`
@@ -64,6 +75,7 @@ pub fn arguments() -> Vec<&'static str> {
     let mut arguments = vec!["kani", "--package", "dcbor", "--lib"];
     arguments.extend_from_slice(FEATURES);
     arguments.extend_from_slice(UNSTABLE);
+    arguments.extend_from_slice(HARNESS_TIMEOUT);
     arguments
 }
 
@@ -160,11 +172,15 @@ pub fn harnesses(src: &Path) -> Result<BTreeSet<String>, String> {
 /// final summary disagrees with the blocks.
 pub fn checked(report: &str) -> Result<Vec<(String, Outcome)>, String> {
     let mut found: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut names = BTreeSet::new();
     for line in report.lines() {
         if let Some(name) = line
             .strip_prefix("Checking harness ")
             .and_then(|rest| rest.strip_suffix("..."))
         {
+            if name.is_empty() || !names.insert(name) {
+                return Err(format!("harness {name:?}: empty or repeated harness name"));
+            }
             found.push((name.to_string(), Vec::new()));
         } else if let Some((_, block)) = found.last_mut() {
             block.push(line);
@@ -173,23 +189,36 @@ pub fn checked(report: &str) -> Result<Vec<(String, Outcome)>, String> {
     let mut results = Vec::new();
     for (name, block) in &found {
         let text = block.join("\n");
-        let result = if text.contains(outcome::KANI_UNSUPPORTED) {
+        let mut verification = block
+            .iter()
+            .filter_map(|line| line.strip_prefix("VERIFICATION:- "));
+        let reported = match (verification.next(), verification.next()) {
+            (Some("SUCCESSFUL"), None) => Outcome::Pass,
+            (Some("FAILED"), None) => Outcome::Failed,
+            (None, _) => {
+                return Err(format!(
+                    "harness {name}: its block reports no verification result"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "harness {name}: its block reports ambiguous or invalid verification results"
+                ));
+            }
+        };
+        let result = if outcome::kani_without_verdict(&text) {
+            Outcome::NoVerdict
+        } else if text.contains(outcome::KANI_UNSUPPORTED) {
             Outcome::Unsupported
         } else if text.contains(outcome::KANI_UNWINDING) {
             Outcome::BoundRefused
-        } else if text.contains("VERIFICATION:- SUCCESSFUL") {
-            Outcome::Pass
-        } else if text.contains("VERIFICATION:- FAILED") {
-            Outcome::Failed
         } else {
-            return Err(format!(
-                "harness {name}: its block reports no verification result"
-            ));
+            reported
         };
         results.push((name.clone(), result));
     }
     let Some((verified, failed, total)) = outcome::kani_summary(report) else {
-        return Err("the report has no final summary".to_string());
+        return Err("the report has no unique, well-formed final summary".to_string());
     };
     let passes = results
         .iter()
@@ -300,7 +329,11 @@ mod tests {
                 "--features",
                 "std",
                 "-Z",
-                "stubbing"
+                "stubbing",
+                "-Z",
+                "unstable-options",
+                "--harness-timeout",
+                "30m"
             ]
         );
         assert!(!arguments.contains(&"--tests"));
@@ -391,6 +424,34 @@ mod tests {
             checked(&unwound).unwrap(),
             [("a::x".to_string(), Outcome::BoundRefused)]
         );
+        for incomplete_block in outcome::fixtures::kani_no_verdict_blocks("a::x") {
+            let incomplete = format!(
+                "{incomplete_block}{}{}",
+                block("a::y", "SUCCESSFUL"),
+                summary(1, 1)
+            );
+            assert_eq!(
+                checked(&incomplete).unwrap(),
+                [
+                    ("a::x".to_string(), Outcome::NoVerdict),
+                    ("a::y".to_string(), Outcome::Pass),
+                ],
+                "a harness whose CBMC run produced no results was given a verdict"
+            );
+            let (found, faults) = rows(
+                Termination::Exited(1),
+                &incomplete,
+                &declared(&["a::x", "a::y"]),
+            );
+            assert!(faults.is_empty(), "{faults:?}");
+            assert_eq!(found[0].evidence, Evidence::Unverified);
+            assert_eq!(found[1].evidence, Evidence::Proved);
+            assert_eq!(
+                crate::rows::verdict(&found).len(),
+                1,
+                "the incomplete harness must fail qualification independently of the verified one"
+            );
+        }
         let disagree = format!("{}{}", block("a::x", "SUCCESSFUL"), summary(2, 0));
         assert!(checked(&disagree).unwrap_err().contains("summary counts"));
         assert!(
@@ -400,6 +461,27 @@ mod tests {
         );
         let (_, faults) = rows(Termination::Exited(1), &report, &declared(&["a::x"]));
         assert!(faults[0].contains("call for exit 0"), "{faults:?}");
+        for malformed in [
+            format!(
+                "{}{}{}",
+                block("a::x", "SUCCESSFUL"),
+                block("a::x", "SUCCESSFUL"),
+                summary(2, 0)
+            ),
+            format!("{}{}", block("", "SUCCESSFUL"), summary(1, 0)),
+            format!("{report}{}", summary(1, 0)),
+            format!("{report}VERIFICATION:- FAILED\n"),
+            format!("{}{}", block("a::x", "UNKNOWN"), summary(0, 1)),
+        ] {
+            assert!(checked(&malformed).is_err(), "{malformed}");
+            for code in [0, 1] {
+                assert_eq!(
+                    outcome::kani(Termination::Exited(code), &malformed),
+                    Outcome::NoVerdict,
+                    "an ambiguous report supplied a verdict: {malformed}"
+                );
+            }
+        }
     }
 
     /// The census reads harnesses by module path, nested inline modules

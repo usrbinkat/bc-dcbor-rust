@@ -2,6 +2,7 @@
 //! each the production transition it records (the crate's documentation),
 //! and the driver's marks checked against the state they reach.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
@@ -915,7 +916,7 @@ impl Machine {
 
 /// A mark of the run's driver, in the order the run places them.
 enum Mark<'r> {
-    Checkpoint(&'r Checkpoint),
+    Checkpoint,
     Cleaning(Cause),
     Published(&'r Publication),
 }
@@ -926,20 +927,20 @@ enum Mark<'r> {
 /// Checkpoints are given in order and refused out of it; cleaning and
 /// publication are merged in by boundary. Marks add checks; their absence
 /// relaxes none. The machine reached, or the first divergence.
-fn replay(
+fn replay<C: Borrow<Checkpoint>>(
     observed: &[Observed],
-    checkpoints: &[Checkpoint],
+    checkpoints: impl Iterator<Item = C> + Clone,
     cleaning: Option<(usize, Cause)>,
     published: Option<&Publication>,
 ) -> Result<Machine, Divergence> {
     let mut marks: Vec<(usize, At, Mark<'_>)> = checkpoints
-        .iter()
+        .clone()
         .enumerate()
         .map(|(index, checkpoint)| {
             (
-                checkpoint.boundary,
+                checkpoint.borrow().boundary,
                 At::Checkpoint(index),
-                Mark::Checkpoint(checkpoint),
+                Mark::Checkpoint,
             )
         })
         .collect();
@@ -980,6 +981,7 @@ fn replay(
         }
         Ok(())
     };
+    let mut checkpoints = checkpoints;
     for (boundary, at, mark) in marks {
         if boundary > observed.len() {
             return Err(Divergence {
@@ -992,7 +994,13 @@ fn replay(
         }
         advance(&mut machine, boundary)?;
         let result = match mark {
-            Mark::Checkpoint(checkpoint) => machine.checkpoint(&checkpoint.custody),
+            Mark::Checkpoint => machine.checkpoint(
+                &checkpoints
+                    .next()
+                    .expect("each checkpoint has one mark")
+                    .borrow()
+                    .custody,
+            ),
             Mark::Cleaning(cause) => machine.clean(cause),
             Mark::Published(publication) => machine.publish(publication),
         };
@@ -1011,7 +1019,7 @@ fn replay(
 pub fn check(run: &Run) -> Result<(), Divergence> {
     let machine = replay(
         &run.observed,
-        &run.checkpoints,
+        run.checkpoints.iter(),
         run.cleaning,
         run.published.as_ref(),
     )?;
@@ -1044,6 +1052,13 @@ pub fn evidence(run: &Run) -> Result<Evidence, Divergence> {
 /// reaches. What every recorded test's evidence is checked by
 /// (`tests/support/lifecycle.rs`, `recorded_run`).
 pub fn settled(observed: &[Observed], checkpoints: &[Checkpoint]) -> Result<(), Divergence> {
+    settled_iter(observed, checkpoints.iter())
+}
+
+pub(super) fn settled_iter<C: Borrow<Checkpoint>>(
+    observed: &[Observed],
+    checkpoints: impl Iterator<Item = C> + Clone,
+) -> Result<(), Divergence> {
     replay(observed, checkpoints, None, None).map(|_| ())
 }
 

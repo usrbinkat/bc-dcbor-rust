@@ -80,11 +80,13 @@ pub use dcbor::bounded::{
 };
 pub use dcbor_record::Evidence;
 
+mod history;
 mod machine;
 pub mod model;
 mod row;
 mod text;
 
+pub use history::History;
 pub use machine::{calls, check, evidence, settled};
 pub use model::{At, Divergence, Rule};
 pub use row::{Row, parse_record, parse_row};

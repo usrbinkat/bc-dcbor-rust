@@ -35,6 +35,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 for tool in cargo rustc patch time sha256sum getconf git tar; do
 	if ! command -v "$tool" >/dev/null; then

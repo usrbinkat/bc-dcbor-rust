@@ -14,6 +14,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 for tool in cargo cargo-kani rustc sha256sum git; do
 	if ! command -v "$tool" >/dev/null; then
@@ -26,7 +27,7 @@ if (($# != 0)); then
 	exit 2
 fi
 gate_prepare || exit 2
-logs="${PROOF_LOG_DIR:-${TMPDIR:?required, or PROOF_LOG_DIR: the proof gate's log directory}/proofs}"
+logs="${PROOF_LOG_DIR:-${TMPDIR:?required, or PROOF_LOG_DIR: the log directory of the proof gate}/proofs}"
 mkdir -p "$logs" || exit 2
 {
 	printf 'kani\t%s\n' "$(cargo kani --version)"

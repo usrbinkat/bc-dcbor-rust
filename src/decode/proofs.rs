@@ -2,7 +2,6 @@
 //! head: the checks the head harnesses (`src/varint/proofs.rs`) leave to the
 //! decoder, each over every one-item input of an unsigned, negative or
 //! simple head, of every length up to the widest head (register item 4).
-//! Status: written and unverified until the gate runs them.
 //!
 //! Given the head the parser read (whose representation those harnesses
 //! check), the symbolic decoder ([`super::decode_cbor`]) accepts the input
@@ -31,15 +30,15 @@
 //! [`the_negative_range_rule_is_exact`] is their range check's proof too;
 //! their own float and simple-value checks are not covered here.
 //!
-//! Loops: the head parser has none (`parse_header_varint`, decode.rs:43, a
-//! match over the head's at most [`MAX_HEAD_LEN`] bytes, each read by
-//! index); a scalar has no children, so `decode_cbor` enters no item loop;
-//! the float validators and the reference are straight-line
-//! (`float/proofs.rs`, its module doc). The longest loop any reached code
-//! can form is a copy of the head's bytes, at most [`MAX_HEAD_LEN`] = 9
-//! iterations: `kani::unwind(10)`, nine and the exit; the range rule's
-//! harness reaches no loop, `kani::unwind(1)`. Compiled only under
-//! `cfg(kani)`.
+//! The scalar harness uses symbolic bytes and input length, restricting only
+//! the head's major type to unsigned, negative or simple. It has no
+//! enumeration loop. `kani::unwind(1)` keeps speculative container paths
+//! short; unwinding assertions must establish that no reachable execution
+//! needs more iterations or recursive calls. The returned decoded
+//! value is forgotten because this property checks acceptance, not
+//! destruction; internal decoder cleanup remains part of the checked code.
+//! The range rule's harness reaches no loop (`kani::unwind(1)`).
+//! Compiled only under `cfg(kani)`.
 
 use super::{decode_cbor, negative, parse_header_varint};
 use crate::Error;
@@ -76,15 +75,15 @@ fn the_negative_range_rule_is_exact() {
 /// contract, discharged natively and exhaustively (`float/proofs.rs`, "The
 /// `half` conversion").
 #[kani::proof]
-#[kani::unwind(10)]
+#[kani::unwind(1)]
 #[kani::stub(crate::float::narrowed, crate::float::proofs::from_f64_contract)]
 #[kani::stub(crate::float::widened, crate::float::proofs::to_f64_contract)]
 fn a_scalar_item_is_accepted_exactly_in_the_profile() {
     let bytes: [u8; MAX_HEAD_LEN] = kani::any();
-    let length: usize = kani::any();
-    kani::assume(length >= 1 && length <= MAX_HEAD_LEN);
     let major = bytes[0] >> 5;
     kani::assume(major == 0 || major == 1 || major == 7);
+    let length: usize = kani::any();
+    kani::assume(length >= 1 && length <= MAX_HEAD_LEN);
     let input = &bytes[..length];
     let expected = match parse_header_varint(input) {
         Ok((_, _, head)) if head != length => false,
@@ -104,8 +103,11 @@ fn a_scalar_item_is_accepted_exactly_in_the_profile() {
         Ok((MajorType::Simple, argument, _)) => (20..=22).contains(&argument),
         Ok(_) | Err(_) => false,
     };
+    let decoded = decode_cbor(input);
+    let accepted = decoded.is_ok();
+    core::mem::forget(decoded);
     assert!(
-        decode_cbor(input).is_ok() == expected,
+        accepted == expected,
         "a scalar item is accepted exactly when its value is in the dCBOR profile"
     );
 }

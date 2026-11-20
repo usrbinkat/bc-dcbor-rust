@@ -153,20 +153,20 @@ enum Finalized {
 }
 
 /// `observed` and `checkpoints` through the refinement machine: the one
-/// call of [`refinement::settled`] in this crate, the permit, obligation,
+/// call of [`refinement::History::settled`] in this crate, the permit, obligation,
 /// admission and custody lifecycle every recorded stream is held to.
 fn refine(
     observed: &[Observed],
-    checkpoints: &[refinement::Checkpoint],
+    checkpoints: &refinement::History,
 ) -> Result<(), refinement::Divergence> {
-    refinement::settled(observed, checkpoints)
+    checkpoints.settled(observed)
 }
 
 /// `session` finished once nothing that can publish into it lives, and,
 /// when it finishes, its stream and `checkpoints` refined ([`refine`]): the
 /// one completion of every recording. Never panics; what the result means is
 /// its consumers' ([`settled`], [`describe`]).
-fn finalize(session: Recording, checkpoints: &[refinement::Checkpoint]) -> Finalized {
+fn finalize(session: Recording, checkpoints: &refinement::History) -> Finalized {
     let cause = session.invalidation();
     match session.finish() {
         Err(incomplete) => Finalized::Refused(incomplete, cause),
@@ -257,7 +257,7 @@ pub fn refinement_of_words(words: &[[u64; dcbor::bounded::OBSERVED_WORDS]]) -> R
             })?,
         );
     }
-    refine(&observed, &[]).map_err(|divergence| {
+    refine(&observed, &refinement::History::new()).map_err(|divergence| {
         format!(
             "the recording does not refine the protocol: {}",
             located(&observed, divergence)
@@ -281,7 +281,7 @@ pub fn refine_words(words: &[[u64; dcbor::bounded::OBSERVED_WORDS]]) {
 /// incomplete recording satisfies no expectation, a rejection included.
 fn settled(
     session: Recording,
-    checkpoints: &[refinement::Checkpoint],
+    checkpoints: &refinement::History,
     expected: ExpectedVerdict,
 ) -> Vec<Observed> {
     match finalize(session, checkpoints) {
@@ -426,7 +426,7 @@ pub struct PolicyId(usize);
 
 /// A fixture-specific reading of a run's finished evidence, made once the
 /// run's mandatory checks pass ([`RecordedRun::inspect_evidence`]).
-type Inspection = Box<dyn FnOnce(&[Observed], &[refinement::Checkpoint])>;
+type Inspection = Box<dyn FnOnce(&[Observed], &refinement::History)>;
 
 /// One recorded run ([`recorded_run`]): its recording session, made before
 /// anything runs, the policies it makes, the custody checkpoints it takes,
@@ -435,7 +435,7 @@ type Inspection = Box<dyn FnOnce(&[Observed], &[refinement::Checkpoint])>;
 pub struct RecordedRun {
     session: Recording,
     policies: Vec<Limits>,
-    checkpoints: Vec<refinement::Checkpoint>,
+    checkpoints: refinement::History,
     inspections: Vec<Inspection>,
     defects: Vec<Finding>,
 }
@@ -2498,7 +2498,7 @@ where
 /// returned for a checkpoint that does not exist.
 fn stack_checkpoint<O: Custodial<Permit> + Resumable<Limits>>(
     session: &Recording,
-    checkpoints: &mut Vec<refinement::Checkpoint>,
+    checkpoints: &mut refinement::History,
     defects: &mut Vec<Finding>,
     surrounding: &mut dyn Custodial<Permit>,
     operation: &mut O,
@@ -2701,7 +2701,7 @@ fn boundary(session: &Recording) -> usize {
 /// finding beside what the recording finished as ([`concluded`]).
 fn capture(
     session: &Recording,
-    checkpoints: &mut Vec<refinement::Checkpoint>,
+    checkpoints: &mut refinement::History,
     defects: &mut Vec<Finding>,
     observe: impl FnOnce(&mut dyn CustodySink<Permit>) -> PermitsObserved,
 ) -> Option<CheckpointId> {
@@ -2739,7 +2739,7 @@ impl CheckpointId {
 /// in `defects`, when nothing was stored.
 fn capture_collected(
     session: &Recording,
-    checkpoints: &mut Vec<refinement::Checkpoint>,
+    checkpoints: &mut refinement::History,
     defects: &mut Vec<Finding>,
     collected: Result<Vec<refinement::Custody>, Unobserved>,
 ) -> Option<(CheckpointId, Vec<refinement::Custody>)> {
@@ -3070,7 +3070,7 @@ fn retirement_violations(
 /// failed observation never skips destruction or supplies partial evidence.
 fn retired<T, W: pipeline::Physical>(
     session: &Recording,
-    checkpoints: &mut Vec<refinement::Checkpoint>,
+    checkpoints: &mut refinement::History,
     defects: &mut Vec<Finding>,
     kind: Retirement,
     value: T,
@@ -3100,7 +3100,7 @@ fn retired<T, W: pipeline::Physical>(
 )]
 fn retired_by<T, W: pipeline::Physical>(
     session: &Recording,
-    checkpoints: &mut Vec<refinement::Checkpoint>,
+    checkpoints: &mut refinement::History,
     defects: &mut Vec<Finding>,
     kind: Retirement,
     mut value: T,
@@ -3404,7 +3404,7 @@ impl RecordedRun {
     /// the checkpoints the run took, the same ones the machine refined.
     pub fn inspect_evidence(
         &mut self,
-        inspect: impl FnOnce(&[Observed], &[refinement::Checkpoint]) + 'static,
+        inspect: impl FnOnce(&[Observed], &refinement::History) + 'static,
     ) {
         self.inspections.push(Box::new(inspect));
     }
@@ -3498,7 +3498,7 @@ fn recorded_evidence<R>(
     let mut run = RecordedRun {
         session: Recording::new(capacity),
         policies: Vec::new(),
-        checkpoints: Vec::new(),
+        checkpoints: refinement::History::new(),
         inspections: Vec::new(),
         defects: Vec::new(),
     };
@@ -3555,7 +3555,7 @@ pub fn panic_report(payload: &(dyn std::any::Any + Send)) -> String {
 fn concluded(
     session: Recording,
     policies: Vec<Limits>,
-    checkpoints: &[refinement::Checkpoint],
+    checkpoints: &refinement::History,
     defects: &[Finding],
     expected: ExpectedVerdict,
 ) -> Vec<Observed> {
@@ -7981,6 +7981,67 @@ mod tests {
     #[global_allocator]
     static HEAP: heap::Heap = heap::Heap;
 
+    #[test]
+    fn checkpoint_history_retains_edits_instead_of_repeated_custody() {
+        let checkpoint = refinement::Checkpoint {
+            boundary: 0,
+            custody: vec![reporting(
+                Identity::new(1, 1),
+                &(0..256).map(|id| (id, None)).collect::<Vec<_>>(),
+            )],
+        };
+        let measure = |compressed| {
+            let observation = heap::Observation::begin(None);
+            let mut history = refinement::History::new();
+            let mut snapshots = Vec::new();
+            for _ in 0..64 {
+                if compressed {
+                    history.push(checkpoint.clone());
+                } else {
+                    snapshots.push(checkpoint.clone());
+                }
+            }
+            observation.stop();
+            let retained = observation.snapshot();
+            assert!(
+                !retained.overflow,
+                "live-allocation measurement is incomplete"
+            );
+            drop(history);
+            drop(snapshots);
+            assert_eq!(observation.snapshot().live, 0, "checkpoint storage leaked");
+            retained.live
+        };
+        // The former implementation is the negative control of this same
+        // live-byte bound, not an RSS or allocator-residency estimate.
+        let limit = 32 * 1024;
+        assert!(
+            measure(false) > limit,
+            "full snapshots escaped the memory witness"
+        );
+        assert!(
+            measure(true) <= limit,
+            "checkpoint history retains repeated full custody"
+        );
+    }
+
+    /// A session's permit records and event slots are each one zeroed
+    /// allocation (`policy/record.rs`, `zeroed`): built element by element,
+    /// they are allocated uninitialized and written one element at a time.
+    #[test]
+    fn a_session_allocates_its_records_and_slots_zeroed() {
+        let observation = heap::Observation::begin(None);
+        let session = Recording::new(CAPACITY);
+        observation.stop();
+        let stats = observation.snapshot();
+        drop(session);
+        assert!(!stats.overflow, "the allocation observation is incomplete");
+        assert_eq!(
+            stats.zeroed, 2,
+            "a session's records and slots are not each one zeroed allocation: {stats:?}"
+        );
+    }
+
     struct AllocatingObserver;
 
     impl Custody for AllocatingObserver {
@@ -9498,7 +9559,9 @@ mod tests {
 
     /// Whether the checkpoint `id` of `run` reports `permit`.
     fn reports(run: &RecordedRun, id: CheckpointId, permit: Identity) -> bool {
-        run.checkpoints[id.index()]
+        run.checkpoints
+            .get(id.index())
+            .expect("a captured checkpoint")
             .custody
             .iter()
             .flat_map(|group| &group.permits)

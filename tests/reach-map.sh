@@ -49,6 +49,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 : "${TMPDIR:?required: the reach map output directory}"
 for tool in cargo cargo-llvm-cov rustc sha256sum; do

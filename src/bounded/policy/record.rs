@@ -344,11 +344,10 @@ fn invalidation(store: &Shared) -> Option<Invalidation> {
 /// `len` values each equal to `make()`, allocated whole: a session's permit
 /// records or its slots. The shipped build allocates them zeroed in one
 /// request: `core`'s `AtomicU64` has the in-memory representation of `u64`,
-/// so the all-zero bytes are `AtomicU64::new(0)`; the allocator's zeroed
-/// pages are written only as observations are published, and no element is
-/// constructed one by one, natively or under Miri. A model checker's atomics
-/// (`loom`, `shuttle`) carry state of their own that no zero pattern holds,
-/// so those builds construct each element with `make`.
+/// so the all-zero bytes are `AtomicU64::new(0)`. No element is constructed
+/// one by one, natively or under Miri. A model checker's atomics (`loom`,
+/// `shuttle`) carry state of their own that no zero pattern holds, so those
+/// builds construct each element with `make`.
 ///
 /// # Safety
 /// The all-zero byte pattern of `T` is a valid `T` equal to `make()`'s.

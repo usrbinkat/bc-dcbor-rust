@@ -1,11 +1,76 @@
 # Sourced by the evidence gates (tests/miri-owned.sh, tests/reach-map.sh,
-# tests/mutation-evidence.sh, tests/concurrency-models.sh): their one
-# definition of an input closure, of the mutation domains' features, of the
-# Miri gate's selection and models, of the tests a suite runs under Miri, of
-# what a passing run and an aborting one are, of the commit evidence is of,
-# its copies, and applying a planted diff to one. Run from the repository
-# root in the configured development shell.
+# tests/mutation-evidence.sh, tests/concurrency-models.sh, tests/controls.sh,
+# tests/proofs.sh, tests/record-evidence.sh, tests/profile-codec.sh,
+# fuzz/qualify.sh): their one definition of the process group a gate runs
+# in, of an input closure, of the mutation domains' features, of the Miri
+# gate's selection and models, of the tests a suite runs under Miri, of what
+# a passing run and an aborting one are, of the commit evidence is of, its
+# copies, and applying a planted diff to one. Run from the repository root
+# in the configured development shell.
 # shellcheck shell=bash
+
+# Every process a gate starts ends with it. A gate calls
+# `own_process_group "$@"` on the line after sourcing this file, from the
+# repository root its first line changed to. The call runs the gate again,
+# with the same arguments, as the leader of a process group of its own
+# (bash job control, `set -m`), under this process, its supervisor, which
+# stays in the caller's group and owns the gate's group:
+#
+# - a termination, interruption or hangup of the supervisor is sent to the
+#   whole group (every cargo, test binary, checker and copy the gate
+#   launched), and the supervisor exits with the gate's status;
+# - when the gate exits, whatever of its group outlives it is terminated;
+# - inside the group a watcher terminates the group once the gate's parent
+#   is no longer its supervisor: the supervisor was killed outright
+#   (SIGKILL, which no trap sees). The watcher survives SIGTERM long enough
+#   to escalate to SIGKILL after one second, including for resistant children.
+#
+# The launch marker is consumed before starting work. A marked child whose
+# parent already died exits instead of starting another supervisor. Nested
+# gates inherit no marker and create their own supervisor and group.
+own_process_group() {
+	local supervisor="${DCBOR_GATE_SUPERVISOR:-}" parent
+	if [[ -n "$supervisor" ]]; then
+		unset DCBOR_GATE_SUPERVISOR
+		[[ "$supervisor" == "$PPID" ]] || exit 143
+		local ready
+		# EOF before readiness refuses the launch. The pipe handshake does
+		# not depend on the caller's inherited signal dispositions.
+		IFS= read -r ready < <(
+			stop_group() {
+				trap '' TERM INT HUP
+				kill -TERM 0
+				sleep 1
+				kill -KILL 0
+			}
+			trap stop_group TERM INT HUP
+			printf '%s\n' ready
+			while read -r parent < <(ps -o ppid= -p "$$") && [[ "$parent" == "$supervisor" ]]; do
+				sleep 1
+			done
+			stop_group
+		) || exit 1
+		[[ "$ready" == ready ]] || exit 1
+		return 0
+	fi
+	local script leader="" status stopping=0
+	script="$PWD/$(basename "$(dirname "$0")")/$(basename "$0")"
+	trap 'stopping=1; if [[ -n "$leader" ]]; then kill -TERM -- "-$leader" 2>/dev/null || :; fi' TERM INT HUP
+	set -m
+	DCBOR_GATE_SUPERVISOR=$$ bash "$script" "$@" &
+	leader=$!
+	set +m
+	if ((stopping)); then
+		kill -TERM -- "-$leader" 2>/dev/null || :
+	fi
+	while :; do
+		status=0
+		wait "$leader" || status=$?
+		[[ -d "/proc/$leader" ]] || break
+	done
+	kill -TERM -- "-$leader" 2>/dev/null || :
+	exit "$status"
+}
 
 # Every input a gate's evidence depends on, one digest line each: the whole
 # input closure, every file of the repository git tracks or would track (the

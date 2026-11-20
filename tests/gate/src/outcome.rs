@@ -41,12 +41,17 @@ pub enum Outcome {
     /// The build of what would have run failed: a compiler refusal, the
     /// outcome a planted defect evaluated at compile time must produce.
     BuildRefused,
+    /// The checker ended without a verdict: Kani's CBMC run ran out of
+    /// memory, reached the harness timeout, reported unusable results
+    /// ([`kani_without_verdict`]), or ended without a complete, consistent
+    /// report ([`kani`]). Neither a pass nor a refusal.
+    NoVerdict,
     /// The run never started.
     NotRun,
 }
 
 impl Outcome {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Pass,
         Self::BoundRefused,
         Self::StackOverflow,
@@ -57,6 +62,7 @@ impl Outcome {
         Self::AbnormalTermination,
         Self::Failed,
         Self::BuildRefused,
+        Self::NoVerdict,
         Self::NotRun,
     ];
 
@@ -73,6 +79,7 @@ impl Outcome {
             Self::AbnormalTermination => "abnormal_termination",
             Self::Failed => "failed",
             Self::BuildRefused => "build_refused",
+            Self::NoVerdict => "no_verdict",
             Self::NotRun => "not_run",
         }
     }
@@ -135,11 +142,15 @@ impl fmt::Display for Judgement {
 
 /// The judgement of a mutant from the outcomes of every run of every test
 /// reaching it, under every model: caught when any ran and did not pass,
-/// missed when all passed, and none when a run never started, which shows
-/// nothing of the mutant (the mutation verdict reports it undecided).
+/// missed when all passed, and none when a run never started or produced no
+/// verdict (the mutation verdict reports it undecided).
 pub fn judged(outcomes: impl IntoIterator<Item = Outcome>) -> Option<Judgement> {
     let outcomes: Vec<Outcome> = outcomes.into_iter().collect();
-    if outcomes.is_empty() || outcomes.contains(&Outcome::NotRun) {
+    if outcomes.is_empty()
+        || outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::NotRun | Outcome::NoVerdict))
+    {
         None
     } else if outcomes.iter().all(|outcome| *outcome == Outcome::Pass) {
         Some(Judgement::MissedUnderMiri)
@@ -292,19 +303,23 @@ pub const KANI_BUILD_FAILED: &str = "Failed to execute cargo (";
 /// The counts Kani's final summary line in `log` reports, `Complete - S
 /// successfully verified harnesses, F failures, T total.`
 /// (kani-driver `harness_runner.rs` `print_final_summary`): verified,
-/// failed, total. None when no summary line is found.
+/// failed, total. None unless exactly one well-formed summary line is found.
 pub fn kani_summary(log: &str) -> Option<(usize, usize, usize)> {
-    log.lines().find_map(|line| {
-        let rest = line.strip_prefix("Complete - ")?;
-        let (verified, rest) = rest.split_once(" successfully verified harnesses, ")?;
-        let (failed, rest) = rest.split_once(" failures, ")?;
-        let total = rest.strip_suffix(" total.")?;
-        Some((
-            verified.parse().ok()?,
-            failed.parse().ok()?,
-            total.parse().ok()?,
-        ))
-    })
+    let mut summaries = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("Complete - "));
+    let rest = summaries.next()?;
+    if summaries.next().is_some() {
+        return None;
+    }
+    let (verified, rest) = rest.split_once(" successfully verified harnesses, ")?;
+    let (failed, rest) = rest.split_once(" failures, ")?;
+    let total = rest.strip_suffix(" total.")?;
+    Some((
+        verified.parse().ok()?,
+        failed.parse().ok()?,
+        total.parse().ok()?,
+    ))
 }
 
 /// Kani's report of a reachable construct it does not model, whose failure
@@ -318,35 +333,79 @@ pub const KANI_UNSUPPORTED: &str =
 /// (the same renderer).
 pub const KANI_UNWINDING: &str = "Verification output shows one or more unwinding failures";
 
+/// The headers of Kani's report of a CBMC run whose results it does not
+/// use, each on a line of its own before `VERIFICATION:- FAILED`
+/// (kani-driver `call_cbmc.rs` `VerificationResult::render`, its
+/// `Err(exit_status)` arm): `CBMC failed` (out of memory, the harness
+/// timeout reached) or `CBMC failed with status N`, in 0.68.0 and on main
+/// (5d80a64); `CBMC did not finish reporting its results (exit status N)`,
+/// main's `IncompleteResults`, a result array without CBMC's overall
+/// status. Kani counts such a harness among its failures, though no
+/// property's result is read.
+pub const KANI_NO_RESULTS: [&str; 2] = ["CBMC failed", "CBMC did not finish reporting its results"];
+
+/// Kani's report that the solver dropped a quantifier it could not encode
+/// (kani-driver `call_cbmc.rs` `ignored_quantifiers_error`, 0.68.0 and
+/// main): the analysis is unsound, an assumption holding it unenforced, and
+/// Kani forces the harness to fail whatever its properties showed.
+pub const KANI_UNSOUND: &str = "Kani cannot soundly verify this harness";
+
+/// Whether `report` holds a CBMC run that gave no verdict: one whose
+/// results Kani does not use ([`KANI_NO_RESULTS`] opening a line), or one
+/// it reports unsound ([`KANI_UNSOUND`]). The one reading of it, for a run
+/// ([`kani`]) and for each harness's block (`crate::proofs::checked`).
+pub fn kani_without_verdict(report: &str) -> bool {
+    report.contains(KANI_UNSOUND)
+        || report.lines().any(|line| {
+            let line = line.trim_start();
+            KANI_NO_RESULTS
+                .iter()
+                .any(|header| line.starts_with(header))
+        })
+}
+
 /// The outcome of a Kani run. A fundamental failure is classed first,
 /// whatever else the run reports, since it makes every other result
-/// undetermined: a reachable unsupported construct is `Unsupported`, a
-/// failed unwinding assertion `BoundRefused` (the bound given refused, as a
-/// model checker's is). Then a pass when it exited 0 and its summary
+/// undetermined: a CBMC run that produced no results is `NoVerdict`
+/// ([`kani_without_verdict`]), a reachable unsupported construct
+/// `Unsupported`, a failed unwinding assertion `BoundRefused` (the bound
+/// given refused, as a model checker's is). Then a pass when it exited 0 and its summary
 /// verified every harness it checked, at least one; failed when it exited 1
 /// (Kani's exit on a failing harness) and its summary names a failure; a
-/// refused build when cargo failed before any harness was checked; anything
-/// else failed, a run whose report the judgement then refuses as no one
-/// harness's ([`crate::controls`]). So no intended assertion failure is ever
-/// confused with a construct Kani cannot execute or a bound too short.
+/// refused build when cargo failed before any harness was checked. Signals,
+/// missing or inconsistent reports, empty selections and contradictory exit
+/// statuses provide no verdict. Report completeness is checked by the same
+/// parser as the proof suite ([`crate::proofs::checked`]).
 pub fn kani(termination: Termination, log: &str) -> Outcome {
+    if matches!(termination, Termination::Signaled(_)) || kani_without_verdict(log) {
+        return Outcome::NoVerdict;
+    }
     if log.contains(KANI_UNSUPPORTED) {
         return Outcome::Unsupported;
     }
     if log.contains(KANI_UNWINDING) {
         return Outcome::BoundRefused;
     }
-    let checked = log.contains("Checking harness ");
-    match (termination, kani_summary(log)) {
-        (Termination::Exited(0), Some((verified, 0, total))) if verified == total && total > 0 => {
+    if matches!(termination, Termination::Exited(code) if code != 0)
+        && !log.contains("Checking harness ")
+        && log.contains(KANI_BUILD_FAILED)
+    {
+        return Outcome::BuildRefused;
+    }
+    let Ok(results) = crate::proofs::checked(log) else {
+        return Outcome::NoVerdict;
+    };
+    if results.is_empty() {
+        return Outcome::NoVerdict;
+    }
+    match termination {
+        Termination::Exited(0) if results.iter().all(|(_, result)| *result == Outcome::Pass) => {
             Outcome::Pass
         }
-        (Termination::Exited(1), Some((_, failed, _))) if failed > 0 => Outcome::Failed,
-        (Termination::Exited(_), None) if !checked && log.contains(KANI_BUILD_FAILED) => {
-            Outcome::BuildRefused
+        Termination::Exited(1) if results.iter().any(|(_, result)| *result == Outcome::Failed) => {
+            Outcome::Failed
         }
-        (Termination::Signaled(SIGSEGV), _) => Outcome::Segfault,
-        _ => Outcome::Failed,
+        _ => Outcome::NoVerdict,
     }
 }
 
@@ -358,6 +417,37 @@ pub fn native(kind: Kind, termination: Termination, log: &str) -> Outcome {
         (Kind::Test, Termination::Exited(0)) if executed(log) => Outcome::Pass,
         (_, Termination::Signaled(SIGSEGV)) => Outcome::Segfault,
         _ => Outcome::Failed,
+    }
+}
+
+/// Upstream report fixtures shared by the whole-run and per-harness tests.
+/// Literal diagnostics remain independent of the classifier's constants.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    pub(crate) fn kani_no_verdict_blocks(name: &str) -> impl Iterator<Item = String> + '_ {
+        [
+            (
+                "CBMC failed",
+                "CBMC timed out. You may want to rerun your proof with a larger timeout or use stubbing to reduce the size of the code the verifier reasons about.\n",
+            ),
+            (
+                "CBMC failed",
+                "CBMC appears to have run out of memory. You may want to rerun your proof in an environment with additional memory or use stubbing to reduce the size of the code the verifier reasons about.\n",
+            ),
+            ("CBMC failed with status 6", ""),
+            (
+                "CBMC did not finish reporting its results (exit status 6)",
+                "CBMC's output ended before its overall verification status, so the results it reported may be incomplete and were not used.\n",
+            ),
+            (
+                "error: the solver backend does not support quantifiers with non-constant bounds and ignored 1 quantifier expression(s), replacing them with unconstrained values.",
+                "Kani cannot soundly verify this harness: `kani::assume` calls containing such a quantifier are NOT enforced.\n",
+            ),
+        ]
+        .into_iter()
+        .map(move |(header, explanation)| {
+            format!("Checking harness {name}...\n\n{header}\nVERIFICATION:- FAILED\n{explanation}")
+        })
     }
 }
 
@@ -445,7 +535,8 @@ mod tests {
     }
 
     /// A mutant is caught when any run reaching it ran and did not pass, and
-    /// judged not at all when a run never started or none was made; every
+    /// judged not at all when a run never started, produced no verdict, or
+    /// none was made; every
     /// judgement reads back its name, an unknown one refused.
     #[test]
     fn a_mutant_is_caught_by_any_run_that_did_not_pass() {
@@ -458,6 +549,9 @@ mod tests {
             Some(Judgement::CaughtUnderMiri)
         );
         assert_eq!(judged([Outcome::Failed, Outcome::NotRun]), None);
+        assert_eq!(judged([Outcome::NoVerdict]), None);
+        assert_eq!(judged([Outcome::Pass, Outcome::NoVerdict]), None);
+        assert_eq!(judged([Outcome::Failed, Outcome::NoVerdict]), None);
         assert_eq!(judged([]), None);
         for judgement in Judgement::ALL {
             assert_eq!(Judgement::parse(judgement.name()), Some(judgement));
@@ -512,7 +606,7 @@ mod tests {
         let passed = "Checking harness bounded::proofs::x...\nVERIFICATION:- SUCCESSFUL\n\
                       Manual Harness Summary:\n\
                       Complete - 1 successfully verified harnesses, 0 failures, 1 total.\n";
-        let failed = "Checking harness bounded::proofs::x...\n\
+        let failed = "Checking harness bounded::proofs::x...\nVERIFICATION:- FAILED\n\
                       Manual Harness Summary:\nVerification failed for - bounded::proofs::x\n\
                       Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n";
         let exit = Termination::Exited;
@@ -521,12 +615,12 @@ mod tests {
         assert_eq!(kani(exit(1), failed), Outcome::Failed);
         assert_eq!(
             kani(exit(1), passed),
-            Outcome::Failed,
+            Outcome::NoVerdict,
             "a nonzero exit is no pass"
         );
         assert_eq!(
             kani(exit(0), "Manual Harness Summary:\n"),
-            Outcome::Failed,
+            Outcome::NoVerdict,
             "no summary is no pass"
         );
         let unbuilt = "error[E0308]: mismatched types\n\
@@ -537,9 +631,38 @@ mod tests {
                 exit(0),
                 "Complete - 0 successfully verified harnesses, 0 failures, 0 total.\n"
             ),
-            Outcome::Failed,
+            Outcome::NoVerdict,
             "an empty run verified nothing"
         );
+        for termination in [
+            Termination::Signaled(9),
+            Termination::Signaled(15),
+            Termination::Signaled(SIGSEGV),
+            exit(143),
+        ] {
+            for report in [
+                "",
+                "Checking harness bounded::proofs::x...\n",
+                passed,
+                failed,
+            ] {
+                assert_eq!(
+                    kani(termination, report),
+                    Outcome::NoVerdict,
+                    "an interrupted checker supplied a verdict: {termination:?}"
+                );
+            }
+        }
+        for report in [
+            failed.replace("VERIFICATION:- FAILED\n", ""),
+            failed.replace("1 failures, 1 total", "1 failures, 2 total"),
+        ] {
+            assert_eq!(
+                kani(exit(1), &report),
+                Outcome::NoVerdict,
+                "an incomplete report supplied a failure verdict"
+            );
+        }
         // A fundamental failure is classed before the summary: an
         // unsupported construct or a short unwind is never an intended
         // assertion failure, nor a pass.
@@ -549,6 +672,20 @@ mod tests {
         assert_eq!(kani(exit(1), &unsupported), Outcome::Unsupported);
         let unwound = format!("{passed}[Kani] info: {KANI_UNWINDING}.\n");
         assert_eq!(kani(exit(0), &unwound), Outcome::BoundRefused);
+        // A CBMC run without results, as kani-driver 0.68.0 renders it, is
+        // no verdict, though Kani counts it a failure: timed out, out of
+        // memory, or another failing status.
+        for block in fixtures::kani_no_verdict_blocks("bounded::proofs::x") {
+            let ended = format!(
+                "{block}Manual Harness Summary:\nVerification failed for - bounded::proofs::x\n\
+                 Complete - 0 successfully verified harnesses, 1 failures, 1 total.\n"
+            );
+            assert_eq!(
+                kani(exit(1), &ended),
+                Outcome::NoVerdict,
+                "a CBMC run without results was judged a verdict: {block}"
+            );
+        }
     }
 
     /// A binary cargo reports killed by a signal ended by that signal; any

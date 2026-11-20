@@ -1,0 +1,18 @@
+--- tests/refinement/src/history.rs
++++ tests/refinement/src/history.rs
+@@ -56,6 +56,7 @@
+ 
+ impl Delta {
+     fn between(before: &[Custody], after: &Checkpoint) -> Self {
++        let before = &before[..0];
+         let changed = before
+             .iter()
+             .zip(&after.custody)
+@@ -78,6 +79,7 @@
+     }
+ 
+     fn apply(&self, checkpoint: &mut Checkpoint) {
++        checkpoint.custody.clear();
+         checkpoint.boundary = self.boundary;
+         checkpoint.custody.truncate(self.len);
+         for change in &self.changed {

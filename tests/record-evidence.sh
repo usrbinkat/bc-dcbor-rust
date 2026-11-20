@@ -11,6 +11,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 mode="${1:-check}"
 resume="${2:-}"
 if (($# > 2)) || [[ -n "$resume" && "$mode" != record-costs && "$mode" != check-costs ]]; then

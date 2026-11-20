@@ -1,0 +1,10 @@
+--- tests/refinement/src/history.rs
++++ tests/refinement/src/history.rs
+@@ -84,7 +84,6 @@
+             let group = &mut checkpoint.custody[change.index];
+             group.owner = change.owner;
+             change.bound.apply(&mut group.bound);
+-            change.held.apply(&mut group.held);
+             change.permits.apply(&mut group.permits);
+         }
+         checkpoint.custody.extend(self.appended.iter().cloned());

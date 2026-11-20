@@ -30,6 +30,8 @@ pub struct Stats {
     /// Live and peak observed bytes.
     pub live: usize,
     pub peak: usize,
+    /// Granted requests made through `alloc_zeroed` while armed.
+    pub zeroed: usize,
     /// Fixed storage was exhausted; the other figures are incomplete.
     pub overflow: bool,
 }
@@ -81,7 +83,7 @@ thread_local! {
         fail_at: None,
         admitted: Sorted { entries: [0; CAPACITY], len: 0 },
         slots: Sorted { entries: [(0, 0); CAPACITY], len: 0 },
-        stats: Stats { calls: 0, denied: 0, unadmitted: 0, live: 0, peak: 0, overflow: false },
+        stats: Stats { calls: 0, denied: 0, unadmitted: 0, live: 0, peak: 0, zeroed: 0, overflow: false },
     }) };
 }
 
@@ -209,6 +211,13 @@ unsafe impl GlobalAlloc for Heap {
         }
         let ptr = unsafe { System.alloc_zeroed(layout) };
         allocated(ptr, layout.size());
+        if !ptr.is_null() {
+            with(|state| {
+                if state.armed {
+                    state.stats.zeroed += 1;
+                }
+            });
+        }
         ptr
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {

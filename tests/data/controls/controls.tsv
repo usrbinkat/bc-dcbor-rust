@@ -601,3 +601,27 @@ recording-capacity-hand-sized	tests/data/controls/recording-capacity-hand-sized.
 # session's records are one zeroed allocation (`zeroed`), so the build is
 # refused by the assertion beside the constant before any record is made.
 zeroed-record-not-void	tests/data/controls/zeroed-record-not-void.patch	native	nightly	dcbor	all	lib	bounded::policy::record::boundary_tests::malformed_window_invalidation_preserves_the_first_cause	-	build_refused	a zeroed permit record is VOID
+# Full snapshots preserve replay semantics but exceed the live-allocation bound.
+checkpoint-full-snapshots-retained	tests/data/controls/checkpoint-full-snapshots-retained.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::checkpoint_history_retains_edits_instead_of_repeated_custody	-	failed	checkpoint history retains repeated full custody
+# A checkpoint history that drops its held-obligation edits
+# (refinement/history.rs, `Delta::apply`): a reconstructed checkpoint keeps
+# the obligations of the snapshot before it.
+checkpoint-obligation-edit-dropped	tests/data/controls/checkpoint-obligation-edit-dropped.patch	native	nightly	dcbor-refinement	dcbor/std	lib	history::tests::obligation_edits_and_large_reordered_custody_reconstruct_exactly	-	failed	reconstructed checkpoints differ from the checkpoints pushed
+# A session's permit records and slots built element by element
+# (policy/record.rs, `zeroed`): each array is allocated uninitialized and
+# written one element at a time, with no zeroed allocation.
+session-storage-built-per-element	tests/data/controls/session-storage-built-per-element.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_session_allocates_its_records_and_slots_zeroed	-	failed	a session's records and slots are not each one zeroed allocation
+# A gate that owns no process group (tests/gate-common.sh,
+# `own_process_group`): stopping it leaves its children and theirs running.
+gate-process-group-unowned	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_stopped_gate_leaves_no_process_running	-	failed	a gate stopped by SIGTERM left
+gate-process-group-unowned-nested	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_stopped_gate_ends_the_gates_it_started	-	failed	a nested gate stopped by SIG
+gate-process-group-unowned-starting	tests/data/controls/gate-process-group-unowned.patch	native	nightly	dcbor-gate	-	launchers	a_gate_stopped_while_it_starts_leaves_no_process_running	-	failed	a gate stopped while starting by SIG
+# A gate that never calls `own_process_group` (tests/controls.sh): the
+# census of the gates names it.
+gate-process-group-uncalled	tests/data/controls/gate-process-group-uncalled.patch	native	nightly	dcbor-gate	-	launchers	every_gate_owns_its_process_group	-	failed	gates owning no process group
+# A Kani run whose CBMC gave no verdict (timed out, out of memory, results
+# incomplete, unsound) judged as Kani counts it, a failure
+# (tests/gate/src/outcome.rs, `kani_without_verdict`): a run ended without
+# a verdict would pass as a control's refusal.
+kani-no-verdict-judged-failed	tests/data/controls/kani-no-verdict-judged-failed.patch	native	nightly	dcbor-gate	-	lib	outcome::tests::a_kani_run_is_classed_by_its_summary	-	failed	a CBMC run without results was judged a verdict
+kani-no-verdict-judged-failed-harness	tests/data/controls/kani-no-verdict-judged-failed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_harness_unchecked_or_misreported_is_named	-	failed	a harness whose CBMC run produced no results was given a verdict

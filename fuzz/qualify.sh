@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
+own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
 # The gate tool, before anything else: the identity reads the Unicode
 # version through it (`source_identity`).

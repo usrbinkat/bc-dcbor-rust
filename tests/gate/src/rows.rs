@@ -157,10 +157,10 @@ pub fn target(row: &Row) -> Option<&str> {
 }
 
 /// The one definition of what a row's run supports, in order: a run that
-/// never started is unverified; a measurement, and a suite's verdict over
-/// its runs, are derived; a model checker's run is modeled (loom exhaustive
-/// within its branch bound, shuttle's depth-first search, both within the
-/// recorded bound); a seeded Miri run is one sampled schedule of a race
+/// never started or produced no verdict is unverified; a measurement, and a
+/// suite's verdict over its runs, are derived; a model checker's run is
+/// modeled (loom exhaustive within its branch bound, shuttle's depth-first
+/// search, both within the recorded bound); a seeded Miri run is one sampled schedule of a race
 /// suite, observed; a proof harness Kani verified, an evidence run that
 /// passed, is proved, over the domain and assumptions its harness states
 /// (`crate::proofs`); a run of a [`NORMATIVE`] target is normative; every
@@ -168,7 +168,7 @@ pub fn target(row: &Row) -> Option<&str> {
 /// checks the check) and a harness that did not verify included, is
 /// checked.
 pub fn supported(row: &Row) -> Evidence {
-    if row.outcome == Outcome::NotRun {
+    if matches!(row.outcome, Outcome::NotRun | Outcome::NoVerdict) {
         Evidence::Unverified
     } else if matches!(row.purpose, Purpose::Derive | Purpose::Suite) {
         Evidence::Derived
@@ -558,6 +558,11 @@ pub fn verdict(rows: &[Row]) -> Vec<String> {
                 faults.push(format!("{named}: no evidence, yet expected {expected}"));
             }
             (_, None) => faults.push(format!("{named}: evidence without an expected outcome")),
+            (_, Some(Outcome::NoVerdict)) => {
+                faults.push(format!(
+                    "{named}: no_verdict cannot be an evidence expectation"
+                ));
+            }
             (_, Some(expected)) if expected == row.outcome => {}
             (_, Some(expected)) => faults.push(format!(
                 "{named}: {}, where {expected} was planned",
@@ -691,7 +696,9 @@ mod tests {
         harness.test = "bounded::proofs::checked_add_is_exact".to_string();
         assert_eq!(harness.clone().classified().evidence, Evidence::Proved);
         harness.outcome = Outcome::Failed;
-        assert_eq!(harness.classified().evidence, Evidence::Checked);
+        assert_eq!(harness.clone().classified().evidence, Evidence::Checked);
+        harness.outcome = Outcome::NoVerdict;
+        assert_eq!(harness.classified().evidence, Evidence::Unverified);
     }
 
     /// The planted controls of the class check: a row claiming a class its
@@ -900,6 +907,21 @@ mod tests {
     /// run published twice are each named.
     #[test]
     fn only_rows_with_their_planned_outcomes_are_evidence() {
+        for purpose in [
+            Purpose::Normal,
+            Purpose::BoundProbe,
+            Purpose::StackProbe,
+            Purpose::Suite,
+        ] {
+            let inconclusive = row(purpose, None, Outcome::NoVerdict);
+            assert_eq!(inconclusive.evidence, Evidence::Unverified);
+            let faults = verdict(&[inconclusive]);
+            assert_eq!(faults.len(), 1, "{faults:?}");
+            assert!(
+                faults[0].contains("no_verdict cannot be an evidence expectation"),
+                "{faults:?}"
+            );
+        }
         let rows = vec![
             row(Purpose::Normal, None, Outcome::Pass),
             row(Purpose::BoundProbe, Some(16), Outcome::BoundRefused),

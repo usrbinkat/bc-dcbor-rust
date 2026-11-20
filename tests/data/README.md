@@ -173,15 +173,14 @@ integration test can size a recording by hand); an overflowing count is refused.
 budget, a recording is never enlarged: a pipeline schedule states no capacity, and the one public
 sizing, `support::recorded_run_short`, only shrinks the default, to witness a recording's
 exhaustion. A session's permit records and event slots are one zeroed allocation each
-(`policy/record.rs`, `zeroed`): every field is a `core` `AtomicU64` of 0 and a void record's state is
-0, so no element is built one by one and the allocator's pages are written only as observations
-are published, natively and under Miri; a model checker's build (`loom`, `shuttle`), whose atomics
-carry state of their own, constructs each element. The default is defined once, by the library
-(`Capacity::DEFAULT`), and
-`support::CAPACITY` names it: the library's own unit tests, which cannot reach the support crate,
-record into the same default. A capacity is stated only by the budget authority (`measured`,
-`MEASURING`) or where the size is what its test checks (a boundary bounded by its slot count, an
-exhaustion at a stated size, a short recording's refusal, the concurrency models' derived capacity);
+(`policy/record.rs`, `zeroed`): every field is a `core` `AtomicU64` of 0 and a void record's state
+is 0, so no element is built one by one, natively and under Miri. A model checker's build (`loom`,
+`shuttle`), whose atomics carry state of their own, constructs each element. The default is defined
+once, by the library (`Capacity::DEFAULT`), and `support::CAPACITY` names it: the library's own unit
+tests, which cannot reach the support crate, record into the same default. A capacity is stated only
+by the budget authority (`measured`, `MEASURING`) or where the size is what its test checks (a
+boundary bounded by its slot count, an exhaustion at a stated size, a short recording's refusal, the
+concurrency models' derived capacity);
 `every_recording_records_into_the_default_unless_its_size_is_tested`
 (`tests/lifecycle_authority.rs`, `SIZED`) inventories explicit capacity expressions in the library,
 its tests and fuzz targets, including `Self` in capacity implementations and nested macro bodies.
@@ -195,6 +194,17 @@ sets it for one record at a time.
 Driver selection and observation extraction are private to the budget authority. Fixtures supply
 inputs and semantic inspections; they cannot supply a replacement observation stream to the
 recorder.
+
+Custody checkpoints use a lossless edit history (`tests/refinement/src/history.rs`): the latest
+snapshot and positional replacements of each changed owner's bindings, obligations and permits.
+Unchanged reports retain only their boundary and ordinal. Replay reconstructs one snapshot at a time
+and runs the same refinement machine as ordinary trace records; every checkpoint remains checked,
+including repeated boundaries. Positional edits preserve traversal order, duplicates and malformed
+reports, so compression cannot normalize away a divergence. Evidence inspections iterate the same
+history; trace serialization explicitly materializes it. The support crate's
+`checkpoint_history_retains_edits_instead_of_repeated_custody` measures live allocations and
+requires the former full-snapshot storage to exceed the bound that compressed history satisfies;
+dropping either representation must release all measured bytes.
 
 ### Matrix cost evidence
 
@@ -288,12 +298,12 @@ Each is an exact `-p0` diff against the source it plants into, applied to a copy
 never to the checkout: a change to those lines makes it fail to apply, and the gate fails. The model
 checkers' controls run in the concurrency gate (`tests/concurrency-models.sh`,
 `gate models control`). The native, Miri and Kani controls run in `tests/controls.sh CHANNEL`, the
-channel named, never inferred, and refused in a shell that cannot serve it: a native or Miri
-control in the shell of the toolchain channel its row names (a Miri control's is nightly, whose
-toolchain carries Miri), a Kani control under `kani` in any shell carrying `cargo kani`: red
-with the diff applied, then green with it reversed in the same copy, the copy's digest required to
-change with the diff and to read back equal once it is reversed (`gate control evidence`). A Miri
-control's test runs under the Miri gate's own command and its model's flags (`tests/gate-common.sh`,
+channel named, never inferred, and refused in a shell that cannot serve it: a native or Miri control
+in the shell of the toolchain channel its row names (a Miri control's is nightly, whose toolchain
+carries Miri), a Kani control under `kani` in any shell carrying `cargo kani`: red with the diff
+applied, then green with it reversed in the same copy, the copy's digest required to change with the
+diff and to read back equal once it is reversed (`gate control evidence`). A Miri control's test
+runs under the Miri gate's own command and its model's flags (`tests/gate-common.sh`,
 `miri_command`, `miri_flags`), the flags part of the run's identity, and is judged by the gate tool
 as a native run is (`gate control judge`): a defect only undefined behavior shows, such as a drop
 reading a field its prefix never initialized, is refused there.
@@ -513,7 +523,52 @@ incomplete record refused outside the recording run. `recording-capacity-hand-si
 stable-storage tests' session by hand inside a local macro; the sizing census requires that macro
 named outside the exact-size table. `zeroed-record-not-void.patch` gives a void permit record a
 nonzero state; the assertion beside `VOID` refuses the build, naming
-`a zeroed permit record is VOID`.
+`a zeroed permit record is VOID`. `checkpoint-full-snapshots-retained.patch` makes the checkpoint
+history diff each checkpoint against nothing and rebuild each snapshot from empty, so every
+checkpoint stores its whole custody again while replay reconstructs it exactly;
+`checkpoint_history_retains_edits_instead_of_repeated_custody` requires the history's live bytes
+within the bound full snapshots exceed. `checkpoint-obligation-edit-dropped.patch` drops each
+checkpoint's held-obligation edits from reconstruction;
+`obligation_edits_and_large_reordered_custody_reconstruct_exactly` requires every checkpoint of a
+fixed sequence of obligation changes, settlements, admissions and large permit and group reorders
+reconstructed exactly. `session-storage-built-per-element.patch` builds a session's permit records
+and slots element by element; `a_session_allocates_its_records_and_slots_zeroed` requires each to be
+one zeroed allocation, counted by the heap observer's `zeroed` requests.
+
+Every gate script owns the processes it starts (`tests/gate-common.sh`, `own_process_group`): it
+runs as the leader of a process group of its own under a supervisor that forwards termination,
+interruption and hangup to the group and ends whatever of the group outlives the gate, and a watcher
+inside the group ends it when the supervisor is killed outright. The watcher installs its handler
+before acknowledging readiness; no workload starts before that acknowledgement. Shutdown sends
+SIGTERM and escalates to SIGKILL after one second, including for descendants that ignore SIGTERM.
+The single-use launch marker is consumed before work starts, and an orphaned supervised launch exits
+without starting work (`an_orphaned_supervised_launch_starts_no_work`). The supervisor installs its
+signal handler before spawning and retains an early stop until the child's PID is available.
+`gate-process-group-unowned.patch` makes the gate own no group;
+`a_stopped_gate_leaves_no_process_running` (tests/gate, `launchers`) stops a gate holding a child
+and a grandchild by SIGTERM, SIGINT, SIGHUP and SIGKILL and requires none left running. It also
+checks normal gate exit, with cooperative and SIGTERM-resistant descendants in each case. Test waits
+are bounded, and fixture cleanup runs even when an assertion fails. Every assertion of what is left
+running reads every live member of the fixture's dedicated session from `/proc/PID/stat`, recorded
+or not, supervisors and watchers included. Nested groups retain that session after reparenting.
+Session membership does not require access to unrelated processes' protected working directories.
+`a_stopped_gate_ends_the_gates_it_started` stops, by SIGTERM and by SIGKILL, a gate that started a
+gate of its own, whose supervisor lies in the outer group and whose group does not, with cooperative
+and SIGTERM-resistant workloads; a workload that ignores SIGTERM leaves it ignored in the nested
+supervisor and watcher too, so the nested group ends by its watcher's escalation once the outer
+escalation kills its supervisor. `a_gate_stopped_while_it_starts_leaves_no_process_running` stops
+the supervisor by SIGTERM and by SIGKILL at four observed startup boundaries: child marker
+consumption, watcher handler installation, readiness publication, and workload entry. Fixture-only
+Bash DEBUG tracing pauses the boundary process with SIGSTOP; the test observes its stopped state
+before signaling the supervisor and resuming the boundary process. The copied supervisor source is
+unchanged. Every boundary requires no workload PID recorded yet; a missing boundary fails
+qualification rather than counting as a successful interruption. The unowned control is registered
+against each of the three tests. Process inspection propagates unexpected errors instead of treating
+them as absence. Cleanup rescans and kills remaining fixture processes until the supervisor is
+reaped and no live fixture process remains, with a bounded deadline; cleanup failure fails the test
+or is reported alongside an existing panic. `gate-process-group-uncalled.patch` drops the call from
+`tests/controls.sh`; `every_gate_owns_its_process_group` requires every script sourcing
+`tests/gate-common.sh` to call it on the next line.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both
@@ -748,6 +803,25 @@ resumed turn's first pair left uncompared, refused by the long-key harness
 (`key-resumed-pair-skipped`), and `undefined` (simple 23) decoded as `null`, refused by the scalar
 profile harness (`decode-simple-undefined-accepted`). A Kani control is judged by the one harness
 its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`).
+
+Every Kani run, a control's and the proof suite's, bounds each harness's CBMC run
+(`tests/gate/src/proofs.rs`, `HARNESS_TIMEOUT`, `--harness-timeout 30m` under
+`-Z unstable-options`). A CBMC run whose results Kani does not use (out of memory, the timeout
+reached, another failing status, results reported without CBMC's overall status) or that Kani
+reports unsound (a quantifier the solver dropped) is no verdict (`outcome::kani_without_verdict`,
+`Outcome::NoVerdict`), though Kani counts it among its failures: never a pass, never a control's
+refusal. A checker killed by a signal, an empty selection, an incomplete report, or an exit status
+contradicting the report also provides no verdict. The run classifier uses the proof suite's
+per-harness parser to check report completeness. `kani-no-verdict-judged-failed.patch` reads every
+explicit no-results report as Kani counts it; `a_kani_run_is_classed_by_its_summary` and
+`every_harness_unchecked_or_misreported_is_named` require each report kani-driver renders for one,
+in 0.68.0 and on main, classed as no verdict. The scalar profile harness checks symbolic bytes and
+input length, restricting only the head's major type to unsigned, negative or simple (0, 1, 7).
+There is no enumeration loop requiring a larger global unwind bound. Its bound of 1 limits
+speculative container paths; enabled unwinding assertions must establish that no reachable execution
+needs more iterations or recursive calls. The harness forgets the returned decoded value because
+this property checks acceptance, not destruction; cleanup within the decoder remains part of the
+checked code. No proof is established until the harness produces a successful verdict.
 
 The binary32 test runs the run's layer's domain (`DCBOR_RIGOR`): every pattern under `exhaustive`,
 which `run_tests.sh` runs once optimized, and the reduction rules' edges under `fast` (`float.rs`,
