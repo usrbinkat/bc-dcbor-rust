@@ -209,6 +209,22 @@ history; trace serialization explicitly materializes it. The support crate's
 requires the former full-snapshot storage to exceed the bound that compressed history satisfies;
 dropping either representation must release all measured bytes.
 
+Every recorded run's finalization (`tests/support/lifecycle.rs`, `finalize`) also holds its
+checkpoints' storage to their changes (`History::storage`): the bytes the history retains, read from
+its allocations' capacities (`History::retained_bytes`), must be within the latest custody, the
+deltas' own vector at its growth bound, and an allowance `History::push` accumulates group by group
+from each checkpoint and the one before it, independently of the deltas stored: a changed group its
+edit record and its whole new report, an appended group its group and its report, an unchanged group
+nothing. A run whose checkpoints retain more fails at its finalization (`the run's checkpoint storage
+exceeds its edits`), so the bound holds in every workload that takes checkpoints, the B-tree
+occupancy round trips and constructions (`tests/owned_btree.rs`) among them, never in a chosen few.
+`checkpoint_storage_is_its_edits_on_changing_custody` attributes those bytes by the allocator: four
+owners' groups changed by the refinement crate's fixed edit sequence (obligation work changed,
+settled away and newly admitted, permits rotated and reversed, groups swapped), at a size whose
+allocations the heap observer holds whole, observed only across the pushes; their live bytes must
+equal `History::retained_bytes`, every checkpoint must reconstruct exactly, the storage must be
+within the changes, and dropping the history must release every byte.
+
 ### Matrix cost evidence
 
 The same recording command also records matrix costs for both rigor layers and all four feature
@@ -530,7 +546,11 @@ nonzero state; the assertion beside `VOID` refuses the build, naming
 history diff each checkpoint against nothing and rebuild each snapshot from empty, so every
 checkpoint stores its whole custody again while replay reconstructs it exactly;
 `checkpoint_history_retains_edits_instead_of_repeated_custody` requires the history's live bytes
-within the bound full snapshots exceed. `checkpoint-obligation-edit-dropped.patch` drops each
+within the bound full snapshots exceed, `checkpoint_storage_is_its_edits_on_changing_custody`
+refuses it as storage of unchanged custody, and the B-tree occupancy round trips and integer
+constructions (`node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding`,
+`tree_construction_is_complete_and_its_transitions_legal`) fail at their finalization naming their
+checkpoint storage beyond its edits. `checkpoint-obligation-edit-dropped.patch` drops each
 checkpoint's held-obligation edits from reconstruction;
 `obligation_edits_and_large_reordered_custody_reconstruct_exactly` requires every checkpoint of a
 fixed sequence of obligation changes, settlements, admissions and large permit and group reorders

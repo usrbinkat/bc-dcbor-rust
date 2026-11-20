@@ -608,6 +608,16 @@ recording-capacity-hand-sized	tests/data/controls/recording-capacity-hand-sized.
 zeroed-record-not-void	tests/data/controls/zeroed-record-not-void.patch	native	nightly	dcbor	all	lib	bounded::policy::record::boundary_tests::malformed_window_invalidation_preserves_the_first_cause	-	build_refused	a zeroed permit record is VOID
 # Full snapshots preserve replay semantics but exceed the live-allocation bound.
 checkpoint-full-snapshots-retained	tests/data/controls/checkpoint-full-snapshots-retained.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::checkpoint_history_retains_edits_instead_of_repeated_custody	-	failed	checkpoint history retains repeated full custody
+# The same full snapshots over changing custody: the history's storage,
+# equal to its live allocations, exceeds its checkpoints' changes
+# (refinement/history.rs, `History::storage`).
+checkpoint-full-snapshots-changing	tests/data/controls/checkpoint-full-snapshots-retained.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::checkpoint_storage_is_its_edits_on_changing_custody	-	failed	checkpoint history stores unchanged custody
+# The same full snapshots in the real occupancy workloads: every recorded
+# run's finalization holds its checkpoints to their changes
+# (support/lifecycle.rs, `finalize`), so the B-tree occupancy round trips
+# and the integer constructions fail at their own finalization.
+checkpoint-full-snapshots-occupancy	tests/data/controls/checkpoint-full-snapshots-retained.patch	native	nightly	dcbor	all	owned_btree	node_occupancy_boundaries_preserve_rust_order_and_canonical_encoding	-	failed	checkpoint storage exceeds its edits
+checkpoint-full-snapshots-construction	tests/data/controls/checkpoint-full-snapshots-retained.patch	native	nightly	dcbor	all	owned_btree	tree_construction_is_complete_and_its_transitions_legal	-	failed	checkpoint storage exceeds its edits
 # A checkpoint history that drops its held-obligation edits
 # (refinement/history.rs, `Delta::apply`): a reconstructed checkpoint keeps
 # the obligations of the snapshot before it.

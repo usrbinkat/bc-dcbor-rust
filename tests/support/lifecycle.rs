@@ -138,7 +138,8 @@ enum ExpectedVerdict {
 /// permit, held obligation or owner of it still alive, its capacity
 /// exhausted, an incompatible pairing of policy and owner, or an unpublished
 /// slot); or its whole stream, with the refinement machine's verdict on it
-/// and the checkpoints.
+/// and the checkpoints, and whether the checkpoints' storage held no more
+/// than their changes ([`refinement::History::storage`]).
 enum Finalized {
     /// Refused, naming why and, for an invalid session, what first
     /// invalidated it ([`dcbor::bounded::Invalidation`]).
@@ -149,6 +150,7 @@ enum Finalized {
     Finished {
         observed: Vec<Observed>,
         verdict: Result<(), refinement::Divergence>,
+        storage: Result<(), String>,
     },
 }
 
@@ -163,16 +165,23 @@ fn refine(
 }
 
 /// `session` finished once nothing that can publish into it lives, and,
-/// when it finishes, its stream and `checkpoints` refined ([`refine`]): the
-/// one completion of every recording. Never panics; what the result means is
-/// its consumers' ([`settled`], [`describe`]).
+/// when it finishes, its stream and `checkpoints` refined ([`refine`]) and
+/// the checkpoints' storage held to their changes
+/// ([`refinement::History::storage`]): the one completion of every
+/// recording, so every checkpoint any recorded run takes, in any workload,
+/// is stored within its edits. Never panics; what the result means is its
+/// consumers' ([`settled`], [`describe`]).
 fn finalize(session: Recording, checkpoints: &refinement::History) -> Finalized {
     let cause = session.invalidation();
     match session.finish() {
         Err(incomplete) => Finalized::Refused(incomplete, cause),
         Ok(observed) => {
             let verdict = refine(&observed, checkpoints);
-            Finalized::Finished { observed, verdict }
+            Finalized::Finished {
+                observed,
+                verdict,
+                storage: checkpoints.storage(),
+            }
         }
     }
 }
@@ -188,8 +197,18 @@ fn describe(finalized: &Finalized) -> String {
             format!("the recording is no evidence: {incomplete:?}, first by {cause:?}")
         }
         Finalized::Finished {
-            verdict: Ok(()), ..
+            verdict: Ok(()),
+            storage: Ok(()),
+            ..
         } => "the recording finished and refined the protocol".to_string(),
+        Finalized::Finished {
+            verdict: Ok(()),
+            storage: Err(excess),
+            ..
+        } => format!(
+            "the recording finished and refined the protocol, and its checkpoint storage \
+             exceeds its edits: {excess}"
+        ),
         Finalized::Finished {
             verdict: Err(divergence),
             ..
@@ -278,7 +297,8 @@ pub fn refine_words(words: &[[u64; dcbor::bounded::OBSERVED_WORDS]]) {
 /// ([`enforce`]): the one finalization of every recorded run, the scoped
 /// runner's ([`recorded_run`], [`recorded_control`]) and the drivers' that
 /// own their session whole ([`construction_requests`], `pipeline`). An
-/// incomplete recording satisfies no expectation, a rejection included.
+/// incomplete recording satisfies no expectation, a rejection included;
+/// checkpoints stored beyond their changes fail any run, a control's too.
 fn settled(
     session: Recording,
     checkpoints: &refinement::History,
@@ -291,8 +311,15 @@ fn settled(
         Finalized::Refused(incomplete, Some(cause)) => {
             panic!("the run's recording is no evidence: {incomplete:?}, first by {cause:?}")
         }
-        Finalized::Finished { observed, verdict } => {
+        Finalized::Finished {
+            observed,
+            verdict,
+            storage,
+        } => {
             enforce(&observed, verdict, expected);
+            if let Err(excess) = storage {
+                panic!("the run's checkpoint storage exceeds its edits: {excess}");
+            }
             observed
         }
     }
@@ -8023,6 +8050,115 @@ mod tests {
             measure(true) <= limit,
             "checkpoint history retains repeated full custody"
         );
+    }
+
+    /// Checkpoint storage on changing custody, attributed by the allocator:
+    /// four owners' groups, each binding an acquisition, holding obligations
+    /// and reporting permits, changed by the refinement crate's fixed edit
+    /// sequence (`history.rs`,
+    /// `obligation_edits_and_large_reordered_custody_reconstruct_exactly`:
+    /// obligation work changed, settled away and newly admitted, permits
+    /// rotated and reversed, groups swapped), at a size whose allocations
+    /// the heap observer holds whole (`heap.rs`, `CAPACITY`). Only the pushes
+    /// are observed, so the live bytes after them are exactly the history's
+    /// allocations: they must equal what the history reports it retains
+    /// (`History::retained_bytes`, the figure every recorded run's
+    /// finalization holds to `History::storage`), every checkpoint must
+    /// reconstruct exactly, the storage must be within the checkpoints'
+    /// changes, and dropping the history must release every byte.
+    #[test]
+    fn checkpoint_storage_is_its_edits_on_changing_custody() {
+        use refinement::{Checkpoint, Custody, Hold, Identity, Obligation, Reported, WriteWork};
+        let hold = |n: u64, values: u64| Hold {
+            obligation: [
+                Obligation::Release,
+                Obligation::Grant,
+                Obligation::BucketWindow,
+            ][(n % 3) as usize],
+            work: WriteWork::new(values, values * 3),
+            id: Identity::new(1, 1_000 + n),
+            acquisition: Identity::new(1, 100 + n % 7),
+        };
+        let mut custody: Vec<Custody> = (0..4)
+            .map(|g| Custody {
+                owner: Identity::new(1, g + 1),
+                bound: vec![Identity::new(1, 100 + g)],
+                held: (0..8).map(|n| hold(g * 8 + n, 4)).collect(),
+                permits: (0..32)
+                    .map(|n| Reported {
+                        permit: Identity::new(1, 100_000 + g * 32 + n),
+                        record: None,
+                    })
+                    .collect(),
+            })
+            .collect();
+        // xorshift64: the refinement crate's fixed sequence of edits.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % bound as u64).expect("below a usize bound")
+        };
+        let mut history = refinement::History::new();
+        let mut expected = Vec::new();
+        let observation = heap::Observation::begin(None);
+        observation.stop();
+        for turn in 0..48_u64 {
+            let g = next(custody.len());
+            let group = &mut custody[g];
+            match next(6) {
+                0 if !group.held.is_empty() => {
+                    let at = next(group.held.len());
+                    group.held[at].work = WriteWork::new(next(8) as u64, next(64) as u64);
+                }
+                1 if !group.held.is_empty() => {
+                    let at = next(group.held.len());
+                    group.held.remove(at);
+                }
+                2 => {
+                    let by = next(group.permits.len());
+                    group.permits.rotate_left(by);
+                }
+                3 => group.permits.reverse(),
+                4 => {
+                    let other = next(custody.len());
+                    custody.swap(g, other);
+                }
+                _ => group.held.push(hold(10_000 + turn, 1)),
+            }
+            let boundary = usize::try_from(turn).expect("a turn fits in usize");
+            expected.push(Checkpoint {
+                boundary,
+                custody: custody.clone(),
+            });
+            observation.window(|| {
+                history.push(Checkpoint {
+                    boundary,
+                    custody: custody.clone(),
+                })
+            });
+        }
+        let retained = observation.snapshot();
+        assert!(
+            !retained.overflow,
+            "the live-allocation measurement is incomplete: {retained:?}"
+        );
+        assert_eq!(
+            retained.live,
+            history.retained_bytes(),
+            "the history's reported storage is not its live allocations"
+        );
+        assert_eq!(
+            history.to_vec(),
+            expected,
+            "reconstructed checkpoints differ from the checkpoints pushed"
+        );
+        if let Err(excess) = history.storage() {
+            panic!("checkpoint history stores unchanged custody: {excess}");
+        }
+        drop(history);
+        assert_eq!(observation.snapshot().live, 0, "checkpoint storage leaked");
     }
 
     /// A session's permit records and event slots are each one zeroed

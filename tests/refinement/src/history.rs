@@ -72,7 +72,7 @@ impl Delta {
         Self {
             boundary: after.boundary,
             len: after.custody.len(),
-            changed,
+            changed: exact(changed),
             appended: after.custody[before.len().min(after.custody.len())..].to_vec(),
         }
     }
@@ -89,14 +89,68 @@ impl Delta {
         }
         checkpoint.custody.extend(self.appended.iter().cloned());
     }
+
+    /// The heap bytes this delta holds beyond its own place in the history:
+    /// its changed groups and their edits, and its appended groups.
+    fn heap_bytes(&self) -> usize {
+        self.changed.capacity() * size_of::<Changed>()
+            + self
+                .changed
+                .iter()
+                .map(|change| {
+                    change.bound.inserted.capacity() * size_of::<Identity>()
+                        + change.held.inserted.capacity() * size_of::<Hold>()
+                        + change.permits.inserted.capacity() * size_of::<Reported>()
+                })
+                .sum::<usize>()
+            + groups_heap_bytes(&self.appended)
+    }
+}
+
+/// `values` holding exactly its elements: the heap bytes a delta reports
+/// ([`History::retained_bytes`]) are then its contents', with no growth
+/// slack of the iterator it was collected from.
+fn exact<T>(mut values: Vec<T>) -> Vec<T> {
+    values.shrink_to_fit();
+    values
+}
+
+/// The heap bytes `groups` holds: the vector of groups and each group's
+/// bindings, obligations and permits, by allocated capacity.
+fn groups_heap_bytes(groups: &Vec<Custody>) -> usize {
+    groups.capacity() * size_of::<Custody>()
+        + groups
+            .iter()
+            .map(|group| {
+                group.bound.capacity() * size_of::<Identity>()
+                    + group.held.capacity() * size_of::<Hold>()
+                    + group.permits.capacity() * size_of::<Reported>()
+            })
+            .sum::<usize>()
+}
+
+/// The bytes one group's bindings, obligations and permits occupy, by
+/// length: what storing that group's report once costs at most.
+fn group_contents_bytes(group: &Custody) -> usize {
+    group.bound.len() * size_of::<Identity>()
+        + group.held.len() * size_of::<Hold>()
+        + group.permits.len() * size_of::<Reported>()
 }
 
 /// Every checkpoint, including repeated boundaries and unchanged reports.
-/// Storage is the latest custody plus the edits, not the sum of snapshots.
+/// Storage is the latest custody plus the edits, not the sum of snapshots:
+/// each checkpoint costs at most the groups that differ from the one
+/// before it, an unchanged group nothing ([`History::storage`]).
 #[derive(Clone, Debug, Default)]
 pub struct History {
     deltas: Vec<Delta>,
     latest: Vec<Custody>,
+    /// The bytes the checkpoints pushed may cost, accumulated by
+    /// [`History::push`] from each checkpoint and the one before it, group
+    /// by group, independently of the deltas stored: a changed group its
+    /// edit record and its whole new report, an appended group its group
+    /// and its report, an unchanged group nothing.
+    allowance: usize,
 }
 
 impl History {
@@ -113,8 +167,62 @@ impl History {
     }
 
     pub fn push(&mut self, checkpoint: Checkpoint) {
+        self.allowance += checkpoint
+            .custody
+            .iter()
+            .enumerate()
+            .filter(|(index, group)| self.latest.get(*index) != Some(*group))
+            .map(|(index, group)| {
+                let record = if index < self.latest.len() {
+                    size_of::<Changed>()
+                } else {
+                    size_of::<Custody>()
+                };
+                record + group_contents_bytes(group)
+            })
+            .sum::<usize>();
         self.deltas.push(Delta::between(&self.latest, &checkpoint));
         self.latest = checkpoint.custody;
+    }
+
+    /// The heap bytes the history holds, by allocated capacity: the
+    /// deltas' vector, each delta's changed groups, edits and appended
+    /// groups, and the latest custody. Exactly the live bytes its
+    /// allocations occupy (`checkpoint_storage_is_its_edits_on_changing_custody`,
+    /// in the support crate, compares it with the heap observer's count).
+    pub fn retained_bytes(&self) -> usize {
+        self.deltas.capacity() * size_of::<Delta>()
+            + self.deltas.iter().map(Delta::heap_bytes).sum::<usize>()
+            + groups_heap_bytes(&self.latest)
+    }
+
+    /// Whether the history holds no more than its checkpoints' changes: its
+    /// retained bytes ([`History::retained_bytes`]) within the latest
+    /// custody, the deltas' own vector at its growth bound (at most twice its
+    /// length, and the four-element first allocation), and the allowance
+    /// [`History::push`] accumulated group by group. A history storing a
+    /// group that did not change (a full snapshot, a group diffed against
+    /// nothing) exceeds it whenever any group is unchanged. Err names every
+    /// figure.
+    pub fn storage(&self) -> Result<(), String> {
+        let retained = self.retained_bytes();
+        let latest = groups_heap_bytes(&self.latest);
+        let deltas = if self.deltas.is_empty() {
+            0
+        } else {
+            self.deltas.len().saturating_mul(2).max(4) * size_of::<Delta>()
+        };
+        let bound = latest + deltas + self.allowance;
+        if retained <= bound {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} checkpoint(s) retain {retained} bytes where their changes allow {bound} \
+                 (latest custody {latest}, deltas {deltas}, changed groups {})",
+                self.deltas.len(),
+                self.allowance
+            ))
+        }
     }
 
     /// Reconstruct history in its original order with one working snapshot.
