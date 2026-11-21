@@ -5,6 +5,7 @@
 //! while the gate tool recording its judgement stays outside.
 
 use std::collections::BTreeMap;
+// `PathBuf` is the launcher's resolved path ([`kani_launcher`]).
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -290,44 +291,164 @@ pub fn run_kani(
     harness: &str,
     target_dir: &Path,
     log: &Path,
+    launcher: &Path,
 ) -> Result<(Termination, String), String> {
-    kani(root, &["--harness", harness, "--exact"], target_dir, log)
+    let declared = crate::proofs::harnesses(&root.join("src"))?;
+    if !declared.contains(harness) {
+        return Err(format!(
+            "harness {harness}: declared by no #[kani::proof] of {}",
+            root.display()
+        ));
+    }
+    let entries = crate::proofs::policy(root, &declared)?;
+    kani(root, &entries, Some(harness), target_dir, log, launcher)
 }
 
 /// One `cargo kani` run of every harness of the library in `root`
-/// ([`crate::proofs::arguments`], no harness filter), as [`run_kani`] runs
-/// one: the proof suite's evidence run.
+/// ([`crate::proofs::arguments`], no harness filter), under the policy
+/// `entries` ([`crate::proofs::policy`]), as [`run_kani`] runs one: the
+/// proof suite's evidence run.
 pub fn run_kani_suite(
     root: &Path,
+    entries: &BTreeMap<String, serde_json::Value>,
     target_dir: &Path,
     log: &Path,
+    launcher: &Path,
 ) -> Result<(Termination, String), String> {
-    kani(root, &[], target_dir, log)
+    kani(root, entries, None, target_dir, log, launcher)
 }
 
-/// The one `cargo kani` invocation, `selection` after the build's own
-/// arguments.
+/// The Kani a run selects: `cargo-kani` as `PATH` resolves it, canonical
+/// (the development shell's bundle, `flake.nix` `kaniBundle`). The one
+/// resolution of the launcher, made once per run by `proofs-identity`
+/// ([`crate::proofs::identity`]); every Kani run of the run is given the
+/// path it selected ([`crate::proofs::selected_launcher`]).
+pub fn kani_launcher() -> Result<PathBuf, String> {
+    let found = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("cargo-kani"))
+                .find(|candidate| candidate.is_file())
+        })
+        .ok_or("cargo-kani is not on PATH: run the gate in the development shell")?;
+    std::fs::canonicalize(&found).map_err(|error| format!("{}: {error}", found.display()))
+}
+
+/// `bytes` written to a new file at `path`, refused when the path exists:
+/// evidence is created once and never overwritten.
+fn create_evidence(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The SHA-256 digest of the file at `path`, as `sha256sum` computes it:
+/// the gates' one digest tool (tests/gate-common.sh, every gate script's
+/// prerequisite), independent of the Kani driver whose recorded digests it
+/// checks. The file is opened here and given as `sha256sum`'s standard
+/// input, so its one output line is `DIGEST  -` whatever the path holds.
+/// Refused when the file cannot be opened, when `sha256sum` fails, or when
+/// its output is not exactly that line.
+pub fn sha256(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let output = Command::new("sha256sum")
+        .stdin(file)
+        .output()
+        .map_err(|error| format!("sha256sum < {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sha256sum < {}: {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    match text.strip_suffix("  -\n") {
+        Some(digest) if crate::proofs::sha256_text(digest) => Ok(digest.to_string()),
+        _ => Err(format!(
+            "sha256sum < {}: not one digest line: {text:?}",
+            path.display()
+        )),
+    }
+}
+
+/// The one `cargo kani` invocation: the run's selected `launcher` with the
+/// build's own arguments, then `--harness HARNESS --exact` for a run of one
+/// harness, then the target directory, then the run's loop-bound policy and
+/// its evidence. The run's evidence is reserved beside its log, at
+/// `LOG.evidence/`, and created exclusively, as the log is: `launcher`, the
+/// program spawned; `loop-bounds.json`, the policy of the harnesses the run
+/// checks ([`crate::proofs::selected`]), which Kani reads; `loop-bounds/`,
+/// the directory Kani writes each harness's loop discovery, resolution,
+/// solver command, executables and launch into (`--loop-bounds-evidence`);
+/// and, once the run ends, `execution.json`, the launcher and the verifier
+/// its harnesses ran. Refused before anything runs when any of them exists
+/// or the launcher no longer is the canonical path it was selected as; and
+/// after the run when its evidence does not reconcile with its policy and
+/// its report ([`crate::proofs::check_execution_evidence`]), so neither the
+/// suite nor a control can take a verdict the evidence does not support.
 fn kani(
     root: &Path,
-    selection: &[&str],
+    entries: &BTreeMap<String, serde_json::Value>,
+    harness: Option<&str>,
     target_dir: &Path,
     log: &Path,
+    launcher: &Path,
 ) -> Result<(Termination, String), String> {
-    let file = std::fs::File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    let canonical = std::fs::canonicalize(launcher)
+        .map_err(|error| format!("{}: {error}", launcher.display()))?;
+    if canonical != launcher {
+        return Err(format!(
+            "the selected launcher {} now resolves to {}",
+            launcher.display(),
+            canonical.display()
+        ));
+    }
+    let evidence = log.with_extension("evidence");
+    std::fs::create_dir(&evidence).map_err(|error| format!("{}: {error}", evidence.display()))?;
+    create_evidence(
+        &evidence.join("launcher"),
+        format!("{}\n", launcher.display()).as_bytes(),
+    )?;
+    let policy = evidence.join("loop-bounds.json");
+    let selected = crate::proofs::selected(entries, harness);
+    let encoded = serde_json::to_vec_pretty(&selected)
+        .map_err(|error| format!("{}: {error}", policy.display()))?;
+    create_evidence(&policy, &encoded)?;
+    let bounds = evidence.join("loop-bounds");
+    std::fs::create_dir(&bounds).map_err(|error| format!("{}: {error}", bounds.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(log)
+        .map_err(|error| format!("{}: {error}", log.display()))?;
     let error = file
         .try_clone()
         .map_err(|error| format!("{}: {error}", log.display()))?;
-    let status = controlled("cargo")?
+    let mut command = controlled(launcher)?;
+    command
         .current_dir(root)
         .env("TERM", "dumb")
-        .args(crate::proofs::arguments())
-        .args(selection)
+        .args(crate::proofs::arguments());
+    if let Some(harness) = harness {
+        command.args(["--harness", harness, "--exact"]);
+    }
+    let status = command
         .arg("--target-dir")
         .arg(target_dir)
+        .arg("--loop-bounds")
+        .arg(&policy)
+        .arg("--loop-bounds-evidence")
+        .arg(&bounds)
         .stdout(file)
         .stderr(error)
         .status()
-        .map_err(|error| format!("cargo kani: {error}"))?;
+        .map_err(|error| format!("{}: {error}", launcher.display()))?;
     let termination = {
         use std::os::unix::process::ExitStatusExt;
         match status.signal() {
@@ -337,6 +458,12 @@ fn kani(
     };
     let text =
         std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+    let verifier = crate::proofs::check_execution_evidence(&bounds, &selected, &text)
+        .map_err(|fault| format!("{}: {fault}", log.display()))?;
+    let execution = serde_json::json!({ "launcher": launcher, "verifier": verifier });
+    let encoded = serde_json::to_vec_pretty(&execution)
+        .map_err(|error| format!("{}: {error}", evidence.display()))?;
+    create_evidence(&evidence.join("execution.json"), &encoded)?;
     Ok((termination, text))
 }
 

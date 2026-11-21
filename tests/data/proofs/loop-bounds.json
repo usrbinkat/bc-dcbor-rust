@@ -1,0 +1,17 @@
+{
+  "harnesses": [
+    {
+      "harness": "bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source",
+      "loops": [
+        {
+          "function": "bounded::encoding::admit_stepped::<bounded::proof_budget::Counting>",
+          "file": "src/bounded/encoding.rs",
+          "loops_in_function": 1,
+          "loop": 0,
+          "bound": 0,
+          "reason": "CBMC checks a loop's bound where its backward goto is reached: it stops at the arrival whose count reaches the bound and asserts there that the goto is not taken (goto-symex/symex_goto.cpp, goto-checker/symex_bmc.cpp should_stop_unwind). Bound 0 is therefore the obligation that no execution of the harness's domain reaches the backward goto of admit_stepped's `while left > 0` loop, from the end of an iteration back to its `left > 0` evaluation; it does not by itself assert that the body is never entered, since an iteration that leaves through `?` takes no backedge. admit_stepped is called by Instruction::Inspect and, through ShapeWalk::moved, by Instruction::Entries (encoding.rs, the shape walk), which the harness's Leaf and Source schemas do not yield, and a call with nothing left takes no backedge. The unwinding assertion of the resolved loop is what checks the obligation over the full domain; the resolution evidence records the instrumented loop it applies to."
+        }
+      ]
+    }
+  ]
+}

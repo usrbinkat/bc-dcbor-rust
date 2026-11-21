@@ -270,10 +270,11 @@ fn a_delta_is_the_interval_unless_violated_and_never_hides_a_violation() {
 
 /// An origin family of the conservation model: settlements made through
 /// production's custody ([`Retained`]) are recorded into its ledgers, the
-/// one update rule, as a [`super::Family`] records them.
-struct Ledger(&'static Ledgers);
+/// one update rule, as a [`super::Family`] records them. It borrows ledgers
+/// the harness owns, which outlive every custody holding the origin.
+struct Ledger<'l>(&'l Ledgers);
 
-impl Origin for Ledger {
+impl Origin for Ledger<'_> {
     fn family(&self) -> u64 {
         0
     }
@@ -292,24 +293,6 @@ impl Origin for Ledger {
 /// The families of the conservation model.
 const FAMILIES: usize = 2;
 
-/// A family's ledgers before any event: every component zero, unviolated,
-/// `Ledgers::default()` as a constant initializer.
-const fn fresh() -> Ledgers {
-    use super::AtomicU64;
-    Ledgers {
-        admitted: [AtomicU64::new(0), AtomicU64::new(0)],
-        consumed: [AtomicU64::new(0), AtomicU64::new(0)],
-        forfeited: [AtomicU64::new(0), AtomicU64::new(0)],
-        violated: AtomicU64::new(0),
-    }
-}
-
-/// The families' ledgers have static storage so origins can retain them
-/// without a heap allocation. Updates still use production's
-/// [`Ledgers::record`] and its compare-exchange loop; the harness's unwinding
-/// assertions must establish that the loop fits its bound.
-static LEDGERS: [Ledgers; FAMILIES] = [fresh(), fresh()];
-
 /// Conservation over legal transitions: every sequence of at most
 /// [`EVENTS`] legal steps over [`FAMILIES`] families (an admission, held or
 /// not, into any family; a spend or forfeit of any outstanding obligation,
@@ -320,13 +303,15 @@ static LEDGERS: [Ledgers; FAMILIES] = [fresh(), fresh()];
 #[kani::proof]
 #[kani::unwind(5)]
 fn legal_transitions_conserve_every_family() {
-    // Origins outlive their custodies, as a family's counters outlive every
-    // obligation admitted through them: the families' typed static ledgers
-    // ([`LEDGERS`]), each zero when the harness starts.
-    let ledgers: [&'static Ledgers; FAMILIES] = [&LEDGERS[0], &LEDGERS[1]];
+    // The families' ledgers, owned here and declared before every custody,
+    // so they outlive each one, as a family's counters outlive every
+    // obligation admitted through them: a custody left outstanding forfeits
+    // into its ledger when it drops, before the ledger does.
+    let storage: [Ledgers; FAMILIES] = [Ledgers::default(), Ledgers::default()];
+    let ledgers: [&Ledgers; FAMILIES] = [&storage[0], &storage[1]];
     // The model's outstanding obligations: family, remaining work, and the
     // production custody holding it.
-    let mut outstanding: [Option<(usize, WriteWork, Retained<Ledger>)>; EVENTS] =
+    let mut outstanding: [Option<(usize, WriteWork, Retained<Ledger<'_>>)>; EVENTS] =
         core::array::from_fn(|_| None);
     let steps: usize = kani::any();
     kani::assume(steps <= EVENTS);

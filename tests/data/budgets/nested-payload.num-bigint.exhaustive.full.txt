@@ -1,0 +1,19 @@
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+reordered/false/depth/1/bytes/256	1485	28
+reordered/false/depth/1/bytes/4096	17197	36
+reordered/false/depth/1/bytes/64	649	24
+reordered/false/depth/32/bytes/256	5211	62
+reordered/false/depth/32/bytes/4096	23591	68
+reordered/false/depth/32/bytes/64	3957	60
+reordered/false/depth/8/bytes/256	2199	44
+reordered/false/depth/8/bytes/4096	18751	52
+reordered/false/depth/8/bytes/64	1605	42
+reordered/true/depth/1/bytes/256	2905	40
+reordered/true/depth/1/bytes/4096	36145	56
+reordered/true/depth/1/bytes/64	1133	32
+reordered/true/depth/32/bytes/256	57783	384
+reordered/true/depth/32/bytes/4096	637059	646
+reordered/true/depth/32/bytes/64	27633	288
+reordered/true/depth/8/bytes/256	13811	126
+reordered/true/depth/8/bytes/4096	170587	198
+reordered/true/depth/8/bytes/64	5729	92

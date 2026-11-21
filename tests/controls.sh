@@ -70,7 +70,9 @@ esac
 gate_prepare || exit 2
 miri_models || exit 2
 logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls log directory}/controls-$channel}"
-mkdir -p "$logs" || exit 2
+# A run's evidence is created once: an existing log directory is another
+# run's, never overwritten.
+mkdir "$logs" || exit 2
 
 listed="$(gate control list "$PWD" "$channel" native kani "${MIRI_MODELS[@]}")" || {
 	event "FAIL the controls' table is refused; nothing was run"
@@ -93,8 +95,22 @@ for line in "${controls[@]}"; do
 	fi
 done
 
+# The Kani a kani channel's controls launch, selected once: its path is
+# written to kani-launcher, which every side of every control is given.
+kani_identity=""
+launcher=-
+if [[ "$channel" == kani ]]; then
+	launcher="$logs/kani-launcher"
+	kani_identity="$(gate proofs-identity "$launcher")" || {
+		event "FAIL the Kani the controls launch could not be identified; nothing was run"
+		exit 2
+	}
+fi
 {
 	printf 'channel\t%s\n' "$channel"
+	if [[ -n "$kani_identity" ]]; then
+		printf '%s\n' "$kani_identity"
+	fi
 	printf 'control\t%s\n' "${controls[@]}"
 	for model in "${!miri_used[@]}"; do
 		printf 'model\t%s\tMIRIFLAGS\t%s\n' "$model" "$(miri_flags "$model")"
@@ -147,8 +163,10 @@ miri_control() {
 # `$3`: built and run by the gate tool (native, and a Kani harness, which it
 # checks with `cargo kani`), or by `miri_control`.
 control_side() {
-	if [[ "$runner" == native || "$runner" == kani ]]; then
-		gate control run "$1" "$2" "$built" "$logs" "$name" "$runner"
+	if [[ "$runner" == native ]]; then
+		gate control run "$1" "$2" "$built" "$logs" "$name" "$runner" -
+	elif [[ "$runner" == kani ]]; then
+		gate control run "$1" "$2" "$built" "$logs" "$name" "$runner" "$launcher"
 	else
 		miri_control "$1" "$2" "$3"
 	fi
@@ -179,7 +197,7 @@ for line in "${controls[@]}"; do
 	fi
 	directory="$logs/$run"
 	copy="$copies/$run"
-	mkdir -p "$directory"
+	mkdir "$directory" || exit 2
 	cp "$logs/identity.txt" "$directory/identity.txt"
 	copy_of "$copy" "$commit" || exit 2
 	tree_digest "$copy" >"$directory/before.sha256" || exit 2

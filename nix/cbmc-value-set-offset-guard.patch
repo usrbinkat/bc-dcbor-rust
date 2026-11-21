@@ -1,0 +1,295 @@
+diff --git a/src/pointer-analysis/value_set_dereference.cpp b/src/pointer-analysis/value_set_dereference.cpp
+index f9a99530a6..8c6e62d712 100644
+--- a/src/pointer-analysis/value_set_dereference.cpp
++++ b/src/pointer-analysis/value_set_dereference.cpp
+@@ -579,6 +579,21 @@ value_set_dereferencet::valuet value_set_dereferencet::build_reference_to(
+         typecast_exprt::conditional_cast(pointer_expr, object_pointer.type()),
+         object_pointer);
+     }
++    else if(o.offset().is_constant())
++    {
++      // A constant offset, relative to the root object as below, fixes the
++      // one subobject this candidate's value denotes. Another candidate of the
++      // same allocation at another constant offset denotes another subobject,
++      // so the guard must require this offset, not only the allocation:
++      // otherwise both guards hold and whichever candidate is tested first is
++      // read or written for both.
++      const exprt actual_offset = pointer_offset(pointer_expr);
++      result.pointer_guard = and_exprt{
++        same_object(pointer_expr, object_pointer),
++        equal_exprt{
++          actual_offset,
++          typecast_exprt::conditional_cast(o.offset(), actual_offset.type())}};
++    }
+     else
+     {
+       result.pointer_guard=same_object(pointer_expr, object_pointer);
+diff --git a/unit/Makefile b/unit/Makefile
+index 0f58fc69aa..2ad32a4ccd 100644
+--- a/unit/Makefile
++++ b/unit/Makefile
+@@ -102,6 +102,7 @@ SRC += analyses/ai/ai.cpp \
+        json_symbol_table.cpp \
+        path_strategies.cpp \
+        pointer-analysis/value_set.cpp \
++       pointer-analysis/value_set_dereference.cpp \
+        solvers/bdd/miniBDD/miniBDD.cpp \
+        solvers/flattening/boolbv.cpp \
+        solvers/flattening/boolbv_enumeration.cpp \
+diff --git a/unit/pointer-analysis/module_dependencies.txt b/unit/pointer-analysis/module_dependencies.txt
+index 92206e9e62..f5919a3901 100644
+--- a/unit/pointer-analysis/module_dependencies.txt
++++ b/unit/pointer-analysis/module_dependencies.txt
+@@ -1,3 +1,4 @@
+ pointer-analysis
++solvers
+ testing-utils
+ util
+diff --git a/unit/pointer-analysis/value_set_dereference.cpp b/unit/pointer-analysis/value_set_dereference.cpp
+new file mode 100644
+index 0000000000..966ec4694e
+--- /dev/null
++++ b/unit/pointer-analysis/value_set_dereference.cpp
+@@ -0,0 +1,242 @@
++/*******************************************************************\
++
++Module: Unit tests for value_set_dereferencet
++
++\*******************************************************************/
++
++/// \file
++/// Unit tests for value_set_dereferencet: candidate selection when a
++/// pointer's value set holds several constant-offset entries of one
++/// allocation.
++
++#include <util/arith_tools.h>
++#include <util/bitvector_types.h>
++#include <util/c_types.h>
++#include <util/config.h>
++#include <util/namespace.h>
++#include <util/pointer_expr.h>
++#include <util/std_expr.h>
++#include <util/symbol_table.h>
++
++#include <pointer-analysis/dereference_callback.h>
++#include <pointer-analysis/value_set_dereference.h>
++#include <solvers/flattening/bv_pointers.h>
++#include <solvers/sat/satcheck.h>
++#include <testing-utils/message.h>
++#include <testing-utils/use_catch.h>
++
++#include <vector>
++
++namespace
++{
++/// The value set a dereference is asked about, fixed by the test and returned
++/// in the order given: `value_set_dereferencet` folds candidates in that order,
++/// so the order decides which candidate's guard is tested first.
++class fixed_value_sett : public dereference_callbackt
++{
++public:
++  explicit fixed_value_sett(std::vector<exprt> values)
++    : values(std::move(values))
++  {
++  }
++
++  std::vector<exprt> get_value_set(const exprt &) const override
++  {
++    return values;
++  }
++
++  const symbolt *get_or_create_failed_symbol(const exprt &) override
++  {
++    return nullptr;
++  }
++
++private:
++  std::vector<exprt> values;
++};
++
++/// Two ledgers in one array, laid out as the Kani conservation harness's
++/// `[Ledgers; 2]` is: three pairs of 64-bit counters and a 64-bit flag per
++/// ledger, 56 bytes each, so `ledgers[1].consumed[0]` is at byte 72 of the
++/// allocation and `ledgers[0].consumed[0]` at byte 16.
++struct ledgers_fixturet
++{
++  symbol_tablet symbol_table;
++  namespacet ns{symbol_table};
++  unsignedbv_typet u64{64};
++  struct_tag_typet ledger_tag{"ledger"};
++  symbol_exprt ledgers{"ledgers", typet{}};
++  symbol_exprt dst{"dst", pointer_type(u64)};
++
++  ledgers_fixturet()
++  {
++    config.ansi_c.mode = configt::ansi_ct::flavourt::GCC;
++    config.ansi_c.set_arch_spec_x86_64();
++
++    const array_typet pair{u64, from_integer(2, c_index_type())};
++    struct_typet ledger{
++      {{"admitted", pair},
++       {"consumed", pair},
++       {"forfeited", pair},
++       {"violated", u64}}};
++    ledger.set_tag("ledger");
++    type_symbolt ledger_symbol{"ledger", ledger, ID_C};
++    ledger_symbol.base_name = "ledger";
++    symbol_table.add(ledger_symbol);
++
++    const array_typet two_ledgers{ledger_tag, from_integer(2, c_index_type())};
++    symbolt ledgers_symbol{"ledgers", two_ledgers, ID_C};
++    ledgers_symbol.base_name = "ledgers";
++    ledgers_symbol.is_static_lifetime = true;
++    ledgers_symbol.is_lvalue = true;
++    symbol_table.add(ledgers_symbol);
++    ledgers = ledgers_symbol.symbol_expr();
++
++    symbolt dst_symbol{"dst", pointer_type(u64), ID_C};
++    dst_symbol.base_name = "dst";
++    dst_symbol.is_lvalue = true;
++    symbol_table.add(dst_symbol);
++    dst = dst_symbol.symbol_expr();
++  }
++
++  index_exprt ledger(std::size_t family) const
++  {
++    return index_exprt{ledgers, from_integer(family, c_index_type())};
++  }
++
++  /// `ledgers[family].field[component]`
++  index_exprt counter(
++    std::size_t family,
++    const irep_idt &field,
++    std::size_t component) const
++  {
++    const struct_typet &ledger_type = ns.follow_tag(ledger_tag);
++    return index_exprt{
++      member_exprt{ledger(family), ledger_type.get_component(field)},
++      from_integer(component, c_index_type())};
++  }
++
++  /// The value-set entry `(object, offset)`, the offset from the start of the
++  /// allocation as `value_sett` records it; an empty offset is unknown.
++  static exprt
++  descriptor(const exprt &object, std::optional<mp_integer> offset)
++  {
++    object_descriptor_exprt result{object};
++    if(offset.has_value())
++      result.offset() = from_integer(*offset, c_index_type());
++    return std::move(result);
++  }
++
++  /// `*dst` under the value set `values`, in that order.
++  exprt dereference(std::vector<exprt> values)
++  {
++    fixed_value_sett value_set{std::move(values)};
++    value_set_dereferencet dereferencer{
++      ns, symbol_table, value_set, ID_C, true, null_message_handler};
++    return dereferencer.dereference(dst);
++  }
++
++  /// Whether `constraint` is satisfiable, decided over bit-vector pointers.
++  decision_proceduret::resultt decide(const exprt &constraint) const
++  {
++    satcheckt satcheck{null_message_handler};
++    bv_pointerst solver{ns, satcheck, null_message_handler};
++    solver << constraint;
++    return solver();
++  }
++
++  /// The counters' values every query below assumes.
++  exprt counters() const
++  {
++    return and_exprt{
++      {equal_exprt{counter(0, "admitted", 0), from_integer(5, u64)},
++       equal_exprt{counter(0, "consumed", 0), from_integer(11, u64)},
++       equal_exprt{counter(1, "consumed", 0), from_integer(29, u64)}}};
++  }
++
++  /// That `value`, read with `dst` at `target`, is exactly `expected`: the
++  /// constraints are satisfiable, and no model reads anything else.
++  void require_reads(
++    const exprt &value,
++    const exprt &target,
++    unsigned expected) const
++  {
++    const exprt at_target = equal_exprt{dst, address_of_exprt{target}};
++    REQUIRE(
++      decide(and_exprt{at_target, counters()}) ==
++      decision_proceduret::resultt::D_SATISFIABLE);
++    REQUIRE(
++      decide(and_exprt{
++        at_target,
++        counters(),
++        notequal_exprt{value, from_integer(expected, u64)}}) ==
++      decision_proceduret::resultt::D_UNSATISFIABLE);
++  }
++};
++} // namespace
++
++SCENARIO(
++  "value_set_dereferencet selects a constant-offset candidate by its offset",
++  "[core][pointer-analysis][value_set_dereference]")
++{
++  ledgers_fixturet fixture;
++  const exprt family_one_root =
++    ledgers_fixturet::descriptor(fixture.ledgers, mp_integer{72});
++  const exprt family_zero_member =
++    ledgers_fixturet::descriptor(fixture.ledger(0), mp_integer{16});
++
++  GIVEN("Entries (ledgers, 72) and (ledgers[0], 16), in that order")
++  {
++    const exprt value =
++      fixture.dereference({family_one_root, family_zero_member});
++
++    THEN("A pointer to ledgers[1].consumed[0] reads family 1")
++    {
++      fixture.require_reads(value, fixture.counter(1, "consumed", 0), 29);
++    }
++    THEN("A pointer to ledgers[0].consumed[0] reads family 0")
++    {
++      fixture.require_reads(value, fixture.counter(0, "consumed", 0), 11);
++    }
++  }
++
++  GIVEN("Entries (ledgers[0], 16) and (ledgers, 72), in that order")
++  {
++    const exprt value =
++      fixture.dereference({family_zero_member, family_one_root});
++
++    THEN("A pointer to ledgers[1].consumed[0] reads family 1")
++    {
++      fixture.require_reads(value, fixture.counter(1, "consumed", 0), 29);
++    }
++    THEN("A pointer to ledgers[0].consumed[0] reads family 0")
++    {
++      fixture.require_reads(value, fixture.counter(0, "consumed", 0), 11);
++    }
++  }
++
++  GIVEN("The entry (ledgers, 0)")
++  {
++    const exprt value = fixture.dereference(
++      {ledgers_fixturet::descriptor(fixture.ledgers, mp_integer{0})});
++
++    THEN("A pointer to the allocation's start reads ledgers[0].admitted[0]")
++    {
++      fixture.require_reads(value, fixture.counter(0, "admitted", 0), 5);
++    }
++  }
++
++  GIVEN("The entry (ledgers, unknown offset)")
++  {
++    const exprt value = fixture.dereference(
++      {ledgers_fixturet::descriptor(fixture.ledgers, std::nullopt)});
++
++    THEN("A pointer at byte 16 reads ledgers[0].consumed[0]")
++    {
++      fixture.require_reads(value, fixture.counter(0, "consumed", 0), 11);
++    }
++    THEN("A pointer at byte 72 reads ledgers[1].consumed[0]")
++    {
++      fixture.require_reads(value, fixture.counter(1, "consumed", 0), 29);
++    }
++  }
++}

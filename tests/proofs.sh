@@ -28,16 +28,25 @@ if (($# != 0)); then
 fi
 gate_prepare || exit 2
 logs="${PROOF_LOG_DIR:-${TMPDIR:?required, or PROOF_LOG_DIR: the log directory of the proof gate}/proofs}"
-mkdir -p "$logs" || exit 2
+# A run's evidence is created once: an existing log directory is another
+# run's, never overwritten.
+mkdir "$logs" || exit 2
+# The Kani this run launches, selected once: its path is written to
+# kani-launcher, which the verification below is given.
+launcher="$logs/kani-launcher"
+kani_identity="$(gate proofs-identity "$launcher")" || {
+	event "FAIL the Kani the run launches could not be identified; nothing was run"
+	exit 2
+}
 {
-	printf 'kani\t%s\n' "$(cargo kani --version)"
+	printf '%s\n' "$kani_identity"
 	printf 'build\t%s\n' "$(gate proofs-build)"
 } | identity "$logs" || {
 	event "FAIL the run's identity could not be written; nothing was run"
 	exit 2
 }
 echo "identity: $(cat "$logs/identity.txt")"
-gate proofs "$PWD" "$PWD/target/kani" "$logs"
+gate proofs "$PWD" "$PWD/target/kani" "$logs" "$launcher"
 status=$?
 event "DONE proofs; status $status; results $logs/results.tsv, report $logs/kani.log"
 exit "$status"

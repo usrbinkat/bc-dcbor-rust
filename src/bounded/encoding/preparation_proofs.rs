@@ -89,8 +89,9 @@
 //! normalization's ordering tables of sixteen counters
 //! (`text_cursor/ordering.rs`:51); publication's segment loop, at most
 //! `emit_bound(34)`'s 70 values (`writer.rs`:143); the places' folds over
-//! at most 21 places (`bounded.rs` `additive`, :669). No bucket loop is
-//! compiled: the harness builds without `hashbrown` and
+//! at most 21 places (`bounded.rs` `additive`, :669). A text leaf runs no
+//! UTF-8 validation: it is a range of [`TEXTS`], validated at compile time.
+//! No bucket loop is compiled: the harness builds without `hashbrown` and
 //! `custom-std-collections` (`tests/gate/src/proofs.rs` `arguments`).
 //! `kani::unwind(1007)`: the engine loop's 1006 iterations and its exit.
 //! Compiled only under `cfg(kani)`.
@@ -105,14 +106,99 @@ const WIDTH: usize = 2;
 /// The most bytes of a byte string or a text leaf.
 const BYTES: usize = 2;
 
+// [`TEXTS`] lists every text of at most two bytes.
+const _: () = assert!(BYTES == 2, "TEXTS holds the texts of at most BYTES bytes");
+
+/// The one-byte scalars, U+0000..=U+007F.
+const ONE_BYTE: usize = 0x80;
+
+/// The two-byte scalars, U+0080..=U+07FF.
+const TWO_BYTE: usize = 0x800 - 0x80;
+
+/// Where the pairs of one-byte scalars begin in [`TEXTS`]: after every
+/// scalar of at most two bytes.
+const PAIRS: usize = ONE_BYTE + 2 * TWO_BYTE;
+
+/// The bytes of [`TEXTS`]: every scalar of at most two bytes in order, each
+/// encoded by `char::encode_utf8`, then every ordered pair of one-byte
+/// scalars.
+const TEXT_BYTES: usize = PAIRS + 2 * ONE_BYTE * ONE_BYTE;
+
+/// [`TEXTS`]'s bytes, computed at compile time.
+const fn text_bytes() -> [u8; TEXT_BYTES] {
+    let mut bytes = [0u8; TEXT_BYTES];
+    let mut at = 0;
+    let mut scalar = 0u32;
+    while scalar < 0x800 {
+        let Some(c) = char::from_u32(scalar) else {
+            panic!("every value below U+0800 is a scalar");
+        };
+        let mut buffer = [0u8; 2];
+        let encoded = c.encode_utf8(&mut buffer).len();
+        let mut byte = 0;
+        while byte < encoded {
+            bytes[at] = buffer[byte];
+            at += 1;
+            byte += 1;
+        }
+        scalar += 1;
+    }
+    let mut first = 0;
+    while first < ONE_BYTE {
+        let mut second = 0;
+        while second < ONE_BYTE {
+            bytes[at] = first as u8;
+            bytes[at + 1] = second as u8;
+            at += 2;
+            second += 1;
+        }
+        first += 1;
+    }
+    bytes
+}
+
+/// [`TEXTS`]'s bytes as a constant.
+const TEXT_TABLE: [u8; TEXT_BYTES] = text_bytes();
+
+/// Every text of at most [`BYTES`] bytes but the empty one, concatenated:
+/// each one-byte and two-byte scalar, then each ordered pair of one-byte
+/// scalars, which with the empty text are every UTF-8 text of at most two
+/// bytes. Validated at compile time by `core::str::from_utf8`, the standard
+/// library's own validation, so the harness reads its texts by slicing
+/// alone: a run-time validation walks its slice by pointer, and over a
+/// symbolic length its loops unroll to the harness's whole `kani::unwind`
+/// (1006 iterations of the preparation engine's bound).
+const TEXTS: &str = match core::str::from_utf8(&TEXT_TABLE) {
+    Ok(texts) => texts,
+    Err(_) => panic!("TEXTS is UTF-8 by construction"),
+};
+
+/// The text of index `index` in [`TEXTS`]'s order, as a byte range: the
+/// empty text, then each scalar, then each pair, `None` past the last.
+fn text_range(index: usize) -> Option<(usize, usize)> {
+    if index == 0 {
+        Some((0, 0))
+    } else if index <= ONE_BYTE {
+        Some((index - 1, index))
+    } else if index <= ONE_BYTE + TWO_BYTE {
+        let start = ONE_BYTE + 2 * (index - 1 - ONE_BYTE);
+        Some((start, start + 2))
+    } else if index <= ONE_BYTE + TWO_BYTE + ONE_BYTE * ONE_BYTE {
+        let start = PAIRS + 2 * (index - 1 - ONE_BYTE - TWO_BYTE);
+        Some((start, start + 2))
+    } else {
+        None
+    }
+}
+
 /// A leaf of the domain.
 #[derive(Clone, Copy)]
 enum Leaf {
     Unsigned(u64),
     Negative(u64),
     Bytes([u8; BYTES], usize),
-    /// UTF-8 by construction ([`any_leaf`]).
-    Text([u8; BYTES], usize),
+    /// A text of [`TEXTS`], by its byte range ([`text_range`]).
+    Text(usize, usize),
 }
 
 impl Schema for Leaf {
@@ -128,12 +214,8 @@ impl Schema for Leaf {
                 Instruction::Head(MajorType::ByteString, Argument::Shortest(*length as u64))
             }
             (Leaf::Bytes(bytes, length), 1) => Instruction::Bytes(&bytes[..*length]),
-            // UTF-8 by construction; a text that were not would be outside
-            // the profile, never a panic.
-            (Leaf::Text(bytes, length), 0) => match core::str::from_utf8(&bytes[..*length]) {
-                Ok(text) => Instruction::Text(text),
-                Err(_) => Instruction::OutOfRange,
-            },
+            // A range of `text_range`, so on character boundaries of TEXTS.
+            (Leaf::Text(start, end), 0) => Instruction::Text(&TEXTS[*start..*end]),
             _ => Instruction::End,
         }
     }
@@ -148,10 +230,13 @@ fn any_leaf() -> Leaf {
         0 => Leaf::Unsigned(kani::any()),
         1 => Leaf::Negative(kani::any()),
         2 => Leaf::Bytes(bytes, length),
-        _ => {
-            kani::assume(core::str::from_utf8(&bytes[..length]).is_ok());
-            Leaf::Text(bytes, length)
-        }
+        _ => match text_range(kani::any()) {
+            Some((start, end)) => Leaf::Text(start, end),
+            None => {
+                kani::assume(false);
+                Leaf::Text(0, 0)
+            }
+        },
     }
 }
 

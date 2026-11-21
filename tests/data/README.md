@@ -318,6 +318,33 @@ upward across processes and rewrites the record: a change states its cause, the 
 toolchain that moved a count. `bash tests/concurrency-models.sh gate` runs each model at its
 recorded values, one under each, and the planted controls, on copies of a clean commit.
 
+## Proof loop bounds
+
+`proofs/loop-bounds.json` is the one declaration of harness-scoped loop bounds for the Kani proof
+harnesses: per harness, each loop by the function holding it, its source file, the number of loops
+that function holds, the loop's number, the bound, and the reason the bound covers the harness's
+domain. It is read from the tree being verified (`tests/gate/src/proofs.rs`, `POLICY`), a control's
+copy included, so a planted change to a bound reaches that control's run. The gate checks only
+that each harness it names is a `#[kani::proof]` of the source, named once with at least one bound,
+and gives each Kani run the entries of the harnesses that run checks. Kani resolves the selectors
+against each harness's instrumented goto binary immediately before CBMC runs on it
+(`nix/kani-driver-loop-bounds.patch`, `kani-driver/src/loop_bounds.rs`); unwinding assertions stay
+on, so a bound too small for an execution of the domain fails the harness. A resolution checks the
+function, file, loop count and symbol; it cannot see two loops of one function exchange numbers,
+and the bound's soundness rests on the unwinding assertion.
+
+Every Kani run of a gate keeps its evidence beside its log, `LOG.evidence/`, each file created
+once: the launcher it ran (the run's one selection, `gate proofs-identity`), the policy it was
+given, and per harness the instrumented binary it was checked on, copied before anything read it
+(`artifact.out`, with its build path and digest in `artifact.json`), the loop discovery's
+invocation, status and streams, the resolution, the solver's command and executables and its
+launch attempt, then `execution.json`, the launcher and verifier of the run. The preserved binary
+is what a replay or an inspection of a harness's loops reads: the shared `target/kani` build
+directory is rewritten by every later run. A run's verdicts count only when that evidence reconciles with its policy and
+report (`proofs::check_execution_evidence`): the preserved bytes have their recorded digest, the
+solver ran on them, and a bounded harness's resolution names them, for the proof suite and every
+Kani control alike.
+
 ## Planted controls
 
 `controls/` holds diffs a gate applies to show that one of its checks fails on the defect the diff

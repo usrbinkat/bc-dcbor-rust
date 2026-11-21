@@ -44,11 +44,12 @@
 //!                   is checked complete against the diffs under ROOT;
 //!                   status 1, each fault named, when it is not
 //!                   (`controls::read`)
-//!   control run baseline|red|green ROOT TARGET LOGS NAME RUNNER
+//!   control run baseline|red|green ROOT TARGET LOGS NAME RUNNER LAUNCHER
 //!                   the control NAME of RUNNER, `native` (its test, built
-//!                   into TARGET from the copy ROOT and run alone) or `kani`
-//!                   (its harness, checked alone by `cargo kani`, its
-//!                   artifacts in TARGET), a Kani control's harness before
+//!                   into TARGET from the copy ROOT and run alone; LAUNCHER
+//!                   `-`) or `kani` (its harness, checked alone by the Kani
+//!                   LAUNCHER names, the run's selection, `proofs-identity`,
+//!                   its artifacts in TARGET), a Kani control's harness before
 //!                   its diff is applied (baseline: it must verify,
 //!                   `controls::verified`), its diff applied (red: the
 //!                   run must refuse it by its own rule, `controls::judge`)
@@ -83,9 +84,16 @@
 //!   proofs-build    the proof build's `cargo` arguments on one line
 //!                   (`proofs::arguments`), an input of the proof gate's
 //!                   identity
-//!   proofs ROOT TARGET LOGS
+//!   proofs-identity LAUNCHER
+//!                   select the Kani a run launches: `cargo-kani` resolved
+//!                   once, its absolute path written to the new file
+//!                   LAUNCHER, which every Kani run of the run is given;
+//!                   then that Kani's identity, one `KEY<TAB>VALUE` line each
+//!                   (`proofs::identity`), an input of the proof gate's and
+//!                   the Kani controls' identities
+//!   proofs ROOT TARGET LOGS LAUNCHER
 //!                   every proof harness of the library under ROOT checked by
-//!                   `cargo kani` (`proofs::arguments`), its artifacts in
+//!                   the Kani LAUNCHER names (`proofs::arguments`), its artifacts in
 //!                   TARGET, its report LOGS/kani.log: one results row per
 //!                   `#[kani::proof]` of the source, proved when it verified,
 //!                   published under the identity in LOGS, then the verdict;
@@ -183,10 +191,11 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      models evidence ROOT PAGE LOGS | \
                      models control ROOT LOGS NAME CHECKER | \
                      control list ROOT CHANNEL RUNNER... | \
-                     control run baseline|red|green ROOT TARGET LOGS NAME native|kani | \
+                     control run baseline|red|green ROOT TARGET LOGS NAME native|kani LAUNCHER|- | \
                      control judge red|green ROOT LOGS NAME RUNNER OUTCOME LOG | \
                      control evidence ROOT LOGS CHANNEL | \
-                     classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs ROOT TARGET LOGS | \
+                     classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs-identity LAUNCHER | \
+                     proofs ROOT TARGET LOGS LAUNCHER | \
                      miri models | \
                      miri inventory LOG OUT | \
                      miri coverage NATIVE OUT DIFF RUN... | miri results ROOT LOGS MODEL... | \
@@ -544,6 +553,7 @@ fn control_run(
     target_dir: &Path,
     logs: &Path,
     (name, runner): (&str, Runner),
+    launcher: Option<&Path>,
     configuration: &str,
 ) -> Result<ExitCode, Broken> {
     if !matches!(runner, Runner::Native | Runner::Kani) {
@@ -557,7 +567,8 @@ fn control_run(
     let directory = controls::directory(logs, control);
     std::fs::create_dir_all(&directory)
         .map_err(|error| Broken(format!("{}: {error}", directory.display())))?;
-    let (outcome, report) = controls::observe(root, target_dir, &directory, control, side)?;
+    let (outcome, report) =
+        controls::observe(root, target_dir, &directory, control, side, launcher)?;
     judged(side, control, outcome, &report, &directory, configuration)
 }
 
@@ -940,14 +951,43 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
                 Err(fault) => Ok(verdict(&[fault])),
             }
         }
-        ["control", "run", side, root, target_dir, logs, name, runner] => {
+        [
+            "control",
+            "run",
+            side,
+            root,
+            target_dir,
+            logs,
+            name,
+            runner,
+            launcher,
+        ] => {
             let runner = Runner::parse(runner).ok_or_else(|| Broken(Runner::unknown(runner)))?;
+            // A Kani control runs the run's selected Kani; a native one none.
+            let launcher = match (runner, *launcher) {
+                (Runner::Kani, "-") => {
+                    return Err(Broken(format!(
+                        "{name}: a kani control needs the run's launcher file"
+                    )));
+                }
+                (Runner::Kani, file) => {
+                    Some(dcbor_gate::proofs::selected_launcher(Path::new(file)).map_err(Broken)?)
+                }
+                (_, "-") => None,
+                (_, file) => {
+                    return Err(Broken(format!(
+                        "{name}: a {} control launches no Kani, but names the launcher {file}",
+                        runner.name()
+                    )));
+                }
+            };
             control_run(
                 side,
                 Path::new(root),
                 Path::new(target_dir),
                 Path::new(logs),
                 (name, runner),
+                launcher.as_deref(),
                 configuration,
             )
         }
@@ -1011,12 +1051,23 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             println!("{}", dcbor_gate::proofs::arguments().join(" "));
             Ok(ExitCode::SUCCESS)
         }
-        ["proofs", root, target_dir, logs] => {
+        // The Kani every proof and Kani-control run launches, as their
+        // identities record it: the one resolution of the launcher.
+        ["proofs-identity", launcher] => {
+            for (key, value) in dcbor_gate::proofs::identity(Path::new(launcher)).map_err(Broken)? {
+                println!("{key}\t{value}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ["proofs", root, target_dir, logs, launcher] => {
             let logs = Path::new(logs);
+            let launcher =
+                dcbor_gate::proofs::selected_launcher(Path::new(launcher)).map_err(Broken)?;
             let (rows, faults) = dcbor_gate::proofs::run(
                 Path::new(root),
                 Path::new(target_dir),
                 &logs.join("kani.log"),
+                &launcher,
             )?;
             publish_results(logs, configuration, &rows)?;
             let (_, _, published) = rows::parse(&contents(&logs.join("results.tsv"))?)?;

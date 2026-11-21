@@ -17,6 +17,7 @@
 //! libtest's summary), or a trybuild fixture's own block in its suite's
 //! report.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use dcbor_model_bounds::Checker;
@@ -593,20 +594,35 @@ pub fn verified(control: &Control, outcome: Outcome, report: &str) -> Result<(),
 }
 
 /// One run of the native `control` in the copy `root`: its target built into
-/// `target_dir`, its one test run alone, logged under `logs` by `side`. Its
-/// outcome and report: a refused build's log, or the run's.
+/// `target_dir`, its one test run alone, logged under `logs` by `side`; a
+/// Kani control's harness checked alone by the run's selected `launcher`
+/// (`proofs-identity`), its evidence reconciled with its policy
+/// (`process::kani`). Its outcome and report: a refused build's log, or the
+/// run's.
 pub fn observe(
     root: &Path,
     target_dir: &Path,
     logs: &Path,
     control: &Control,
     side: &str,
+    launcher: Option<&Path>,
 ) -> Result<(Outcome, String), String> {
     let missing = |what: &str| format!("{}: a native control without its {what}", control.name);
     if control.runner == Runner::Kani {
         let harness = control.test.as_deref().ok_or_else(|| missing("harness"))?;
-        let (termination, text) =
-            crate::process::run_kani(root, harness, target_dir, &logs.join(format!("{side}.log")))?;
+        let launcher = launcher.ok_or_else(|| {
+            format!(
+                "{}: a kani control without the run's launcher",
+                control.name
+            )
+        })?;
+        let (termination, text) = crate::process::run_kani(
+            root,
+            harness,
+            target_dir,
+            &logs.join(format!("{side}.log")),
+            launcher,
+        )?;
         return Ok((outcome::kani(termination, &text), text));
     }
     let package = control
@@ -667,6 +683,38 @@ pub fn evidence(controls: &[Control], logs: &Path, toolchain: &str) -> Vec<Strin
                     "{label}: its harness never ran unmutated ({})",
                     directory.display()
                 )),
+            }
+            // Its three sides ran one Kani: the launcher selected for the run,
+            // and one verifier wherever a side's harness reached it (a side
+            // refused before verification records none) (`process::kani`,
+            // `execution.json`).
+            let executions: Result<Vec<serde_json::Value>, String> = ["baseline", "red", "green"]
+                .iter()
+                .map(|side| {
+                    let text = read(&format!("{side}.evidence/execution.json"))
+                        .map_err(|_| format!("{label}: its {side} side recorded no execution"))?;
+                    serde_json::from_str(&text)
+                        .map_err(|error| format!("{label}: its {side} execution: {error}"))
+                })
+                .collect();
+            match executions {
+                Ok(executions) => {
+                    let launchers: BTreeSet<String> = executions
+                        .iter()
+                        .map(|run| run["launcher"].to_string())
+                        .collect();
+                    let verifiers: BTreeSet<String> = executions
+                        .iter()
+                        .filter(|run| !run["verifier"].is_null())
+                        .map(|run| run["verifier"].to_string())
+                        .collect();
+                    if launchers.len() != 1 || verifiers.len() > 1 {
+                        faults.push(format!(
+                            "{label}: its sides ran different launchers or verifiers"
+                        ));
+                    }
+                }
+                Err(fault) => faults.push(fault),
             }
         }
         match (read("red.judged"), read("green.judged")) {
@@ -855,6 +903,38 @@ mod kani_tests {
             "a Kani control without a baseline was evidence: {inconclusive:#?}"
         );
         write("baseline.judged", "verified\n");
+        let unexecuted = evidence(&control, &logs, KANI_TOOLCHAIN);
+        assert!(
+            unexecuted
+                .iter()
+                .any(|fault| fault.contains("recorded no execution")),
+            "a Kani control without its sides' executions was evidence: {unexecuted:#?}"
+        );
+        let execution = |verifier: &str| {
+            format!(r#"{{"launcher": "/kani/bin/cargo-kani", "verifier": {verifier}}}"#)
+        };
+        for side in ["baseline", "red", "green"] {
+            std::fs::create_dir_all(at.join(format!("{side}.evidence"))).unwrap();
+            write(
+                &format!("{side}.evidence/execution.json"),
+                &execution(r#"{"solver": "a"}"#),
+            );
+        }
+        write(
+            "red.evidence/execution.json",
+            &execution(r#"{"solver": "b"}"#),
+        );
+        let mixed = evidence(&control, &logs, KANI_TOOLCHAIN);
+        assert!(
+            mixed
+                .iter()
+                .any(|fault| fault.contains("different launchers or verifiers")),
+            "sides that ran different verifiers were evidence: {mixed:#?}"
+        );
+        write(
+            "red.evidence/execution.json",
+            &execution(r#"{"solver": "a"}"#),
+        );
         let based = evidence(&control, &logs, KANI_TOOLCHAIN);
         std::fs::remove_dir_all(&logs).expect("the fixture removed");
         assert_eq!(based, Vec::<String>::new());
