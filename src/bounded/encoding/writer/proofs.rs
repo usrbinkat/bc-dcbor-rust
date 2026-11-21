@@ -46,13 +46,20 @@
 //! [`OWNED_BYTES`] and [`GAPS`]; `Owned::reserve`'s growths, at most six
 //! (`bounded.rs`:1799); the output's `resize` (writer.rs:275), one
 //! iteration per byte, at most [`OWNED_BYTES`]; `encode_into`'s segment loop
-//! (:190), at most `ceil(OWNED_BYTES / 64) + 2 GAPS + 1` = 7; the places'
-//! fold, 5; and the bound's selection over every encoded length
-//! ([`bound_at`]), 67. The longest, 67: `kani::unwind(68)`.
+//! (:190), at most `ceil(OWNED_BYTES / 64) + 2 GAPS + 1` = 7; and the
+//! places' fold, 5. The longest, the plan's pushes and the output's resize,
+//! 66 iterations each: `kani::unwind(67)`, held by each loop's unwinding
+//! assertion.
+//!
+//! Both bounds, [`emit_bound`] and [`owned_emit_bound`], are checked
+//! arithmetic on the encoded length (`Capped::covering`, `Unit::times`,
+//! `Scan::units`, a fold over the fixed places) and hold no loop whose trip
+//! count depends on it, so each harness computes its bound for the symbolic
+//! encoded length directly.
 //!
 //! Compiled only under `cfg(kani)`.
 
-use super::super::super::proof_budget::{Counting, Permit, bound_at};
+use super::super::super::proof_budget::{Counting, Permit};
 use super::*;
 
 /// The most plan bytes of the domain: past two quanta.
@@ -94,19 +101,19 @@ fn the_emission_bound_covers_every_emission() {
     let steps = bound.steps::<()>().expect("the steps of the domain fit");
     let mut at = EmitPosition::default();
     let mut budget = Counting::scheduled(any_index(), None);
-    let mut complete = false;
-    // Findings recorded in the loop and asserted after it, so every run
-    // reaches the same tail.
+    // The emission is stepped to its outcome, each call counted; the loop's
+    // unwinding assertion establishes that every run reaches it within the
+    // harness's unwind. Findings recorded in the loop and asserted after it,
+    // so every run reaches the same tail.
+    let mut calls = 0u64;
     let mut moved_on_refusal = false;
     let mut failed = false;
-    for _ in 0..=steps {
+    loop {
+        calls += 1;
         let before = at;
         match view.segment(&mut at, &mut budget) {
             Ok(Segment::Skip | Segment::Bytes(_)) => {}
-            Ok(Segment::Complete) => {
-                complete = true;
-                break;
-            }
+            Ok(Segment::Complete) => break,
             Err(BoundedError::Refused(())) => moved_on_refusal |= at != before,
             Err(_) => {
                 failed = true;
@@ -116,7 +123,10 @@ fn the_emission_bound_covers_every_emission() {
     }
     assert!(!moved_on_refusal, "a refused unit moves nothing");
     assert!(!failed, "a well-formed plan's emission fails");
-    assert!(complete, "the emission completes within its bound's steps");
+    assert!(
+        u128::from(calls) <= u128::from(steps) + 1,
+        "the emission completes within its bound's steps and the one refused call"
+    );
     assert!(at.written == len, "the emission writes the whole encoding");
     assert!(
         bound.work().covers(&budget.admitted),
@@ -140,7 +150,7 @@ fn any_index() -> Option<u64> {
 /// write returns its refusal and retains nothing; nothing is held once the
 /// result drops.
 #[kani::proof]
-#[kani::unwind(68)]
+#[kani::unwind(67)]
 fn the_owned_emission_bound_covers_every_owned_write() {
     let length: usize = kani::any();
     kani::assume(length <= OWNED_BYTES);
@@ -182,9 +192,7 @@ fn the_owned_emission_bound_covers_every_owned_write() {
         bytes_owner: None,
         holes_owner: None,
     };
-    let bound = bound_at(len, OWNED_BYTES, |size| {
-        owned_emit_bound::<Permit, ()>(size).expect("the domain's bound fits")
-    });
+    let bound = owned_emit_bound::<Permit, ()>(len as u64).expect("the domain's bound fits");
     let mut policy = Counting::scheduled(any_index(), any_index());
     let written = plan.encode_owned(&mut policy);
     let retained = policy.live();

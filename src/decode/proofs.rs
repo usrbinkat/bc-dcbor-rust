@@ -59,6 +59,10 @@ use crate::{CBOR, Error};
 /// The arm of byte strings or texts (`super::decode_byte_string`,
 /// `super::decode_text`) in the scalar harness: reaching it fails the
 /// harness ([`arm_reached`]).
+#[expect(
+    dead_code,
+    reason = "reached only through #[kani::stub], whose path rustc does not count as a use"
+)]
 fn no_bytes_or_text(_: &[u8], _: u64, _: usize) -> crate::Result<(CBOR, usize)> {
     arm_reached()
 }
@@ -66,12 +70,20 @@ fn no_bytes_or_text(_: &[u8], _: u64, _: usize) -> crate::Result<(CBOR, usize)> 
 /// The arm of arrays, maps or tagged items (`super::decode_array`,
 /// `super::decode_map`, `super::decode_tagged`) in the scalar harness:
 /// reaching it fails the harness ([`arm_reached`]).
+#[expect(
+    dead_code,
+    reason = "reached only through #[kani::stub], whose path rustc does not count as a use"
+)]
 fn no_items(_: &[u8], _: u64, _: usize, _: usize) -> crate::Result<(CBOR, usize)> {
     arm_reached()
 }
 
 /// A failed check that a scalar head reached an arm of bytes, text or items,
 /// then the end of that path: nothing after it is executed.
+#[expect(
+    dead_code,
+    reason = "called only by the stubs above, which rustc does not see used"
+)]
 fn arm_reached() -> crate::Result<(CBOR, usize)> {
     kani::assert(
         false,

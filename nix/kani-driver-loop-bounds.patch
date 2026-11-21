@@ -41,7 +41,7 @@ index 0b4ec30c5..46c317432 100644
  toml = "1"
  regex = "1.11.1"
 diff --git a/kani-driver/src/args/mod.rs b/kani-driver/src/args/mod.rs
-index fe43c9770..5adcf3613 100644
+index fe43c9770..f1c38ad2a 100644
 --- a/kani-driver/src/args/mod.rs
 +++ b/kani-driver/src/args/mod.rs
 @@ -350,6 +350,19 @@ pub struct VerificationArgs {
@@ -77,7 +77,7 @@ index fe43c9770..5adcf3613 100644
              Ok(())
          };
  
-@@ -831,6 +850,32 @@ fn validate(&self) -> Result<(), Error> {
+@@ -831,6 +850,41 @@ fn validate(&self) -> Result<(), Error> {
                      "Conflicting flags: unwind flags provided to kani and in --cbmc-args.",
                  ));
              }
@@ -98,6 +98,15 @@ index fe43c9770..5adcf3613 100644
 +                        "Conflicting options: --loop-bounds requires unwinding checks.",
 +                    ));
 +                }
++                // Each harness's deadline is the policy's; a global timeout beside it would be a
++                // second, competing limit.
++                if self.harness_timeout.is_some() {
++                    return Err(Error::raw(
++                        ErrorKind::ArgumentConflict,
++                        "Conflicting options: --loop-bounds gives each harness its deadline; \
++                         --harness-timeout is refused beside it.",
++                    ));
++                }
 +                // `old` runs CBMC without the per-harness report that records the resolution.
 +                if self.output_format() == OutputFormat::Old {
 +                    return Err(Error::raw(
@@ -110,7 +119,7 @@ index fe43c9770..5adcf3613 100644
              if self.cbmc_args.contains(&OsString::from("--function")) {
                  return Err(Error::raw(
                      ErrorKind::ArgumentConflict,
-@@ -1262,6 +1307,43 @@ fn check_export_json_conflicts() {
+@@ -1262,6 +1316,45 @@ fn check_export_json_conflicts() {
          );
      }
  
@@ -146,6 +155,8 @@ index fe43c9770..5adcf3613 100644
 +             --no-default-checks",
 +            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
 +             --output-format=old",
++            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
++             --harness-timeout 30m",
 +        ] {
 +            expect_validation_error(args, ErrorKind::ArgumentConflict);
 +        }
@@ -155,10 +166,10 @@ index fe43c9770..5adcf3613 100644
      fn check_log_file_conflicts() {
          // `old` bypasses the piped-output path that populates the log, so the
 diff --git a/kani-driver/src/call_cbmc.rs b/kani-driver/src/call_cbmc.rs
-index ba8926038..3693cf7c8 100644
+index ba8926038..87aa10ee8 100644
 --- a/kani-driver/src/call_cbmc.rs
 +++ b/kani-driver/src/call_cbmc.rs
-@@ -7,7 +7,7 @@
+@@ -7,22 +7,24 @@
  use rustc_demangle::demangle;
  use std::collections::BTreeMap;
  use std::collections::btree_map::Entry;
@@ -167,7 +178,63 @@ index ba8926038..3693cf7c8 100644
  use std::fmt::Write;
  use std::path::Path;
  use std::sync::OnceLock;
-@@ -215,12 +215,45 @@ pub struct VerificationResult {
+-use std::time::{Duration, Instant};
++use std::time::Duration;
+ use strum_macros::Display;
+ use tokio::process::Command as TokioCommand;
+ 
+ use crate::args::common::Verbosity;
+ use crate::args::{OutputFormat, VerificationArgs};
+ use crate::cbmc_output_parser::{
+-    CheckStatus, ParserItem, Property, VerificationOutput, extract_results, process_cbmc_output,
++    CheckStatus, ParserItem, ProcessTermination, Property, VerificationOutput, extract_results,
++    process_cbmc_output,
+ };
+ use crate::cbmc_property_renderer::{format_coverage, format_result, kani_cbmc_output_filter};
+ use crate::coverage::cov_results::{CoverageCheck, CoverageResults};
+ use crate::coverage::cov_results::{CoverageRegion, CoverageTerm};
++use crate::loop_bounds::SolverTermination;
+ use crate::session::KaniSession;
+ use crate::util::render_command;
+ 
+@@ -150,6 +152,10 @@ fn record_seconds(value: &str, field: &mut Option<f64>) -> bool {
+     field.is_some()
+ }
+ 
++/// The prefix of the report line of a run killed at its policy deadline
++/// ([`ExitStatus::Deadline`]), followed by the deadline in milliseconds.
++pub const DEADLINE_LINE: &str = "CBMC exceeded its deadline of ";
++
+ /// We will use Cadical by default since it performed better than MiniSAT in our analysis.
+ /// Note: Kissat was marginally better, but it is an external solver which could be more unstable.
+ static DEFAULT_SOLVER: CbmcSolver = CbmcSolver::Cadical;
+@@ -174,13 +180,20 @@ pub enum FailedProperties {
+     Error,
+ }
+ 
+-/// The possible CBMC exit statuses
+-#[derive(Clone, Copy, Debug)]
++/// How a CBMC run that produced no results ended. An exit code and a signal are kept apart, and
++/// neither is read as running out of memory: nothing CBMC or the operating system reports here
++/// establishes what ended the process.
++#[derive(Clone, Debug)]
+ pub enum ExitStatus {
++    /// The run reached `--harness-timeout` and was killed.
+     Timeout,
+-    OutOfMemory,
+-    /// the integer is the process exit status
+-    Other(i32),
++    /// The run reached the deadline its `--loop-bounds` policy gives the harness and was killed;
++    /// the last status message CBMC reported before it, `None` when it reported none.
++    Deadline { milliseconds: u64, last_status_message: Option<String> },
++    /// CBMC exited with this code.
++    Exited(i32),
++    /// CBMC was terminated by this signal.
++    Signaled(i32),
+ }
+ 
+ /// Our (kani-driver) notions of CBMC results.
+@@ -215,12 +228,45 @@ pub struct VerificationResult {
  impl KaniSession {
      /// Verify a goto binary that's been prepared with goto-instrument
      pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<VerificationResult> {
@@ -216,7 +283,7 @@ index ba8926038..3693cf7c8 100644
          let verification_results = if self.args.output_format() == crate::args::OutputFormat::Old {
              if self.run_terminal_timeout(cmd).is_err() {
                  VerificationResult::mock_failure()
-@@ -233,7 +266,8 @@ pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<Verific
+@@ -233,7 +279,8 @@ pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<Verific
              // TODO: move this now that we don't use --visualize
              cmd.arg("--json-ui");
  
@@ -226,7 +293,7 @@ index ba8926038..3693cf7c8 100644
          };
  
          Ok(verification_results)
-@@ -243,15 +277,29 @@ async fn run_cbmc_piped(
+@@ -243,70 +290,65 @@ async fn run_cbmc_piped(
          &self,
          mut cmd: TokioCommand,
          harness: &HarnessMetadata,
@@ -236,6 +303,37 @@ index ba8926038..3693cf7c8 100644
          if self.args.common_args.verbose() {
              println!("[Kani] Running: `{}`", render_command(cmd.as_std()).to_string_lossy());
          }
+-        // Spawn the CBMC process and process its output below
+-        let mut cbmc_process = cmd
+-            .stdout(std::process::Stdio::piped())
+-            .spawn()
+-            .map_err(|_| anyhow::Error::msg("Failed to run cbmc"))?;
+-
+-        let start_time = Instant::now();
+-
+-        let res = if let Some(timeout) = self.args.harness_timeout {
+-            tokio::time::timeout(
+-                timeout.into(),
+-                process_cbmc_output(&mut cbmc_process, |i| {
+-                    kani_cbmc_output_filter(
+-                        i,
+-                        self.args.extra_pointer_checks,
+-                        self.args.common_args.quiet,
+-                        &self.args.output_format(),
+-                        self.args.log_file.as_ref(),
+-                    )
+-                }),
+-            )
+-            .await
+-        } else {
+-            Ok(process_cbmc_output(&mut cbmc_process, |i| {
+-                kani_cbmc_output_filter(
+-                    i,
+-                    self.args.extra_pointer_checks,
+-                    self.args.common_args.quiet,
+-                    &self.args.output_format(),
+-                    self.args.log_file.as_ref(),
+-                )
 +        cmd.stdout(std::process::Stdio::piped());
 +        // The command is complete: the launch attempt is recorded from it, immediately before it
 +        // is spawned, and a record that cannot be written stops the run before the spawn.
@@ -250,21 +348,588 @@ index ba8926038..3693cf7c8 100644
 +                file.display()
 +            ));
 +        }
-         // Spawn the CBMC process and process its output below
--        let mut cbmc_process = cmd
--            .stdout(std::process::Stdio::piped())
--            .spawn()
--            .map_err(|_| anyhow::Error::msg("Failed to run cbmc"))?;
-+        let mut cbmc_process =
-+            cmd.spawn().map_err(|error| anyhow::anyhow!("Failed to run cbmc: {error}"))?;
++        // Under `--loop-bounds`, the harness's own deadline from the policy, which requires one of
++        // every harness verified and is refused beside `--harness-timeout`; otherwise that option.
++        let deadline = self
++            .loop_bounds
++            .as_ref()
++            .map(|bounds| {
++                bounds.policy.deadline(&harness.pretty_name).cloned().ok_or_else(|| {
++                    anyhow::anyhow!("harness `{}` has no deadline", harness.pretty_name)
++                })
+             })
+-            .await)
++            .transpose()?;
++        let limit: Option<Duration> = match &deadline {
++            Some(deadline) => Some(Duration::from_millis(deadline.milliseconds)),
++            None => self.args.harness_timeout.map(Into::into),
++        };
++        let filter = |item: ParserItem| {
++            kani_cbmc_output_filter(
++                item,
++                self.args.extra_pointer_checks,
++                self.args.common_args.quiet,
++                &self.args.output_format(),
++                self.args.log_file.as_ref(),
++            )
+         };
  
-         let start_time = Instant::now();
+-        if let Ok(output) = res {
+-            // The timeout wasn't reached
+-            Ok(VerificationResult::from(
+-                output?,
+-                harness.attributes.should_panic,
+-                start_time,
+-                self.args.export_json.is_some(),
+-            ))
+-        } else {
+-            // An error occurs if the timeout was reached
+-
+-            // Kill the process
+-            cbmc_process.kill().await?;
+-
+-            Ok(VerificationResult {
+-                status: VerificationStatus::Failure,
+-                failed_properties: FailedProperties::None,
+-                results: Err(ExitStatus::Timeout),
+-                runtime: start_time.elapsed(),
+-                generated_concrete_test: false,
+-                ignored_quantifiers: 0,
+-                coverage_results: None,
+-                cbmc_stats: None,
+-            })
++        let supervised = supervise(cmd, limit, filter).await?;
++        if let (Some(evidence), Some(deadline)) = (evidence, &deadline) {
++            evidence.execution(
++                deadline.milliseconds,
++                supervised.elapsed,
++                &supervised.termination,
++            )?;
+         }
++        verification_of(
++            supervised,
++            deadline.map(|deadline| deadline.milliseconds),
++            harness.attributes.should_panic,
++            self.args.export_json.is_some(),
++        )
+     }
  
+     /// "Internal," but also used by call_cbmc_viewer
+@@ -468,6 +510,152 @@ pub fn handle_solver_args(
+     }
+ }
+ 
++/// One supervised solver execution: CBMC's output when it ran to its end, the time from
++/// immediately after its spawn to its end, and how it ended ([`SolverTermination`]).
++pub(crate) struct Supervised {
++    pub output: Option<VerificationOutput>,
++    pub elapsed: Duration,
++    pub termination: SolverTermination,
++}
++
++/// Spawn `cmd` and read its output through `filter` until it ends or `limit` passes. One
++/// monotonic start is taken immediately after the spawn returns, and the absolute deadline is
++/// computed from it; the elapsed time ends at normal completion, at the deadline's detection, or at
++/// an execution error. At the deadline, CBMC's last status message is kept, the process is killed
++/// and reaped, and the time and any error of that cleanup are recorded apart. A spawn that fails
++/// is an error: no execution began.
++pub(crate) async fn supervise(
++    mut cmd: TokioCommand,
++    limit: Option<Duration>,
++    mut filter: impl FnMut(ParserItem) -> Option<ParserItem>,
++) -> Result<Supervised> {
++    let mut child = cmd.spawn().map_err(|error| anyhow::anyhow!("Failed to run cbmc: {error}"))?;
++    let start = tokio::time::Instant::now();
++    let deadline = match limit.map(|limit| start.checked_add(limit)) {
++        Some(Some(at)) => Some(at),
++        Some(None) => {
++            let elapsed = start.elapsed();
++            let cleanup = child.kill().await;
++            return Ok(Supervised {
++                output: None,
++                elapsed,
++                termination: SolverTermination::ExecutionError {
++                    operation: "computing the deadline".to_string(),
++                    diagnostic: format!(
++                        "the deadline of {limit:?} past the start does not fit the clock{}",
++                        cleanup
++                            .err()
++                            .map(|error| format!("; terminating CBMC: {error}"))
++                            .unwrap_or_default()
++                    ),
++                },
++            });
++        }
++        None => None,
++    };
++    let last_status = std::cell::RefCell::new(None::<String>);
++    let tracked = |item: ParserItem| {
++        if let ParserItem::Message { message_text, message_type } = &item
++            && message_type == "STATUS-MESSAGE"
++        {
++            *last_status.borrow_mut() = Some(message_text.clone());
++        }
++        filter(item)
++    };
++    let read = match deadline {
++        Some(at) => tokio::time::timeout_at(at, process_cbmc_output(&mut child, tracked)).await,
++        None => Ok(process_cbmc_output(&mut child, tracked).await),
++    };
++    let elapsed = start.elapsed();
++    Ok(match read {
++        Ok(Ok(output)) => Supervised {
++            termination: match output.termination {
++                ProcessTermination::Exited { code } => SolverTermination::Exited { code },
++                ProcessTermination::Signaled { signal } => SolverTermination::Signaled { signal },
++            },
++            output: Some(output),
++            elapsed,
++        },
++        Ok(Err(error)) => Supervised {
++            output: None,
++            elapsed,
++            termination: SolverTermination::ExecutionError {
++                operation: "reading CBMC's output and reaping it".to_string(),
++                diagnostic: format!("{error:#}"),
++            },
++        },
++        Err(_) => {
++            let last_status_message = last_status.into_inner();
++            let detected = tokio::time::Instant::now();
++            let cleanup = child.kill().await;
++            Supervised {
++                output: None,
++                elapsed,
++                termination: SolverTermination::Deadline {
++                    last_status_message,
++                    cleanup_elapsed: detected.elapsed().into(),
++                    cleanup_error: cleanup.err().map(|error| error.to_string()),
++                },
++            }
++        }
++    })
++}
++
++/// The verification result of a supervised execution. Only a normal exit permits its properties
++/// to be interpreted, whatever its exit code (CBMC exits nonzero for a harness Kani verifies, its
++/// reachability checks reported as failures). A run terminated by a signal has no verdict
++/// whatever it printed: its properties may be incomplete or the signal may have interrupted a
++/// consistent run, and neither can qualify a proof or detect a planted defect; they stay in the
++/// run's log as diagnostics. A run killed at its `deadline` (`--loop-bounds`) or
++/// `--harness-timeout` has no verdict. A deadline whose cleanup failed, and an execution error,
++/// are errors: no result is accepted from them.
++pub(crate) fn verification_of(
++    supervised: Supervised,
++    deadline: Option<u64>,
++    should_panic: bool,
++    collect_cbmc_stats: bool,
++) -> Result<VerificationResult> {
++    let results = match supervised.termination {
++        SolverTermination::Exited { code } => {
++            let output = supervised
++                .output
++                .ok_or_else(|| anyhow::anyhow!("a CBMC run that exited has no output"))?;
++            return Ok(VerificationResult::from(
++                output.processed_items,
++                code,
++                should_panic,
++                supervised.elapsed,
++                collect_cbmc_stats,
++            ));
++        }
++        SolverTermination::Signaled { signal } => Err(ExitStatus::Signaled(signal)),
++        SolverTermination::Deadline { cleanup_error: Some(error), .. } => {
++            bail!("CBMC could not be terminated at its deadline: {error}")
++        }
++        SolverTermination::Deadline { last_status_message, cleanup_error: None, .. } => {
++            match deadline {
++                Some(milliseconds) => {
++                    Err(ExitStatus::Deadline { milliseconds, last_status_message })
++                }
++                None => Err(ExitStatus::Timeout),
++            }
++        }
++        SolverTermination::ExecutionError { operation, diagnostic } => {
++            bail!("CBMC's execution failed {operation}: {diagnostic}")
++        }
++    };
++    Ok(VerificationResult {
++        status: VerificationStatus::Failure,
++        failed_properties: FailedProperties::None,
++        results,
++        runtime: supervised.elapsed,
++        generated_concrete_test: false,
++        ignored_quantifiers: 0,
++        coverage_results: None,
++        cbmc_stats: None,
++    })
++}
++
+ /// Count CBMC messages reporting that a quantifier expression could not be encoded and was
+ /// dropped. CBMC's SAT-based backends only support quantifiers with constant bounds; other
+ /// quantifiers are replaced by unconstrained values, with only a low-visibility message
+@@ -497,23 +685,25 @@ fn ignored_quantifiers_error(count: usize) -> String {
+ }
+ 
+ impl VerificationResult {
+-    /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from a
+-    /// `VerificationOutput` (cbmc_output_parser's idea of CBMC results).
++    /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from
++    /// the items of a CBMC run that exited by itself with `exit_code` (cbmc_output_parser's idea
++    /// of CBMC results). Only a normal exit reaches here: a run terminated by a signal gives no
++    /// verdict whatever it printed ([`verification_of`]).
+     ///
+-    /// NOTE: We actually ignore the CBMC exit status, in favor of two checks:
++    /// NOTE: We actually ignore the CBMC exit code, in favor of two checks:
+     ///   1. Examining the actual results of CBMC properties.
+     ///      (CBMC will regularly report "failure" but that's just our cover checks.)
+     ///   2. Positively checking for the presence of results.
+     ///      (Do not mistake lack of results for success: report it as failure.)
+     fn from(
+-        output: VerificationOutput,
++        processed_items: Vec<ParserItem>,
++        exit_code: i32,
+         should_panic: bool,
+-        start_time: Instant,
++        runtime: Duration,
+         collect_cbmc_stats: bool,
+     ) -> VerificationResult {
+-        let runtime = start_time.elapsed();
+-        let ignored_quantifiers = count_ignored_quantifiers(&output.processed_items);
+-        let (remaining_items, results) = extract_results(output.processed_items);
++        let ignored_quantifiers = count_ignored_quantifiers(&processed_items);
++        let (remaining_items, results) = extract_results(processed_items);
+ 
+         // Only `--export-json` consumes these, and collecting them means running several regexes
+         // over every message CBMC emitted, so skip the work entirely when nothing will read it.
+@@ -543,15 +733,10 @@ fn from(
+             }
+         } else {
+             // We never got results from CBMC - something went wrong (e.g. crash) so it's failure
+-            let exit_status = if output.process_status == 137 {
+-                ExitStatus::OutOfMemory
+-            } else {
+-                ExitStatus::Other(output.process_status)
+-            };
+             VerificationResult {
+                 status: VerificationStatus::Failure,
+                 failed_properties: FailedProperties::Other,
+-                results: Err(exit_status),
++                results: Err(ExitStatus::Exited(exit_code)),
+                 runtime,
+                 generated_concrete_test: false,
+                 ignored_quantifiers,
+@@ -581,7 +766,7 @@ fn mock_failure() -> VerificationResult {
+             // on failure, exit codes in theory might be used,
+             // but `mock_failure` should never be used in a context where they will,
+             // so again use something weird:
+-            results: Err(ExitStatus::Other(42)),
++            results: Err(ExitStatus::Exited(42)),
+             runtime: Duration::from_secs(0),
+             generated_concrete_test: false,
+             ignored_quantifiers: 0,
+@@ -629,20 +814,36 @@ pub fn render(&self, output_format: &OutputFormat, should_panic: bool) -> String
+             Err(exit_status) => {
+                 let verification_result = console::style("FAILED").red();
+                 let (header, explanation) = match exit_status {
+-                    ExitStatus::OutOfMemory => (
+-                        String::from("CBMC failed"),
+-                        "CBMC appears to have run out of memory. You may want to rerun your proof in \
+-                    an environment with additional memory or use stubbing to reduce the size of the \
+-                    code the verifier reasons about.\n",
+-                    ),
+                     ExitStatus::Timeout => (
+                         String::from("CBMC failed"),
+-                        "CBMC timed out. You may want to rerun your proof with a larger timeout \
+-                    or use stubbing to reduce the size of the code the verifier reasons about.\n",
++                        String::from(
++                            "CBMC reached --harness-timeout and the harness has no verdict. The \
++                             run cost more than the limit: right-size the harness's domain or the \
++                             code it reasons about, or find the defect that made it cost more.\n",
++                        ),
++                    ),
++                    ExitStatus::Deadline { milliseconds, last_status_message } => (
++                        format!("{DEADLINE_LINE}{milliseconds} ms"),
++                        format!(
++                            "The run was killed at its deadline and the harness has no verdict. \
++                             It cost more than its policy allows over its supported expectation: \
++                             the harness is wrongly sized for the expectation, the expectation is \
++                             wrong, or the code it checks regressed; an expectation is never \
++                             raised solely to turn the run green. CBMC's last status message: \
++                             {}\n",
++                            last_status_message.as_deref().unwrap_or("none")
++                        ),
+                     ),
+-                    ExitStatus::Other(exit_status) => {
+-                        (format!("CBMC failed with status {exit_status}"), "")
++                    ExitStatus::Exited(code) => {
++                        (format!("CBMC failed with status {code}"), String::new())
+                     }
++                    ExitStatus::Signaled(signal) => (
++                        format!("CBMC failed: terminated by signal {signal}"),
++                        String::from(
++                            "The signal's sender is not established by its number; the harness \
++                             has no verdict.\n",
++                        ),
++                    ),
+                 };
+                 format!(
+                     "\n{header}\n\
+@@ -847,6 +1048,145 @@ fn check_cbmc_stats_absent() {
+         assert!(merge_cbmc_stats(&[]).is_none());
+     }
+ 
++    /// `script` run by `sh` under `limit`, supervised as CBMC is.
++    fn supervised(script: &str, limit: Option<Duration>) -> Supervised {
++        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++        let mut cmd = TokioCommand::new("sh");
++        cmd.args(["-c", script]).stdout(std::process::Stdio::piped());
++        runtime.block_on(supervise(cmd, limit, Some)).unwrap()
++    }
++
++    /// An exit code of 137 and a SIGKILL are different terminations, each kept as it happened,
++    /// and neither is reported as running out of memory.
++    #[test]
++    fn an_exit_and_a_signal_are_kept_apart() {
++        let exited = supervised("exit 137", None);
++        assert_eq!(exited.termination, SolverTermination::Exited { code: 137 });
++        let result = verification_of(exited, None, false, false).unwrap();
++        assert!(matches!(result.results, Err(ExitStatus::Exited(137))));
++        let rendered = result.render(&OutputFormat::Regular, false);
++        assert!(rendered.contains("CBMC failed with status 137"), "{rendered}");
++        assert!(!rendered.contains("memory"), "{rendered}");
++        let killed = supervised("kill -9 $$", None);
++        assert_eq!(killed.termination, SolverTermination::Signaled { signal: 9 });
++        let result = verification_of(killed, None, false, false).unwrap();
++        assert!(matches!(result.results, Err(ExitStatus::Signaled(9))));
++        let rendered = result.render(&OutputFormat::Regular, false);
++        assert!(rendered.contains("CBMC failed: terminated by signal 9"), "{rendered}");
++        assert!(!rendered.contains("memory"), "{rendered}");
++    }
++
++    /// A run that outlives its limit is detected at it, killed and reaped, the time to its
++    /// detection and the time of its cleanup measured apart; under a policy deadline it is a
++    /// deadline, otherwise `--harness-timeout`'s timeout, and either has no verdict.
++    #[test]
++    fn a_deadline_is_detected_then_cleaned_up_apart() {
++        let limit = Duration::from_millis(100);
++        let found = supervised("sleep 30", Some(limit));
++        assert!(
++            found.elapsed >= limit && found.elapsed < Duration::from_secs(30),
++            "{:?}",
++            found.elapsed
++        );
++        let SolverTermination::Deadline { cleanup_error: None, cleanup_elapsed, .. } =
++            &found.termination
++        else {
++            panic!("not a cleaned-up deadline: {:?}", found.termination);
++        };
++        assert!(Duration::new(cleanup_elapsed.seconds, cleanup_elapsed.nanoseconds) < limit);
++        let result = verification_of(found, Some(100), false, false).unwrap();
++        assert!(matches!(
++            result.results,
++            Err(ExitStatus::Deadline { milliseconds: 100, last_status_message: None })
++        ));
++        assert_eq!(result.status, VerificationStatus::Failure);
++        let timed_out = verification_of(supervised("sleep 30", Some(limit)), None, false, false);
++        assert!(matches!(timed_out.unwrap().results, Err(ExitStatus::Timeout)));
++    }
++
++    /// CBMC's result item of one assertion with `status`, as `--json-ui` reports it.
++    fn properties(status: &str) -> Vec<ParserItem> {
++        let item = serde_json::from_str(&format!(
++            r#"{{"result": [{{"description": "assertion failed: x", "property": "h.assertion.1",
++                "sourceLocation": {{"file": "a.rs", "function": "h", "line": "1", "column": "1"}},
++                "status": "{status}"}}]}}"#
++        ))
++        .unwrap();
++        vec![item]
++    }
++
++    /// A supervised run that ended by `termination`, CBMC having printed `items`.
++    fn ended(termination: ProcessTermination, items: Vec<ParserItem>) -> Supervised {
++        Supervised {
++            termination: match termination {
++                ProcessTermination::Exited { code } => SolverTermination::Exited { code },
++                ProcessTermination::Signaled { signal } => SolverTermination::Signaled { signal },
++            },
++            output: Some(VerificationOutput { termination, processed_items: items }),
++            elapsed: Duration::from_millis(7),
++        }
++    }
++
++    /// Only a normal exit permits property interpretation, whatever its code: exit 10 with
++    /// successful properties verifies. A signal gives no verdict whatever CBMC printed before
++    /// it, successful properties, a failed assertion or none: never a proof and never an
++    /// attributable failure.
++    #[test]
++    fn only_a_normal_exit_interprets_properties() {
++        let verified = verification_of(
++            ended(ProcessTermination::Exited { code: 10 }, properties("SUCCESS")),
++            None,
++            false,
++            false,
++        )
++        .unwrap();
++        assert_eq!(verified.status, VerificationStatus::Success);
++        assert!(verified.results.is_ok());
++        for items in [properties("SUCCESS"), properties("FAILURE"), Vec::new()] {
++            let found = verification_of(
++                ended(ProcessTermination::Signaled { signal: 9 }, items),
++                None,
++                false,
++                false,
++            )
++            .unwrap();
++            assert!(matches!(found.results, Err(ExitStatus::Signaled(9))));
++            assert_eq!(found.status, VerificationStatus::Failure);
++            assert!(matches!(found.failed_properties, FailedProperties::None));
++            assert_eq!(found.runtime, Duration::from_millis(7));
++            let rendered = found.render(&OutputFormat::Regular, false);
++            assert!(rendered.contains("CBMC failed: terminated by signal 9"), "{rendered}");
++            assert!(!rendered.contains("SUCCESSFUL") && !rendered.contains("Failed Checks"));
++        }
++    }
++
++    /// A deadline whose cleanup failed, and an execution error, are never accepted as a
++    /// termination with a result.
++    #[test]
++    fn a_failed_cleanup_or_execution_is_never_a_result() {
++        let cleanup = Supervised {
++            output: None,
++            elapsed: Duration::from_millis(5),
++            termination: SolverTermination::Deadline {
++                last_status_message: None,
++                cleanup_elapsed: Duration::ZERO.into(),
++                cleanup_error: Some("no such process".to_string()),
++            },
++        };
++        let error = verification_of(cleanup, Some(5), false, false).unwrap_err().to_string();
++        assert!(error.contains("could not be terminated at its deadline"), "{error}");
++        let execution = Supervised {
++            output: None,
++            elapsed: Duration::ZERO,
++            termination: SolverTermination::ExecutionError {
++                operation: "reading".to_string(),
++                diagnostic: "broken pipe".to_string(),
++            },
++        };
++        let error = verification_of(execution, Some(5), false, false).unwrap_err().to_string();
++        assert!(error.contains("CBMC's execution failed reading: broken pipe"), "{error}");
++    }
++
+     #[test]
+     fn check_resolve_unwind_value() {
+         // Command line unwind value for specific harnesses take precedence over default annotation value
+diff --git a/kani-driver/src/cbmc_output_parser.rs b/kani-driver/src/cbmc_output_parser.rs
+index 686ced189..5c33e4873 100644
+--- a/kani-driver/src/cbmc_output_parser.rs
++++ b/kani-driver/src/cbmc_output_parser.rs
+@@ -517,9 +517,19 @@ async fn read_output(
+     }
+ }
+ 
++/// How the CBMC process ended, as the operating system reports it: its exit code, or the signal
++/// that terminated it. The two are kept apart: an exit code of 137 is not a SIGKILL, and neither
++/// is evidence of what sent the signal.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum ProcessTermination {
++    Exited { code: i32 },
++    Signaled { signal: i32 },
++}
++
+ /// The verification output, as extracted by the CBMC output parser.
+ pub struct VerificationOutput {
+-    pub process_status: i32,
++    pub termination: ProcessTermination,
+     pub processed_items: Vec<ParserItem>,
+ }
+ 
+@@ -530,7 +540,7 @@ pub struct VerificationOutput {
+ /// In general, a filter will pre-process an item (this may or may not transform the item),
+ /// then formatted (according to the output format) and print.
+ ///
+-/// The cbmc process status is returned, along with the (post-filter) items.
++/// The cbmc process's termination is returned, along with the (post-filter) items.
+ pub async fn process_cbmc_output(
+     process: &mut Child,
+     mut eager_filter: impl FnMut(ParserItem) -> Option<ParserItem>,
+@@ -550,19 +560,17 @@ pub async fn process_cbmc_output(
+     // This will get us the process's exit code
+     let status = process.wait().await?;
+ 
+-    let process_status = match (status.code(), status.signal()) {
++    let termination = match (status.code(), status.signal()) {
+         // normal unix exit codes (cbmc uses currently 0-10)
+         // https://github.com/diffblue/cbmc/blob/develop/src/util/exit_codes.h
+-        (Some(x), _) => x,
+-        // process exited with signal (e.g. OOM-killed)
+-        // bash/zsh have a convention for translating signal number to exit code:
+-        // https://tldp.org/LDP/abs/html/exitcodes.html
+-        (_, Some(x)) => 128 + x,
+-        // I think this shouldn't happen? either exit or signal, right?
+-        (None, None) => unreachable!("Process exited with neither status code nor signal?"),
++        (Some(code), _) => ProcessTermination::Exited { code },
++        (None, Some(signal)) => ProcessTermination::Signaled { signal },
++        (None, None) => {
++            anyhow::bail!("CBMC ended with neither an exit code nor a signal: {status}")
++        }
+     };
+ 
+-    Ok(VerificationOutput { process_status, processed_items })
++    Ok(VerificationOutput { termination, processed_items })
+ }
+ 
+ /// Takes (by ownership) a vector of messages, and returns that vector with the `Result`
+diff --git a/kani-driver/src/frontend/schema_utils.rs b/kani-driver/src/frontend/schema_utils.rs
+index 00d906321..4f5126988 100644
+--- a/kani-driver/src/frontend/schema_utils.rs
++++ b/kani-driver/src/frontend/schema_utils.rs
+@@ -349,8 +349,9 @@ pub fn process_harness_results(
+                         "failed_properties_type": format!("{:?}", result.result.failed_properties),
+                         "exit_status": match &result.result.results {
+                             Err(crate::call_cbmc::ExitStatus::Timeout) => "timeout".to_string(),
+-                            Err(crate::call_cbmc::ExitStatus::OutOfMemory) => "out_of_memory".to_string(),
+-                            Err(crate::call_cbmc::ExitStatus::Other(code)) => format!("exit_code_{}", code),
++                            Err(crate::call_cbmc::ExitStatus::Deadline { .. }) => "deadline".to_string(),
++                            Err(crate::call_cbmc::ExitStatus::Exited(code)) => format!("exit_code_{}", code),
++                            Err(crate::call_cbmc::ExitStatus::Signaled(signal)) => format!("signal_{}", signal),
+                             Ok(_) => "properties_failed".to_string()
+                         }
+                     })
+diff --git a/kani-driver/src/frontend/tests/schema_utils_test.rs b/kani-driver/src/frontend/tests/schema_utils_test.rs
+index 4a46d1c8c..6d8233e00 100644
+--- a/kani-driver/src/frontend/tests/schema_utils_test.rs
++++ b/kani-driver/src/frontend/tests/schema_utils_test.rs
+@@ -218,7 +218,7 @@ fn test_add_runner_results_to_json_real() {
+     let verification_result = VerificationResult {
+         status: VerificationStatus::Failure,
+         failed_properties: FailedProperties::Other,
+-        results: Err(ExitStatus::Other(42)),
++        results: Err(ExitStatus::Exited(42)),
+         runtime: Duration::from_millis(120),
+         generated_concrete_test: false,
+         ignored_quantifiers: 0,
 diff --git a/kani-driver/src/harness_runner.rs b/kani-driver/src/harness_runner.rs
-index 0f0137025..fc4cc28a4 100644
+index 0f0137025..f4349089a 100644
 --- a/kani-driver/src/harness_runner.rs
 +++ b/kani-driver/src/harness_runner.rs
-@@ -175,20 +175,26 @@ fn process_output(
+@@ -135,8 +135,11 @@ pub(crate) fn check_all_harnesses(
+                 // Update progress indicator if active
+                 if progress_indicator.is_active() {
+                     let succeeded = result.status == VerificationStatus::Success;
+-                    let timed_out =
+-                        matches!(&result.results, Err(crate::call_cbmc::ExitStatus::Timeout));
++                    let timed_out = matches!(
++                        &result.results,
++                        Err(crate::call_cbmc::ExitStatus::Timeout
++                            | crate::call_cbmc::ExitStatus::Deadline { .. })
++                    );
+                     progress_indicator.update_with_result(succeeded, timed_out);
+                 }
+ 
+@@ -175,20 +178,26 @@ fn process_output(
              }
  
              let output = result.render(&self.args.output_format(), harness.attributes.should_panic);
@@ -298,7 +963,7 @@ index 0f0137025..fc4cc28a4 100644
      fn emit_line(&self, line: &str) {
          if let Some(ref log_file_path) = self.args.log_file {
              if let Err(e) = crate::log_file::append_line(log_file_path, line) {
-@@ -245,7 +251,7 @@ pub(crate) fn check_harness(
+@@ -245,7 +254,7 @@ pub(crate) fn check_harness(
          let thread_index = rayon::current_thread_index().unwrap_or_default();
          if !self.args.common_args.quiet {
              // If the harness is automatically generated, pretty_name refers to the function under verification.
@@ -307,7 +972,7 @@ index 0f0137025..fc4cc28a4 100644
                  // A bounded harness only explores some arguments up to a bound, so it does not
                  // check *all* possible inputs; qualify the message accordingly so a bounded run
                  // does not masquerade as exhaustive (c.f. the "(bounded)" marker in the summary).
-@@ -269,27 +275,18 @@ pub(crate) fn check_harness(
+@@ -269,27 +278,18 @@ pub(crate) fn check_harness(
                  format!("Checking harness {}...", harness.pretty_name)
              };
  
@@ -343,20 +1008,23 @@ index 0f0137025..fc4cc28a4 100644
  
 diff --git a/kani-driver/src/loop_bounds.rs b/kani-driver/src/loop_bounds.rs
 new file mode 100644
-index 000000000..520bfacc9
+index 000000000..ba7613a50
 --- /dev/null
 +++ b/kani-driver/src/loop_bounds.rs
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,1239 @@
 +// Copyright Kani Contributors
 +// SPDX-License-Identifier: Apache-2.0 OR MIT
 +
-+//! Harness-scoped loop bounds (`--loop-bounds FILE --loop-bounds-evidence DIR`,
++//! Function- and harness-scoped loop bounds (`--loop-bounds FILE --loop-bounds-evidence DIR`,
 +//! `-Z unstable-options`).
 +//!
-+//! A policy file names, per harness, loops by what the source fixes: the function holding the loop
-+//! (its pretty name, generic arguments included), the source file of that function, the number of
-+//! loops the function is expected to have, the loop's number within it, the bound, and the reason
-+//! the bound covers the harness's domain. The concrete CBMC loop identifiers are never part of the
++//! A policy file names loops by what the source fixes: the function holding the loop (its pretty
++//! name, generic arguments included), the source file of that function, the number of loops the
++//! function is expected to have, the loop's number within it, the bound, and the reason the bound
++//! holds. Each loop's bound is declared once, at the scope its reason belongs to: a bound that is a
++//! property of the code (a loop over a fixed table) is function-scoped, applied in every harness
++//! whose binary holds the function; a bound that rests on one harness's domain is that harness's.
++//! No loop is bounded in both scopes. The concrete CBMC loop identifiers are never part of the
 +//! policy: they are derived from the goto binary CBMC is about to check, after Kani's
 +//! instrumentation has rewritten it in place (harness specialization, contract instrumentation,
 +//! unused-function removal and back-edge rewriting can each change the loops a function holds).
@@ -387,13 +1055,28 @@ index 000000000..520bfacc9
 +//! copy is the one binary the harness's run reads from then on: the build directory may be
 +//! rewritten by a later run or another instrumentation of the same path without changing what was
 +//! checked, and the copy survives a refused resolution or a failed verification for replay. For
-+//! a harness the policy bounds, the discovery's invocation,
-+//! termination, stdout and stderr are written before they are parsed; then the resolution (the
-+//! harness, its policy entry, the binary's SHA-256 digest and each resolved loop with its source
-+//! location), or the error that refused it. For every harness, the final CBMC command (NUL-ended
++//! every harness, the loop discovery's invocation, termination, stdout and stderr are written
++//! before they are parsed, and the inventory is validated; for a harness the policy bounds, then
++//! the resolution (the harness, its policy entry, the binary's SHA-256 digest and each resolved
++//! loop with its source location). An inventory or resolution that is refused leaves its error
++//! (`resolution.error`). For every harness, the final CBMC command (NUL-ended
 +//! parts), the driver and solver executables (canonical path and SHA-256 digest), and the launch
 +//! attempt are recorded, in files and in the harness's report, immediately before CBMC is spawned:
 +//! a refused policy leaves its discovery and its error and no attempt.
++//!
++//! Deadlines: the policy gives every harness the run verifies its own deadline (`deadlines`, the
++//! milliseconds and the reason they follow from the harness's domain), and `--harness-timeout` is
++//! refused beside it. Every solver execution that reaches spawn records one timing record
++//! (`solver.execution.json`): the deadline it was given, the time from immediately after CBMC
++//! was spawned to its end (CBMC's output read to its end and its exit reaped, the deadline's
++//! detection, or an execution error; compilation, instrumentation, preservation and discovery
++//! come before it, rendering after), and how it ended: CBMC's exit code or signal, kept apart;
++//! the deadline, with CBMC's last status message and the separate time of its termination and
++//! reaping; or the driver's execution error. A run that reaches its deadline has no verdict. A
++//! breach shows that the harness is wrongly sized for its expectation, that the expectation is
++//! wrong, or that the code it checks regressed. An expectation is never raised solely to turn a
++//! failed run green: a correction needs its own justification, the failure is kept, and the run is
++//! repeated.
 +
 +use anyhow::{Context, Result, bail};
 +use kani_metadata::HarnessMetadata;
@@ -414,11 +1097,27 @@ index 000000000..520bfacc9
 +/// The prefix of the line recording that CBMC is about to be spawned for a harness.
 +pub const LAUNCH_LINE: &str = "CBMC launch attempt: ";
 +
-+/// A `--loop-bounds` file: the harnesses that take loop bounds of their own.
++/// A `--loop-bounds` file: the loops whose bound is a property of the code that holds them, each
++/// applied in every harness whose binary holds its function, the harnesses that take loop
++/// bounds of their own, and each harness's deadline.
 +#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 +#[serde(deny_unknown_fields)]
 +pub struct Policy {
++    pub loops: Vec<Selector>,
 +    pub harnesses: Vec<HarnessPolicy>,
++    pub deadlines: Vec<Deadline>,
++}
++
++/// The longest one harness's CBMC run may take, measured from immediately after CBMC is spawned,
++/// and why: the caller's margin over the run's supported expectation. A run that reaches it is
++/// killed and has no verdict ([`SolverTermination::Deadline`]); a deadline is never evidence of a
++/// proof, and an expectation is never raised solely to turn a failed run green.
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct Deadline {
++    pub harness: String,
++    pub milliseconds: u64,
++    pub reason: String,
 +}
 +
 +/// One harness's loop bounds, the harness named by its fully qualified pretty name.
@@ -458,61 +1157,50 @@ index 000000000..520bfacc9
 +    }
 +
 +    /// Parse and validate a policy: harnesses named once each, every harness with at least one
-+    /// bound, every bound with a reason, no loop selected twice, every selected loop number below
-+    /// its function's declared loop count, and one loop count and one file per function.
++    /// bound; in each scope, every bound with a reason, no loop selected twice, every selected
++    /// loop number below its function's declared loop count, and one loop count and one file per
++    /// function; and no loop bounded both by the function scope and by a harness.
 +    pub fn parse(text: &str) -> Result<Self> {
 +        let policy: Policy = serde_json::from_str(text)?;
++        check_selectors("the function scope", &policy.loops)?;
++        let scoped: BTreeSet<(&str, u32)> = policy
++            .loops
++            .iter()
++            .map(|selector| (selector.function.as_str(), selector.number))
++            .collect();
 +        let mut harnesses = BTreeSet::new();
 +        for entry in &policy.harnesses {
++            let scope = format!("harness `{}`", entry.harness);
 +            if !harnesses.insert(entry.harness.as_str()) {
-+                bail!("harness `{}` is named more than once", entry.harness);
++                bail!("{scope} is named more than once");
 +            }
 +            if entry.loops.is_empty() {
-+                bail!("harness `{}` declares no loop bound", entry.harness);
++                bail!("{scope} declares no loop bound");
 +            }
-+            let mut selected = BTreeSet::new();
-+            let mut functions: BTreeMap<&str, (&str, u32)> = BTreeMap::new();
-+            for selector in &entry.loops {
-+                if selector.reason.trim().is_empty() {
-+                    bail!(
-+                        "harness `{}`: the bound of loop {} of `{}` gives no reason",
-+                        entry.harness,
-+                        selector.number,
-+                        selector.function
-+                    );
-+                }
-+                if selector.number >= selector.loops_in_function {
-+                    bail!(
-+                        "harness `{}`: loop {} of `{}` is not one of its {} loop(s)",
-+                        entry.harness,
-+                        selector.number,
-+                        selector.function,
-+                        selector.loops_in_function
-+                    );
-+                }
-+                if !selected.insert((selector.function.as_str(), selector.number)) {
-+                    bail!(
-+                        "harness `{}`: loop {} of `{}` is bounded more than once",
-+                        entry.harness,
-+                        selector.number,
-+                        selector.function
-+                    );
-+                }
-+                let shape = (selector.file.as_str(), selector.loops_in_function);
-+                if let Some(previous) = functions.insert(selector.function.as_str(), shape)
-+                    && previous != shape
-+                {
-+                    bail!(
-+                        "harness `{}`: `{}` is declared both as {} loop(s) in {} and as {} loop(s) \
-+                         in {}",
-+                        entry.harness,
-+                        selector.function,
-+                        previous.1,
-+                        previous.0,
-+                        shape.1,
-+                        shape.0
-+                    );
-+                }
++            check_selectors(&scope, &entry.loops)?;
++            if let Some(both) = entry
++                .loops
++                .iter()
++                .find(|selector| scoped.contains(&(selector.function.as_str(), selector.number)))
++            {
++                bail!(
++                    "{scope}: loop {} of `{}` is bounded by the function scope too",
++                    both.number,
++                    both.function
++                );
++            }
++        }
++        let mut deadlines = BTreeSet::new();
++        for deadline in &policy.deadlines {
++            let scope = format!("the deadline of harness `{}`", deadline.harness);
++            if !deadlines.insert(deadline.harness.as_str()) {
++                bail!("{scope} is declared more than once");
++            }
++            if deadline.milliseconds == 0 {
++                bail!("{scope} is zero milliseconds");
++            }
++            if deadline.reason.trim().is_empty() {
++                bail!("{scope} gives no reason");
 +            }
 +        }
 +        Ok(policy)
@@ -528,10 +1216,20 @@ index 000000000..520bfacc9
 +            .harnesses
 +            .iter()
 +            .map(|entry| entry.harness.as_str())
++            .chain(self.deadlines.iter().map(|deadline| deadline.harness.as_str()))
 +            .filter(|name| !known.contains(name))
 +            .collect();
 +        if !unknown.is_empty() {
 +            bail!("the loop-bounds file names harnesses this run does not verify: {unknown:?}");
++        }
++        // Every harness verified has its own deadline: none falls back to an unbounded run or to
++        // another harness's.
++        let undated: Vec<&str> =
++            known.iter().copied().filter(|name| self.deadline(name).is_none()).collect();
++        if !undated.is_empty() {
++            bail!(
++                "the loop-bounds file gives no deadline to harnesses this run verifies: {undated:?}"
++            );
 +        }
 +        Ok(())
 +    }
@@ -540,13 +1238,68 @@ index 000000000..520bfacc9
 +    pub fn for_harness(&self, harness: &str) -> Option<&HarnessPolicy> {
 +        self.harnesses.iter().find(|entry| entry.harness == harness)
 +    }
++
++    /// The deadline of `harness` ([`Self::check_harnesses`] requires one of every harness a run
++    /// verifies).
++    pub fn deadline(&self, harness: &str) -> Option<&Deadline> {
++        self.deadlines.iter().find(|deadline| deadline.harness == harness)
++    }
 +}
 +
-+/// A run's loop bounds: the validated policy and the evidence directory the caller owns.
++/// The selectors of one `scope`, validated: every bound with a reason, every selected loop number
++/// below its function's declared loop count, no loop selected twice, and one loop count and one
++/// file per function.
++fn check_selectors(scope: &str, selectors: &[Selector]) -> Result<()> {
++    let mut selected = BTreeSet::new();
++    let mut functions: BTreeMap<&str, (&str, u32)> = BTreeMap::new();
++    for selector in selectors {
++        if selector.reason.trim().is_empty() {
++            bail!(
++                "{scope}: the bound of loop {} of `{}` gives no reason",
++                selector.number,
++                selector.function
++            );
++        }
++        if selector.number >= selector.loops_in_function {
++            bail!(
++                "{scope}: loop {} of `{}` is not one of its {} loop(s)",
++                selector.number,
++                selector.function,
++                selector.loops_in_function
++            );
++        }
++        if !selected.insert((selector.function.as_str(), selector.number)) {
++            bail!(
++                "{scope}: loop {} of `{}` is bounded more than once",
++                selector.number,
++                selector.function
++            );
++        }
++        let shape = (selector.file.as_str(), selector.loops_in_function);
++        if let Some(previous) = functions.insert(selector.function.as_str(), shape)
++            && previous != shape
++        {
++            bail!(
++                "{scope}: `{}` is declared both as {} loop(s) in {} and as {} loop(s) in {}",
++                selector.function,
++                previous.1,
++                previous.0,
++                shape.1,
++                shape.0
++            );
++        }
++    }
++    Ok(())
++}
++
++/// A run's loop bounds: the validated policy, the evidence directory the caller owns, and, per
++/// function-scoped selector (by index in [`Policy::loops`]), the harnesses of the run that
++/// resolved it.
 +#[derive(Debug)]
 +pub struct LoopBounds {
 +    pub policy: Policy,
 +    evidence: PathBuf,
++    applied: std::sync::Mutex<BTreeMap<usize, BTreeSet<String>>>,
 +}
 +
 +impl LoopBounds {
@@ -556,7 +1309,29 @@ index 000000000..520bfacc9
 +        if !evidence.is_dir() {
 +            bail!("the loop-bounds evidence directory {} does not exist", evidence.display());
 +        }
-+        Ok(Self { policy, evidence: evidence.to_path_buf() })
++        Ok(Self { policy, evidence: evidence.to_path_buf(), applied: Default::default() })
++    }
++
++    /// Record, once every harness of the run has been checked, each function-scoped selector
++    /// with the harnesses whose binary it bounded (`function-scope.json` in the evidence
++    /// directory, created exclusively). A selector no harness of a run resolved is recorded with
++    /// none: whether that is a loss is for the caller that knows which harnesses the run covers.
++    pub fn record_function_scope(&self) -> Result<()> {
++        let applied = self.applied.lock().expect("the applied record is never poisoned");
++        let record: Vec<serde_json::Value> = self
++            .policy
++            .loops
++            .iter()
++            .enumerate()
++            .map(|(index, selector)| {
++                serde_json::json!({
++                    "selector": selector,
++                    "harnesses": applied.get(&index).cloned().unwrap_or_default(),
++                })
++            })
++            .collect();
++        HarnessEvidence { directory: self.evidence.clone() }
++            .write("function-scope.json", serde_json::to_string_pretty(&record)?.as_bytes())
 +    }
 +
 +    /// The evidence of `harness`: its subdirectory, created exclusively.
@@ -568,31 +1343,57 @@ index 000000000..520bfacc9
 +        Ok(HarnessEvidence { directory })
 +    }
 +
-+    /// The bounds the policy declares for `harness`, resolved against `artifact`, the harness's
-+    /// preserved binary ([`HarnessEvidence::preserve_artifact`]), every step's evidence written
-+    /// into `evidence` before the next step reads it: the lines reporting the resolution, then
-+    /// the CBMC arguments applying it. `None` when the harness has no bounds.
++    /// The loop inventory of `artifact`, the harness's preserved binary
++    /// ([`HarnessEvidence::preserve_artifact`]), discovered and validated for every harness, and
++    /// the bounds that apply to `harness` resolved against it: its own entry's, and every
++    /// function-scoped selector whose function the inventory holds; every step's evidence
++    /// written into `evidence` before the next step reads it: the lines reporting the
++    /// resolution, then the CBMC arguments applying it. `None` when no bound applies, the
++    /// inventory recorded all the same.
 +    pub fn apply(
 +        &self,
 +        harness: &HarnessMetadata,
 +        artifact: &Artifact,
 +        evidence: &HarnessEvidence,
 +    ) -> Result<Option<(Vec<String>, Vec<OsString>)>> {
-+        let Some(entry) = self.policy.for_harness(&harness.pretty_name) else {
-+            return Ok(None);
-+        };
 +        let text = evidence.discover(&artifact.path)?;
++        let entry = self.policy.for_harness(&harness.pretty_name);
 +        let resolution = parse_inventory(&text).and_then(|(loops, warnings)| {
-+            let resolved = resolve(entry, &loops)?;
-+            Ok((warnings, resolved))
++            let scoped: Vec<usize> = self
++                .policy
++                .loops
++                .iter()
++                .enumerate()
++                .filter(|(_, selector)| {
++                    loops.iter().any(|listed| {
++                        listed.location.function.as_deref() == Some(selector.function.as_str())
++                    })
++                })
++                .map(|(index, _)| index)
++                .collect();
++            let selectors: Vec<&Selector> = entry
++                .into_iter()
++                .flat_map(|entry| &entry.loops)
++                .chain(scoped.iter().map(|&index| &self.policy.loops[index]))
++                .collect();
++            let resolved = resolve(&harness.pretty_name, &selectors, &loops)?;
++            Ok((warnings, scoped, resolved))
 +        });
-+        let (warnings, resolved) = match resolution {
++        let (warnings, scoped, resolved) = match resolution {
 +            Ok(resolution) => resolution,
 +            Err(error) => {
 +                evidence.write("resolution.error", format!("{error:#}\n").as_bytes())?;
 +                return Err(error);
 +            }
 +        };
++        if resolved.is_empty() {
++            return Ok(None);
++        }
++        let mut applied = self.applied.lock().expect("the applied record is never poisoned");
++        for &index in &scoped {
++            applied.entry(index).or_default().insert(harness.pretty_name.clone());
++        }
++        drop(applied);
 +        let mut lines = Vec::with_capacity(resolved.len() + warnings.len() + 1);
 +        lines.extend(warnings.iter().map(|warning| format!("Loop inventory warning: {warning}")));
 +        lines.push(format!(
@@ -604,6 +1405,7 @@ index 000000000..520bfacc9
 +        let record = serde_json::json!({
 +            "harness": harness.pretty_name,
 +            "policy": entry,
++            "function_scope": scoped.iter().map(|&index| &self.policy.loops[index]).collect::<Vec<_>>(),
 +            "artifact": { "path": artifact.path, "sha256": artifact.sha256 },
 +            "warnings": warnings,
 +            "resolved": resolved.iter().map(|entry| serde_json::json!({
@@ -615,6 +1417,45 @@ index 000000000..520bfacc9
 +        evidence.write("resolution.json", serde_json::to_string_pretty(&record)?.as_bytes())?;
 +        Ok(Some((lines, unwindset(&resolved))))
 +    }
++}
++
++/// A duration as evidence: whole seconds and the nanoseconds below one second, integers, so the
++/// record carries the driver's measurement exactly; no clock instant is recorded, since a
++/// monotonic instant means nothing outside the process that took it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
++pub struct Elapsed {
++    pub seconds: u64,
++    pub nanoseconds: u32,
++}
++
++impl From<std::time::Duration> for Elapsed {
++    fn from(duration: std::time::Duration) -> Self {
++        Self { seconds: duration.as_secs(), nanoseconds: duration.subsec_nanos() }
++    }
++}
++
++/// How one solver execution ended ([`HarnessEvidence::execution`]): CBMC's own exit or signal;
++/// killed at its deadline, with CBMC's last status message, the time from the deadline's
++/// detection through CBMC's termination and reaping, and the error of that termination if it
++/// failed; or an execution error of the driver's, with the operation that failed.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum SolverTermination {
++    Exited {
++        code: i32,
++    },
++    Signaled {
++        signal: i32,
++    },
++    Deadline {
++        last_status_message: Option<String>,
++        cleanup_elapsed: Elapsed,
++        cleanup_error: Option<String>,
++    },
++    ExecutionError {
++        operation: String,
++        diagnostic: String,
++    },
 +}
 +
 +/// One harness's evidence directory ([`LoopBounds::reserve`]).
@@ -676,6 +1517,23 @@ index 000000000..520bfacc9
 +        file.write_all(bytes)
 +            .and_then(|()| file.sync_all())
 +            .with_context(|| format!("failed to write {}", path.display()))
++    }
++
++    /// Record the harness's one solver execution (`solver.execution.json`, created exclusively):
++    /// the deadline the run was given, the time from immediately after CBMC was spawned to its
++    /// end (normal completion, the deadline's detection, or an execution error), and how it ended.
++    pub fn execution(
++        &self,
++        deadline_milliseconds: u64,
++        elapsed: std::time::Duration,
++        termination: &SolverTermination,
++    ) -> Result<()> {
++        let record = serde_json::json!({
++            "deadline_milliseconds": deadline_milliseconds,
++            "elapsed": Elapsed::from(elapsed),
++            "termination": termination,
++        });
++        self.write("solver.execution.json", serde_json::to_string_pretty(&record)?.as_bytes())
 +    }
 +
 +    /// Record the command CBMC is about to be spawned as, its program and arguments read from the
@@ -862,15 +1720,15 @@ index 000000000..520bfacc9
 +    }
 +}
 +
-+/// Resolve each of `policy`'s selectors against `loops`, the inventory of the binary CBMC is about
-+/// to check: the function's loops must number exactly as declared, all lie in the declared file,
-+/// and come from one function symbol; the selected number must be one of them; and no two
-+/// selectors may resolve to one loop. These checks do not establish which source loop a number
-+/// denotes (see the module documentation).
-+pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> {
-+    let mut resolved = Vec::with_capacity(policy.loops.len());
++/// Resolve each of `selectors`, the bounds that apply to `harness`, against `loops`, the inventory
++/// of the binary CBMC is about to check: the function's loops must number exactly as declared,
++/// all lie in the declared file, and come from one function symbol; the selected number must be
++/// one of them; and no two selectors may resolve to one loop. These checks do not establish which
++/// source loop a number denotes (see the module documentation).
++pub fn resolve(harness: &str, selectors: &[&Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
++    let mut resolved = Vec::with_capacity(selectors.len());
 +    let mut used = BTreeSet::new();
-+    for selector in &policy.loops {
++    for &selector in selectors {
 +        let candidates: Vec<&Loop> = loops
 +            .iter()
 +            .filter(|listed| {
@@ -894,7 +1752,7 @@ index 000000000..520bfacc9
 +            bail!(
 +                "harness `{}`: `{}` has {} loop(s) in the instrumented binary, the policy declares \
 +                 {}:{}",
-+                policy.harness,
++                harness,
 +                selector.function,
 +                candidates.len(),
 +                selector.loops_in_function,
@@ -907,7 +1765,7 @@ index 000000000..520bfacc9
 +        {
 +            bail!(
 +                "harness `{}`: loop `{}` of `{}` is in {}, the policy declares {}",
-+                policy.harness,
++                harness,
 +                elsewhere.name,
 +                selector.function,
 +                elsewhere.location.file.as_deref().unwrap_or("?"),
@@ -926,7 +1784,7 @@ index 000000000..520bfacc9
 +        if symbols.len() != 1 {
 +            bail!(
 +                "harness `{}`: `{}` names {} function symbols in the instrumented binary:{}",
-+                policy.harness,
++                harness,
 +                selector.function,
 +                symbols.len(),
 +                describe(&candidates)
@@ -936,14 +1794,14 @@ index 000000000..520bfacc9
 +            [one] => (*one).clone(),
 +            _ => bail!(
 +                "harness `{}`: `{}` has no loop {} in the instrumented binary:{}",
-+                policy.harness,
++                harness,
 +                selector.function,
 +                selector.number,
 +                describe(&candidates)
 +            ),
 +        };
 +        if !used.insert(listed.name.clone()) {
-+            bail!("harness `{}`: two bounds resolve to loop `{}`", policy.harness, listed.name);
++            bail!("harness `{harness}`: two bounds resolve to loop `{}`", listed.name);
 +        }
 +        resolved.push(Resolved { selector: selector.clone(), listed });
 +    }
@@ -1032,8 +1890,9 @@ index 000000000..520bfacc9
 +        }
 +    }
 +
-+    fn harness(loops: Vec<Selector>) -> HarnessPolicy {
-+        HarnessPolicy { harness: "h".to_string(), loops }
++    /// `selectors` resolved for the harness `h` against `loops`.
++    fn resolved(selectors: &[Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
++        resolve("h", &selectors.iter().collect::<Vec<_>>(), loops)
 +    }
 +
 +    #[test]
@@ -1047,11 +1906,8 @@ index 000000000..520bfacc9
 +    #[test]
 +    fn a_selector_resolves_to_its_loop_and_bound() {
 +        let (loops, _) = parse_inventory(INVENTORY).unwrap();
-+        let resolved = resolve(
-+            &harness(vec![selector("pair", 2, 1, 4), selector("count_up", 1, 0, 0)]),
-+            &loops,
-+        )
-+        .unwrap();
++        let resolved =
++            resolved(&[selector("pair", 2, 1, 4), selector("count_up", 1, 0, 0)], &loops).unwrap();
 +        assert_eq!(resolved[0].listed.name, "_RNvCs1_4demo4pair.1");
 +        assert_eq!(
 +            unwindset(&resolved),
@@ -1069,17 +1925,17 @@ index 000000000..520bfacc9
 +    #[test]
 +    fn a_selector_without_its_loop_is_refused() {
 +        let (loops, _) = parse_inventory(INVENTORY).unwrap();
-+        for (policy, expected) in [
-+            (harness(vec![selector("absent", 1, 0, 1)]), "has 0 loop(s)"),
-+            (harness(vec![selector("pair", 3, 2, 1)]), "has 2 loop(s)"),
-+            (harness(vec![selector("count_up", 2, 1, 1)]), "has 1 loop(s)"),
++        for (selectors, expected) in [
++            ([selector("absent", 1, 0, 1)], "has 0 loop(s)"),
++            ([selector("pair", 3, 2, 1)], "has 2 loop(s)"),
++            ([selector("count_up", 2, 1, 1)], "has 1 loop(s)"),
 +        ] {
-+            let error = resolve(&policy, &loops).unwrap_err().to_string();
++            let error = resolved(&selectors, &loops).unwrap_err().to_string();
 +            assert!(error.contains(expected), "{error}");
 +        }
 +        let mut elsewhere = selector("pair", 2, 0, 1);
 +        elsewhere.file = "other.rs".to_string();
-+        let error = resolve(&harness(vec![elsewhere]), &loops).unwrap_err().to_string();
++        let error = resolved(&[elsewhere], &loops).unwrap_err().to_string();
 +        assert!(error.contains("is in demo.rs"), "{error}");
 +    }
 +
@@ -1087,7 +1943,7 @@ index 000000000..520bfacc9
 +    fn two_symbols_for_one_function_are_ambiguous() {
 +        let text = INVENTORY.replace("_RNvCs1_4demo4pair.1", "_RNvCs2_4demo4pair.1");
 +        let (loops, _) = parse_inventory(&text).unwrap();
-+        let error = resolve(&harness(vec![selector("pair", 2, 0, 1)]), &loops).unwrap_err();
++        let error = resolved(&[selector("pair", 2, 0, 1)], &loops).unwrap_err();
 +        assert!(error.to_string().contains("names 2 function symbols"), "{error}");
 +    }
 +
@@ -1119,58 +1975,190 @@ index 000000000..520bfacc9
 +
 +    #[test]
 +    fn a_policy_is_validated_before_use() {
-+        let valid = r#"{"harnesses": [{"harness": "h", "loops": [
++        let valid = r#"{"loops": [
++            {"function": "count_up", "file": "demo.rs", "loops_in_function": 1, "loop": 0,
++             "bound": 0, "reason": "the code's"}
++        ], "harnesses": [{"harness": "h", "loops": [
 +            {"function": "pair", "file": "demo.rs", "loops_in_function": 2, "loop": 1, "bound": 4,
 +             "reason": "the test's"}
-+        ]}]}"#;
-+        assert_eq!(Policy::parse(valid).unwrap().harnesses[0].loops[0], selector("pair", 2, 1, 4));
++        ]}], "deadlines": [{"harness": "h", "milliseconds": 2000, "reason": "twice 1 s"}]}"#;
++        let policy = Policy::parse(valid).unwrap();
++        assert_eq!(policy.harnesses[0].loops[0], selector("pair", 2, 1, 4));
++        assert_eq!(policy.loops[0].function, "count_up");
++        assert_eq!(policy.deadline("h").unwrap().milliseconds, 2000);
++        assert!(policy.deadline("g").is_none());
 +        let entry = |loops: &str| format!(r#"{{"harness": "h", "loops": [{loops}]}}"#);
 +        let bound = |function: &str, file: &str, count: u32, number: u32| {
 +            format!(
 +                r#"{{"function": "{function}", "file": "{file}", "loops_in_function": {count}, "loop": {number}, "bound": 1, "reason": "r"}}"#
 +            )
 +        };
++        let harnesses = |entries: &str| {
++            format!(r#"{{"loops": [], "harnesses": [{entries}], "deadlines": []}}"#)
++        };
++        let deadlines = |entries: &str| {
++            format!(r#"{{"loops": [], "harnesses": [], "deadlines": [{entries}]}}"#)
++        };
 +        for (text, expected) in [
 +            (
-+                format!(
-+                    r#"{{"harnesses": [{}, {}]}}"#,
++                harnesses(&format!(
++                    "{}, {}",
 +                    entry(&bound("f", "a.rs", 1, 0)),
 +                    entry(&bound("f", "a.rs", 1, 0))
-+                ),
++                )),
 +                "named more than once",
 +            ),
-+            (format!(r#"{{"harnesses": [{}]}}"#, entry("")), "declares no loop bound"),
++            (harnesses(&entry("")), "declares no loop bound"),
++            (harnesses(&entry(&bound("f", "a.rs", 1, 1))), "is not one of its 1 loop(s)"),
 +            (
-+                format!(r#"{{"harnesses": [{}]}}"#, entry(&bound("f", "a.rs", 1, 1))),
-+                "is not one of its 1 loop(s)",
-+            ),
-+            (
-+                format!(
-+                    r#"{{"harnesses": [{}]}}"#,
-+                    entry(&format!("{}, {}", bound("f", "a.rs", 2, 0), bound("f", "a.rs", 2, 0)))
-+                ),
++                harnesses(&entry(&format!(
++                    "{}, {}",
++                    bound("f", "a.rs", 2, 0),
++                    bound("f", "a.rs", 2, 0)
++                ))),
 +                "bounded more than once",
 +            ),
 +            (
-+                format!(
-+                    r#"{{"harnesses": [{}]}}"#,
-+                    entry(&format!("{}, {}", bound("f", "a.rs", 2, 0), bound("f", "b.rs", 2, 1)))
-+                ),
++                harnesses(&entry(&format!(
++                    "{}, {}",
++                    bound("f", "a.rs", 2, 0),
++                    bound("f", "b.rs", 2, 1)
++                ))),
 +                "is declared both as",
 +            ),
 +            (
-+                format!(
-+                    r#"{{"harnesses": [{}]}}"#,
-+                    entry(
-+                        &bound("f", "a.rs", 1, 0).replace(r#""reason": "r""#, r#""reason": " ""#)
-+                    )
-+                ),
++                harnesses(&entry(
++                    &bound("f", "a.rs", 1, 0).replace(r#""reason": "r""#, r#""reason": " ""#),
++                )),
 +                "gives no reason",
 +            ),
-+            (r#"{"harnesses": [], "unknown": 1}"#.to_string(), "unknown field"),
++            (
++                format!(
++                    r#"{{"loops": [{}, {}], "harnesses": [], "deadlines": []}}"#,
++                    bound("f", "a.rs", 1, 0),
++                    bound("f", "a.rs", 1, 0)
++                ),
++                "the function scope: loop 0 of `f` is bounded more than once",
++            ),
++            (
++                format!(
++                    r#"{{"loops": [{}], "harnesses": [{}], "deadlines": []}}"#,
++                    bound("f", "a.rs", 1, 0),
++                    entry(&bound("f", "a.rs", 1, 0))
++                ),
++                "is bounded by the function scope too",
++            ),
++            (
++                deadlines(
++                    r#"{"harness": "h", "milliseconds": 1, "reason": "r"},
++                       {"harness": "h", "milliseconds": 2, "reason": "r"}"#,
++                ),
++                "the deadline of harness `h` is declared more than once",
++            ),
++            (
++                deadlines(r#"{"harness": "h", "milliseconds": 0, "reason": "r"}"#),
++                "the deadline of harness `h` is zero milliseconds",
++            ),
++            (
++                deadlines(r#"{"harness": "h", "milliseconds": 1, "reason": " "}"#),
++                "the deadline of harness `h` gives no reason",
++            ),
++            (r#"{"harnesses": [], "deadlines": []}"#.to_string(), "missing field `loops`"),
++            (r#"{"loops": [], "harnesses": []}"#.to_string(), "missing field `deadlines`"),
++            (
++                r#"{"loops": [], "harnesses": [], "deadlines": [], "unknown": 1}"#.to_string(),
++                "unknown field",
++            ),
 +        ] {
 +            let found = format!("{:#}", Policy::parse(&text).unwrap_err());
 +            assert!(found.contains(expected), "{expected}: {found}");
++        }
++    }
++
++    /// Every harness a run verifies has its own deadline, and every deadline names one of them:
++    /// a harness without one, or a deadline of a harness the run does not verify, is refused.
++    #[test]
++    fn every_verified_harness_has_its_deadline() {
++        let policy = |names: &[&str]| {
++            let deadlines: Vec<String> = names
++                .iter()
++                .map(|name| format!(r#"{{"harness": "{name}", "milliseconds": 1, "reason": "r"}}"#))
++                .collect();
++            Policy::parse(&format!(
++                r#"{{"loops": [], "harnesses": [], "deadlines": [{}]}}"#,
++                deadlines.join(", ")
++            ))
++            .unwrap()
++        };
++        let a = crate::metadata::tests::mock_proof_harness("a", None, None, None);
++        let b = crate::metadata::tests::mock_proof_harness("b", None, None, None);
++        policy(&["a", "b"]).check_harnesses(&[&a, &b]).unwrap();
++        let undated = policy(&["a"]).check_harnesses(&[&a, &b]).unwrap_err().to_string();
++        assert!(
++            undated.contains(r#"gives no deadline to harnesses this run verifies: ["b"]"#),
++            "{undated}"
++        );
++        let unknown = policy(&["a", "c"]).check_harnesses(&[&a]).unwrap_err().to_string();
++        assert!(
++            unknown.contains(r#"names harnesses this run does not verify: ["c"]"#),
++            "{unknown}"
++        );
++    }
++
++    /// The execution record holds the deadline, the exact elapsed duration as integer seconds and
++    /// nanoseconds, and the tagged termination; it is created once, and a second record is
++    /// refused with the first left as it was.
++    #[test]
++    fn an_execution_is_recorded_once_exactly() {
++        let root = tempfile::tempdir().unwrap();
++        let evidence = HarnessEvidence { directory: root.path().to_path_buf() };
++        let termination = SolverTermination::Deadline {
++            last_status_message: Some("Running Symex".to_string()),
++            cleanup_elapsed: Elapsed { seconds: 0, nanoseconds: 2_000_001 },
++            cleanup_error: None,
++        };
++        evidence.execution(2000, std::time::Duration::new(2, 123_456_789), &termination).unwrap();
++        let path = root.path().join("solver.execution.json");
++        let first = std::fs::read(&path).unwrap();
++        let record: serde_json::Value = serde_json::from_slice(&first).unwrap();
++        assert_eq!(
++            record,
++            serde_json::json!({
++                "deadline_milliseconds": 2000,
++                "elapsed": {"seconds": 2, "nanoseconds": 123_456_789},
++                "termination": {
++                    "kind": "deadline",
++                    "last_status_message": "Running Symex",
++                    "cleanup_elapsed": {"seconds": 0, "nanoseconds": 2_000_001},
++                    "cleanup_error": null,
++                },
++            })
++        );
++        let again = evidence.execution(
++            1,
++            std::time::Duration::ZERO,
++            &SolverTermination::Exited { code: 0 },
++        );
++        assert!(format!("{:#}", again.unwrap_err()).starts_with("failed to create"));
++        assert_eq!(std::fs::read(&path).unwrap(), first);
++        for (termination, json) in [
++            (
++                SolverTermination::Exited { code: 137 },
++                serde_json::json!({"kind": "exited", "code": 137}),
++            ),
++            (
++                SolverTermination::Signaled { signal: 9 },
++                serde_json::json!({"kind": "signaled", "signal": 9}),
++            ),
++            (
++                SolverTermination::ExecutionError {
++                    operation: "o".to_string(),
++                    diagnostic: "d".to_string(),
++                },
++                serde_json::json!({"kind": "execution_error", "operation": "o", "diagnostic": "d"}),
++            ),
++        ] {
++            assert_eq!(serde_json::to_value(&termination).unwrap(), json);
 +        }
 +    }
 +
@@ -1264,7 +2252,7 @@ index 000000000..520bfacc9
 +    }
 +}
 diff --git a/kani-driver/src/main.rs b/kani-driver/src/main.rs
-index e6ed618e1..5eedd86c3 100644
+index e6ed618e1..c220d6ded 100644
 --- a/kani-driver/src/main.rs
 +++ b/kani-driver/src/main.rs
 @@ -40,6 +40,7 @@
@@ -1284,6 +2272,32 @@ index e6ed618e1..5eedd86c3 100644
 +    }
      let harnesses = session.determine_targets(project.get_all_harnesses())?;
      debug!(n = harnesses.len(), ?harnesses, "verify_project");
+ 
+@@ -199,6 +203,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
+     // Verification
+     let runner = harness_runner::HarnessRunner { sess: &session, project: &project };
+     let results = runner.check_all_harnesses(&harnesses, handler.as_mut())?;
++    if let Some(bounds) = &session.loop_bounds {
++        bounds.record_function_scope()?;
++    }
+ 
+     if let Some(handler) = handler.as_mut() {
+         // Process harness results and add additional metadata using frontend utility function
+diff --git a/kani-driver/src/sarif.rs b/kani-driver/src/sarif.rs
+index bae13621d..617e7de5a 100644
+--- a/kani-driver/src/sarif.rs
++++ b/kani-driver/src/sarif.rs
+@@ -241,8 +241,9 @@ fn sarif_level(status: &CheckStatus) -> Option<&'static str> {
+ fn exit_status_rule(exit_status: &ExitStatus) -> (&'static str, &'static str) {
+     match exit_status {
+         ExitStatus::Timeout => ("kani.cbmc.timeout", "CBMC timed out"),
+-        ExitStatus::OutOfMemory => ("kani.cbmc.oom", "CBMC ran out of memory"),
+-        ExitStatus::Other(_) => ("kani.cbmc.failed", "CBMC failed"),
++        ExitStatus::Deadline { .. } => ("kani.cbmc.deadline", "CBMC exceeded its deadline"),
++        ExitStatus::Exited(_) => ("kani.cbmc.failed", "CBMC failed"),
++        ExitStatus::Signaled(_) => ("kani.cbmc.signaled", "CBMC was terminated by a signal"),
+     }
+ }
  
 diff --git a/kani-driver/src/session.rs b/kani-driver/src/session.rs
 index 500679d0c..604e14c02 100644

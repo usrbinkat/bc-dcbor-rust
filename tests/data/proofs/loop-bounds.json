@@ -1,4 +1,14 @@
 {
+  "loops": [
+    {
+      "function": "bounded::text::Normalizer::<'_, bounded::proof_budget::Counting>::release",
+      "file": "src/bounded/text.rs",
+      "loops_in_function": 4,
+      "loop": 1,
+      "bound": 257,
+      "reason": "The prefix sum over the counting pass's offsets (text.rs, Normalizer::release, `for offset in &mut offsets`) iterates once per combining class, CLASSES = 256 (text.rs:68), whatever the text: its backward goto is taken at most 256 times, and bound 257 lets the 256th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 257th. The bound is a property of the code, not of any harness's domain."
+    }
+  ],
   "harnesses": [
     {
       "harness": "bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source",

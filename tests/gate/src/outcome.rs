@@ -340,9 +340,25 @@ pub const KANI_UNWINDING: &str = "Verification output shows one or more unwindin
 /// timeout reached) or `CBMC failed with status N`, in 0.68.0 and on main
 /// (5d80a64); `CBMC did not finish reporting its results (exit status N)`,
 /// main's `IncompleteResults`, a result array without CBMC's overall
-/// status. Kani counts such a harness among its failures, though no
-/// property's result is read.
-pub const KANI_NO_RESULTS: [&str; 2] = ["CBMC failed", "CBMC did not finish reporting its results"];
+/// status; and [`KANI_DEADLINE`], the patched driver's report of a run
+/// killed at the deadline its policy gives the harness. Kani counts such a
+/// harness among its failures, though no property's result is read.
+pub const KANI_NO_RESULTS: [&str; 3] = [
+    "CBMC failed",
+    "CBMC did not finish reporting its results",
+    KANI_DEADLINE,
+];
+
+/// The report line of a harness killed at its deadline, followed by the
+/// deadline in milliseconds (nix/kani-driver-loop-bounds.patch,
+/// `call_cbmc.rs` `DEADLINE_LINE`).
+pub const KANI_DEADLINE: &str = "CBMC exceeded its deadline of ";
+
+/// The report line of a harness whose CBMC run a signal terminated, followed
+/// by the signal's number (nix/kani-driver-loop-bounds.patch, `call_cbmc.rs`
+/// `render`, `ExitStatus::Signaled`): no verdict whatever CBMC printed, its
+/// `CBMC failed` opening one of [`KANI_NO_RESULTS`].
+pub const KANI_SIGNAL: &str = "CBMC failed: terminated by signal ";
 
 /// Kani's report that the solver dropped a quantifier it could not encode
 /// (kani-driver `call_cbmc.rs` `ignored_quantifiers_error`, 0.68.0 and
@@ -442,6 +458,14 @@ pub(crate) mod fixtures {
                 "CBMC appears to have run out of memory. You may want to rerun your proof in an environment with additional memory or use stubbing to reduce the size of the code the verifier reasons about.\n",
             ),
             ("CBMC failed with status 6", ""),
+            (
+                "CBMC exceeded its deadline of 2000 ms",
+                "The run was killed at its deadline and the harness has no verdict.\n",
+            ),
+            (
+                "CBMC failed: terminated by signal 9",
+                "The signal's sender is not established by its number; the harness has no verdict.\n",
+            ),
             ("", ""),
             ("checker stopped without usable results", ""),
             (" ** 1 of 3 failed\nCBMC failed", ""),

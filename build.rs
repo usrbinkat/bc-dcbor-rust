@@ -12,13 +12,49 @@
 //! A malformed file, a header naming another version than its directory,
 //! or any number of version directories but one, fails the build naming
 //! what it found.
+//!
+//! It also writes the Kani harness instances of `tests/data/proofs/
+//! instances.rs`, the one declaration the gate's census reads too, each
+//! family's into `$OUT_DIR/proof_instances/`, which the family's file
+//! includes under `cfg(kani)`.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The one declaration of the Kani harness instances, shared with the
+/// gate's census.
+#[path = "tests/data/proofs/instances.rs"]
+mod instances;
+
 /// The directory holding one directory per Unicode version.
 const UNICODE_DATA: &str = "data/unicode";
+
+/// Each family's instances ([`instances::FAMILIES`]) written to
+/// `$OUT_DIR/proof_instances/`, for its file to include; a declaration
+/// [`instances::instances`] refuses fails the build naming its fault.
+fn proof_instances(out_dir: &Path) {
+    println!("cargo:rerun-if-changed=tests/data/proofs/instances.rs");
+    let directory = out_dir.join("proof_instances");
+    fs::create_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("{} cannot be created: {error}", directory.display()));
+    for family in instances::FAMILIES {
+        println!("cargo:rerun-if-changed={}", family.file);
+        let text = fs::read_to_string(family.file)
+            .unwrap_or_else(|error| panic!("{} cannot be read: {error}", family.file));
+        let inclusion = instances::inclusion(family);
+        if text.matches(inclusion.as_str()).count() != 1 {
+            panic!(
+                "{} ({}) must include its generated instances once: {inclusion}",
+                family.file, family.module
+            );
+        }
+        let source = instances::generated(family).unwrap_or_else(|fault| panic!("{fault}"));
+        let target = directory.join(family.generated);
+        fs::write(&target, source)
+            .unwrap_or_else(|error| panic!("{} cannot be written: {error}", target.display()));
+    }
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -62,6 +98,7 @@ fn main() {
     let target = out_dir.join("unicode_assigned.rs");
     fs::write(&target, out)
         .unwrap_or_else(|error| panic!("{} cannot be written: {error}", target.display()));
+    proof_instances(&out_dir);
 }
 
 /// The one version directory under `root`; none, or more than one, fails

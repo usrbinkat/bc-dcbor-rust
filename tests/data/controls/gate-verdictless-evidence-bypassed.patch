@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -650,7 +650,7 @@
+         // owes. One refused before launch (its policy's resolution) owes none
+         // and may report no verification result; one launched owes all of it,
+         // verdict or not, validated before its report is read.
+-        if !at.join("solver.attempt").exists() {
++        if !verified || !at.join("solver.attempt").exists() {
+             if verified {
+                 return Err(format!(
+                     "harness {name}: its report has a verification result, but its solver was \

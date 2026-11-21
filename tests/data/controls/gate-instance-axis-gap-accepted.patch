@@ -1,0 +1,11 @@
+--- tests/data/proofs/instances.rs
++++ tests/data/proofs/instances.rs
+@@ -130,7 +130,7 @@
+ /// `values`, which must be every value from 0 through its largest once, in
+ /// order: the axis covers its domain exactly.
+ fn covering(family: &Family, axis: &str, values: &[usize]) -> Result<(), String> {
+-    if values.is_empty() || values.iter().copied().ne(0..values.len()) {
++    if values.is_empty() {
+         return Err(format!(
+             "{}: its {axis} {values:?} are not every value from 0 through the largest, once each",
+             family.file

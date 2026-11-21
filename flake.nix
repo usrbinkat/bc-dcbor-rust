@@ -278,13 +278,45 @@
             # (`toolchain_shorthand`); rustup sets it, this build does not.
             env.RUSTUP_TOOLCHAIN = kaniRelease.toolchainChannel;
           };
-          # The policies the install check runs the bundle under, one bound
-          # of nix/kani-loop-bounds.rs's one loop each.
+          # The policies the install check runs the bundle under: POLICY's
+          # function scope and harness entries, each empty unless given, and
+          # a deadline of each harness of nix/kani-loop-bounds.rs. Each
+          # harness's CBMC run takes under a second (a loop of at most three
+          # iterations, a formula of a few hundred steps); a minute is the
+          # guard of a run gone wrong, not an expectation the check measures.
+          kaniPolicy =
+            name: policy:
+            (pkgs.formats.json { }).generate "kani-loop-bounds-${name}.json" (
+              pkgs.lib.recursiveUpdate {
+                loops = [ ];
+                harnesses = [ ];
+                deadlines =
+                  map
+                    (harness: {
+                      inherit harness;
+                      milliseconds = 60000;
+                      reason = "a loop of at most three iterations, verified in under a second";
+                    })
+                    [
+                      "counts_to_its_limit"
+                      "sums_without_a_local_bound"
+                    ];
+              } policy
+            );
+          # A policy of one harness entry, bounding LOOPS of HARNESS.
           kaniLoopBounds =
             name: harness: loops:
-            (pkgs.formats.json { }).generate "kani-loop-bounds-${name}.json" {
-              harnesses = [ { inherit harness loops; } ];
-            };
+            kaniPolicy name { harnesses = [ { inherit harness loops; } ]; };
+          # sum_to's loop, bounded in the function scope: a property of
+          # sum_to under every caller's n <= 3.
+          sumTo = {
+            function = "sum_to";
+            file = "bounds.rs";
+            loops_in_function = 1;
+            loop = 0;
+            bound = 4;
+            reason = "sum_to's loop takes its backward goto once per body execution, at most three times under its callers' n <= 3, and CBMC stops at the arrival whose count reaches the bound: bound 4 lets the third backedge reach the exit evaluation, and the unwinding assertion checks no fourth is taken";
+          };
           countUp =
             fields:
             pkgs.lib.recursiveUpdate {
@@ -391,8 +423,10 @@
             # (share/kani-checks/loop-bounds/CASE) and its report printed
             # into the build log, whatever the outcome; a case is accepted on
             # its exit status, the report lines that establish it, and its
-            # evidence: a case that reaches CBMC records its launch, a refused
-            # policy records none.
+            # evidence: a case that reaches CBMC records counts_to_its_limit's
+            # launch, a policy refused for it records none; a refusal is the
+            # harness's own, so the other harness of bounds.rs is verified
+            # all the same.
             postInstallCheck = (old.postInstallCheck or "") + ''
               export HOME=$TMPDIR
               cp ${./nix/kani-loop-bounds.rs} bounds.rs
@@ -434,7 +468,7 @@
                     refuse $name "no reported solver launch"
                 else
                   [[ ! -e $attempt ]] || refuse $name "a refused policy recorded a solver launch"
-                  ! grep -F -q 'CBMC launch attempt:' $case/report.log ||
+                  ! grep -F -q 'CBMC launch attempt: counts_to_its_limit' $case/report.log ||
                     refuse $name "a refused policy reported a solver launch"
                 fi
               }
@@ -457,34 +491,70 @@
                 }
               verify unknown-harness 1 'names harnesses this run does not verify' \
                 no ${kaniLoopBounds "unknown-harness" "absent" [ (countUp { }) ]}
-              # The refused resolutions kept the discovery they refused.
-              for refused in absent miscounted; do
-                for kept in discovery.arguments discovery.status discovery.stdout discovery.stderr resolution.error; do
-                  [[ -f $checks/$refused/evidence/counts_to_its_limit/$kept ]] ||
-                    refuse $refused "no $kept in its evidence"
-                done
-              done
-              # The resolved runs kept their discovery, resolution, command,
-              # executables and launch.
-              for resolved in sufficient insufficient; do
-                for kept in discovery.arguments discovery.status discovery.stdout discovery.stderr \
-                  resolution.json solver.arguments solver.identity solver.attempt; do
-                  [[ -f $checks/$resolved/evidence/counts_to_its_limit/$kept ]] ||
-                    refuse $resolved "no $kept in its evidence"
-                done
-              done
-              # preserved NAME: the case's instrumented binary was preserved
-              # before anything read it, and outlived the run whatever its
-              # outcome: artifact.out and artifact.json exist, the record
-              # names that copy and an absolute build path outside the
-              # evidence, the copy's bytes have the recorded digest, and the
-              # loop discovery read the copy, never the build path.
+              # A function-scoped bound of sum_to's loop, no harness entry:
+              # it applies in the harness whose binary holds sum_to.
+              verify function-scoped 0 $'Loop bound: sum_to loop 0 of 1 at bounds.rs:\nunwound to 4\nVERIFICATION:- SUCCESSFUL' \
+                yes ${kaniPolicy "function-scoped" { loops = [ sumTo ]; }}
+              # A deadline CBMC cannot meet: counts_to_its_limit's run is
+              # killed at 1 ms and has no verdict; the other harness, under its
+              # own deadline, verifies all the same.
+              verify deadline-breach 1 $'CBMC exceeded its deadline of 1 ms\nComplete - 1 successfully verified harnesses, 1 failures, 2 total.' \
+                yes ${
+                  kaniPolicy "deadline-breach" {
+                    deadlines = [
+                      {
+                        harness = "counts_to_its_limit";
+                        milliseconds = 1;
+                        reason = "below CBMC's start-up: the run cannot meet it";
+                      }
+                      {
+                        harness = "sums_without_a_local_bound";
+                        milliseconds = 60000;
+                        reason = "a loop of at most three iterations, verified in under a second";
+                      }
+                    ];
+                  }
+                }
+              # A policy that dates one harness and not the other is refused
+              # before any solver runs.
+              verify undated 1 'gives no deadline to harnesses this run verifies: ["sums_without_a_local_bound"]' \
+                no ${
+                  kaniPolicy "undated" {
+                    deadlines = [
+                      {
+                        harness = "counts_to_its_limit";
+                        milliseconds = 60000;
+                        reason = "a loop of at most three iterations, verified in under a second";
+                      }
+                    ];
+                  }
+                }
+              # The evidence of each harness of each case, one check per
+              # property. CASE names a case, HARNESS a harness of
+              # bounds.rs; its evidence is the case's directory for it.
               jq=${pkgs.lib.getExe pkgs.jq}
+              discovery=(discovery.arguments discovery.status discovery.stdout discovery.stderr)
+              solver=(solver.arguments solver.identity solver.attempt solver.execution.json)
+              part() {
+                tr '\0' '\n' <"$1" | grep -F -x -q -- "$2"
+              }
+              # holds CASE HARNESS FILE...: each file is in the evidence.
+              holds() {
+                local name=$1 at=$checks/$1/evidence/$2 kept
+                shift 2
+                for kept in "$@"; do
+                  [[ -f $at/$kept ]] || refuse $name "no $kept in its evidence"
+                done
+              }
+              # preserved CASE HARNESS: the instrumented binary was preserved
+              # before anything read it and outlived the run whatever its
+              # outcome: the record names the copy and an absolute build path
+              # outside the evidence, the copy's bytes have the recorded
+              # digest, and the loop discovery read the copy, never the
+              # build path.
               preserved() {
-                local name=$1 at=$checks/$1/evidence/counts_to_its_limit
-                local path digest source
-                [[ -f $at/artifact.out && -f $at/artifact.json ]] ||
-                  refuse $name "no preserved artifact in its evidence"
+                local name=$1 at=$checks/$1/evidence/$2 path digest source
+                holds $name $2 artifact.out artifact.json
                 path=$($jq -er .path $at/artifact.json) || refuse $name "artifact.json names no path"
                 digest=$($jq -er .sha256 $at/artifact.json) || refuse $name "artifact.json records no digest"
                 source=$($jq -er .source $at/artifact.json) || refuse $name "artifact.json records no build path"
@@ -493,32 +563,171 @@
                   refuse $name "artifact.json's build path $source is not outside its evidence"
                 [[ $(sha256sum <$at/artifact.out) == "$digest  -" ]] ||
                   refuse $name "the preserved bytes do not have the recorded digest $digest"
-                tr '\0' '\n' <$at/discovery.arguments | grep -F -x -q -- "$path" ||
+                part $at/discovery.arguments "$path" ||
                   refuse $name "the loop discovery did not read the preserved artifact"
-                ! tr '\0' '\n' <$at/discovery.arguments | grep -F -x -q -- "$source" ||
+                ! part $at/discovery.arguments "$source" ||
                   refuse $name "the loop discovery read the build path"
               }
-              # A refused resolution keeps the artifact it refused.
+              # solved CASE HARNESS: the solver ran on the preserved copy,
+              # never the build path.
+              solved() {
+                local name=$1 at=$checks/$1/evidence/$2
+                part $at/solver.arguments "$($jq -er .path $at/artifact.json)" ||
+                  refuse $name "the solver did not run on the preserved artifact"
+                ! part $at/solver.arguments "$($jq -er .source $at/artifact.json)" ||
+                  refuse $name "the solver ran on the build path"
+              }
+              # A refused resolution keeps its discovery, its error and the
+              # artifact it refused.
               for refused in absent miscounted; do
-                preserved $refused
+                holds $refused counts_to_its_limit "''${discovery[@]}" resolution.error
+                preserved $refused counts_to_its_limit
               done
-              # A resolved run resolved and solved the preserved artifact:
-              # the solver ran on the copy, never the build path, and
-              # resolution.json names the copy with its recorded digest.
               for resolved in sufficient insufficient; do
-                preserved $resolved
+                # The bounded harness resolved and solved its preserved
+                # artifact, its resolution naming the copy and its digest.
                 at=$checks/$resolved/evidence/counts_to_its_limit
-                path=$($jq -er .path $at/artifact.json)
-                source=$($jq -er .source $at/artifact.json)
-                tr '\0' '\n' <$at/solver.arguments | grep -F -x -q -- "$path" ||
-                  refuse $resolved "the solver did not run on the preserved artifact"
-                ! tr '\0' '\n' <$at/solver.arguments | grep -F -x -q -- "$source" ||
-                  refuse $resolved "the solver ran on the build path"
+                holds $resolved counts_to_its_limit "''${discovery[@]}" resolution.json "''${solver[@]}"
+                preserved $resolved counts_to_its_limit
+                solved $resolved counts_to_its_limit
                 $jq -e --slurpfile record $at/artifact.json \
                   '.artifact == {path: $record[0].path, sha256: $record[0].sha256}' \
                   $at/resolution.json >/dev/null ||
                   refuse $resolved "resolution.json names another artifact than artifact.json"
+                # The harness the policy does not bound keeps the same
+                # evidence but a resolution: its loop inventory lists
+                # sum_to's loop, and its solver runs with no local bound.
+                at=$checks/$resolved/evidence/sums_without_a_local_bound
+                holds $resolved sums_without_a_local_bound "''${discovery[@]}" "''${solver[@]}"
+                preserved $resolved sums_without_a_local_bound
+                solved $resolved sums_without_a_local_bound
+                [[ ! -e $at/resolution.json ]] ||
+                  refuse $resolved "the unbounded harness has a resolution"
+                $jq -e '[.[] | select(.loops) | .loops[] | select(.sourceLocation.function == "sum_to")] | length == 1' \
+                  $at/discovery.stdout >/dev/null ||
+                  refuse $resolved "the unbounded harness's inventory does not list sum_to's loop"
+                ! part $at/solver.arguments --unwindset ||
+                  refuse $resolved "the unbounded harness's solver ran with a local bound"
               done
+              # The function-scoped bound resolved in sums_without_a_local_bound
+              # alone: its resolution records no harness entry and the
+              # policy's selector, its solver runs with that loop's bound,
+              # and counts_to_its_limit, whose binary has no sum_to, has no
+              # resolution and no local bound. The run's function-scope.json
+              # names the selector with that one harness.
+              scoped=$checks/function-scoped
+              at=$scoped/evidence/sums_without_a_local_bound
+              holds function-scoped sums_without_a_local_bound "''${discovery[@]}" resolution.json "''${solver[@]}"
+              preserved function-scoped sums_without_a_local_bound
+              solved function-scoped sums_without_a_local_bound
+              $jq -e --slurpfile policy $scoped/policy.json \
+                '.policy == null and .function_scope == $policy[0].loops and ([.resolved[].selector] == $policy[0].loops)' \
+                $at/resolution.json >/dev/null ||
+                refuse function-scoped "resolution.json does not record the function-scoped selector alone"
+              loop=$($jq -er '.resolved[0].loop' $at/resolution.json) ||
+                refuse function-scoped "resolution.json resolves no loop"
+              part $at/solver.arguments --unwindset && part $at/solver.arguments "$loop:4" ||
+                refuse function-scoped "the solver did not run with $loop:4"
+              at=$scoped/evidence/counts_to_its_limit
+              holds function-scoped counts_to_its_limit "''${discovery[@]}" "''${solver[@]}"
+              [[ ! -e $at/resolution.json ]] ||
+                refuse function-scoped "counts_to_its_limit resolved the function-scoped bound"
+              ! part $at/solver.arguments --unwindset ||
+                refuse function-scoped "counts_to_its_limit's solver ran with a local bound"
+              [[ -f $scoped/evidence/function-scope.json ]] ||
+                refuse function-scoped "no function-scope.json"
+              $jq -e --slurpfile policy $scoped/policy.json \
+                '. == [{selector: $policy[0].loops[0], harnesses: ["sums_without_a_local_bound"]}]' \
+                $scoped/evidence/function-scope.json >/dev/null ||
+                refuse function-scoped "function-scope.json does not name the selector with sums_without_a_local_bound"
+              # Every spawned solver execution recorded its one timing record:
+              # the killed run its 1 ms deadline, a duration of at least it,
+              # and its deadline termination with the cleanup timed apart; the
+              # harness that met its deadline its 60000 ms deadline and an
+              # exit of CBMC's own. Its exit code is CBMC's, recorded as it
+              # was: CBMC reports Kani's reachability checks as failed
+              # properties and exits nonzero for a harness Kani verifies
+              # (kani-driver call_cbmc.rs, `VerificationResult::from`), so the
+              # code is not asserted here.
+              breach=$checks/deadline-breach/evidence
+              holds deadline-breach counts_to_its_limit solver.execution.json "''${solver[@]}"
+              $jq -e '.deadline_milliseconds == 1
+                  and (.elapsed.seconds * 1000000000 + .elapsed.nanoseconds) >= 1000000
+                  and .termination.kind == "deadline"
+                  and .termination.cleanup_error == null
+                  and (.termination.cleanup_elapsed.nanoseconds < 1000000000)' \
+                $breach/counts_to_its_limit/solver.execution.json >/dev/null ||
+                refuse deadline-breach "solver.execution.json does not record the 1 ms deadline it was killed at"
+              holds deadline-breach sums_without_a_local_bound solver.execution.json
+              $jq -e '.deadline_milliseconds == 60000
+                  and (.termination | keys) == ["code", "kind"]
+                  and .termination.kind == "exited"
+                  and (.termination.code | type) == "number"' \
+                $breach/sums_without_a_local_bound/solver.execution.json >/dev/null ||
+                refuse deadline-breach "the harness that met its deadline did not record its exit"
+              # A normal exit permits property interpretation whatever its code:
+              # the sufficient case verified, and its run exited 10, CBMC's
+              # exit for a run whose properties include Kani's failed
+              # reachability checks (CPROVER_EXIT_VERIFICATION_UNSAFE).
+              $jq -e '.termination == {kind: "exited", code: 10}' \
+                $checks/sufficient/evidence/counts_to_its_limit/solver.execution.json >/dev/null ||
+                refuse sufficient "its verified run did not record its normal exit 10"
+              # A solver killed by a signal after its whole report gives no
+              # verdict whatever the report holds. The installed driver is run
+              # as its launcher runs it (lib/kani/bin first on PATH, argv[0]
+              # `kani`), the controlled solver first: the bundle's own CBMC,
+              # its whole --json-ui output kept beside the case's evidence
+              # (solver.stdout), then SIGKILL of itself. Under bound 4
+              # count_up's unwinding property was SUCCESS, under bound 3
+              # FAILURE; each harness records the signal, and the report
+              # carries the signal's header and neither a verification nor a
+              # failed-checks summary.
+              signalling=$TMPDIR/signalling-solver
+              mkdir $signalling
+              printf '%s\n' '#!${pkgs.runtimeShell}' \
+                '${kaniCbmc}/bin/cbmc "$@" | tee "$SOLVER_COPY"' \
+                'kill -KILL $$' >$signalling/cbmc
+              chmod +x $signalling/cbmc
+              signalled() { # NAME STATUS POLICY
+                local name=$1 status=$2 policy=$3 case=$checks/$1 found=0 harness
+                mkdir $case $case/evidence
+                cp $policy $case/policy.json
+                (
+                  export PATH=$signalling:$out/lib/kani/bin:$PATH SOLVER_COPY=$case/solver.stdout
+                  exec -a kani $out/lib/kani/bin/kani-driver bounds.rs -Z unstable-options \
+                    --loop-bounds $case/policy.json --loop-bounds-evidence $case/evidence
+                ) >$case/report.log 2>&1 || found=$?
+                echo "$found" >$case/exit
+                echo "=== loop bounds, $name: exit $found"
+                cat $case/report.log
+                [[ $found == 1 ]] || refuse $name "exit $found, expected 1"
+                $jq -e --arg status "$status" \
+                  '[.[] | select(.result) | .result[] | select(.property == "count_up.unwind.0") | .status] == [$status]' \
+                  $case/solver.stdout >/dev/null ||
+                  refuse $name "the solver's report did not hold count_up.unwind.0 as $status"
+                for harness in counts_to_its_limit sums_without_a_local_bound; do
+                  holds $name $harness "''${discovery[@]}" "''${solver[@]}"
+                  preserved $name $harness
+                  solved $name $harness
+                  $jq -e '.termination == {kind: "signaled", signal: 9}' \
+                    $case/evidence/$harness/solver.execution.json >/dev/null ||
+                    refuse $name "$harness did not record its SIGKILL"
+                done
+                grep -F -q 'CBMC failed: terminated by signal 9' $case/report.log ||
+                  refuse $name "no signal header in its report"
+                ! grep -F -q 'VERIFICATION:- SUCCESSFUL' $case/report.log ||
+                  refuse $name "a signalled run was reported verified"
+                ! grep -F -q 'Failed Checks:' $case/report.log ||
+                  refuse $name "a signalled run reported failed checks"
+                grep -F -q 'Complete - 0 successfully verified harnesses, 2 failures, 2 total.' $case/report.log ||
+                  refuse $name "its summary does not count both signalled harnesses as failures"
+              }
+              signalled signal-after-success SUCCESS ${
+                kaniLoopBounds "signal-after-success" "counts_to_its_limit" [ (countUp { }) ]
+              }
+              signalled signal-after-failure FAILURE ${
+                kaniLoopBounds "signal-after-failure" "counts_to_its_limit" [ (countUp { bound = 3; }) ]
+              }
               # Evidence is created exclusively: a harness whose evidence
               # directory already exists is refused before its discovery, and
               # nothing in that directory is written or replaced.
@@ -536,7 +745,7 @@
                 refuse collision "no refused reservation"
               [[ -z $(ls -A $collision/evidence/counts_to_its_limit) ]] ||
                 refuse collision "the existing evidence directory was written"
-              ! grep -F -q 'CBMC launch attempt:' $collision/report.log ||
+              ! grep -F -q 'CBMC launch attempt: counts_to_its_limit' $collision/report.log ||
                 refuse collision "a refused reservation reported a solver launch"
             '';
           });

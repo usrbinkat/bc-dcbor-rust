@@ -464,14 +464,14 @@ tree-height-reference-off-by-one	tests/data/controls/tree-height-reference-off-b
 # bounded/decode/header/proofs.rs): the emission's segments that gaps end
 # early left unpriced, and the header validation's bytes left unpriced.
 emit-bound-gaps-uncounted	tests/data/controls/emit-bound-gaps-uncounted.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_emission_bound_covers_every_emission	-	failed	the emission completes within its bound's steps
-header-bound-validation-unpriced	tests/data/controls/header-bound-validation-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_every_head	-	failed	the cursor admits no more than its bound
+header-bound-validation-unpriced	tests/data/controls/header-bound-validation-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_heads_of_1_bytes	-	failed	the cursor admits no more than its bound
 # A step that changes its cursor before its admission: refused, the change
 # is kept (header.rs, `HeaderState::step`, `finished` set before VALIDATE;
 # writer.rs, `PlanView::segment`, a gap passed before BOUNDARY).
-header-finished-before-admission	tests/data/controls/header-finished-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_every_head	-	failed	a refused step changes nothing the cursor holds
+header-finished-before-admission	tests/data/controls/header-finished-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::header::proofs::the_header_bound_covers_heads_of_1_bytes	-	failed	a refused step changes nothing the cursor holds
 owned-output-request-unpriced	tests/data/controls/owned-output-request-unpriced.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_owned_emission_bound_covers_every_owned_write	-	failed	the owned write requests no more than its bound
-string-inspect-advanced-before-admission	tests/data/controls/string-inspect-advanced-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_every_input	-	failed	a refused step changes nothing the decode reports
-string-retained-unpriced	tests/data/controls/string-retained-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_every_input	-	failed	the string decode's string retains no more than its bound
+string-inspect-advanced-before-admission	tests/data/controls/string-inspect-advanced-before-admission.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_inputs_of_1_bytes_at_depth_0_normalized	-	failed	a refused step changes nothing the decode reports
+string-retained-unpriced	tests/data/controls/string-retained-unpriced.patch	kani	kani	dcbor	-	lib	bounded::decode::string_cursor::proofs::the_string_bound_covers_inputs_of_2_bytes_at_depth_0_normalized	-	failed	the string decode's string retains no more than its bound
 gap-passed-before-admission	tests/data/controls/gap-passed-before-admission.patch	kani	kani	dcbor	-	lib	bounded::encoding::writer::proofs::the_emission_bound_covers_every_emission	-	failed	a refused unit moves nothing
 # The whole-operation bounds of preparation, decoding and strict text
 # validation (encoding/preparation_proofs.rs, decode/decode_proofs.rs,
@@ -479,7 +479,7 @@ gap-passed-before-admission	tests/data/controls/gap-passed-before-admission.patc
 # plan's retained bytes, the document arena's growth, the normalization
 # buffers' requests.
 preparation-bound-plan-unretained	tests/data/controls/preparation-bound-plan-unretained.patch	kani	kani	dcbor	-	lib	bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source	-	failed	the encoding retains no more than its bound
-decode-bound-arena-halved	tests/data/controls/decode-bound-arena-halved.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_every_input	-	failed	the decode's document retains no more than its bound
+decode-bound-arena-halved	tests/data/controls/decode-bound-arena-halved.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_inputs_of_1_bytes_at_depth_0_normalized	-	failed	the decode's document retains no more than its bound
 text-bound-buffers-unpriced	tests/data/controls/text-bound-buffers-unpriced.patch	kani	kani	dcbor	-	lib	bounded::text::proofs::the_validation_bound_covers_every_text	-	failed	the validation requests no more than its bound
 # A policy refusal swallowed where it must propagate, one site per harness
 # that schedules a refusal at any attempt and request (proof_budget.rs,
@@ -488,7 +488,7 @@ text-bound-buffers-unpriced	tests/data/controls/text-bound-buffers-unpriced.patc
 # (text.rs, `is_normalized`) and one in emission (writer.rs,
 # `PlanView::segment`). The policy records the refusal and the operation
 # returns as if admitted.
-reserve-refusal-swallowed	tests/data/controls/reserve-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_every_input	-	failed	a refused decode returns its refusal
+reserve-refusal-swallowed	tests/data/controls/reserve-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::decode::decode_proofs::the_decode_bound_covers_inputs_of_1_bytes_at_depth_0_normalized	-	failed	a refused decode returns its refusal
 validation-pass-refusal-swallowed	tests/data/controls/validation-pass-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::text::proofs::the_validation_bound_covers_every_text	-	failed	a refused validation returns its refusal
 segment-refusal-swallowed	tests/data/controls/segment-refusal-swallowed.patch	kani	kani	dcbor	-	lib	bounded::encoding::preparation_proofs::the_encoding_bound_covers_every_source	-	failed	a refused encoding returns its refusal
 # The retained text encoder's cleanup keeping its output's permit
@@ -681,3 +681,27 @@ kani-control-baseline-unrequired	tests/data/controls/kani-control-baseline-unreq
 # A Kani control whose baseline did not verify still planted and run
 # (tests/controls.sh): its red side runs over a harness with no verdict.
 kani-baseline-not-blocking	tests/data/controls/kani-baseline-not-blocking.patch	native	nightly	dcbor-gate	-	launchers	a_kani_control_runs_only_over_a_verified_baseline	-	failed	a Kani control's red side ran over a baseline that did not verify
+# The execution evidence every Kani run reconciles (tests/gate/src/proofs.rs,
+# `check_execution_evidence`), each weakened by one plant and refused by the
+# case it lets through, which the test names (`refused`): a signal's report
+# claiming a failed property accepted beside its record
+# (`termination_agrees`); a launched harness without a verdict passed over
+# with its evidence unread; a function-scope record naming a harness no
+# reconciled resolution supports (`check_function_scope`); a discovery whose
+# exit status is unread, and one holding two inventories (`discovered`,
+# `inventory_functions`); a completed run's duration compared in whole
+# milliseconds (`check_expectations`); an execution record's deadline unread
+# (`execution`).
+gate-signal-verdict-accepted	tests/data/controls/gate-signal-verdict-accepted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_signal_is_no_verdict_whatever_the_report_claims	-	failed	signal-beside-failure: accepted
+gate-verdictless-evidence-bypassed	tests/data/controls/gate-verdictless-evidence-bypassed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_verdictless_launched_harness_owes_its_evidence	-	failed	verdictless-artifact-missing: accepted
+gate-function-scope-claim-unreconciled	tests/data/controls/gate-function-scope-claim-unreconciled.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::the_function_scope_record_matches_the_reconciled_evidence	-	failed	[{"harnesses":["nonexistent"]
+gate-discovery-status-unchecked	tests/data/controls/gate-discovery-status-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_completed_harness_ran_on_its_preserved_artifact	-	failed	discovery-failed: accepted
+gate-discovery-inventories-uncounted	tests/data/controls/gate-discovery-inventories-uncounted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_completed_harness_ran_on_its_preserved_artifact	-	failed	inventory-twice: accepted
+gate-expectation-milliseconds-only	tests/data/controls/gate-expectation-milliseconds-only.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_harness_over_its_expectation_fails_at_one_nanosecond	-	failed	one-nanosecond-over: accepted
+gate-execution-deadline-unreconciled	tests/data/controls/gate-execution-deadline-unreconciled.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::the_execution_record_reconciles_with_its_report	-	failed	deadline-disagrees: accepted
+# The instance declaration (tests/data/proofs/instances.rs, `instances`) and
+# the census that expects it (tests/gate/src/proofs.rs, `harnesses`): an axis
+# that skips a value of its domain accepted, and a family's file that does
+# not include its generated instances counted all the same.
+gate-instance-axis-gap-accepted	tests/data/controls/gate-instance-axis-gap-accepted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_declaration_that_does_not_cover_its_domain_is_refused	-	failed	declaration its lengths [0, 2] are not every value: accepted
+gate-census-inclusion-unchecked	tests/data/controls/gate-census-inclusion-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::the_census_expects_every_declared_instance	-	failed	inclusion-missing: accepted

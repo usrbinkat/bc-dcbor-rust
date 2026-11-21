@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -483,7 +483,7 @@
+             }
+         }
+     }
+-    let [loops] = inventories.as_slice() else {
++    let [loops, ..] = inventories.as_slice() else {
+         return Err(format!(
+             "the loop discovery holds {} loop inventories, not one",
+             inventories.len()

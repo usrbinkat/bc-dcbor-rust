@@ -300,22 +300,33 @@ pub fn run_kani(
             root.display()
         ));
     }
-    let entries = crate::proofs::policy(root, &declared)?;
-    kani(root, &entries, Some(harness), target_dir, log, launcher)
+    let policy = crate::proofs::policy(root, &declared)?;
+    let expectations = crate::proofs::expectations(root, &declared)?;
+    kani(
+        root,
+        &policy,
+        &expectations,
+        Some(harness),
+        target_dir,
+        log,
+        launcher,
+    )
 }
 
 /// One `cargo kani` run of every harness of the library in `root`
-/// ([`crate::proofs::arguments`], no harness filter), under the policy
-/// `entries` ([`crate::proofs::policy`]), as [`run_kani`] runs one: the
-/// proof suite's evidence run.
+/// ([`crate::proofs::arguments`], no harness filter), under `policy`
+/// ([`crate::proofs::policy`]) and `expectations`
+/// ([`crate::proofs::expectations`]), as [`run_kani`] runs one: the proof
+/// suite's evidence run.
 pub fn run_kani_suite(
     root: &Path,
-    entries: &BTreeMap<String, serde_json::Value>,
+    policy: &crate::proofs::Policy,
+    expectations: &std::collections::BTreeMap<String, crate::proofs::Expectation>,
     target_dir: &Path,
     log: &Path,
     launcher: &Path,
 ) -> Result<(Termination, String), String> {
-    kani(root, entries, None, target_dir, log, launcher)
+    kani(root, policy, expectations, None, target_dir, log, launcher)
 }
 
 /// The Kani a run selects: `cargo-kani` as `PATH` resolves it, canonical
@@ -394,7 +405,8 @@ pub fn sha256(path: &Path) -> Result<String, String> {
 /// suite nor a control can take a verdict the evidence does not support.
 fn kani(
     root: &Path,
-    entries: &BTreeMap<String, serde_json::Value>,
+    policy_of_root: &crate::proofs::Policy,
+    expectations: &std::collections::BTreeMap<String, crate::proofs::Expectation>,
     harness: Option<&str>,
     target_dir: &Path,
     log: &Path,
@@ -416,7 +428,7 @@ fn kani(
         format!("{}\n", launcher.display()).as_bytes(),
     )?;
     let policy = evidence.join("loop-bounds.json");
-    let selected = crate::proofs::selected(entries, harness);
+    let selected = crate::proofs::selected(policy_of_root, expectations, harness);
     let encoded = serde_json::to_vec_pretty(&selected)
         .map_err(|error| format!("{}: {error}", policy.display()))?;
     create_evidence(&policy, &encoded)?;
@@ -458,9 +470,13 @@ fn kani(
     };
     let text =
         std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
-    let verifier = crate::proofs::check_execution_evidence(&bounds, &selected, &text)
+    let reconciled = crate::proofs::check_execution_evidence(&bounds, &selected, &text)
         .map_err(|fault| format!("{}: {fault}", log.display()))?;
-    let execution = serde_json::json!({ "launcher": launcher, "verifier": verifier });
+    crate::proofs::check_function_scope(&bounds, &selected, &reconciled.applied, harness.is_none())
+        .map_err(|fault| format!("{}: {fault}", log.display()))?;
+    crate::proofs::check_expectations(&reconciled, expectations)
+        .map_err(|fault| format!("{}: {fault}", log.display()))?;
+    let execution = serde_json::json!({ "launcher": launcher, "verifier": reconciled.verifier });
     let encoded = serde_json::to_vec_pretty(&execution)
         .map_err(|error| format!("{}: {error}", evidence.display()))?;
     create_evidence(&evidence.join("execution.json"), &encoded)?;

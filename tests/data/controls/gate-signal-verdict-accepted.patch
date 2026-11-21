@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -837,7 +837,7 @@
+     };
+     let (agrees, completed) = match ended {
+         Ended::Exited => (verified && !killed && !signaled, true),
+-        Ended::Signaled => (verified && signaled && !killed && no_verdict(), false),
++        Ended::Signaled => (verified && !killed && !successful, false),
+         Ended::Deadline => (verified && killed && !signaled && no_verdict(), false),
+         Ended::ExecutionError => (false, false),
+     };

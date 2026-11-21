@@ -28,17 +28,19 @@
 //!
 //! # Unwind
 //!
-//! The driver uses [`crate::bounded::ResourceBound::steps`], the sum of
-//! admitted values and allocated bytes, plus the two refused calls. Values
-//! alone do not bound this loop: a step can make an allocation request
-//! without admitting a value. The driver stops at its outcome, which can
-//! precede that conservative limit.
+//! The driver steps the decode to its outcome and counts its calls; the
+//! count is asserted within [`crate::bounded::ResourceBound::steps`], the
+//! sum of admitted values and allocated bytes, and the two refused calls.
+//! Values alone do not bound the calls: a step can make an allocation
+//! request without admitting a value. The loop's limit is not derived from
+//! the bound, so the observation stays independent of it.
 //!
-//! `kani::unwind(378)` is a separate verification limit, not a derivation
-//! from the bound's values. Its enabled unwinding assertions must establish
-//! that every reachable loop, including the driver and cleanup, fits this
-//! limit over the whole domain. A reachable iteration beyond it fails
-//! verification; the harness does not assume early completion.
+//! `kani::unwind(378)` is the verification limit of every instance, not a
+//! derivation from the bound's values. Its enabled unwinding assertions must
+//! establish that every reachable loop, the driver and cleanup included,
+//! fits this limit over the instance's domain; a reachable iteration beyond
+//! it fails verification. The instances are declared once, with their
+//! unwinds and stubs, in `tests/data/proofs/instances.rs`.
 //!
 //! # The `half` conversion
 //!
@@ -52,8 +54,9 @@
 //! binary16 pattern, natively and under Miri (`float.rs` tests). Compiled
 //! only under `cfg(kani)`.
 
-use super::super::super::proof_budget::{Counting, Permit, decode_bound_at};
+use super::super::super::proof_budget::{Counting, Permit};
 use super::{BoundedError, DecodeError, Options, Step, StringDecoder, TextPolicy, string_bound};
+use TextPolicy::{Normalize, QuickOnly};
 
 /// The longest input of the domain.
 const INPUT: usize = 4;
@@ -66,46 +69,41 @@ fn any_index() -> Option<u64> {
     if kani::any() { Some(kani::any()) } else { None }
 }
 
-/// Every input of the domain, under one refusal at any one attempt and one
-/// at any one request, reaches its outcome (a published string or a
-/// terminal error) within its bound's steps and the two refused calls; the
-/// work admitted, the bytes granted, the most held at once and what the
-/// published string retains are each at most the bound's, and the bytes
-/// requested at most the bound's and one request more; a refused step
-/// changes nothing the decode reports; nothing is held once the decode and
-/// its string drop.
-#[kani::proof]
-#[kani::unwind(378)]
-#[kani::stub(crate::float::narrowed, crate::float::proofs::from_f64_contract)]
-#[kani::stub(crate::float::widened, crate::float::proofs::to_f64_contract)]
-fn the_string_bound_covers_every_input() {
-    let bytes: [u8; INPUT] = kani::any();
-    let length: usize = kani::any();
-    kani::assume(length <= INPUT);
-    let max_depth: usize = kani::any();
-    kani::assume(max_depth <= DEPTH);
-    let options = Options {
-        max_depth,
-        text: if kani::any() {
-            TextPolicy::Normalize
-        } else {
-            TextPolicy::QuickOnly
-        },
-    };
-    let input = &bytes[..length];
-    let bound = decode_bound_at(length, options, INPUT, DEPTH, |size, case| {
-        string_bound::<Permit, (), ()>(size, case).expect("the domain's bound fits")
-    });
+/// Every input of `LEN` bytes, under nesting limit `max_depth` and the text
+/// policy `text`, and under one refusal at any one attempt and one at any
+/// one request, reaches its outcome (a published string or a terminal error)
+/// within its bound's steps and the two refused calls; the work admitted,
+/// the bytes granted, the most held at once and what the published string
+/// retains are each at most the bound's, and the bytes requested at most the
+/// bound's and one request more; a refused step changes nothing the decode
+/// reports; nothing is held once the decode and its string drop. The domain
+/// is checked one length, nesting limit and policy at a time, so
+/// [`string_bound`] is computed for constants; the union of the instances
+/// is the domain stated above.
+fn check<const LEN: usize>(max_depth: usize, text: TextPolicy) {
+    const { assert!(LEN <= INPUT, "an instance is within the domain's inputs") };
+    assert!(
+        max_depth <= DEPTH,
+        "an instance is within the domain's nesting limits"
+    );
+    let bytes: [u8; LEN] = kani::any();
+    let options = Options { max_depth, text };
+    let input = &bytes[..];
+    let bound =
+        string_bound::<Permit, (), ()>(LEN as u64, options).expect("the domain's bound fits");
     let steps = bound.steps::<()>().expect("the domain's steps fit");
     let mut policy = Counting::scheduled(any_index(), any_index());
     let mut decoder = StringDecoder::<Permit, ()>::new(input, options);
-    let mut ended = false;
     let mut string = None;
-    // Findings recorded in the loop and asserted after the cleanup tail, so
-    // every run drops what it holds before any assertion.
+    // The decode is stepped to its outcome, each call counted; the loop's
+    // unwinding assertion establishes that every run reaches it within the
+    // harness's unwind. Findings recorded in the loop and asserted after the
+    // cleanup tail, so every run drops what it holds before any assertion.
+    let mut calls = 0u64;
     let mut changed_on_refusal = false;
     let mut finished_early = false;
-    for _ in 0..steps + 2 {
+    loop {
+        calls += 1;
         let before = decoder.position();
         match decoder.step(&mut policy) {
             Ok(Step::Progress) => {}
@@ -114,17 +112,14 @@ fn the_string_bound_covers_every_input() {
             }
             Ok(Step::Complete(published)) => {
                 string = Some(published);
-                ended = true;
                 break;
             }
             Ok(Step::Finished) => {
                 finished_early = true;
                 break;
             }
-            Err(_) => {
-                ended = true;
-                break;
-            }
+            // A terminal error: the outcome.
+            Err(_) => break,
         }
     }
     let retained = policy.live();
@@ -140,8 +135,8 @@ fn the_string_bound_covers_every_input() {
     );
     assert!(!finished_early, "the decode finished before its outcome");
     assert!(
-        ended,
-        "the string decode reaches its outcome within its bound's steps"
+        u128::from(calls) <= u128::from(steps) + 2,
+        "the string decode reaches its outcome within its bound's steps and the two refused calls"
     );
     assert!(
         bound.work().covers(&policy.admitted),
@@ -164,3 +159,8 @@ fn the_string_bound_covers_every_input() {
         "the string decode's string retains no more than its bound"
     );
 }
+
+// The instances, declared in tests/data/proofs/instances.rs and generated
+// by build.rs: every input length through INPUT, every nesting limit
+// through DEPTH, both text policies.
+include!(concat!(env!("OUT_DIR"), "/proof_instances/string.rs"));

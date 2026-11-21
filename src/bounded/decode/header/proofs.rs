@@ -12,7 +12,13 @@
 //! header.rs:39), so the harness steps on after it. The cursor allocates
 //! nothing, so no request is refused. The cursor acquires at most nine bytes
 //! and validates once, so its loop runs at most ten times and the one
-//! refused call: eleven, `kani::unwind(12)`. Compiled only under
+//! refused call: eleven, `kani::unwind(12)`.
+//!
+//! The domain is checked one input length at a time: each instance fixes
+//! the length and leaves every byte any value, so [`header_bound`] is
+//! computed for a constant and the loop's trip count is the cursor's own;
+//! the union of the instances, every length through [`MAX_HEAD_LEN`], is
+//! the domain. The property is one body, [`check`]. Compiled only under
 //! `cfg(kani)`.
 
 use super::super::super::proof_budget::Counting;
@@ -23,27 +29,27 @@ fn any_index() -> Option<u64> {
     if kani::any() { Some(kani::any()) } else { None }
 }
 
-/// Every input of at most a head's bytes is acquired and validated within
+/// Every input of `LEN` bytes is acquired and validated within
 /// [`header_bound`]'s steps and the one refused call, to a head or to its
 /// refusal as invalid input, admitting no more work than the bound; a
 /// refused step changes nothing the cursor holds.
-#[kani::proof]
-#[kani::unwind(12)]
-fn the_header_bound_covers_every_head() {
-    let bytes: [u8; MAX_HEAD_LEN] = kani::any();
-    let length: usize = kani::any();
-    kani::assume(length <= MAX_HEAD_LEN);
-    let input = &bytes[..length];
-    let bound = header_bound(length as u64);
+fn check<const LEN: usize>() {
+    const { assert!(LEN <= MAX_HEAD_LEN, "an instance is within a head's bytes") };
+    let bytes: [u8; LEN] = kani::any();
+    let input = &bytes[..];
+    let bound = header_bound(LEN as u64);
     let steps = bound.steps::<()>().expect("a head's steps fit");
     let mut cursor = HeaderCursor::new(input);
     let mut budget = Counting::scheduled(any_index(), None);
-    let mut ended = false;
-    // Findings recorded in the loop and asserted after it, so every run
-    // reaches the same tail.
+    // The cursor is stepped to its outcome, each call counted; the loop's
+    // unwinding assertion establishes that every run reaches it within the
+    // harness's unwind. Findings recorded in the loop and asserted after it,
+    // so every run reaches the same tail.
+    let mut calls = 0u64;
     let mut changed_on_refusal = false;
     let mut finished_early = false;
-    for _ in 0..=steps {
+    loop {
+        calls += 1;
         let before = cursor.position();
         match cursor.step(&mut budget) {
             Ok(Step::Progress) => {}
@@ -51,10 +57,7 @@ fn the_header_bound_covers_every_head() {
                 changed_on_refusal |= cursor.position() != before;
             }
             // A head, or its refusal as invalid input: the outcome.
-            Ok(Step::Complete(_)) | Err(_) => {
-                ended = true;
-                break;
-            }
+            Ok(Step::Complete(_)) | Err(_) => break,
             Ok(Step::Finished) => {
                 finished_early = true;
                 break;
@@ -67,11 +70,15 @@ fn the_header_bound_covers_every_head() {
     );
     assert!(!finished_early, "the cursor finished before its outcome");
     assert!(
-        ended,
-        "the cursor reaches its outcome within its bound's steps"
+        u128::from(calls) <= u128::from(steps) + 1,
+        "the cursor reaches its outcome within its bound's steps and the one refused call"
     );
     assert!(
         bound.work().covers(&budget.admitted),
         "the cursor admits no more than its bound"
     );
 }
+
+// The instances, declared in tests/data/proofs/instances.rs and generated
+// by build.rs: every input length through MAX_HEAD_LEN.
+include!(concat!(env!("OUT_DIR"), "/proof_instances/header.rs"));

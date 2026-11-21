@@ -320,24 +320,47 @@ recorded values, one under each, and the planted controls, on copies of a clean 
 
 ## Proof loop bounds
 
-`proofs/loop-bounds.json` is the one declaration of harness-scoped loop bounds for the Kani proof
-harnesses: per harness, each loop by the function holding it, its source file, the number of loops
-that function holds, the loop's number, the bound, and the reason the bound covers the harness's
-domain. It is read from the tree being verified (`tests/gate/src/proofs.rs`, `POLICY`), a control's
-copy included, so a planted change to a bound reaches that control's run. The gate checks only
+`proofs/loop-bounds.json` is the one declaration of loop bounds for the Kani proof harnesses, each
+loop by the function holding it, its source file, the number of loops that function holds, the
+loop's number, the bound, and the reason the bound holds. Each bound is declared once, at the scope
+its reason belongs to: `loops`, bounds that are properties of the code (a pass over a fixed table),
+applied in every harness whose binary holds the function; `harnesses`, bounds that rest on one
+harness's domain. It is read from the tree being verified (`tests/gate/src/proofs.rs`, `POLICY`), a
+control's copy included, so a planted change to a bound reaches that control's run. The gate checks
 that each harness it names is a `#[kani::proof]` of the source, named once with at least one bound,
-and gives each Kani run the entries of the harnesses that run checks. Kani resolves the selectors
+and gives each Kani run the whole function scope and the entries of the harnesses that run checks.
+Kani's record of which harnesses applied each function-scoped bound (`function-scope.json`) must
+equal, exactly, the harnesses whose evidence reconciled with it (`proofs::check_function_scope`,
+`proofs::Reconciled`): a name the evidence does not support, a duplicate or a non-name is refused,
+and a run of the whole suite must apply every function-scoped bound in at least one harness, so a
+renamed or unreached function cannot drop its bound silently. Which function-scoped bounds a harness
+owes follows from its loop discovery, which must have exited successfully, have run as
+`goto-instrument --show-loops --json-ui` on the harness's preserved binary, and hold exactly one
+inventory, an empty one included, and no reported error or record of unknown kind
+(`proofs::discovered`): an empty, substituted or failed discovery cannot remove a bound. Kani resolves the selectors
 against each harness's instrumented goto binary immediately before CBMC runs on it
 (`nix/kani-driver-loop-bounds.patch`, `kani-driver/src/loop_bounds.rs`); unwinding assertions stay
 on, so a bound too small for an execution of the domain fails the harness. A resolution checks the
 function, file, loop count and symbol; it cannot see two loops of one function exchange numbers,
 and the bound's soundness rests on the unwinding assertion.
 
+The decode, string and header harnesses check their domains one constant size at a time, so each
+production bound is computed for constants rather than selected over a symbolic size. Each family is
+one generic property body; its instances, every input length (each with its own unwind), nesting
+limit and text policy of its domain, with its stubs, are declared once in `proofs/instances.rs`.
+`build.rs` generates them into `$OUT_DIR/proof_instances/` for the family's file to include, and the
+gate's census expects exactly them, both from one expansion (`instances::instances`), which refuses
+an axis that does not cover its domain exactly or names that do not distinguish every instance; the
+generated code asserts the file's domain constants equal the axes' largest values, and the census
+refuses a file that does not include its instances once or a written harness that shares an
+instance's name.
+
 Every Kani run of a gate keeps its evidence beside its log, `LOG.evidence/`, each file created
 once: the launcher it ran (the run's one selection, `gate proofs-identity`), the policy it was
 given, and per harness the instrumented binary it was checked on, copied before anything read it
 (`artifact.out`, with its build path and digest in `artifact.json`), the loop discovery's
-invocation, status and streams, the resolution, the solver's command and executables and its
+invocation, status and streams for every harness, the resolution of the bounds that apply to it,
+the solver's command and executables and its
 launch attempt, then `execution.json`, the launcher and verifier of the run. The preserved binary
 is what a replay or an inspection of a harness's loops reads: the shared `target/kani` build
 directory is rewritten by every later run. A run's verdicts count only when that evidence reconciles with its policy and
@@ -969,16 +992,47 @@ its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`). Be
 applied, `tests/controls.sh` checks that harness on the unmutated copy (`gate control run
 baseline`): it must verify alone (`controls::verified`), or the control is failed by name, its red
 and green sides never run, since a planted defect in a harness with no verdict on the commit (no
-results, the timeout, CBMC out of memory, a failure, a short bound) shows nothing of the defect.
+results, the deadline, CBMC out of memory, a failure, a short bound) shows nothing of the defect.
 `controls::evidence` requires each Kani control's `baseline.judged` to read `verified` beside its
 red and green judgements. `kani-control-baseline-unrequired.patch` drops that requirement, refused
 by `a_kani_control_is_evidence_only_over_a_verified_baseline`; `kani-baseline-no-verdict-accepted.patch`
 accepts a baseline of any outcome, refused by `a_kani_refusal_is_judged_by_its_one_harness`.
 
-Every Kani run, a control's and the proof suite's, bounds each harness's CBMC run
-(`tests/gate/src/proofs.rs`, `HARNESS_TIMEOUT`, `--harness-timeout 30m` under
-`-Z unstable-options`). A CBMC run whose results Kani does not use (out of memory, the timeout
-reached, another failing status, results reported without CBMC's overall status) or that Kani
+Every Kani run, a control's and the proof suite's, gives each harness it checks a deadline of
+`proofs::DEADLINE_MARGIN` (2, the operator's operational margin) times that harness's expected
+CBMC run time (`proofs/expectations.json`, one entry per harness of the census: the milliseconds
+and their support, a prediction from evidence, never a measurement copied in as it stands;
+`proofs::EXPECTATIONS`, `proofs::selected`). The driver applies each harness's deadline from the
+run's policy and refuses a global `--harness-timeout` beside it. Every spawned CBMC run records one
+timing record (`solver.execution.json`): its deadline, its duration as integer seconds and
+nanoseconds from immediately after spawn to its end (its output read and its exit reaped, the
+deadline's detection, or an execution error; compilation, instrumentation, preservation and loop
+discovery before it, rendering after), and how it ended: its exit code or its signal, kept apart
+and never read as running out of memory; the deadline, with CBMC's last status message and the
+time of its termination and reaping measured apart; or the driver's execution error. The gate
+reconciles every launched harness's evidence whole, its verdict or none (`proofs::execution`,
+`proofs::termination_agrees`): the record must exist, carry the deadline the run's policy gave, and
+agree with the report. Only a normal exit, whatever its code (CBMC exits nonzero for a harness Kani
+verifies), permits a verification result read from properties, and only it is a completed run. A
+signal gives no verdict whatever CBMC printed: the driver reports it as `CBMC failed: terminated by
+signal N` without interpreting properties, and the gate requires that header, a report classified
+as no verdict, and neither a verification nor a failed-property summary, so a signalled run never
+qualifies a proof or a control's detection. A deadline likewise, under its own header; a launched
+harness whose report reaches no verdict is refused once its evidence is validated. The gate then
+compares a completed run's duration, not the report's rendered time, against the expectation
+(`proofs::check_expectations`): equality passes, a nanosecond more fails the run though it met its
+deadline. A run killed at its deadline has no verdict. Either outcome shows that the harness is
+wrongly sized for its expectation, that the expectation is wrong, or that the code it checks
+regressed. An expectation is never raised solely to turn a failed run green: a correction needs
+its own justification, the failed run's evidence is kept, and the run is repeated. Each of these
+checks is a registered control, its check weakened by one plant and refused by the test case the
+plant lets through: `gate-signal-verdict-accepted`, `gate-verdictless-evidence-bypassed`,
+`gate-function-scope-claim-unreconciled`, `gate-discovery-status-unchecked`,
+`gate-discovery-inventories-uncounted`, `gate-expectation-milliseconds-only`,
+`gate-execution-deadline-unreconciled`, `gate-instance-axis-gap-accepted` and
+`gate-census-inclusion-unchecked` (`controls/controls.tsv`). A CBMC run whose
+results Kani does not use (the deadline reached, an exit or signal without results, results
+reported without CBMC's overall status) or that Kani
 reports unsound (a quantifier the solver dropped) is no verdict (`outcome::kani_without_verdict`,
 `Outcome::NoVerdict`), though Kani counts it among its failures: never a pass, never a control's
 refusal. A checker killed by a signal, an empty selection, an incomplete report, or an exit status

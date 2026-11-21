@@ -10,59 +10,9 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use super::decode::{Options, TextPolicy};
 use super::{
-    Allocator, Budget, Effect, Hold, Identity, Owner, Performer, Releasing, ResourceBound,
-    WriteWork, boundary,
+    Allocator, Budget, Effect, Hold, Identity, Owner, Performer, Releasing, WriteWork, boundary,
 };
-
-/// Select a bound by enumerating every length through `most`. Each unrolled
-/// iteration calls the production bound with its concrete length. An absent
-/// case fails the harness rather than supplying a default bound.
-pub(crate) fn bound_at(
-    length: usize,
-    most: usize,
-    bound: impl Fn(u64) -> ResourceBound,
-) -> ResourceBound {
-    let mut selected = None;
-    let mut size = 0;
-    while size <= most {
-        if size == length {
-            selected = Some(bound(size as u64));
-        }
-        size += 1;
-    }
-    selected.expect("every length of the domain is enumerated")
-}
-
-/// Select a decode bound over every length, nesting limit and both text
-/// policies. The caller supplies the production bound and its proof-domain
-/// limits; no bound arithmetic is reproduced here.
-pub(crate) fn decode_bound_at(
-    length: usize,
-    options: Options,
-    input: usize,
-    nesting: usize,
-    bound: impl Fn(u64, Options) -> ResourceBound,
-) -> ResourceBound {
-    bound_at(length, input, |size| {
-        let mut selected = None;
-        let mut depth = 0;
-        while depth <= nesting {
-            for text in [TextPolicy::Normalize, TextPolicy::QuickOnly] {
-                let case = Options {
-                    max_depth: depth,
-                    text,
-                };
-                if case == options {
-                    selected = Some(bound(size, case));
-                }
-            }
-            depth += 1;
-        }
-        selected.expect("every nesting limit and text policy of the domain is enumerated")
-    })
-}
 
 pub(crate) struct Counting {
     /// The work admitted.

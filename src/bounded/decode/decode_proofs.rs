@@ -38,26 +38,39 @@
 //! decoder's), and text validation (`text/proofs.rs`, every UTF-8 text of at
 //! most six bytes). Each written and unverified until the gate runs it.
 //!
+//! # Instances
+//!
+//! The domain is checked one size at a time: each instance fixes the input's
+//! length, the nesting limit and the text policy, and leaves every byte any
+//! value. The production bound is computed for those constants
+//! ([`decode_bound_with`]), so symbolic execution reduces it to constants and
+//! every loop's trip count follows from the instance's own bytes; the union of
+//! the instances is the domain stated above. The property is one body,
+//! [`check`]; the instances calling it are declared once, with their unwinds
+//! and stubs, in `tests/data/proofs/instances.rs`, which `build.rs` generates
+//! them from and the gate's census expects them by.
+//!
 //! # Unwind
 //!
-//! The loops the domain reaches, each with its most iterations:
+//! The loops an instance of `LEN` bytes reaches, each with its most
+//! iterations:
 //!
-//! - `decode_with`'s node loop (decode.rs:387): one head of at least a byte
-//!   per iteration, so at most [`INPUT`]; its completion loop (:506) at most
-//!   the frames open, [`DEPTH`], and the root's;
-//! - `Owned::reserve`'s growth loop (`bounded.rs`:1799): one growth, four
-//!   elements holding every node of [`INPUT`] bytes;
-//! - strict validation's normalization (`text.rs` `normalize`, :263-295):
-//!   per scalar and per part at most three; a release's counting pass
-//!   (`Normalizer::release`, :139-176) clears and sums a table of every
-//!   combining class, 256 iterations (:156, `CLASSES` :68), reached by a
-//!   text holding a combining part, "a" and U+0301 among the domain's;
-//! - the bound's own: `Terms::peak_of`'s splits (:706) at most [`INPUT`];
-//!   the places' folds over 7 decode and 5 validation places (`bounded.rs`
-//!   `additive`, :669).
+//! - `decode_with`'s node loop: one head of at least a byte per iteration,
+//!   at most `LEN`, and its exit; its completion loop at most the frames
+//!   open, at most [`DEPTH`], and the root's;
+//! - UTF-8 validation, the quick check and normalization: at most one
+//!   iteration per payload byte, fewer than `LEN`;
+//! - `Owned::reserve`'s growth loop: one growth, four elements holding every
+//!   node of at most [`INPUT`] bytes;
+//! - `Normalizer::release`'s passes over its waiting parts: at most the
+//!   parts of one text of fewer than `LEN` bytes.
 //!
-//! The longest is the counting pass's 256: `kani::unwind(257)`, its
-//! iterations and its exit.
+//! The claim is that each is within `LEN + 2` iterations, the instance's
+//! `kani::unwind`; the unwinding assertions, which stay on, are what check it,
+//! and an instance whose loop needs more fails. The release's prefix sum over
+//! every combining class takes 256 iterations whatever the text; its bound is
+//! the code's, declared once in the policy's function scope
+//! (`tests/data/proofs/loop-bounds.json`).
 //!
 //! # The `half` conversion
 //!
@@ -72,8 +85,9 @@
 //! (`float.rs` tests, `float/proofs.rs` "The `half` conversion").
 //! Compiled only under `cfg(kani)`.
 
-use super::super::proof_budget::{Counting, decode_bound_at};
+use super::super::proof_budget::Counting;
 use super::{BoundedError, DecodeError, Options, TextPolicy, decode_bound_with, decode_with};
+use TextPolicy::{Normalize, QuickOnly};
 
 /// The longest input of the domain.
 const INPUT: usize = 4;
@@ -86,34 +100,23 @@ fn any_index() -> Option<u64> {
     if kani::any() { Some(kani::any()) } else { None }
 }
 
-/// Every input of the domain, under one refusal at any one attempt and one
-/// at any one request, is decoded or
-/// refused within its bound: the work admitted, the bytes requested, the
-/// most held at once and what the published document retains, each at most
-/// the bound's; a refused decode returns its refusal and retains nothing;
-/// nothing is held once the result drops.
-#[kani::proof]
-#[kani::unwind(257)]
-#[kani::stub(crate::float::narrowed, crate::float::proofs::from_f64_contract)]
-#[kani::stub(crate::float::widened, crate::float::proofs::to_f64_contract)]
-fn the_decode_bound_covers_every_input() {
-    let bytes: [u8; INPUT] = kani::any();
-    let length: usize = kani::any();
-    kani::assume(length <= INPUT);
-    let max_depth: usize = kani::any();
-    kani::assume(max_depth <= DEPTH);
-    let options = Options {
-        max_depth,
-        text: if kani::any() {
-            TextPolicy::Normalize
-        } else {
-            TextPolicy::QuickOnly
-        },
-    };
-    let input = &bytes[..length];
-    let bound = decode_bound_at(length, options, INPUT, DEPTH, |size, case| {
-        decode_bound_with::<()>(size, case).expect("the domain's bound fits")
-    });
+/// Every input of `LEN` bytes, under nesting limit `max_depth` and the
+/// text policy `text`, and under one refusal at any one attempt and one at
+/// any one request, is decoded or refused within its bound: the work
+/// admitted, the bytes requested, the most held at once and what the
+/// published document retains, each at most the bound's; a refused decode
+/// returns its refusal and retains nothing; nothing is held once the result
+/// drops.
+fn check<const LEN: usize>(max_depth: usize, text: TextPolicy) {
+    const { assert!(LEN <= INPUT, "an instance is within the domain's inputs") };
+    assert!(
+        max_depth <= DEPTH,
+        "an instance is within the domain's nesting limits"
+    );
+    let bytes: [u8; LEN] = kani::any();
+    let options = Options { max_depth, text };
+    let input = &bytes[..];
+    let bound = decode_bound_with::<()>(LEN as u64, options).expect("the domain's bound fits");
     let mut policy = Counting::scheduled(any_index(), any_index());
     let decoded = decode_with(input, options, &mut policy);
     let retained = policy.live();
@@ -151,3 +154,8 @@ fn the_decode_bound_covers_every_input() {
         "the decode's document retains no more than its bound"
     );
 }
+
+// The instances, declared in tests/data/proofs/instances.rs and generated
+// by build.rs: every input length through INPUT, every nesting limit
+// through DEPTH, both text policies.
+include!(concat!(env!("OUT_DIR"), "/proof_instances/decode.rs"));
