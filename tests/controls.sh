@@ -71,7 +71,9 @@ gate_prepare || exit 2
 miri_models || exit 2
 logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls log directory}/controls-$channel}"
 # A run's evidence is created once: an existing log directory is another
-# run's, never overwritten.
+# run's, never overwritten. Its parents are created as needed; the directory
+# itself only when it does not exist.
+mkdir -p "$(dirname "$logs")" || exit 2
 mkdir "$logs" || exit 2
 
 listed="$(gate control list "$PWD" "$channel" native kani "${MIRI_MODELS[@]}")" || {

@@ -742,6 +742,10 @@ case "$1" in
 unicode-version) echo 17.0.0 ;;
 dcbor-draft) echo draft ;;
 miri) echo stacked ;;
+proofs-identity)
+	(set -o noclobber && printf '%s\n' /fixture/cargo-kani >"$2") || exit 2
+	printf 'kani-launcher\t/fixture/cargo-kani\nkani-version\tcargo-kani 0.0.0-fixture\n'
+	;;
 control)
 	case "$2" in
 	list) printf 'x\ttests/data/controls/x.patch\tkani\tkani\tdcbor\t-\tlib\ta::h\t-\tfailed\tp\n' ;;

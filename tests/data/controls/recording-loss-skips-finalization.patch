@@ -1,9 +1,9 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -3504,6 +3504,10 @@
-     };
-     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut run)))
-         .unwrap_or_else(|payload| Err(Finding::Defect(panic_report(payload.as_ref()))));
+@@ -3710,6 +3710,10 @@
+                 .unwrap_or_else(|payload| Err(Finding::Defect(panic_report(payload.as_ref()))))
+         },
+     );
 +    // Planted: the body's finding returned past the finalization.
 +    if let Err(finding) = &result {
 +        panic!("{finding}");
