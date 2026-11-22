@@ -787,10 +787,11 @@ gate-restored-artifact-unchecked	tests/data/controls/gate-restored-artifact-unch
 # tests/gate/src/process.rs `KaniRequest::validate`): a discovery whose exit
 # status is unread accepted as its run's judgement (the one validator of a
 # discovery, `discovered`, the plant the reconciliation's own control above
-# uses); a discovery run of another selection than its own validated; a
+# uses); a discovery run of another selection than its own validated, where
+# the run's deadlines (`selected`) still refuse the foreign harness; a
 # discovery run taken for a calibration sample (`eligible_sample`), where the
-# later records a calibration keeps still refuse it, so the pattern is the
-# case's own prefix.
+# later records a calibration keeps still refuse it. In both the pattern is
+# the case's own prefix.
 gate-discovery-purpose-status-unchecked	tests/data/controls/gate-discovery-status-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_discovery_is_judged_by_its_discovery_records	-	failed	discovery-status-nonzero: accepted
-gate-discovery-selection-unchecked	tests/data/controls/gate-discovery-selection-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kani_request_is_validated_before_anything_is_reserved	-	failed	discovery-foreign: accepted
+gate-discovery-selection-unchecked	tests/data/controls/gate-discovery-selection-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kani_request_is_validated_before_anything_is_reserved	-	failed	discovery-foreign:
 gate-discovery-sampled	tests/data/controls/gate-discovery-sampled.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_discovery_run_is_kept_and_is_never_a_sample	-	failed	discovery-sampled:
