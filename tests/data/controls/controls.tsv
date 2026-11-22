@@ -755,7 +755,10 @@ gate-source-kind-unframed	tests/data/controls/gate-source-kind-unframed.patch	na
 # (`KaniRequest::validate`); a sample's loop-bound policy digest, source state,
 # invocation, build or launcher not bound to the records the run kept
 # (`eligible_sample`); a readiness rejection lost when its receipt cannot be
-# preserved (`readiness`).
+# preserved (`readiness`). Where a later rule still refuses the case the plant
+# lets through (runner-widened by the runner-set check, calibration-two by the
+# deadline plan), the pattern is the case's own prefix: the test names a case
+# only when its own fault is missing from the refusal.
 gate-adoption-receipt-unrequired	tests/data/controls/gate-adoption-receipt-unrequired.patch	native	nightly	dcbor-gate	-	lib	proofs::adoption::tests::an_unaccepted_publication_is_refused_until_recovered	-	failed	publication: an unaccepted publication was read
 # Readers must not consume a receipt before acceptance finishes; receipt
 # rollback must synchronize its deletion and preserve the synchronization error.
@@ -763,10 +766,10 @@ gate-adoption-read-unlocked	tests/data/controls/gate-adoption-read-unlocked.patc
 gate-adoption-removal-unsynchronized	tests/data/controls/gate-adoption-removal-unsynchronized.patch	native	nightly	dcbor-gate	-	lib	proofs::adoption::tests::a_failed_receipt_synchronizes_its_removal	-	failed	the receipt removal was not synchronized
 gate-adoption-recovery-follows-link	tests/data/controls/gate-adoption-recovery-follows-link.patch	native	nightly	dcbor-gate	-	lib	proofs::adoption::tests::recovery_never_follows_a_publication_symlink	-	failed	recovery-followed-link: Ok(
 gate-adoption-unlock-omitted	tests/data/controls/gate-adoption-unlock-omitted.patch	native	nightly	dcbor-gate	-	lib	proofs::adoption::tests::completion_unlocks_even_when_an_inherited_descriptor_remains	-	failed	completion left its lock held by an inherited descriptor
-gate-readiness-verdict-unrecomputed	tests/data/controls/gate-readiness-verdict-unrecomputed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	runner-widened: accepted
+gate-readiness-verdict-unrecomputed	tests/data/controls/gate-readiness-verdict-unrecomputed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	runner-widened:
 gate-readiness-facts-unbound	tests/data/controls/gate-readiness-facts-unbound.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	facts-unbound: accepted
 gate-calibration-lock-released-early	tests/data/controls/gate-calibration-lock-released-early.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_holds_the_workload_lock_through_its_last_record	-	failed	lock-released-early
-gate-execution-purpose-unchecked	tests/data/controls/gate-execution-purpose-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kani_request_is_validated_before_anything_is_reserved	-	failed	calibration-two: accepted
+gate-execution-purpose-unchecked	tests/data/controls/gate-execution-purpose-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_kani_request_is_validated_before_anything_is_reserved	-	failed	calibration-two:
 gate-sample-policy-unbound	tests/data/controls/gate-sample-policy-unbound.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	policy-digest-unbound: accepted
 gate-sample-tree-unbound	tests/data/controls/gate-sample-tree-unbound.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	tree-unbound: accepted
 gate-sample-invocation-unbound	tests/data/controls/gate-sample-invocation-unbound.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	invocation-unbound: accepted
