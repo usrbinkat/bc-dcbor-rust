@@ -47,7 +47,7 @@ reachable. Finite work and live-storage limits provide a second bound.
 
 Numeric value preservation and cross-precision identity supplement differential
 comparison. Unicode expectations use the upstream normalizer; the independent
-Unicode 17 corpus remains in `tests/normalization.rs`. Actual heap-failure and
+Unicode 18 corpus remains in `tests/normalization.rs`. Actual heap-failure and
 write-allocation instrumentation lives in `tests/bounded_adversarial.rs`.
 
 `decode` covers malformed bytes, admitted parsing, and refusal cleanup. It calls

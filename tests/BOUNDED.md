@@ -20,8 +20,8 @@
   integers, and numeric map-key identity across source precisions;
   integer-to-float coercion and rejection of fractional float-to-integer
   conversion.
-- `normalization.rs`: all five NFC identities for each of 20,034 Unicode
-  17.0.0 conformance rows; independently expected long ordered, reversed and
+- `normalization.rs`: all five NFC identities for each of 20,171 Unicode
+  18.0.0 conformance rows; independently expected long ordered, reversed and
    equal-class combining runs, expansion, and Hangul contraction. Both encoders
    must agree on each conformance input; distinct NFD forms must be rejected
    as `NonCanonicalString` by symbolic decoding.

@@ -9,7 +9,7 @@
 //! in the plan for the write to copy.
 //!
 //! `normalize` is a push-model restatement of `unicode-normalization`
-//! 0.1.25's `Decompositions` and `Recompositions` (`decompose.rs`,
+//! 0.1.26's `Decompositions` and `Recompositions` (`decompose.rs`,
 //! `recompose.rs`) over the same public character primitives
 //! (`decompose_canonical`, `canonical_combining_class`, `compose`), so the
 //! Unicode data, the Hangul algorithms and the composition rules are that

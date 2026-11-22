@@ -1,9 +1,9 @@
 # Normalization conformance data
 
 `NormalizationTest.txt` is the Unicode Character Database's own conformance file for **Unicode
-17.0.0**, the version the pinned `unicode-normalization` (**0.1.25**, `src/tables.rs`,
+18.0.0**, the version the pinned `unicode-normalization` (**0.1.26**, `src/tables.rs`,
 `UNICODE_VERSION`) normalizes by, copied unchanged from unicodetools
-`unicodetools/data/ucd/17.0.0/NormalizationTest.txt` (revision `2621ff34`). Its license, the Unicode
+`unicodetools/data/ucd/18.0.0/NormalizationTest.txt` (revision `725fb605`). Its license, the Unicode
 License V3 of that repository, is `LICENSE-UNICODE`. `tests/normalization.rs` compiles it in and
 parses it itself (part headers, comments, rows of five columns, anything else refused naming its
 line), so the suite runs under Miri's isolation and holds the data once; no row count is written
@@ -11,7 +11,7 @@ anywhere. The file's header names its version, which must equal `dcbor::UNICODE_
 another version is refused before any row is read, and planted controls rewrite the header to each
 neighbouring version, derived from the pin, and remove it.
 
-The package's other Unicode data, `data/unicode/17.0.0/DerivedAge.txt` (license
+The package's other Unicode data, `data/unicode/18.0.0/DerivedAge.txt` (license
 `data/unicode/LICENSE-UNICODE`), is what `build.rs` generates the stabilized-text table from
 (`src/stabilized_text.rs`); its version is checked against the same constant at compile time.
 

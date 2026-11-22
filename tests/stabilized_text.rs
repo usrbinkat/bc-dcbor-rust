@@ -1,6 +1,6 @@
 //! Stabilized text (UAX #15, section 12) above dCBOR conformance: what dCBOR
 //! accepts as text (NFC), less any code point the pinned Unicode version
-//! leaves unassigned. Vectors from `data/unicode/17.0.0/DerivedAge.txt`:
+//! leaves unassigned. Vectors from `data/unicode/18.0.0/DerivedAge.txt`:
 //! U+1FA8A TROMBONE is assigned in 17.0 (line 2106, `1FA8A ; 17.0`);
 //! U+0378 is unassigned, no line listing it (the nearest lines are 895,
 //! `0376..0377 ; 5.1`, and 71, `037A ; 1.1`).
@@ -12,7 +12,7 @@ use dcbor::{Error, StabilizedText, is_assigned};
 /// U+1FA8A TROMBONE, assigned in Unicode 17.0.
 const ASSIGNED: &str = "\u{1FA8A}";
 
-/// U+0378, unassigned in Unicode 17.0.
+/// U+0378, unassigned in Unicode 18.0.
 const UNASSIGNED: &str = "\u{378}";
 
 /// `text`'s dCBOR text encoding, its head and its UTF-8 bytes.
