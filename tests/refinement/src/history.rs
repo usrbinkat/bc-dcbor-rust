@@ -301,17 +301,60 @@ mod tests {
 
     /// The lending path and the owned API preserve the original snapshots,
     /// including malformed custody; reading boundaries does not consume one.
+    /// A divergence names the first checkpoint and group it reaches, never
+    /// the snapshots themselves, which a large fixture holds in megabytes.
     fn assert_replay(history: &History, expected: &[Checkpoint]) {
+        const DIFFER: &str = "reconstructed checkpoints differ from the checkpoints pushed";
+        let first_group = |got: &Checkpoint, want: &Checkpoint| {
+            got.custody
+                .iter()
+                .zip(&want.custody)
+                .position(|(a, b)| a != b)
+        };
         let mut replay = Replay::new(&history.deltas);
         let boundaries: Vec<usize> = expected.iter().map(|point| point.boundary).collect();
-        assert_eq!(replay.boundaries(), boundaries);
-        for checkpoint in expected {
-            assert_eq!(replay.advance(), Some(checkpoint));
-            assert_eq!(replay.boundaries(), boundaries);
+        assert!(
+            replay.boundaries() == boundaries,
+            "{DIFFER}: the boundaries before replay"
+        );
+        for (index, checkpoint) in expected.iter().enumerate() {
+            match replay.advance() {
+                Some(got) if got == checkpoint => {}
+                Some(got) => panic!(
+                    "{DIFFER}: checkpoint {index} (boundary {} against {}, {} groups against {}, \
+                     first differing group {:?})",
+                    got.boundary,
+                    checkpoint.boundary,
+                    got.custody.len(),
+                    checkpoint.custody.len(),
+                    first_group(got, checkpoint)
+                ),
+                None => panic!("{DIFFER}: the replay ended before checkpoint {index}"),
+            }
+            assert!(
+                replay.boundaries() == boundaries,
+                "{DIFFER}: the boundaries after checkpoint {index}"
+            );
         }
-        assert_eq!(replay.advance(), None);
-        assert_eq!(replay.advance(), None);
-        assert_eq!(history.to_vec(), expected);
+        assert!(
+            replay.advance().is_none() && replay.advance().is_none(),
+            "{DIFFER}: the replay continued past checkpoint {}",
+            expected.len()
+        );
+        let owned = history.to_vec();
+        if let Some(index) = owned
+            .iter()
+            .zip(expected)
+            .position(|(got, want)| got != want)
+        {
+            panic!("{DIFFER}: the owned history's checkpoint {index}");
+        }
+        assert!(
+            owned.len() == expected.len(),
+            "{DIFFER}: the owned history holds {} checkpoints of {}",
+            owned.len(),
+            expected.len()
+        );
     }
 
     fn group(n: u64) -> Custody {
