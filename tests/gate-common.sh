@@ -335,14 +335,14 @@ preflight_controls() {
 	return "$failed"
 }
 
-# The digest of every file of the copy at `$1` (`copy_of`, which carries no
-# git metadata), by path in byte order: a control's copy is recorded before
-# its diff, with it, and after it is reversed, and must read back equal.
+# The source state of the copy at `$1` (`copy_of`, which carries no git
+# metadata), digested by the gate tool's one implementation (`gate
+# tree-digest`, tests/gate `proofs::SourceState`): every entry's raw path,
+# kind, executable bit, link target and bytes, so `gate_prepare` comes
+# first. A control's copy is recorded before its diff, with it, and after it
+# is reversed, and must read back equal.
 tree_digest() {
-	(
-		cd "$1" || exit 1
-		find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
-	) | sha256sum | cut -d' ' -f1
+	gate tree-digest "$1"
 }
 
 # The gate tool (tests/gate): every decision about what a run produced and

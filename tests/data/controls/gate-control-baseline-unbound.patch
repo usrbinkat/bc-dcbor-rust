@@ -1,0 +1,11 @@
+--- tests/gate/src/controls.rs
++++ tests/gate/src/controls.rs
+@@ -770,7 +770,7 @@
+         .map_err(|error| format!("{}: its baseline's authorization: {error}", control.name))?;
+     let fault = if record.version != AUTHORIZATION_VERSION || record.side != Side::Baseline {
+         Some("is no baseline's".to_string())
+-    } else if record.control != control.name || record.harness != harness {
++    } else if record.harness != harness {
+         Some(format!(
+             "is control {}'s, harness {}",
+             record.control, record.harness

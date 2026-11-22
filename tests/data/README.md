@@ -361,12 +361,94 @@ given, and per harness the instrumented binary it was checked on, copied before 
 (`artifact.out`, with its build path and digest in `artifact.json`), the loop discovery's
 invocation, status and streams for every harness, the resolution of the bounds that apply to it,
 the solver's command and executables and its
-launch attempt, then `execution.json`, the launcher and verifier of the run. The preserved binary
+launch attempt, then `execution.json`, the launcher, the verifier and each launched harness's
+artifact digest, written once the evidence reconciled. The preserved binary
 is what a replay or an inspection of a harness's loops reads: the shared `target/kani` build
 directory is rewritten by every later run. A run's verdicts count only when that evidence reconciles with its policy and
 report (`proofs::check_execution_evidence`): the preserved bytes have their recorded digest, the
 solver ran on them, and a bounded harness's resolution names them, for the proof suite and every
 Kani control alike.
+
+## Proof runtime evidence
+
+Every Kani run the gate judges runs on a copy of a clean commit (`tests/gate-common.sh`,
+`copy_of`), never the checkout: the proof gate's at one location, `target/proof-source`, held
+under an exclusive lock (`target/proof-source.lock`) for its whole run, so a calibration's and a
+qualification's builds share their source paths and so their instrumented binaries; a control's
+at its own copy. The gate never asks git what a tree holds. A run's source identity is the digest
+of the copy's source state (`proofs::SourceState`, `proofs::tree_digest`, the one implementation
+the scripts' `tree_digest` and `gate tree-digest` also are): a versioned record stream
+(`dcbor-gate source tree v1`) of every entry in byte order of its raw path, each field
+length-delimited, a regular file with its executable bit and bytes, a symbolic link with its
+target, never followed, a path another state lists recorded as deleted; any other kind refuses
+the digest. It is read before the run launches and again when it ends; a source that moved
+refuses the run, though a change made and undone while it ran is not detected.
+
+A run's evidence directory, `LOG.evidence/`, is created exclusively, and from then on every
+outcome is judged (`process::kani`): the document the run was given, kept before anything
+launches (`plan.json` for a calibration, `expectations.json` otherwise), the very bytes its
+identity's revision (`run.json`) is the digest of; the identity; for a control side its
+authorization (`authorization.json`); the launch's environment and load before and after
+(`launch.json`); the launcher's ending (`launcher.execution.json`); the reconciled execution; then
+`judgement.json`, accepted or rejected with why, written whatever failed; then `manifest.json`,
+attempted whatever the judgement's own write did. The manifest names the run's identifier only
+when one was made, records the log as present with its digest, missing (the run never created
+it) or unreadable, digests every record or names each it could not, and says whether it is
+complete. A manifest that cannot be written fails the run, accepted or not; a storage failure
+neither record survives is returned, never claimed durable. Each document is read once, its
+digest and its interpretation of the same bytes (`process::sha256_bytes`, the one digest
+authority beside `process::sha256`), and a run's records are read through its manifest, each
+record's bytes held to its listed digest before they are interpreted (`proofs::Artifacts`).
+
+A workload's environment (`proofs::Environment`) is its processor model, its affinity, the
+effective cpuset of its nearest cpuset-enabled group, and its group and every ancestor through
+`/`, each with its path and its `cpu.max` and `memory.max` observed as a validated value, an
+absence cgroup v2 establishes with its reason (the root keeps neither; a group whose parent's
+`cgroup.subtree_control` does not enable the controller has none of its files), or unavailable
+with why (a permission failure, a group that disappeared, a malformed value, a file missing
+though its controller is enabled). Absence is never unlimited. Two environments are equivalent
+only when both are established and their constraints equal, the ancestors' limits in order; the
+paths, transient scope names among them, are provenance. An environment the gate's own group
+could not be read for establishes no confinement at all.
+
+A calibration (`tests/proofs.sh calibrate PLAN CONTROL_LOGS`, `proofs::calibration`) validates its
+plan once, then preserves its readiness before any run (`readiness.json`): the control run it
+follows, which must have finished and passed on the same commit (its final record,
+`CONTROL_LOGS/verdict.json`, written by `gate control evidence`, read once and digested), and the
+system settled under the declared policy (`proofs::settling_policy`: a reading of
+`/proc/loadavg` every 5 s, six in a row with at most two runnable tasks and a one-minute load of
+at most 1.00, refused after 180 readings; an operational criterion, not a claim of idleness),
+every reading kept. It then checks each planned harness alone, one Kani run each with its own
+identity, environment and load (`LOGS/calibration/HARNESS.N.log` and its evidence), in two passes:
+every harness once, then, to `proofs::SAMPLES` executions, only a harness whose every execution
+verified in an environment equivalent to its first. A deadline, a signal, an unsupported
+construct, a failure, a bound refused or a rejected run is left to diagnosis, never repeated, and
+nothing is retried; an execution that could not be scheduled ends the schedule, every one after
+it recorded as never run. The schedule is its last record (`calibration.json`). An accepted run
+alone is adopted (`gate proofs-adopt LOGS/calibration/HARNESS.N.evidence ROOT`, `proofs::adopt`):
+its records copied whole beside their destination, every instrumented binary recorded by digest
+alone, and checked against its complete manifest and its accepted judgement before the copy is
+renamed into `proofs/calibration/RUN`. A prediction cites adopted runs only (`proofs::expectations`).
+
+A Kani control side runs under an authorization its runner validates (`controls::authorize`,
+`controls::Authorization`, made nowhere else): its control, the digest of its diff's bytes, its
+harness, its side, the digest of the predictions it is held to, its copy and build directory, the
+copy's source state and each path's digest, and the transition it was validated for. A baseline's
+copy must be the unplanted copy its runner recorded (`before.sha256`); it records the
+calibration's artifact beside its own and the transfer that explains a copy's build
+(`controls::TRANSFER`). A red side must cite its verified baseline, the same diff bytes and the
+same predictions, its copy changed from the baseline's in exactly the paths the diff touches; a
+restored green side must cite the same baseline and equal it in every path, and its harness's
+artifact must equal the baseline's (`proofs::check_expectations`). A deadline, a signal, a timing
+excess, an unsupported construct or another failure than the control's is no detection.
+
+Each enforcement is a registered control, its check weakened by one plant and refused by the case
+it lets through (`controls/controls.tsv`): `gate-unavailable-limit-absent`,
+`gate-rejection-manifest-omitted`, `gate-rejected-run-adopted`, `gate-document-unretained`,
+`gate-manifest-record-unverified`, `gate-calibration-repeats-unverified`,
+`gate-control-run-unverified`, `gate-source-move-unchecked`, `gate-source-kind-unframed`,
+`gate-control-mutation-unbounded`, `gate-control-baseline-unbound` and
+`gate-restored-artifact-unchecked`.
 
 ## Planted controls
 

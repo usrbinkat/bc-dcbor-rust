@@ -1014,13 +1014,31 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
                 configuration,
             )
         }
+        // The verdict over a control run, and its final record
+        // (`verdict.json`, `proofs::ControlVerdict`), written once whatever
+        // the verdict: what a calibration's readiness cites.
         ["control", "evidence", root, logs, channel] => {
+            let logs = Path::new(logs);
             let table = controls::read(Path::new(root)).map_err(Broken)?;
-            Ok(verdict(&controls::evidence(
-                &table,
-                Path::new(logs),
-                channel,
-            )))
+            let faults = controls::evidence(&table, logs, channel);
+            let counted = table
+                .iter()
+                .filter(|control| {
+                    control.runner.runs_one_test() && control.toolchain.as_deref() == Some(*channel)
+                })
+                .count();
+            let record = dcbor_gate::proofs::ControlVerdict {
+                version: dcbor_gate::proofs::RUNTIME_VERSION,
+                channel: channel.to_string(),
+                commit: contents(&logs.join("commit.txt"))?.trim().to_string(),
+                identity: contents(&logs.join("identity.txt"))?.trim().to_string(),
+                controls: counted,
+                faults: faults.clone(),
+            };
+            let encoded = serde_json::to_vec_pretty(&record)
+                .map_err(|error| Broken(format!("{}: {error}", logs.display())))?;
+            dcbor_gate::process::record(&logs.join("verdict.json"), &encoded).map_err(Broken)?;
+            Ok(verdict(&faults))
         }
         ["classify", runner, kind, status, log] => {
             let kind = suite_kind(kind)?;
@@ -1074,6 +1092,72 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             let mut found = rows::verdict(&published);
             found.extend(faults);
             Ok(verdict(&found))
+        }
+        // A calibration of the harnesses a plan names, after the control run
+        // whose logs are `control_logs`: each harness checked alone under its
+        // plan's operational limit, qualifying nothing and writing no results
+        // row (`proofs::calibration`). Each scheduled execution is printed;
+        // the command fails unless every one verified, since only a verified
+        // execution is a calibration sample.
+        [
+            "proofs-calibrate",
+            root,
+            target_dir,
+            logs,
+            launcher,
+            plan,
+            control_logs,
+        ] => {
+            let launcher =
+                dcbor_gate::proofs::selected_launcher(Path::new(launcher)).map_err(Broken)?;
+            let schedule = dcbor_gate::proofs::calibrate(
+                Path::new(root),
+                Path::new(plan),
+                Path::new(target_dir),
+                Path::new(logs),
+                &launcher,
+                Path::new(control_logs),
+            )
+            .map_err(Broken)?;
+            let mut unverified = Vec::new();
+            for execution in &schedule.executions {
+                let observed = match &execution.observed {
+                    dcbor_gate::proofs::Observed::Outcome { outcome } => outcome.clone(),
+                    dcbor_gate::proofs::Observed::Rejected { error } => {
+                        format!("rejected: {error}")
+                    }
+                    dcbor_gate::proofs::Observed::NotRun { reason } => format!("not run: {reason}"),
+                };
+                println!(
+                    "{}\tpass {}\t{observed}\t{}",
+                    execution.harness, execution.pass, execution.log
+                );
+                if observed != dcbor_gate::outcome::Outcome::Pass.name() {
+                    unverified.push(format!(
+                        "harness {} pass {}: {observed}, not a sample",
+                        execution.harness, execution.pass
+                    ));
+                }
+            }
+            Ok(verdict(&unverified))
+        }
+        // The source state of the copy at `root` (`copy_of`), the one digest
+        // of a tree's kinds, modes, link targets and bytes
+        // (`proofs::SourceState`) every script and run records.
+        ["tree-digest", root] => {
+            println!(
+                "{}",
+                dcbor_gate::proofs::tree_digest(Path::new(root)).map_err(Broken)?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        // A finished calibration's records copied into the tree, where a
+        // prediction may cite them.
+        ["proofs-adopt", evidence, root] => {
+            let adopted =
+                dcbor_gate::proofs::adopt(Path::new(evidence), Path::new(root)).map_err(Broken)?;
+            println!("{}", adopted.display());
+            Ok(ExitCode::SUCCESS)
         }
         ["miri", "models"] => {
             print_lines(&miri::MIRI_MODELS);

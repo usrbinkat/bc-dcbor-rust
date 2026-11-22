@@ -1,0 +1,11 @@
+--- tests/gate/src/controls.rs
++++ tests/gate/src/controls.rs
+@@ -890,7 +890,7 @@
+                 .collect();
+             if side == Side::Red {
+                 let touched = patch_paths(&String::from_utf8_lossy(&patch));
+-                if changed != touched {
++                if !touched.is_subset(&changed) {
+                     return Err(format!(
+                         "{}: the copy changed {changed:?} from its baseline, the registered diff \
+                          touches {touched:?}: the source change is not exactly the registered \

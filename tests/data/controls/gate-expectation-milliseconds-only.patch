@@ -1,11 +1,11 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -208,7 +208,7 @@
-             .get(name)
-             .ok_or_else(|| format!("harness {name}: checked, but has no expectation"))?;
+@@ -1885,7 +1885,7 @@
+             ));
+         }
          let expected = std::time::Duration::from_millis(expectation.milliseconds);
 -        if *elapsed > expected {
 +        if elapsed.as_millis() > expected.as_millis() {
              return Err(format!(
-                 "harness {name}: its CBMC run took {elapsed:?}, more than its expected {} ms \
-                  ({}): the harness is wrongly sized for its expectation, the expectation is \
+                 "harness {name}: its CBMC run took {elapsed:?}, more than its predicted {} ms \
+                  ({}): the harness is wrongly sized for its prediction, the prediction is \

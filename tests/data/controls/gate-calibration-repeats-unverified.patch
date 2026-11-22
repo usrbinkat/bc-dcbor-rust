@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -3659,7 +3659,7 @@
+                     .is_some_and(|initial| initial.equivalent(&environment)),
+                 (None, _) => false,
+             };
+-            if verified && compatible {
++            if compatible {
+                 eligible.insert(harness.clone());
+             } else {
+                 eligible.remove(harness);

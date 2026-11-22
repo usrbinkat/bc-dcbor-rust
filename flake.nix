@@ -753,16 +753,21 @@
           # proof harnesses (Kani, on its own pinned toolchain), the
           # mutation campaign, the reach map's coverage (cargo-llvm-cov), the
           # Miri gate's per-test memory and duration (GNU time), the fuzz
-          # campaign (fuzz/qualify.sh, fuzz/smoke.sh), and the check of the
+          # campaign (fuzz/qualify.sh, fuzz/smoke.sh), the check of the
           # gate scripts, which launch the gate tool (tests/gate), built by
-          # the toolchain itself.
+          # the toolchain itself, and the proof gate's lock on its one source
+          # copy and its workload (flock, tests/proofs.sh).
           maintenance = [
             kaniBundle
+            # Inspect preserved goto artifacts with the same patched tools
+            # the bundle uses internally.
+            kaniCbmc
             cargoMutants
             cargoLlvmCov
             pkgs.cargo-fuzz
             pkgs.shellcheck
             pkgs.time
+            pkgs.util-linux
           ];
           customShell = pkgs.mkShell {
             nativeBuildInputs = [

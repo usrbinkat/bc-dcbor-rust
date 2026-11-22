@@ -742,6 +742,7 @@ case "$1" in
 unicode-version) echo 17.0.0 ;;
 dcbor-draft) echo draft ;;
 miri) echo stacked ;;
+tree-digest) exec "$REAL_GATE" "$@" ;;
 proofs-identity)
 	(set -o noclobber && printf '%s\n' /fixture/cargo-kani >"$2") || exit 2
 	printf 'kani-launcher\t/fixture/cargo-kani\nkani-version\tcargo-kani 0.0.0-fixture\n'
@@ -822,6 +823,7 @@ esac
             .env("DCBOR_CONFIGURATION", "fixture")
             .env("CONTROL_LOG_DIR", repo.join("target/logs").join(baseline))
             .env("GATE_CALLS", &calls)
+            .env("REAL_GATE", env!("CARGO_BIN_EXE_gate"))
             .env("BASELINE_EXIT", baseline)
             .env_remove("DCBOR_GATE_SUPERVISOR")
             .env_remove("DCBOR_GATE_MEMORY")

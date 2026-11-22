@@ -17,7 +17,7 @@
 //! libtest's summary), or a trybuild fixture's own block in its suite's
 //! report.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use dcbor_model_bounds::Checker;
@@ -593,6 +593,364 @@ pub fn verified(control: &Control, outcome: Outcome, report: &str) -> Result<(),
     }
 }
 
+/// The side of a Kani control a run is: its harness on the unmutated copy,
+/// with the registered diff applied, or with it reversed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Side {
+    Baseline,
+    Red,
+    Green,
+}
+
+impl Side {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "baseline" => Ok(Self::Baseline),
+            "red" => Ok(Self::Red),
+            "green" => Ok(Self::Green),
+            other => Err(format!(
+                "no control side {other:?}; the sides are baseline, red and green"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Red => "red",
+            Self::Green => "green",
+        }
+    }
+}
+
+/// The version of a control side's authorization record.
+pub const AUTHORIZATION_VERSION: u64 = 1;
+
+/// Why a control copy's build is not the calibration's artifact: the
+/// instrumented binary records its source paths, and a control's copy is
+/// built at its own location (`target/control-copies/RUN`, built into
+/// `target/control-builds`), the calibration at `target/proof-source`. The
+/// baseline's artifact is recorded beside the calibration's, its timing held
+/// to the calibration's prediction; the restored green side's must equal the
+/// baseline's.
+pub const TRANSFER: &str = "a control copy builds at its own location, whose source paths the \
+     instrumented binary records; its baseline's artifact is recorded beside the calibration's \
+     and its timing held to the calibration's prediction, and its restored side's artifact must \
+     equal its baseline's";
+
+/// How a side's source must stand against its baseline's: the unplanted
+/// copy itself; exactly the paths the registered diff touches changed; or
+/// none changed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Transition {
+    Unplanted,
+    Planted { paths: BTreeSet<String> },
+    Restored,
+}
+
+/// A verified baseline as a red or green side cites it: its run, the digest
+/// of its manifest, the artifact its harness ran on, and its source state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineReceipt {
+    pub run: String,
+    pub manifest_sha256: String,
+    pub artifact_sha256: String,
+    pub source_sha256: String,
+}
+
+/// What a control side's run is authorized for, as its evidence keeps it
+/// (`authorization.json`, written before the run launches): the registry's
+/// control and the digest of its diff's bytes, the harness, the side, the
+/// digest of the predictions it is held to, the copy and the build
+/// directory, the copy's source state and each path's digest
+/// ([`crate::proofs::SourceState::digests`]), the source transition the side
+/// was validated for, the baseline a red or green side cites, and the
+/// calibration's artifact beside the transfer that explains why a copy's
+/// build is not it ([`TRANSFER`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationRecord {
+    pub version: u64,
+    pub control: String,
+    pub patch_sha256: String,
+    pub harness: String,
+    pub side: Side,
+    pub expectations_sha256: String,
+    pub copy: String,
+    pub build: String,
+    pub source_sha256: String,
+    pub sources: BTreeMap<String, String>,
+    pub transition: Transition,
+    pub baseline: Option<BaselineReceipt>,
+    pub calibration_artifact_sha256: String,
+    pub transfer: String,
+}
+
+/// A control side's validated authorization ([`AuthorizationRecord`]):
+/// made only here, by the control runner's validation of the side
+/// ([`authorize`]), so no run is a control side without it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authorization {
+    record: AuthorizationRecord,
+}
+
+impl Authorization {
+    pub fn record(&self) -> &AuthorizationRecord {
+        &self.record
+    }
+
+    /// The verified baseline a restored green side's artifact must equal.
+    pub fn restored_baseline(&self) -> Option<&BaselineReceipt> {
+        match self.record.side {
+            Side::Green => self.record.baseline.as_ref(),
+            Side::Baseline | Side::Red => None,
+        }
+    }
+}
+
+/// The paths a unified diff of `-p0` paths touches: every `--- ` and `+++ `
+/// header's path, its timestamp after a tab left out, `/dev/null` (a file
+/// created or deleted) none.
+fn patch_paths(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            line.strip_prefix("--- ")
+                .or_else(|| line.strip_prefix("+++ "))
+        })
+        .map(|rest| rest.split('\t').next().unwrap_or(rest).to_string())
+        .filter(|path| path != "/dev/null")
+        .collect()
+}
+
+/// The verified baseline of the Kani `control` under `directory`, as a red
+/// or green side must cite it: judged verified (`baseline.judged`); its
+/// evidence a finished run's whose manifest is complete
+/// ([`crate::proofs::read_manifest`]), every record read through it; its
+/// judgement accepted; and its authorization a baseline's of this control
+/// and harness, of the diff whose bytes have digest `patch_sha256`, under the
+/// predictions of digest `expectations_sha256`. The receipt and the
+/// baseline's own authorization record.
+fn baseline_receipt(
+    directory: &Path,
+    control: &Control,
+    harness: &str,
+    patch_sha256: &str,
+    expectations_sha256: &str,
+) -> Result<(BaselineReceipt, AuthorizationRecord), String> {
+    let judged = std::fs::read_to_string(directory.join("baseline.judged"))
+        .map_err(|_| format!("{}: no baseline was run", control.name))?;
+    if judged.trim() != "verified" {
+        return Err(format!(
+            "{}: no verified baseline: {}",
+            control.name,
+            judged.trim()
+        ));
+    }
+    let evidence = directory.join("baseline.evidence");
+    let (manifest, manifest_sha256) = crate::proofs::read_manifest(&evidence, None)
+        .map_err(|fault| format!("{}: its baseline: {fault}", control.name))?;
+    let records = crate::proofs::Artifacts::Adopted {
+        evidence: &evidence,
+        files: &manifest.files,
+    };
+    let json = |file: &str| -> Result<serde_json::Value, String> {
+        crate::proofs::strict_json(&records.read(&evidence.join(file))?)
+            .map_err(|fault| format!("{}: its baseline's {file}: {fault}", control.name))
+    };
+    if json("judgement.json")? != serde_json::json!({"status": "accepted"}) {
+        return Err(format!(
+            "{}: its baseline's judgement is not accepted",
+            control.name
+        ));
+    }
+    let record: AuthorizationRecord = serde_json::from_value(json("authorization.json")?)
+        .map_err(|error| format!("{}: its baseline's authorization: {error}", control.name))?;
+    let fault = if record.version != AUTHORIZATION_VERSION || record.side != Side::Baseline {
+        Some("is no baseline's".to_string())
+    } else if record.control != control.name || record.harness != harness {
+        Some(format!(
+            "is control {}'s, harness {}",
+            record.control, record.harness
+        ))
+    } else if record.patch_sha256 != patch_sha256 {
+        Some(format!(
+            "is of the diff {}, whose bytes are now {patch_sha256}",
+            record.patch_sha256
+        ))
+    } else if record.expectations_sha256 != expectations_sha256 {
+        Some(format!(
+            "froze the predictions {}, this side is given {expectations_sha256}",
+            record.expectations_sha256
+        ))
+    } else {
+        None
+    };
+    if let Some(fault) = fault {
+        return Err(format!(
+            "{}: the baseline authorization it cites {fault}",
+            control.name
+        ));
+    }
+    let artifact_sha256 = json("execution.json")?["artifacts"][harness]
+        .as_str()
+        .filter(|digest| crate::proofs::sha256_text(digest))
+        .ok_or_else(|| {
+            format!(
+                "{}: its baseline recorded no artifact of {harness}",
+                control.name
+            )
+        })?
+        .to_string();
+    let run = manifest.run.clone().unwrap_or_default();
+    Ok((
+        BaselineReceipt {
+            run,
+            manifest_sha256,
+            artifact_sha256,
+            source_sha256: record.source_sha256.clone(),
+        },
+        record,
+    ))
+}
+
+/// The authorization of the Kani `control`'s `side` in the copy `root`,
+/// built into `target_dir`, its records under `directory`, held to
+/// `expectations`: validated from the side's source and its records, never
+/// assumed. A baseline's copy must be the unplanted source its runner
+/// recorded once the copy was made (`before.sha256`). A red side must cite
+/// its verified baseline ([`baseline_receipt`]) of the same diff bytes and
+/// predictions, and its copy must differ from the baseline's in exactly the
+/// paths the diff touches, its source the one its runner recorded with the
+/// diff applied (`planted.sha256`). A restored green side must cite the
+/// same baseline, and its copy must equal the baseline's in every path
+/// (`after.sha256`).
+fn authorize(
+    root: &Path,
+    target_dir: &Path,
+    directory: &Path,
+    control: &Control,
+    side: Side,
+    expectations: &crate::proofs::Expectations,
+) -> Result<Authorization, String> {
+    let harness = control
+        .test
+        .as_deref()
+        .ok_or_else(|| format!("{}: a kani control without its harness", control.name))?;
+    let diff = root.join(&control.diff);
+    let patch = std::fs::read(&diff).map_err(|error| format!("{}: {error}", diff.display()))?;
+    let patch_sha256 = crate::process::sha256_bytes(&patch)?;
+    let calibration_artifact_sha256 = expectations
+        .harnesses
+        .get(harness)
+        .ok_or_else(|| format!("{}: harness {harness} has no prediction", control.name))?
+        .artifact_sha256
+        .clone();
+    let recorded = |file: &str| {
+        std::fs::read_to_string(directory.join(file))
+            .map(|text| text.trim().to_string())
+            .map_err(|_| format!("{}: its runner recorded no {file}", control.name))
+    };
+    let state = crate::proofs::SourceState::read(root)?;
+    let source_sha256 = state.digest()?;
+    let (transition, baseline, sources) = match side {
+        Side::Baseline => {
+            let before = recorded("before.sha256")?;
+            if source_sha256 != before {
+                return Err(format!(
+                    "{}: the copy's source state is {source_sha256}, the unplanted copy was \
+                     {before}: a baseline runs on the unplanted source alone",
+                    control.name
+                ));
+            }
+            (Transition::Unplanted, None, state.digests()?)
+        }
+        Side::Red | Side::Green => {
+            let (receipt, base) = baseline_receipt(
+                directory,
+                control,
+                harness,
+                &patch_sha256,
+                &expectations.sha256,
+            )?;
+            let listed: BTreeSet<Vec<u8>> = base
+                .sources
+                .keys()
+                .map(|path| path.as_bytes().to_vec())
+                .collect();
+            let sources = state.with_deletions(&listed).digests()?;
+            let changed: BTreeSet<String> = base
+                .sources
+                .keys()
+                .chain(sources.keys())
+                .filter(|path| base.sources.get(*path) != sources.get(*path))
+                .cloned()
+                .collect();
+            if side == Side::Red {
+                let touched = patch_paths(&String::from_utf8_lossy(&patch));
+                if changed != touched {
+                    return Err(format!(
+                        "{}: the copy changed {changed:?} from its baseline, the registered diff \
+                         touches {touched:?}: the source change is not exactly the registered \
+                         mutation",
+                        control.name
+                    ));
+                }
+                let planted = recorded("planted.sha256")?;
+                if source_sha256 != planted {
+                    return Err(format!(
+                        "{}: the copy's source state is {source_sha256}, its runner recorded \
+                         {planted} with the diff applied",
+                        control.name
+                    ));
+                }
+                (
+                    Transition::Planted { paths: touched },
+                    Some(receipt),
+                    sources,
+                )
+            } else {
+                if !changed.is_empty() || source_sha256 != receipt.source_sha256 {
+                    return Err(format!(
+                        "{}: the restored copy differs from its baseline in {changed:?}: the \
+                         restoration is incomplete",
+                        control.name
+                    ));
+                }
+                let after = recorded("after.sha256")?;
+                if source_sha256 != after {
+                    return Err(format!(
+                        "{}: the copy's source state is {source_sha256}, its runner recorded \
+                         {after} with the diff reversed",
+                        control.name
+                    ));
+                }
+                (Transition::Restored, Some(receipt), sources)
+            }
+        }
+    };
+    Ok(Authorization {
+        record: AuthorizationRecord {
+            version: AUTHORIZATION_VERSION,
+            control: control.name.clone(),
+            patch_sha256,
+            harness: harness.to_string(),
+            side,
+            expectations_sha256: expectations.sha256.clone(),
+            copy: root.display().to_string(),
+            build: target_dir.display().to_string(),
+            source_sha256,
+            sources,
+            transition,
+            baseline,
+            calibration_artifact_sha256,
+            transfer: TRANSFER.to_string(),
+        },
+    })
+}
+
 /// One run of the native `control` in the copy `root`: its target built into
 /// `target_dir`, its one test run alone, logged under `logs` by `side`; a
 /// Kani control's harness checked alone by the run's selected `launcher`
@@ -609,16 +967,29 @@ pub fn observe(
 ) -> Result<(Outcome, String), String> {
     let missing = |what: &str| format!("{}: a native control without its {what}", control.name);
     if control.runner == Runner::Kani {
-        let harness = control.test.as_deref().ok_or_else(|| missing("harness"))?;
         let launcher = launcher.ok_or_else(|| {
             format!(
                 "{}: a kani control without the run's launcher",
                 control.name
             )
         })?;
+        // Every side held to the census's predictions, under the
+        // authorization validated for it: a calibration is never a side.
+        let declared = crate::proofs::harnesses(&root.join("src"))?;
+        let expectations = crate::proofs::expectations(root, &declared)?;
+        let authorization = authorize(
+            root,
+            target_dir,
+            logs,
+            control,
+            Side::parse(side)?,
+            &expectations,
+        )?;
         let (termination, text) = crate::process::run_kani(
             root,
-            harness,
+            &declared,
+            expectations,
+            authorization,
             target_dir,
             &logs.join(format!("{side}.log")),
             launcher,
@@ -938,5 +1309,378 @@ mod kani_tests {
         let based = evidence(&control, &logs, KANI_TOOLCHAIN);
         std::fs::remove_dir_all(&logs).expect("the fixture removed");
         assert_eq!(based, Vec::<String>::new());
+    }
+
+    const DIFF: &str =
+        "--- src/a.rs\n+++ src/a.rs\n@@ -1 +1 @@\n-pub fn a() {}\n+pub fn a() { panic!() }\n";
+
+    /// A control copy, its control's directory, and the predictions its
+    /// sides are held to: the copy holds `src/a.rs`, `src/b.rs` and the
+    /// registered diff, which plants `src/a.rs`.
+    struct Copy {
+        root: std::path::PathBuf,
+        copy: std::path::PathBuf,
+        directory: std::path::PathBuf,
+        control: Control,
+        expectations: crate::proofs::Expectations,
+    }
+
+    impl Copy {
+        fn new(test: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("dcbor-authorization-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let copy = root.join("copy");
+            let directory = root.join("logs/x-kani");
+            std::fs::create_dir_all(&directory).unwrap();
+            let fixture = Self {
+                control: parse(&row("kani", "-", "lib")).unwrap().remove(0),
+                expectations: predictions(b"predictions"),
+                root,
+                copy,
+                directory,
+            };
+            fixture.write("src/a.rs", "pub fn a() {}\n");
+            fixture.write("src/b.rs", "pub fn b() {}\n");
+            fixture.write("tests/data/controls/x.patch", DIFF);
+            fixture.record_digest("before.sha256");
+            fixture
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.copy.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+
+        /// The copy's source digest recorded as its runner records it.
+        fn record_digest(&self, file: &str) {
+            std::fs::write(
+                self.directory.join(file),
+                format!("{}\n", crate::proofs::tree_digest(&self.copy).unwrap()),
+            )
+            .unwrap();
+        }
+
+        fn authorize(
+            &self,
+            side: Side,
+            expectations: &crate::proofs::Expectations,
+        ) -> Result<Authorization, String> {
+            authorize(
+                &self.copy,
+                &self.root.join("build"),
+                &self.directory,
+                &self.control,
+                side,
+                expectations,
+            )
+        }
+
+        /// The baseline run's evidence as `process::kani` leaves an accepted
+        /// one: its authorization, judgement and execution, its log and its
+        /// manifest; its directory judged verified.
+        fn baseline(&self, record: &AuthorizationRecord) {
+            let evidence = self.directory.join("baseline.evidence");
+            std::fs::create_dir_all(&evidence).unwrap();
+            let write = |file: &str, value: serde_json::Value| {
+                std::fs::write(evidence.join(file), value.to_string()).unwrap();
+            };
+            write("authorization.json", serde_json::to_value(record).unwrap());
+            write("judgement.json", serde_json::json!({"status": "accepted"}));
+            write(
+                "execution.json",
+                serde_json::json!({"launcher": "/k", "verifier": {}, "artifacts": {HARNESS: ARTIFACT}}),
+            );
+            let log = self.directory.join("baseline.log");
+            std::fs::write(&log, "report\n").unwrap();
+            let manifest = crate::proofs::manifest_of(
+                &evidence,
+                Some(&log),
+                Some("00000000-0000-0000-0000-000000000001"),
+            );
+            std::fs::write(
+                evidence.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(self.directory.join("baseline.judged"), "verified\n").unwrap();
+        }
+    }
+
+    impl Drop for Copy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const ARTIFACT: &str = "d96c7f46b0c37d43d5f7d38282b95dc4856d342d2b43e9a2f28adddcb2a528a7";
+
+    /// Predictions of digest that of `bytes`, predicting the control's
+    /// harness on [`ARTIFACT`].
+    fn predictions(bytes: &[u8]) -> crate::proofs::Expectations {
+        crate::proofs::Expectations {
+            sha256: crate::process::sha256_bytes(bytes).unwrap(),
+            bytes: bytes.to_vec(),
+            environment: crate::proofs::Environment::unknown(),
+            harnesses: BTreeMap::from([(
+                HARNESS.to_string(),
+                crate::proofs::Expectation {
+                    milliseconds: 1000,
+                    transfer: "t".to_string(),
+                    deadline_milliseconds: 2000,
+                    calibration_runs: BTreeSet::new(),
+                    artifact_sha256: ARTIFACT.to_string(),
+                    verifier: serde_json::json!({}),
+                },
+            )]),
+        }
+    }
+
+    /// A control side runs only under the authorization its runner validated:
+    /// a baseline on the unplanted copy; a red side citing that verified
+    /// baseline, of the same diff bytes and predictions, its copy changed in
+    /// exactly the registered diff's paths; a restored side equal to the
+    /// baseline in every path. A missing baseline, another control's
+    /// baseline, changed diff bytes, another revision of the predictions, an
+    /// edit beside the diff's and an incomplete restoration are each refused.
+    #[test]
+    fn a_control_side_runs_only_under_its_validated_authorization() {
+        let fixture = Copy::new("sides");
+        let baseline = fixture
+            .authorize(Side::Baseline, &fixture.expectations)
+            .unwrap();
+        let record = baseline.record().clone();
+        assert_eq!(record.transition, Transition::Unplanted);
+        assert_eq!(record.calibration_artifact_sha256, ARTIFACT);
+        let missing = refused_by(
+            "missing-baseline",
+            fixture.authorize(Side::Red, &fixture.expectations),
+        );
+        assert!(
+            missing.contains("no baseline was run"),
+            "missing-baseline: {missing}"
+        );
+        fixture.baseline(&record);
+        // The registered mutation, then its red side.
+        fixture.write("src/a.rs", "pub fn a() { panic!() }\n");
+        fixture.record_digest("planted.sha256");
+        let red = fixture.authorize(Side::Red, &fixture.expectations).unwrap();
+        assert_eq!(
+            red.record().transition,
+            Transition::Planted {
+                paths: BTreeSet::from(["src/a.rs".to_string()])
+            }
+        );
+        assert_eq!(
+            red.record().baseline.as_ref().unwrap().artifact_sha256,
+            ARTIFACT
+        );
+        let revised = refused_by(
+            "revision-changed",
+            fixture.authorize(Side::Red, &predictions(b"revised")),
+        );
+        assert!(
+            revised.contains("froze the predictions"),
+            "revision-changed: {revised}"
+        );
+        fixture.write("src/b.rs", "pub fn b() { panic!() }\n");
+        fixture.record_digest("planted.sha256");
+        let extra = refused_by(
+            "extra-edit",
+            fixture.authorize(Side::Red, &fixture.expectations),
+        );
+        assert!(
+            extra.contains("not exactly the registered mutation"),
+            "extra-edit: {extra}"
+        );
+        // Restored but for one path, then whole.
+        fixture.write("src/b.rs", "pub fn b() {}\n");
+        fixture.record_digest("after.sha256");
+        let incomplete = refused_by(
+            "incomplete-restoration",
+            fixture.authorize(Side::Green, &fixture.expectations),
+        );
+        assert!(
+            incomplete.contains("the restoration is incomplete"),
+            "incomplete-restoration: {incomplete}"
+        );
+        fixture.write("src/a.rs", "pub fn a() {}\n");
+        fixture.record_digest("after.sha256");
+        let green = fixture
+            .authorize(Side::Green, &fixture.expectations)
+            .unwrap();
+        assert_eq!(green.record().transition, Transition::Restored);
+        assert_eq!(green.restored_baseline().unwrap().artifact_sha256, ARTIFACT);
+        // Another control's baseline.
+        let other = AuthorizationRecord {
+            control: "other".to_string(),
+            ..record.clone()
+        };
+        std::fs::remove_dir_all(fixture.directory.join("baseline.evidence")).unwrap();
+        fixture.baseline(&other);
+        let foreign = refused_by(
+            "another-control",
+            fixture.authorize(Side::Green, &fixture.expectations),
+        );
+        assert!(
+            foreign.contains("is control other's"),
+            "another-control: {foreign}"
+        );
+        // The diff's bytes changed since the baseline.
+        std::fs::remove_dir_all(fixture.directory.join("baseline.evidence")).unwrap();
+        fixture.baseline(&record);
+        fixture.write(
+            "tests/data/controls/x.patch",
+            &DIFF.replace("panic!()", "todo!()"),
+        );
+        let changed = refused_by(
+            "patch-changed",
+            fixture.authorize(Side::Green, &fixture.expectations),
+        );
+        assert!(
+            changed.contains("is of the diff"),
+            "patch-changed: {changed}"
+        );
+        // A baseline on a copy that is not the unplanted source.
+        let planted = refused_by(
+            "baseline-planted",
+            fixture.authorize(Side::Baseline, &fixture.expectations),
+        );
+        assert!(
+            planted.contains("a baseline runs on the unplanted source alone"),
+            "{planted}"
+        );
+    }
+
+    /// Held to its predictions, a restored side's artifact must be its
+    /// baseline's and its one harness the only one launched.
+    #[test]
+    fn a_restored_side_runs_its_baselines_artifact_alone() {
+        use crate::proofs::{
+            Applicability, Ended, Launched, Reconciled, RunIdentity, check_expectations,
+        };
+        let fixture = Copy::new("restored");
+        let baseline = fixture
+            .authorize(Side::Baseline, &fixture.expectations)
+            .unwrap();
+        fixture.baseline(baseline.record());
+        fixture.record_digest("after.sha256");
+        let green = fixture
+            .authorize(Side::Green, &fixture.expectations)
+            .unwrap();
+        let identity = RunIdentity {
+            version: crate::proofs::RUNTIME_VERSION,
+            id: "00000000-0000-0000-0000-000000000009".to_string(),
+            purpose: "control".to_string(),
+            revision: fixture.expectations.sha256.clone(),
+            tree_sha256: green.record().source_sha256.clone(),
+            build: String::new(),
+            loop_policy_sha256: String::new(),
+            started: crate::proofs::Instant {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+        };
+        let launch = crate::proofs::Launch {
+            environment: crate::proofs::Environment::unknown(),
+            workload_cgroup: None,
+            load_before: None,
+            load_after: None,
+        };
+        let ran = |harness: &str, artifact: &str| Reconciled {
+            verifier: serde_json::json!({}),
+            applied: Vec::new(),
+            completed: BTreeMap::from([(harness.to_string(), std::time::Duration::from_millis(1))]),
+            launched: BTreeMap::from([(
+                harness.to_string(),
+                Launched {
+                    elapsed: std::time::Duration::from_millis(1),
+                    ended: Ended::Exited,
+                    artifact_sha256: artifact.to_string(),
+                },
+            )]),
+        };
+        // The environment is checked first; the side's own rules are what
+        // these runs reach once it is established and equal.
+        let mut expectations = fixture.expectations.clone();
+        expectations.environment = established();
+        let launch = crate::proofs::Launch {
+            environment: established(),
+            ..launch
+        };
+        check_expectations(
+            &identity,
+            &launch,
+            &ran(HARNESS, ARTIFACT),
+            &expectations,
+            Applicability::Control(&green),
+        )
+        .unwrap();
+        let rebuilt = refused_by(
+            "restored-rebuilt",
+            check_expectations(
+                &identity,
+                &launch,
+                &ran(HARNESS, "00"),
+                &expectations,
+                Applicability::Control(&green),
+            ),
+        );
+        assert!(rebuilt.contains("investigate the build"), "{rebuilt}");
+        let other = refused_by(
+            "other-harness",
+            check_expectations(
+                &identity,
+                &launch,
+                &ran("other", ARTIFACT),
+                &expectations,
+                Applicability::Control(&green),
+            ),
+        );
+        assert!(other.contains("authorizes"), "{other}");
+        let moved = RunIdentity {
+            tree_sha256: "0".repeat(64),
+            ..identity.clone()
+        };
+        let source = refused_by(
+            "source-moved",
+            check_expectations(
+                &moved,
+                &launch,
+                &ran(HARNESS, ARTIFACT),
+                &expectations,
+                Applicability::Control(&green),
+            ),
+        );
+        assert!(source.contains("authorization binds"), "{source}");
+    }
+
+    /// An environment every fact of which is established.
+    fn established() -> crate::proofs::Environment {
+        use crate::proofs::{Environment, Level, LimitObservation};
+        Environment {
+            cpu_model: Some("cpu".to_string()),
+            cpus_allowed: Some("0-3".to_string()),
+            cpuset_effective: Some("0-3".to_string()),
+            levels: vec![Level {
+                path: "/".to_string(),
+                cpu_max: LimitObservation::Absent {
+                    reason: "root".to_string(),
+                },
+                memory_max: LimitObservation::Absent {
+                    reason: "root".to_string(),
+                },
+            }],
+        }
+    }
+
+    /// The refusal `result` must be, named `case`: a planted defect that lets
+    /// the case be accepted fails here by the case's name.
+    fn refused_by<T>(case: &str, result: Result<T, String>) -> String {
+        match result {
+            Ok(_) => panic!("{case}: accepted"),
+            Err(fault) => fault,
+        }
     }
 }

@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -1866,7 +1866,7 @@
+             // baseline's, the same source built at the same location.
+             Applicability::Control(authorization) => {
+                 if let Some(baseline) = authorization.restored_baseline()
+-                    && launched.artifact_sha256 != baseline.artifact_sha256
++                    && baseline.artifact_sha256.is_empty()
+                 {
+                     return Err(format!(
+                         "harness {name}: the restored copy built artifact {}, its verified \

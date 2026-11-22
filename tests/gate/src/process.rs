@@ -280,53 +280,65 @@ pub fn run_test(
     ))
 }
 
-/// One `cargo kani` run of harness `harness` alone in `root`
+/// One `cargo kani` run of a control side's one harness alone in `root`
 /// ([`crate::proofs::arguments`], then `--harness HARNESS --exact`, which
 /// kani-driver's `VerificationArgs` declares: the filter matching only that
-/// fully qualified name), its artifacts under `target_dir`, one thread
-/// (no `-j`: `NumThreads::NoMultithreading`), colour off, its standard
-/// output and error logged to `log`: its termination and its log's text.
+/// fully qualified name), held to `expectations` under the side's validated
+/// `authorization` ([`crate::controls::Authorization`]), its artifacts under
+/// `target_dir`, one thread (no `-j`: `NumThreads::NoMultithreading`),
+/// colour off, its standard output and error logged to `log`: its
+/// termination and its log's text.
+#[allow(clippy::too_many_arguments)]
 pub fn run_kani(
     root: &Path,
-    harness: &str,
+    declared: &std::collections::BTreeSet<String>,
+    expectations: crate::proofs::Expectations,
+    authorization: crate::controls::Authorization,
     target_dir: &Path,
     log: &Path,
     launcher: &Path,
 ) -> Result<(Termination, String), String> {
-    let declared = crate::proofs::harnesses(&root.join("src"))?;
-    if !declared.contains(harness) {
+    let harness = authorization.record().harness.clone();
+    if !declared.contains(&harness) {
         return Err(format!(
             "harness {harness}: declared by no #[kani::proof] of {}",
             root.display()
         ));
     }
-    let policy = crate::proofs::policy(root, &declared)?;
-    let expectations = crate::proofs::expectations(root, &declared)?;
+    let policy = crate::proofs::policy(root, declared)?;
     kani(
         root,
         &policy,
-        &expectations,
-        Some(harness),
+        &crate::proofs::RunPurpose::Control(expectations, Box::new(authorization)),
+        &crate::proofs::Selection::one(&harness),
+        declared,
         target_dir,
         log,
         launcher,
+        &Workload::exported()?,
     )
 }
 
-/// One `cargo kani` run of every harness of the library in `root`
-/// ([`crate::proofs::arguments`], no harness filter), under `policy`
-/// ([`crate::proofs::policy`]) and `expectations`
-/// ([`crate::proofs::expectations`]), as [`run_kani`] runs one: the proof
-/// suite's evidence run.
-pub fn run_kani_suite(
+/// One `cargo kani` run in `root` of the harnesses `selection` names, every
+/// one of the census when it names all ([`crate::proofs::arguments`], no
+/// harness filter), for `purpose`, under `policy` ([`crate::proofs::policy`]),
+/// launched as a `workload`, as [`run_kani`] runs one: the proof suite's
+/// evidence run, or one calibration execution.
+#[allow(clippy::too_many_arguments)]
+pub fn run_kani_purpose(
     root: &Path,
     policy: &crate::proofs::Policy,
-    expectations: &std::collections::BTreeMap<String, crate::proofs::Expectation>,
+    purpose: &crate::proofs::RunPurpose,
+    selection: &crate::proofs::Selection,
+    declared: &std::collections::BTreeSet<String>,
     target_dir: &Path,
     log: &Path,
     launcher: &Path,
+    workload: &Workload,
 ) -> Result<(Termination, String), String> {
-    kani(root, policy, expectations, None, target_dir, log, launcher)
+    kani(
+        root, policy, purpose, selection, declared, target_dir, log, launcher, workload,
+    )
 }
 
 /// The Kani a run selects: `cargo-kani` as `PATH` resolves it, canonical
@@ -345,16 +357,44 @@ pub fn kani_launcher() -> Result<PathBuf, String> {
     std::fs::canonicalize(&found).map_err(|error| format!("{}: {error}", found.display()))
 }
 
+/// A record of the gate's, `bytes` at the new file `path`, durable as every
+/// run's evidence is ([`create_evidence`]).
+pub fn record(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    create_evidence(path, bytes)
+}
+
 /// `bytes` written to a new file at `path`, refused when the path exists:
 /// evidence is created once and never overwritten.
-fn create_evidence(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn create_evidence(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| {
+            std::fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+        })
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Persist acceptance or rejection before propagating the judgement. A rejected
+/// execution carries diagnostics, never a fabricated verifier identity.
+fn record_judgement<T>(evidence: &Path, result: Result<T, String>) -> Result<T, String> {
+    let receipt = match &result {
+        Ok(_) => serde_json::json!({"status": "accepted"}),
+        Err(error) => serde_json::json!({"status": "rejected", "error": error}),
+    };
+    let encoded = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| format!("{}: {error}", evidence.display()))?;
+    create_evidence(&evidence.join("judgement.json"), &encoded).map_err(|error| match &result {
+        Ok(_) => error,
+        Err(original) => format!("{original}; cannot preserve judgement: {error}"),
+    })?;
+    result
 }
 
 /// The SHA-256 digest of the file at `path`, as `sha256sum` computes it:
@@ -370,10 +410,38 @@ pub fn sha256(path: &Path) -> Result<String, String> {
         .stdin(file)
         .output()
         .map_err(|error| format!("sha256sum < {}: {error}", path.display()))?;
+    digest_of(&output, &path.display().to_string())
+}
+
+/// The SHA-256 digest of `bytes`, by the same tool and the same check of
+/// its output as [`sha256`]: the digest of a byte snapshot a caller parses,
+/// so its identity and its interpretation are of one version.
+pub fn sha256_bytes(bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = Command::new("sha256sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("sha256sum: {error}"))?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or("sha256sum: no standard input")?
+        .write_all(bytes);
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("sha256sum: {error}"))?;
+    written.map_err(|error| format!("sha256sum: writing {} bytes: {error}", bytes.len()))?;
+    digest_of(&output, &format!("{} bytes", bytes.len()))
+}
+
+/// The digest `sha256sum` printed for the standard input it read, `what`
+/// naming it: exactly one `DIGEST  -` line of a successful run.
+fn digest_of(output: &std::process::Output, what: &str) -> Result<String, String> {
     if !output.status.success() {
         return Err(format!(
-            "sha256sum < {}: {}: {}",
-            path.display(),
+            "sha256sum < {what}: {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim_end()
         ));
@@ -381,10 +449,7 @@ pub fn sha256(path: &Path) -> Result<String, String> {
     let text = String::from_utf8_lossy(&output.stdout);
     match text.strip_suffix("  -\n") {
         Some(digest) if crate::proofs::sha256_text(digest) => Ok(digest.to_string()),
-        _ => Err(format!(
-            "sha256sum < {}: not one digest line: {text:?}",
-            path.display()
-        )),
+        _ => Err(format!("sha256sum < {what}: not one digest line: {text:?}")),
     }
 }
 
@@ -403,14 +468,17 @@ pub fn sha256(path: &Path) -> Result<String, String> {
 /// after the run when its evidence does not reconcile with its policy and
 /// its report ([`crate::proofs::check_execution_evidence`]), so neither the
 /// suite nor a control can take a verdict the evidence does not support.
+#[allow(clippy::too_many_arguments)]
 fn kani(
     root: &Path,
     policy_of_root: &crate::proofs::Policy,
-    expectations: &std::collections::BTreeMap<String, crate::proofs::Expectation>,
-    harness: Option<&str>,
+    purpose: &crate::proofs::RunPurpose,
+    selection: &crate::proofs::Selection,
+    declared: &std::collections::BTreeSet<String>,
     target_dir: &Path,
     log: &Path,
     launcher: &Path,
+    workload: &Workload,
 ) -> Result<(Termination, String), String> {
     let canonical = std::fs::canonicalize(launcher)
         .map_err(|error| format!("{}: {error}", launcher.display()))?;
@@ -423,64 +491,216 @@ fn kani(
     }
     let evidence = log.with_extension("evidence");
     std::fs::create_dir(&evidence).map_err(|error| format!("{}: {error}", evidence.display()))?;
-    create_evidence(
-        &evidence.join("launcher"),
-        format!("{}\n", launcher.display()).as_bytes(),
-    )?;
-    let policy = evidence.join("loop-bounds.json");
-    let selected = crate::proofs::selected(policy_of_root, expectations, harness);
-    let encoded = serde_json::to_vec_pretty(&selected)
-        .map_err(|error| format!("{}: {error}", policy.display()))?;
-    create_evidence(&policy, &encoded)?;
-    let bounds = evidence.join("loop-bounds");
-    std::fs::create_dir(&bounds).map_err(|error| format!("{}: {error}", bounds.display()))?;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(log)
-        .map_err(|error| format!("{}: {error}", log.display()))?;
-    let error = file
-        .try_clone()
-        .map_err(|error| format!("{}: {error}", log.display()))?;
-    let mut command = controlled(launcher)?;
-    command
-        .current_dir(root)
-        .env("TERM", "dumb")
-        .args(crate::proofs::arguments());
-    if let Some(harness) = harness {
-        command.args(["--harness", harness, "--exact"]);
-    }
-    let status = command
-        .arg("--target-dir")
-        .arg(target_dir)
-        .arg("--loop-bounds")
-        .arg(&policy)
-        .arg("--loop-bounds-evidence")
-        .arg(&bounds)
-        .stdout(file)
-        .stderr(error)
-        .status()
-        .map_err(|error| format!("{}: {error}", launcher.display()))?;
-    let termination = {
-        use std::os::unix::process::ExitStatusExt;
-        match status.signal() {
-            Some(signal) => Termination::Signaled(signal),
-            None => Termination::Exited(status.code().unwrap_or(-1)),
+    // From here every outcome, a setup failure included, leaves its
+    // judgement and the manifest of what the run recorded.
+    let mut identified: Option<String> = None;
+    let mut log_created = false;
+    let result = (|| {
+        create_evidence(
+            &evidence.join("launcher"),
+            format!("{}\n", launcher.display()).as_bytes(),
+        )?;
+        // The document the run was given, the very bytes its revision is the
+        // digest of; then its identity before anything launches: what it is
+        // for, that revision, and the tree's source state it ran.
+        let (name, document) = purpose.document();
+        create_evidence(&evidence.join(name), document)?;
+        let identity = crate::proofs::run_identity(root, purpose)?;
+        identified = Some(identity.id.clone());
+        let encoded = serde_json::to_vec_pretty(&identity)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join("run.json"), &encoded)?;
+        // A control side's authorization, kept before it launches, and the
+        // run held to it: its one harness, on the source state it binds.
+        if let crate::proofs::RunPurpose::Control(_, authorization) = purpose {
+            let record = authorization.record();
+            if *selection != crate::proofs::Selection::one(&record.harness) {
+                return Err(format!(
+                    "a {} side authorizes harness {} alone, the run selects {selection:?}",
+                    record.side.name(),
+                    record.harness
+                ));
+            }
+            if identity.tree_sha256 != record.source_sha256 {
+                return Err(format!(
+                    "{}: its source state is {}, the {} side was authorized on {}",
+                    root.display(),
+                    identity.tree_sha256,
+                    record.side.name(),
+                    record.source_sha256
+                ));
+            }
+            let encoded = serde_json::to_vec_pretty(record)
+                .map_err(|error| format!("{}: {error}", evidence.display()))?;
+            create_evidence(&evidence.join("authorization.json"), &encoded)?;
         }
-    };
-    let text =
-        std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
-    let reconciled = crate::proofs::check_execution_evidence(&bounds, &selected, &text)
+        let policy = evidence.join("loop-bounds.json");
+        let selected =
+            crate::proofs::selected(policy_of_root, &purpose.deadlines(), selection, declared)?;
+        let encoded = serde_json::to_vec_pretty(&selected)
+            .map_err(|error| format!("{}: {error}", policy.display()))?;
+        create_evidence(&policy, &encoded)?;
+        let bounds = evidence.join("loop-bounds");
+        std::fs::create_dir(&bounds).map_err(|error| format!("{}: {error}", bounds.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(log)
+            .map_err(|error| format!("{}: {error}", log.display()))?;
+        log_created = true;
+        let error = file
+            .try_clone()
+            .map_err(|error| format!("{}: {error}", log.display()))?;
+        let mut command = isolated(workload.command(launcher));
+        command
+            .current_dir(root)
+            .env("TERM", "dumb")
+            .args(crate::proofs::arguments());
+        if let crate::proofs::Selection::Only(harnesses) = selection {
+            for harness in harnesses {
+                command.args(["--harness", harness.as_str(), "--exact"]);
+            }
+        }
+        command
+            .arg("--target-dir")
+            .arg(target_dir)
+            .arg("--loop-bounds")
+            .arg(&policy)
+            .arg("--loop-bounds-evidence")
+            .arg(&bounds)
+            .stdout(file)
+            .stderr(error);
+        // Spawned, not run to its end, so the workload's own control group is
+        // read once its confinement has moved it there; then waited for.
+        let load_before = crate::proofs::load();
+        let (launched, (environment, workload_cgroup)) = match command.spawn() {
+            Ok(mut child) => {
+                let found = crate::proofs::Environment::of_workload(&mut child);
+                (child.wait(), found)
+            }
+            Err(error) => (Err(error), (crate::proofs::Environment::unknown(), None)),
+        };
+        let launched = launched.map_err(|error| format!("{}: {error}", launcher.display()));
+        let launch = crate::proofs::Launch {
+            environment,
+            workload_cgroup,
+            load_before,
+            load_after: crate::proofs::load(),
+        };
+        let encoded = serde_json::to_vec_pretty(&launch)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join("launch.json"), &encoded)?;
+        let launch_receipt = match &launched {
+            Ok(status) => {
+                use std::os::unix::process::ExitStatusExt;
+                serde_json::json!({"exit_code": status.code(), "signal": status.signal()})
+            }
+            Err(error) => serde_json::json!({"spawn_error": error}),
+        };
+        let encoded = serde_json::to_vec_pretty(&launch_receipt)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join("launcher.execution.json"), &encoded)?;
+        // The source the run is attributed to, read again once it ended: a
+        // tree that differs from the one its identity names ran no one
+        // source. A change made and undone while it ran is not detected.
+        let after = crate::proofs::tree_digest(root)?;
+        if after != identity.tree_sha256 {
+            return Err(format!(
+                "{}: its source state was {} when the run began and {after} when it ended: the \
+                 run is of no one source",
+                root.display(),
+                identity.tree_sha256
+            ));
+        }
+        let status = launched?;
+        let termination = {
+            use std::os::unix::process::ExitStatusExt;
+            match status.signal() {
+                Some(signal) => Termination::Signaled(signal),
+                None => Termination::Exited(status.code().unwrap_or(-1)),
+            }
+        };
+        let text =
+            std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+        let reconciled = crate::proofs::check_execution_evidence(
+            &bounds,
+            &selected,
+            &text,
+            crate::proofs::Artifacts::Preserved,
+        )
         .map_err(|fault| format!("{}: {fault}", log.display()))?;
-    crate::proofs::check_function_scope(&bounds, &selected, &reconciled.applied, harness.is_none())
+        crate::proofs::check_function_scope(
+            &bounds,
+            &selected,
+            &reconciled.applied,
+            *selection == crate::proofs::Selection::All,
+            crate::proofs::Artifacts::Preserved,
+        )
         .map_err(|fault| format!("{}: {fault}", log.display()))?;
-    crate::proofs::check_expectations(&reconciled, expectations)
-        .map_err(|fault| format!("{}: {fault}", log.display()))?;
-    let execution = serde_json::json!({ "launcher": launcher, "verifier": reconciled.verifier });
-    let encoded = serde_json::to_vec_pretty(&execution)
-        .map_err(|error| format!("{}: {error}", evidence.display()))?;
-    create_evidence(&evidence.join("execution.json"), &encoded)?;
-    Ok((termination, text))
+        // The reconciled execution, written once reconciliation succeeded:
+        // the launcher, the verifier, and each launched harness's artifact.
+        let artifacts: BTreeMap<&str, &str> = reconciled
+            .launched
+            .iter()
+            .map(|(harness, launched)| (harness.as_str(), launched.artifact_sha256.as_str()))
+            .collect();
+        let execution = serde_json::json!({
+            "launcher": launcher,
+            "verifier": reconciled.verifier,
+            "artifacts": artifacts,
+        });
+        let encoded = serde_json::to_vec_pretty(&execution)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join("execution.json"), &encoded)?;
+        // The purpose's own judgement, once every record above is kept: a
+        // calibration's launcher must have ended as its harnesses' outcomes
+        // call for, and is held to nothing more; a qualification and a
+        // control side to their predictions, a control side's artifact being
+        // its copy's own build.
+        match purpose {
+            crate::proofs::RunPurpose::Calibration(_) => {
+                crate::proofs::check_calibration_termination(termination, &text)
+                    .map_err(|fault| format!("{}: {fault}", log.display()))?;
+            }
+            crate::proofs::RunPurpose::Qualification(expectations) => {
+                crate::proofs::check_expectations(
+                    &identity,
+                    &launch,
+                    &reconciled,
+                    expectations,
+                    crate::proofs::Applicability::Calibrated,
+                )
+                .map_err(|fault| format!("{}: {fault}", log.display()))?;
+            }
+            crate::proofs::RunPurpose::Control(expectations, authorization) => {
+                crate::proofs::check_expectations(
+                    &identity,
+                    &launch,
+                    &reconciled,
+                    expectations,
+                    crate::proofs::Applicability::Control(authorization),
+                )
+                .map_err(|fault| format!("{}: {fault}", log.display()))?;
+            }
+        }
+        Ok((termination, text))
+    })();
+    // The judgement, then the manifest, attempted whatever the judgement's own
+    // write did: the run's last record, describing exactly what it holds, its
+    // identity named only when one was made.
+    let judged = record_judgement(&evidence, result);
+    let manifest =
+        crate::proofs::manifest_of(&evidence, log_created.then_some(log), identified.as_deref());
+    let written = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("{}: {error}", evidence.display()))
+        .and_then(|encoded| create_evidence(&evidence.join("manifest.json"), &encoded));
+    match (judged, written) {
+        (judged, Ok(())) => judged,
+        (Ok(_), Err(error)) => Err(format!("the run's manifest was not written: {error}")),
+        (Err(fault), Err(error)) => Err(format!(
+            "{fault}; the run's manifest was not written either: {error}"
+        )),
+    }
 }
 
 /// The models of `checker` the `target` binary `executable` lists.
@@ -775,6 +995,36 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{DESCRIPTION, SCHEDULES, Workload, isolate, marked};
+
+    #[test]
+    fn rejected_execution_retains_its_judgement_without_a_verifier() {
+        let directory = std::env::temp_dir().join(format!(
+            "dcbor-gate-rejected-execution-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let rejected = super::record_judgement::<()>(
+            &directory,
+            Err("expectation exceeded by one nanosecond".to_string()),
+        );
+        assert_eq!(
+            rejected,
+            Err("expectation exceeded by one nanosecond".to_string())
+        );
+        let bytes = std::fs::read(directory.join("judgement.json"))
+            .expect("rejection-unrecorded: a rejected execution left no judgement.json");
+        let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["status"], "rejected");
+        assert_eq!(receipt["error"], "expectation exceeded by one nanosecond");
+        assert!(receipt.get("verifier").is_none());
+        let replacement = super::record_judgement(&directory, Ok(()));
+        assert!(replacement.is_err(), "existing rejection was overwritten");
+        assert_eq!(
+            std::fs::read(directory.join("judgement.json")).unwrap(),
+            bytes
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// The cgroup v2 path of the process whose `/proc/PID/cgroup` is `text`.
     fn cgroup(text: &str) -> String {

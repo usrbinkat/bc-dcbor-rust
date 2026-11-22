@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -3382,7 +3382,7 @@
+             "is of commit {}, the calibration's is {commit}",
+             verdict.commit
+         ))
+-    } else if verdict.controls == 0 || !verdict.faults.is_empty() {
++    } else if verdict.controls == 0 {
+         Some(format!(
+             "records {} controls and the faults {:?}: the control run did not pass",
+             verdict.controls, verdict.faults

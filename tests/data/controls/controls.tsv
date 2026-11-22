@@ -705,3 +705,29 @@ gate-execution-deadline-unreconciled	tests/data/controls/gate-execution-deadline
 # not include its generated instances counted all the same.
 gate-instance-axis-gap-accepted	tests/data/controls/gate-instance-axis-gap-accepted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_declaration_that_does_not_cover_its_domain_is_refused	-	failed	declaration its lengths [0, 2] are not every value: accepted
 gate-census-inclusion-unchecked	tests/data/controls/gate-census-inclusion-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::the_census_expects_every_declared_instance	-	failed	inclusion-missing: accepted
+# A run's evidence contract (tests/gate/src/proofs.rs, tests/gate/src/process.rs
+# `kani`), each weakened by one plant and refused by the case it lets through:
+# an unreadable cgroup limit taken for an absent one (`limit`); a rejected
+# run's manifest not attempted once its judgement is written; a rejected
+# calibration adopted (`adopt`); the document a run was given not kept beside
+# its identity; a record read through its manifest without its digest checked
+# (`Artifacts::read`); a calibration repeating a harness that did not verify
+# (`calibration`); a failed control run cited as a calibration's readiness
+# (`control_run`); a source changed while the run ran accepted; a link's
+# record framed as a file's (`tree_stream`).
+gate-unavailable-limit-absent	tests/data/controls/gate-unavailable-limit-absent.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::an_unestablished_limit_prevents_equivalence	-	failed	unreadable-parent-limit: no unavailable limit naming
+gate-rejection-manifest-omitted	tests/data/controls/gate-rejection-manifest-omitted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_failed_run_keeps_its_judgement_and_its_manifest	-	failed	identity.evidence/manifest.json: No such file
+gate-rejected-run-adopted	tests/data/controls/gate-rejected-run-adopted.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_is_adopted_whole_and_once	-	failed	rejected-adopted: accepted
+gate-document-unretained	tests/data/controls/gate-document-unretained.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	document-unretained
+gate-manifest-record-unverified	tests/data/controls/gate-manifest-record-unverified.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	document-mutated: accepted
+gate-calibration-repeats-unverified	tests/data/controls/gate-calibration-repeats-unverified.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	a failed first observation was repeated
+gate-control-run-unverified	tests/data/controls/gate-control-run-unverified.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::a_calibration_is_ready_only_after_a_passed_control_run_and_settling	-	failed	control-failed: accepted
+gate-source-move-unchecked	tests/data/controls/gate-source-move-unchecked.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::every_failed_run_keeps_its_judgement_and_its_manifest	-	failed	source-moved: accepted
+gate-source-kind-unframed	tests/data/controls/gate-source-kind-unframed.patch	native	nightly	dcbor-gate	-	lib	proofs::tests::the_source_digest_distinguishes_kinds_modes_and_partitions	-	failed	file-or-link: one digest for two states
+# A Kani control side's authorization (tests/gate/src/controls.rs `authorize`,
+# tests/gate/src/proofs.rs `check_expectations`): a red side's copy changed
+# beyond its registered diff; another control's baseline cited; a restored
+# side's artifact unequal to its baseline's accepted.
+gate-control-mutation-unbounded	tests/data/controls/gate-control-mutation-unbounded.patch	native	nightly	dcbor-gate	-	lib	controls::kani_tests::a_control_side_runs_only_under_its_validated_authorization	-	failed	extra-edit: accepted
+gate-control-baseline-unbound	tests/data/controls/gate-control-baseline-unbound.patch	native	nightly	dcbor-gate	-	lib	controls::kani_tests::a_control_side_runs_only_under_its_validated_authorization	-	failed	another-control: accepted
+gate-restored-artifact-unchecked	tests/data/controls/gate-restored-artifact-unchecked.patch	native	nightly	dcbor-gate	-	lib	controls::kani_tests::a_restored_side_runs_its_baselines_artifact_alone	-	failed	restored-rebuilt: accepted
