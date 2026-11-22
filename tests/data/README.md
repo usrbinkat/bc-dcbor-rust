@@ -385,9 +385,10 @@ the digest. It is read before the run launches and again when it ends; a source 
 refuses the run, though a change made and undone while it ran is not detected.
 
 A run's evidence directory, `LOG.evidence/`, is created exclusively, and from then on every
-outcome is judged (`process::kani`): the document the run was given, kept before anything
-launches (`plan.json` for a calibration, `expectations.json` otherwise), the very bytes its
-identity's revision (`run.json`) is the digest of; the identity; for a control side its
+outcome is judged (`process::kani`): the documents the run was given, kept before anything
+launches (`plan.json` and the calibration's `readiness.json` for a calibration,
+`expectations.json` otherwise), the plan or predictions the very bytes its identity's revision
+(`run.json`) is the digest of; the identity; for a control side its
 authorization (`authorization.json`); the launch's environment and load before and after
 (`launch.json`); the launcher's ending (`launcher.execution.json`); the reconciled execution; then
 `judgement.json`, accepted or rejected with why, written whatever failed; then `manifest.json`,
@@ -397,58 +398,124 @@ it) or unreadable, digests every record or names each it could not, and says whe
 complete. A manifest that cannot be written fails the run, accepted or not; a storage failure
 neither record survives is returned, never claimed durable. Each document is read once, its
 digest and its interpretation of the same bytes (`process::sha256_bytes`, the one digest
-authority beside `process::sha256`), and a run's records are read through its manifest, each
-record's bytes held to its listed digest before they are interpreted (`proofs::Artifacts`).
+authority beside `process::sha256`), and a finished run's records are read through its complete
+manifest (`proofs::ValidatedManifest`), each record's bytes held to its listed digest before they
+are interpreted, its instrumented binaries held to their digests where the run left them or, in an
+adopted run, required absent (`proofs::Artifacts`, `proofs::Binaries`). A live record counts as
+absent only when the system reports it not found; any other failure to inspect it is a fault.
 
-A workload's environment (`proofs::Environment`) is its processor model, its affinity, the
+Every persisted record is read into a validated type only its validator makes: a run's identity
+(`RunIdentityRecord::validate`), a plan (`plan_of`), predictions (`expectations_of`), a
+manifest (`read_manifest`), an environment (`EnvironmentRecord::establish`), a readiness
+(`Readiness::validate`) and a sample (`eligible_sample`); nothing is trusted because a record says
+so.
+
+A workload's environment (`proofs::EnvironmentRecord`) is its processor model, its affinity, the
 effective cpuset of its nearest cpuset-enabled group, and its group and every ancestor through
 `/`, each with its path and its `cpu.max` and `memory.max` observed as a validated value, an
 absence cgroup v2 establishes with its reason (the root keeps neither; a group whose parent's
 `cgroup.subtree_control` does not enable the controller has none of its files), or unavailable
 with why (a permission failure, a group that disappeared, a malformed value, a file missing
-though its controller is enabled). Absence is never unlimited. Two environments are equivalent
-only when both are established and their constraints equal, the ancestors' limits in order; the
-paths, transient scope names among them, are provenance. An environment the gate's own group
-could not be read for establishes no confinement at all.
+though its controller is enabled). Absence is never unlimited. A record, whether just observed or
+read back from evidence, is established by one validator (`EnvironmentRecord::establish`): every
+value valid for its file, every absence with its reason, the levels exactly one group's ancestry
+through `/`. Only established environments are compared (`EstablishedEnvironment::equivalent`):
+their constraints equal, the ancestors' limits in order; the paths, transient scope names among
+them, are provenance.
 
-A calibration (`tests/proofs.sh calibrate PLAN CONTROL_LOGS`, `proofs::calibration`) validates its
-plan once, then preserves its readiness before any run (`readiness.json`): the control run it
-follows, which must have finished and passed on the same commit (its final record,
-`CONTROL_LOGS/verdict.json`, written by `gate control evidence`, read once and digested), and the
-system settled under the declared policy (`proofs::settling_policy`: a reading of
-`/proc/loadavg` every 5 s, six in a row with at most two runnable tasks and a one-minute load of
-at most 1.00, refused after 180 readings; an operational criterion, not a claim of idleness),
-every reading kept. It then checks each planned harness alone, one Kani run each with its own
-identity, environment and load (`LOGS/calibration/HARNESS.N.log` and its evidence), in two passes:
-every harness once, then, to `proofs::SAMPLES` executions, only a harness whose every execution
-verified in an environment equivalent to its first. A deadline, a signal, an unsupported
-construct, a failure, a bound refused or a rejected run is left to diagnosis, never repeated, and
-nothing is retried; an execution that could not be scheduled ends the schedule, every one after
-it recorded as never run. The schedule is its last record (`calibration.json`). An accepted run
-alone is adopted (`gate proofs-adopt LOGS/calibration/HARNESS.N.evidence ROOT`, `proofs::adopt`):
-its records copied whole beside their destination, every instrumented binary recorded by digest
-alone, and checked against its complete manifest and its accepted judgement before the copy is
-renamed into `proofs/calibration/RUN`. A prediction cites adopted runs only (`proofs::expectations`).
+Every control run's final record (`LOGS/verdict.json`, `proofs::ControlVerdict`) is written by
+one maker (`gate control evidence ROOT LOGS CHANNEL RUNNER...`, `proofs::control_verdict`): its
+channel and runners, the digest of the registry's bytes (`controls::registry`), one result per
+control the registry selects for that channel and those runners (`controls::selected`), each with
+its faults, and every fault. `tests/controls.sh CHANNEL [RUNNER...]` runs that selection, every
+runner when none is named, holding the checkout's workload lock (`target/gate-workload.lock`) for
+its whole run.
+
+A calibration's readiness (`readiness.json`) is established and validated by one validator,
+live and whenever a kept receipt is read (`Readiness::validate`). It requires:
+
+- exactly the native control runs of the nightly and stable channels
+  (`proofs::REQUIRED_CONTROLS`), each finished, of the calibration's commit and of the registry
+  the calibration's copy holds, judging exactly the controls that registry selects, every result
+  passed and its faults recorded exactly (`proofs::control_run`);
+- the workload lock held by the calibration itself (`proofs::WorkloadLock`), so no control or
+  proof run of the checkout competes with it;
+- a valid settling policy (`proofs::settling_policy`): seven readings of `/proc/loadavg` at least
+  5 s apart on the monotonic clock, spanning at least 30 s, each with at most two runnable tasks
+  and a one-minute load of at most 1.00, refused after 180 readings. It is an operational
+  criterion with checked arithmetic, and meeting it does not establish that nothing contends;
+- the readings settling at the last one, every reading recomputed from its `/proc/loadavg`
+  text.
+
+A receipt that only says it is ready establishes nothing.
+
+A calibration (`tests/proofs.sh calibrate PLAN NIGHTLY_LOGS STABLE_LOGS`, `proofs::calibration`)
+validates its plan once and establishes its readiness. It then checks each planned harness alone,
+one Kani run each with its own identity, environment and load (`LOGS/calibration/HARNESS.N.log`
+and its evidence), in two passes: every harness once, then, to `proofs::SAMPLES` executions, only
+a harness whose every execution was a sample.
+
+An execution is a sample by the one authority (`proofs::eligible_sample`), which adoption and the
+predictions' reader apply as well. It must be of a run and a manifest no earlier execution of the
+calibration was, and in its harness's envelope (`CalibrationSample::compatible`: build,
+loop-bound policy, instrumented binary, verifier and environment) against every earlier sample of
+it.
+
+Every planned execution is recorded as it ends, in a journal reserved exclusively
+(`calibration.jsonl`): a sample, no sample with why, rejected, withheld, or never run. Nothing is
+retried. An execution that could not be scheduled, or a journal that cannot be reserved or
+written, halts the schedule as a fault. Whatever failed, the schedule is attempted as the
+calibration's last record (`calibration.json`); it is complete only when every planned harness
+has its samples and nothing failed.
+
+A sample alone is adopted (`gate proofs-adopt LOGS/calibration/HARNESS.N.evidence ROOT`,
+`proofs::adopt`):
+
+1. Its records are copied whole into a staging directory of the adoption's own, beside the
+   destination, every instrumented binary recorded by digest alone.
+2. Every file, every directory created and every parent entry is synchronized.
+3. The staged copy is held to the one authority.
+4. It is published by `renameat2(2)` with `RENAME_NOREPLACE`, which replaces nothing, an empty
+   directory included, and refuses where it is unsupported. Then the published directory and its
+   parent are synchronized.
+
+A publication whose durability could not be established keeps the published run and says so
+(`Adoption::Unsynchronized`); any other refusal leaves nothing behind. A prediction cites adopted
+runs only (`proofs::expectations`).
 
 A Kani control side runs under an authorization its runner validates (`controls::authorize`,
 `controls::Authorization`, made nowhere else): its control, the digest of its diff's bytes, its
 harness, its side, the digest of the predictions it is held to, its copy and build directory, the
-copy's source state and each path's digest, and the transition it was validated for. A baseline's
-copy must be the unplanted copy its runner recorded (`before.sha256`); it records the
-calibration's artifact beside its own and the transfer that explains a copy's build
-(`controls::TRANSFER`). A red side must cite its verified baseline, the same diff bytes and the
-same predictions, its copy changed from the baseline's in exactly the paths the diff touches; a
-restored green side must cite the same baseline and equal it in every path, and its harness's
-artifact must equal the baseline's (`proofs::check_expectations`). A deadline, a signal, a timing
-excess, an unsupported construct or another failure than the control's is no detection.
+copy's source state and each path's digest, and the transition it was validated for.
 
-Each enforcement is a registered control, its check weakened by one plant and refused by the case
-it lets through (`controls/controls.tsv`): `gate-unavailable-limit-absent`,
-`gate-rejection-manifest-omitted`, `gate-rejected-run-adopted`, `gate-document-unretained`,
-`gate-manifest-record-unverified`, `gate-calibration-repeats-unverified`,
-`gate-control-run-unverified`, `gate-source-move-unchecked`, `gate-source-kind-unframed`,
-`gate-control-mutation-unbounded`, `gate-control-baseline-unbound` and
-`gate-restored-artifact-unchecked`.
+- **Baseline.** Its copy must be the unplanted copy its runner recorded (`before.sha256`). It
+  records the calibration's artifact beside its own and the transfer that explains a copy's build
+  (`controls::TRANSFER`). It also records the complete state its copy must become with the
+  registered diff applied (`controls::planted_state`): the baseline written out
+  (`SourceState::materialize`), the diff applied there by the one patch invocation
+  (`controls::patch`, `gate patch`), and the result read back.
+- **Red side.** It must cite its verified baseline, the same diff bytes and the same predictions,
+  and its copy's complete source state must equal that planted state path for path. Every
+  creation, deletion, mode change and link is checked as GNU patch makes it.
+- **Restored green side.** It must cite the same baseline and equal it in every path, and its
+  harness's artifact must equal the baseline's (`proofs::check_expectations`).
+
+A deadline, a signal, a timing excess, an unsupported construct or another failure than the
+control's is no detection.
+
+Each enforcement is a registered control, its check weakened by one plant and refused by the
+case it lets through (`controls/controls.tsv`):
+
+- **Run records:** `gate-unavailable-limit-absent`, `gate-rejection-manifest-omitted`,
+  `gate-document-unretained`, `gate-manifest-record-unverified`, `gate-record-absence-assumed`,
+  `gate-source-move-unchecked`, `gate-source-kind-unframed`.
+- **Calibration and adoption:** `gate-rejected-run-adopted`, `gate-calibration-repeats-unverified`,
+  `gate-journal-shared`, `gate-publication-replaces`, `gate-publication-unsynchronized-accepted`.
+- **Readiness:** `gate-control-run-unverified`, `gate-registry-selection-unchecked`,
+  `gate-readiness-settling-unvalidated`, `gate-readiness-scope-unrequired`,
+  `gate-workload-unlocked`.
+- **Kani control sides:** `gate-control-mutation-unbounded`, `gate-control-baseline-unbound`,
+  `gate-restored-artifact-unchecked`.
 
 ## Planted controls
 

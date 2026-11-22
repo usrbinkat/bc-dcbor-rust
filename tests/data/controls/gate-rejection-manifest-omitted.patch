@@ -1,12 +1,12 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -689,6 +689,9 @@
+@@ -778,6 +778,9 @@
      // write did: the run's last record, describing exactly what it holds, its
      // identity named only when one was made.
-     let judged = record_judgement(&evidence, result);
+     let judged = record_judgement(evidence, result);
 +    if judged.is_err() {
 +        return judged;
 +    }
      let manifest =
-         crate::proofs::manifest_of(&evidence, log_created.then_some(log), identified.as_deref());
+         crate::proofs::manifest_of(evidence, log_created.then_some(log), identified.as_deref());
      let written = serde_json::to_vec_pretty(&manifest)

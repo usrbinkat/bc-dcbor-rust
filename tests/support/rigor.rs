@@ -260,10 +260,7 @@ fn ratchet(name: &str, costs: &[String]) {
     if let Some(previous) = written.get(&identity) {
         let previous = previous.clone();
         drop(written);
-        assert_eq!(
-            previous, data,
-            "{identity}: inconsistent costs for one matrix identity"
-        );
+        consistent_cost(&previous, &data, &identity);
         eprintln!("DCBOR_COST\t{hash:016x}");
         return;
     }
@@ -282,6 +279,13 @@ fn ratchet(name: &str, costs: &[String]) {
     );
     written.insert(identity, data);
     eprintln!("DCBOR_COST\t{hash:016x}");
+}
+
+fn consistent_cost(previous: &str, measured: &str, identity: &str) {
+    assert_eq!(
+        previous, measured,
+        "{identity}: inconsistent costs for one matrix identity"
+    );
 }
 
 fn check_cost(recorded: &str, measured: &str, identity: &str) {
@@ -303,9 +307,24 @@ fn check_cost(recorded: &str, measured: &str, identity: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::check_cost;
+    use super::{check_cost, consistent_cost};
 
     const MEASURED: &str = "#\tconfiguration\tfork-a\n#\tidentity\tcopy\ndimension\tattempts\t12\nstage\tstops\t3\t9\n";
+
+    #[test]
+    fn repeated_identity_with_identical_cost_is_consistent() {
+        consistent_cost(MEASURED, MEASURED, "copy");
+    }
+
+    #[test]
+    #[should_panic(expected = "inconsistent costs for one matrix identity")]
+    fn repeated_identity_with_different_cost_is_rejected() {
+        consistent_cost(
+            MEASURED,
+            &MEASURED.replace("attempts\t12", "attempts\t13"),
+            "copy",
+        );
+    }
 
     #[test]
     fn identical_cost_and_configuration_pass() {

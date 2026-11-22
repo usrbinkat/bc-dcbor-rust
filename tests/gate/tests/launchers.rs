@@ -343,7 +343,9 @@ impl HoldingGate {
     /// The boundary is reached only once its reporting process is stopped.
     /// Recording its PID alone is insufficient: SIGCONT could otherwise
     /// arrive before SIGSTOP and leave the fixture suspended. `qualifying`
-    /// names the case a missing boundary leaves unqualified.
+    /// names the case a missing boundary leaves unqualified; the refusal says
+    /// the run is inconclusive, in words no detection of the case shares, so
+    /// a planted control can never take an unqualified run for its red.
     fn boundary(&mut self, phase: &str, qualifying: &str) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -366,7 +368,7 @@ impl HoldingGate {
             }
             assert!(
                 self.supervisor.try_wait().unwrap().is_none() && Instant::now() < deadline,
-                "{qualifying} cannot be qualified: {phase} boundary was not reached"
+                "inconclusive: {qualifying} is unqualified, its {phase} boundary was not reached"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -556,10 +558,7 @@ fn a_gate_stopped_while_it_starts_leaves_no_process_running() {
                         ("HOLD_PHASE", phase),
                     ],
                 );
-                let paused = gate.boundary(
-                    phase,
-                    &format!("a gate stopped while starting by SIG{action}"),
-                );
+                let paused = gate.boundary(phase, &format!("the SIG{action} stop during startup"));
                 if matches!(phase, "watcher" | "readiness") {
                     gate.awaiting_readiness(paused, phase);
                 }
@@ -598,7 +597,7 @@ fn a_gate_starts_its_work_once_its_watcher_is_ready() {
     for phase in ["watcher", "readiness"] {
         let scratch = Scratch::new(&format!("process-group-ready-{phase}"));
         let mut gate = HoldingGate::start(&scratch, &[("HOLD_PHASE", phase)]);
-        let watcher = gate.boundary(phase, "a gate released by its watcher");
+        let watcher = gate.boundary(phase, "the release by a held watcher");
         gate.awaiting_readiness(watcher, phase);
         let resumed = signal("CONT", &watcher.to_string()).unwrap();
         assert!(resumed.success(), "resume the {phase} watcher {watcher}");
@@ -742,7 +741,7 @@ case "$1" in
 unicode-version) echo 17.0.0 ;;
 dcbor-draft) echo draft ;;
 miri) echo stacked ;;
-tree-digest) exec "$REAL_GATE" "$@" ;;
+tree-digest | patch) exec "$REAL_GATE" "$@" ;;
 proofs-identity)
 	(set -o noclobber && printf '%s\n' /fixture/cargo-kani >"$2") || exit 2
 	printf 'kani-launcher\t/fixture/cargo-kani\nkani-version\tcargo-kani 0.0.0-fixture\n'
@@ -814,14 +813,15 @@ esac
         scratch.0.join("bin").display(),
         std::env::var("PATH").unwrap()
     );
-    let run = |baseline: &str| {
-        let calls = scratch.0.join(format!("calls-{baseline}"));
+    let run_with = |name: &str, baseline: &str, arguments: &[&str]| {
+        let calls = scratch.0.join(format!("calls-{name}"));
         let output = Command::new("bash")
-            .args(["tests/controls.sh", "kani"])
+            .arg("tests/controls.sh")
+            .args(arguments)
             .current_dir(&repo)
             .env("PATH", &path)
             .env("DCBOR_CONFIGURATION", "fixture")
-            .env("CONTROL_LOG_DIR", repo.join("target/logs").join(baseline))
+            .env("CONTROL_LOG_DIR", repo.join("target/logs").join(name))
             .env("GATE_CALLS", &calls)
             .env("REAL_GATE", env!("CARGO_BIN_EXE_gate"))
             .env("BASELINE_EXIT", baseline)
@@ -842,7 +842,11 @@ esac
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        (output.status, sides, report)
+        (output.status, sides, report, recorded)
+    };
+    let run = |baseline: &str| {
+        let (status, sides, report, _) = run_with(baseline, baseline, &["kani"]);
+        (status, sides, report)
     };
     let (status, sides, report) = run("1");
     assert_eq!(
@@ -867,6 +871,44 @@ esac
         "{report}"
     );
     assert_eq!(status.code(), Some(0), "{report}");
+    // The runner scope reaches both the listing and the final record: every
+    // runner when none is named, exactly the runners named otherwise.
+    let scoped_to = |recorded: &str, logs: &str, runners: &str| {
+        let root = repo.display().to_string();
+        let logs = repo.join("target/logs").join(logs).display().to_string();
+        recorded
+            .lines()
+            .any(|line| line == format!("control list {root} kani {runners}"))
+            && recorded
+                .lines()
+                .any(|line| line == format!("control evidence {root} {logs} kani {runners}"))
+    };
+    let (status, _, report, recorded) = run_with("every", "0", &["kani"]);
+    assert_eq!(status.code(), Some(0), "{report}");
+    assert!(
+        scoped_to(&recorded, "every", "native kani stacked"),
+        "an unscoped run did not run every runner: {recorded}"
+    );
+    let (status, _, report, recorded) = run_with("scoped", "0", &["kani", "kani"]);
+    assert_eq!(status.code(), Some(0), "{report}");
+    assert!(
+        scoped_to(&recorded, "scoped", "kani"),
+        "a scoped run did not keep its runners: {recorded}"
+    );
+    // Another gate workload holds the checkout's lock: nothing runs.
+    let held = std::fs::File::create(repo.join("target/gate-workload.lock")).unwrap();
+    held.try_lock().unwrap();
+    let (status, sides, report, _) = run_with("competing", "0", &["kani"]);
+    assert_eq!(status.code(), Some(2), "{report}");
+    assert!(
+        sides.is_empty(),
+        "a control side ran beside another workload: {sides:?}"
+    );
+    assert!(
+        report.contains("another gate workload holds target/gate-workload.lock"),
+        "{report}"
+    );
+    drop(held);
 }
 
 /// Budget recording requires exactly one receipt in each phase, including

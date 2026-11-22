@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/eligibility.rs
++++ tests/gate/src/proofs/eligibility.rs
+@@ -169,7 +169,7 @@
+     /// which is required: a publication whose durability adoption never
+     /// established is no adopted run.
+     pub fn adopted(directory: &Path) -> Result<Self, String> {
+-        let _publication = super::adoption::publication_read_lock(directory)?;
++        let _publication = None::<std::fs::File>;
+         let (mut records, mut top) = Self::laid_out(directory)?;
+         top.remove(ADOPTION_RECORD);
+         if top != Self::layout() {

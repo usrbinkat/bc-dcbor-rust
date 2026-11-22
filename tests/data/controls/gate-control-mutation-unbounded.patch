@@ -1,11 +1,11 @@
 --- tests/gate/src/controls.rs
 +++ tests/gate/src/controls.rs
-@@ -890,7 +890,7 @@
-                 .collect();
-             if side == Side::Red {
-                 let touched = patch_paths(&String::from_utf8_lossy(&patch));
--                if changed != touched {
-+                if !touched.is_subset(&changed) {
-                     return Err(format!(
-                         "{}: the copy changed {changed:?} from its baseline, the registered diff \
-                          touches {touched:?}: the source change is not exactly the registered \
+@@ -1000,7 +1000,7 @@
+                 let differing: Vec<&String> = expected
+                     .keys()
+                     .chain(held.keys())
+-                    .filter(|path| expected.get(*path) != held.get(*path))
++                    .filter(|path| expected.get(*path) != held.get(*path) && base.sources.get(*path) != expected.get(*path))
+                     .collect::<BTreeSet<_>>()
+                     .into_iter()
+                     .collect();

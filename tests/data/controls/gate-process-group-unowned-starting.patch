@@ -1,0 +1,10 @@
+--- tests/gate-common.sh
++++ tests/gate-common.sh
+@@ -60,7 +60,6 @@
+ 	local script leader="" status stopping=0
+ 	script="$PWD/$(basename "$(dirname "$0")")/$(basename "$0")"
+ 	trap 'stopping=1; if [[ -n "$leader" ]]; then kill -TERM -- "-$leader" 2>/dev/null || :; fi' TERM INT HUP
+-	set -m
+ 	DCBOR_GATE_SUPERVISOR=$$ bash "$script" "$@" &
+ 	leader=$!
+ 	set +m

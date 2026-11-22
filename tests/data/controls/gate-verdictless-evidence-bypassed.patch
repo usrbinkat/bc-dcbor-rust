@@ -1,11 +1,11 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2410,7 +2410,7 @@
+@@ -2563,7 +2563,7 @@
          // owes. One refused before launch (its policy's resolution) owes none
          // and may report no verification result; one launched owes all of it,
          // verdict or not, validated before its report is read.
--        if !artifacts.holds(&at.join("solver.attempt")) {
-+        if !verified || !artifacts.holds(&at.join("solver.attempt")) {
-             if verified {
-                 return Err(format!(
-                     "harness {name}: its report has a verification result, but its solver was \
+-        if !artifacts
++        if !verified || !artifacts
+             .holds(&at.join("solver.attempt"))
+             .map_err(|fault| format!("harness {name}: {fault}"))?
+         {

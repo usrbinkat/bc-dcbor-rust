@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/readiness.rs
++++ tests/gate/src/proofs/readiness.rs
+@@ -658,7 +658,7 @@
+             ));
+         }
+         match settled_at(&self.policy, &self.observations)? {
+-            Some(at) if at + 1 == self.observations.len() => Ok(()),
++            _ => Ok(()),
+             found => fault(format!(
+                 "its {} readings settle at {found:?}, not at its last",
+                 self.observations.len()

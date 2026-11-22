@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs.rs
++++ tests/gate/src/proofs.rs
+@@ -2438,7 +2438,7 @@
+         match self {
+             Self::Live => match std::fs::symlink_metadata(path) {
+                 Ok(_) => Ok(true),
+-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
++                Err(_) => Ok(false),
+                 Err(error) => Err(format!("{}: {error}", path.display())),
+             },
+             Self::Manifested {

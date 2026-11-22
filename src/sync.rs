@@ -37,6 +37,8 @@
 #[cfg(all(loom, shuttle))]
 compile_error!("cfg(loom) and cfg(shuttle) each select the library's atomics; set one");
 
+extern crate alloc;
+
 pub(crate) use core::sync::atomic::Ordering;
 
 /// A family of concurrency primitives: the types a structure generic over
@@ -141,6 +143,26 @@ pub(crate) type AtomicUsize = <Shipped as Atomics>::Counter;
 pub(crate) type AtomicPtr<T> = <Shipped as Atomics>::Link<T>;
 pub(crate) type AtomicU64 = <Shipped as Atomics>::Total;
 pub(crate) type Plain<T> = <Shipped as Atomics>::Cell<T>;
+
+/// Allocate recording storage without constructing native atomic words one
+/// at a time. Model atomics require construction inside their execution.
+///
+/// # Safety
+/// The all-zero byte pattern of `T` must be valid and equal to `make()`.
+#[cfg(not(any(loom, shuttle)))]
+pub(crate) unsafe fn zeroed<T>(len: usize, _make: impl FnMut() -> T) -> alloc::boxed::Box<[T]> {
+    // SAFETY: the caller establishes the zero representation of every element.
+    unsafe { alloc::boxed::Box::<[T]>::new_zeroed_slice(len).assume_init() }
+}
+
+/// Construct recording storage with the selected model's atomic constructors.
+///
+/// # Safety
+/// Shares the native allocator's contract; model elements use `make` instead.
+#[cfg(any(loom, shuttle))]
+pub(crate) unsafe fn zeroed<T>(len: usize, make: impl FnMut() -> T) -> alloc::boxed::Box<[T]> {
+    core::iter::repeat_with(make).take(len).collect()
+}
 
 #[cfg(all(test, feature = "std", any(loom, shuttle)))]
 mod models;

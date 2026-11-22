@@ -39,6 +39,24 @@ use crate::rows::{Evidence, Physical, Purpose, Row};
 #[path = "../../data/proofs/instances.rs"]
 pub mod instances;
 
+mod adoption;
+mod calibration;
+mod eligibility;
+mod readiness;
+
+pub use adoption::{Adoption, adopt};
+pub use calibration::{
+    CalibrationRequest, Observed, Runtime, Schedule, Scheduled, calibrate, calibration,
+};
+pub use eligibility::{
+    AdoptionReceipt, CalibrationSample, RunRecords, eligible_sample, ran_sample,
+};
+pub use readiness::{
+    Clocks, ControlRun, ControlVerdict, LockRecord, Prerequisites, REQUIRED_CONTROLS, Readiness,
+    Settled, SettlingPolicy, SystemClocks, WORKLOAD_LOCK, WorkloadLock, control_run,
+    control_verdict, readiness, settle, settling_policy,
+};
+
 /// The build's name in the census.
 pub const NAME: &str = "kani proofs";
 
@@ -77,6 +95,39 @@ pub fn arguments() -> Vec<&'static str> {
     arguments
 }
 
+/// The one layout of a Kani run's arguments: the build's own
+/// ([`arguments`]), then `--harness HARNESS --exact` for each harness an
+/// explicit `selection` names, then the run's target directory, its
+/// selected policy file (`--loop-bounds`) and its evidence directory
+/// (`--loop-bounds-evidence`). What `process::kani` launches with and what
+/// a run's recorded invocation is held to ([`eligible_sample`]).
+pub fn invocation_arguments(
+    selection: &Selection,
+    target_dir: &str,
+    policy: &str,
+    bounds: &str,
+) -> Vec<String> {
+    let mut invocation: Vec<String> = arguments().into_iter().map(str::to_string).collect();
+    if let Selection::Only(harnesses) = selection {
+        for harness in harnesses {
+            invocation.extend([
+                "--harness".to_string(),
+                harness.clone(),
+                "--exact".to_string(),
+            ]);
+        }
+    }
+    invocation.extend([
+        "--target-dir".to_string(),
+        target_dir.to_string(),
+        "--loop-bounds".to_string(),
+        policy.to_string(),
+        "--loop-bounds-evidence".to_string(),
+        bounds.to_string(),
+    ]);
+    invocation
+}
+
 /// Each harness's predicted verification time, relative to the root a run
 /// verifies ([`expectations`]): the one document of the census's predictions
 /// and the one reader of it. Every prediction is fitted by [`RULE`] from
@@ -109,6 +160,34 @@ pub const CALIBRATION: &str = "tests/data/proofs/calibration";
 /// The version of every document the proof suite's runtime evidence reads
 /// and writes: plans, run identities, manifests and predictions.
 pub const RUNTIME_VERSION: u64 = 1;
+
+/// The purposes a run's identity names ([`RunPurpose::name`]).
+pub const PURPOSE_CALIBRATION: &str = "calibration";
+pub const PURPOSE_QUALIFICATION: &str = "qualification";
+pub const PURPOSE_CONTROL: &str = "control";
+
+/// The records a run keeps of the documents it was given, beside its
+/// identity ([`RunPurpose::documents`]).
+pub const PLAN_RECORD: &str = "plan.json";
+pub const READINESS_RECORD: &str = "readiness.json";
+pub const EXPECTATIONS_RECORD: &str = "expectations.json";
+
+/// The records a run keeps of the inputs its validated execution bound
+/// (`process::kani`): the program it launched; the tree's loop-bound policy
+/// file as read, the bytes its identity's policy digest is of; every source
+/// path's own digest, what its identity's source state is the digest of
+/// ([`tree_digest_of`]); and its invocation, the launcher and every argument
+/// it was given.
+pub const LAUNCHER_RECORD: &str = "launcher";
+pub const LOOP_POLICY_RECORD: &str = "loop-policy.json";
+pub const SOURCES_RECORD: &str = "sources.json";
+pub const INVOCATION_RECORD: &str = "invocation.json";
+
+/// An adopted run's acceptance receipt, beside its log and evidence
+/// ([`adopt`], [`AdoptionReceipt`]): written only once the publication's
+/// durability was established, and required by every reader of an adopted
+/// run.
+pub const ADOPTION_RECORD: &str = "adoption.json";
 
 /// The one prediction rule: per-harness repeatability. From [`SAMPLES`]
 /// verified calibration executions of the harness, each in a run of its own,
@@ -219,21 +298,50 @@ fn typed<T: serde::de::DeserializeOwned>(
 }
 
 /// The deadline a run gives one harness, and why: the one form both
-/// purposes give the driver ([`selected`]).
+/// purposes give the driver ([`selected`]), made only from a validated
+/// plan's limit or a validated prediction ([`RunPurpose::deadlines`]): a
+/// positive number of milliseconds and a non-blank reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deadline {
-    pub milliseconds: u64,
-    pub reason: String,
+    milliseconds: u64,
+    reason: String,
 }
 
-/// A calibration plan ([`plan`]): the harnesses a calibration runs, each
-/// with its operational limit, the bytes of the document stating them, and
-/// those bytes' digest.
+impl Deadline {
+    pub fn milliseconds(&self) -> u64 {
+        self.milliseconds
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// A validated calibration plan ([`plan_of`], its only maker): the
+/// harnesses a calibration runs, each with its operational limit, the bytes
+/// of the document stating them, and those bytes' digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    pub sha256: String,
-    pub bytes: Vec<u8>,
-    pub deadlines: BTreeMap<String, Deadline>,
+    sha256: String,
+    bytes: Vec<u8>,
+    deadlines: BTreeMap<String, Deadline>,
+}
+
+impl Plan {
+    /// The digest of the document's bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// The document's bytes, as read.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Each planned harness's limit.
+    pub fn deadlines(&self) -> &BTreeMap<String, Deadline> {
+        &self.deadlines
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -317,11 +425,33 @@ pub fn plan_of(bytes: &[u8], declared: &BTreeSet<String>) -> Result<Plan, String
 /// harness on a control's copy, held to the same predictions under the
 /// authorization its control's runner validated for that side
 /// ([`crate::controls::Authorization`]), never a bare exemption.
+/// A calibration's readiness to run ([`readiness`], its only maker), the
+/// receipt's bytes as preserved and their digest: what every calibration run
+/// keeps beside its plan, binding it to the control run and the settling it
+/// followed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ready {
+    sha256: String,
+    bytes: Vec<u8>,
+}
+
+impl Ready {
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunPurpose {
-    Calibration(Plan),
+    Calibration {
+        plan: Plan,
+        ready: Ready,
+    },
     Qualification(Expectations),
-    Control(Expectations, Box<crate::controls::Authorization>),
+    Control {
+        expectations: Expectations,
+        authorization: Box<crate::controls::Authorization>,
+    },
 }
 
 /// Which instrumented binary a prediction applies to at a run: exactly its
@@ -340,29 +470,32 @@ impl RunPurpose {
     /// The purpose's name, as a run's identity records it.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Calibration(_) => "calibration",
-            Self::Qualification(_) => "qualification",
-            Self::Control(..) => "control",
+            Self::Calibration { .. } => PURPOSE_CALIBRATION,
+            Self::Qualification(_) => PURPOSE_QUALIFICATION,
+            Self::Control { .. } => PURPOSE_CONTROL,
         }
     }
 
-    /// The document the run was given, as the run's evidence keeps it before
-    /// it launches: its file name and its bytes, whose digest is the run's
-    /// revision ([`Self::revision`]).
-    pub fn document(&self) -> (&'static str, &[u8]) {
+    /// The documents the run was given, as its evidence keeps them before it
+    /// launches, each by its file name and bytes: the plan or the
+    /// predictions first, whose digest is the run's revision
+    /// ([`Self::revision`]), then a calibration's readiness.
+    pub fn documents(&self) -> Vec<(&'static str, &[u8])> {
         match self {
-            Self::Calibration(plan) => ("plan.json", &plan.bytes),
-            Self::Qualification(expectations) | Self::Control(expectations, _) => {
-                ("expectations.json", &expectations.bytes)
+            Self::Calibration { plan, ready } => {
+                vec![(PLAN_RECORD, &plan.bytes), (READINESS_RECORD, &ready.bytes)]
+            }
+            Self::Qualification(expectations) | Self::Control { expectations, .. } => {
+                vec![(EXPECTATIONS_RECORD, &expectations.bytes)]
             }
         }
     }
 
-    /// The digest of the document the run was given.
+    /// The digest of the plan or the predictions the run was given.
     pub fn revision(&self) -> &str {
         match self {
-            Self::Calibration(plan) => &plan.sha256,
-            Self::Qualification(expectations) | Self::Control(expectations, _) => {
+            Self::Calibration { plan, .. } => &plan.sha256,
+            Self::Qualification(expectations) | Self::Control { expectations, .. } => {
                 &expectations.sha256
             }
         }
@@ -373,8 +506,8 @@ impl RunPurpose {
     /// control side's [`DEADLINE_MARGIN`] times its prediction.
     pub fn deadlines(&self) -> BTreeMap<String, Deadline> {
         match self {
-            Self::Calibration(plan) => plan.deadlines.clone(),
-            Self::Qualification(expectations) | Self::Control(expectations, _) => expectations
+            Self::Calibration { plan, .. } => plan.deadlines.clone(),
+            Self::Qualification(expectations) | Self::Control { expectations, .. } => expectations
                 .harnesses
                 .iter()
                 .map(|(harness, expectation)| {
@@ -423,12 +556,13 @@ impl Selection {
 /// (`cpuset.cpus.effective`); and its group and every ancestor through `/`
 /// ([`limits`]), each with its path and its `cpu.max` and `memory.max`
 /// observations ([`LimitObservation`]), which together bound what the
-/// workload can use. Equivalence ([`Environment::equivalent`]) compares the
-/// established constraints alone: every run's confinement is a transient
-/// scope of its own, whose name differs.
+/// workload can use. A record is what was observed, kept whatever it holds;
+/// only an established one ([`EnvironmentRecord::establish`]) is compared
+/// ([`EstablishedEnvironment::equivalent`]), its constraints alone: every
+/// run's confinement is a transient scope of its own, whose name differs.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Environment {
+pub struct EnvironmentRecord {
     pub cpu_model: Option<String>,
     pub cpus_allowed: Option<String>,
     pub cpuset_effective: Option<String>,
@@ -611,50 +745,104 @@ pub fn effective_cpuset(hierarchy: &Path, workload: &str) -> Option<String> {
 /// confinement fact is unknown.
 pub const CONFINEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl Environment {
-    /// Whether every fact is established: a non-blank processor model; an
-    /// affinity and an effective cpuset that are non-empty CPU lists; and a
-    /// hierarchy ending at `/` and at it alone, every limit a valid value or
-    /// an absence with its established reason ([`LimitObservation`]), none
-    /// unavailable. Only then can two environments be compared at all.
-    pub fn known(&self) -> bool {
-        let established = |observation: &LimitObservation| match observation {
-            LimitObservation::Value { value } => !value.is_empty(),
-            LimitObservation::Absent { reason } => !reason.trim().is_empty(),
-            LimitObservation::Unavailable { .. } => false,
-        };
-        let roots = self.levels.iter().filter(|level| level.path == "/").count();
-        self.cpu_model
-            .as_deref()
-            .is_some_and(|model| !model.trim().is_empty())
-            && self.cpus_allowed.as_deref().is_some_and(cpu_list)
-            && self.cpuset_effective.as_deref().is_some_and(cpu_list)
-            && roots == 1
-            && self.levels.last().is_some_and(|root| root.path == "/")
-            && self
-                .levels
-                .iter()
-                .all(|level| established(&level.cpu_max) && established(&level.memory_max))
+/// An environment every fact of which is established ([`EnvironmentRecord::
+/// establish`], its only maker): the record it was validated from, kept
+/// whole for diagnosis, and its constraints, the one thing compared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EstablishedEnvironment {
+    record: EnvironmentRecord,
+}
+
+impl EstablishedEnvironment {
+    /// The record it was established from.
+    pub fn record(&self) -> &EnvironmentRecord {
+        &self.record
     }
 
-    /// Whether this environment and `other` are equivalent: both established
-    /// ([`Self::known`]) and their constraints equal, the processor model,
-    /// the affinity, the effective cpuset and every level's limits in order,
-    /// the levels' paths, transient scope names among them, not compared.
+    /// Whether this environment and `other` constrain a workload alike: the
+    /// processor model, the affinity, the effective cpuset and every level's
+    /// limits in ancestry order; the levels' paths, transient scope names
+    /// among them, are provenance and not compared.
     pub fn equivalent(&self, other: &Self) -> bool {
         let constraints = |environment: &Self| {
+            let record = &environment.record;
             (
-                environment.cpu_model.clone(),
-                environment.cpus_allowed.clone(),
-                environment.cpuset_effective.clone(),
-                environment
+                record.cpu_model.clone(),
+                record.cpus_allowed.clone(),
+                record.cpuset_effective.clone(),
+                record
                     .levels
                     .iter()
                     .map(|level| (level.cpu_max.clone(), level.memory_max.clone()))
                     .collect::<Vec<_>>(),
             )
         };
-        self.known() && other.known() && constraints(self) == constraints(other)
+        constraints(self) == constraints(other)
+    }
+}
+
+impl EnvironmentRecord {
+    /// This record established, every fact validated as a live observation
+    /// is, whether it was just observed or read back from evidence: a
+    /// non-blank processor model; an affinity and an effective cpuset that
+    /// are non-empty CPU lists; a hierarchy that is exactly one group's
+    /// ancestry through `/` ([`ancestry`]); and at every level each limit a
+    /// value valid for its file ([`limit_valid`]) or an absence with its
+    /// reason, none unavailable. Refused naming the first fact that is not.
+    pub fn establish(&self) -> Result<EstablishedEnvironment, String> {
+        let fault = |what: String| Err(format!("the environment is not established: {what}"));
+        if !self
+            .cpu_model
+            .as_deref()
+            .is_some_and(|model| !model.trim().is_empty())
+        {
+            return fault(format!("its processor model is {:?}", self.cpu_model));
+        }
+        for (what, list) in [
+            ("affinity", &self.cpus_allowed),
+            ("effective cpuset", &self.cpuset_effective),
+        ] {
+            if !list.as_deref().is_some_and(cpu_list) {
+                return fault(format!("its {what} is {list:?}, not a CPU list"));
+            }
+        }
+        let Some(innermost) = self.levels.first() else {
+            return fault("it records no control group".to_string());
+        };
+        let paths: Vec<&str> = self
+            .levels
+            .iter()
+            .map(|level| level.path.as_str())
+            .collect();
+        if paths
+            != ancestry(&innermost.path)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            return fault(format!(
+                "its levels {paths:?} are not the ancestry of {} through /",
+                innermost.path
+            ));
+        }
+        for level in &self.levels {
+            for (name, observation) in [
+                ("cpu.max", &level.cpu_max),
+                ("memory.max", &level.memory_max),
+            ] {
+                let established = match observation {
+                    LimitObservation::Value { value } => limit_valid(name, value),
+                    LimitObservation::Absent { reason } => !reason.trim().is_empty(),
+                    LimitObservation::Unavailable { .. } => false,
+                };
+                if !established {
+                    return fault(format!("{} {name} is {observation:?}", level.path));
+                }
+            }
+        }
+        Ok(EstablishedEnvironment {
+            record: self.clone(),
+        })
     }
 
     /// An environment of which nothing is known.
@@ -730,11 +918,24 @@ impl Environment {
 
 /// A duration as the gate and the driver record it: whole seconds and the
 /// nanoseconds below one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Instant {
     pub seconds: u64,
     pub nanoseconds: u32,
+}
+
+/// The time now as a run records it.
+pub(crate) fn now() -> Result<Instant, String> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("the clock is before the Unix epoch: {error}"))?;
+    Ok(Instant {
+        seconds: since.as_secs(),
+        nanoseconds: since.subsec_nanos(),
+    })
 }
 
 /// A run's identity, written into its evidence before it launches: a fresh
@@ -747,7 +948,7 @@ pub struct Instant {
 /// load are recorded once the workload is launched ([`Launch`]).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RunIdentity {
+pub struct RunIdentityRecord {
     pub version: u64,
     pub id: String,
     pub purpose: String,
@@ -758,14 +959,93 @@ pub struct RunIdentity {
     pub started: Instant,
 }
 
+impl RunIdentityRecord {
+    /// This record validated ([`RunIdentity`]): of [`RUNTIME_VERSION`], its
+    /// identifier a run identifier ([`run_identifier`]), its purpose one a
+    /// run has, its revision, source state and policy SHA-256 digests, its
+    /// build named, its start's nanoseconds below a second.
+    pub fn validate(self) -> Result<RunIdentity, String> {
+        let fault = |what: String| Err(format!("run.json: {what}"));
+        if self.version != RUNTIME_VERSION {
+            return fault(format!(
+                "version {}, the gate reads {RUNTIME_VERSION}",
+                self.version
+            ));
+        }
+        run_identifier(&self.id)?;
+        if ![PURPOSE_CALIBRATION, PURPOSE_QUALIFICATION, PURPOSE_CONTROL]
+            .contains(&self.purpose.as_str())
+        {
+            return fault(format!("no run has the purpose {:?}", self.purpose));
+        }
+        for (what, digest) in [
+            ("revision", &self.revision),
+            ("source state", &self.tree_sha256),
+            ("loop-bound policy", &self.loop_policy_sha256),
+        ] {
+            if !sha256_text(digest) {
+                return fault(format!("its {what} {digest:?} is no SHA-256 digest"));
+            }
+        }
+        if self.build.trim().is_empty() {
+            return fault("it names no build".to_string());
+        }
+        if self.started.nanoseconds >= 1_000_000_000 {
+            return fault(format!(
+                "its start's nanoseconds {} are not below a second",
+                self.started.nanoseconds
+            ));
+        }
+        Ok(RunIdentity { record: self })
+    }
+}
+
+/// A validated run identity ([`RunIdentityRecord::validate`], its only
+/// maker): what a run's judgement and every reader of its evidence hold it
+/// to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunIdentity {
+    record: RunIdentityRecord,
+}
+
+impl RunIdentity {
+    pub fn record(&self) -> &RunIdentityRecord {
+        &self.record
+    }
+
+    pub fn id(&self) -> &str {
+        &self.record.id
+    }
+
+    pub fn purpose(&self) -> &str {
+        &self.record.purpose
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.record.revision
+    }
+
+    pub fn tree_sha256(&self) -> &str {
+        &self.record.tree_sha256
+    }
+
+    pub fn build(&self) -> &str {
+        &self.record.build
+    }
+
+    pub fn loop_policy_sha256(&self) -> &str {
+        &self.record.loop_policy_sha256
+    }
+}
+
 /// What the launch of a run's workload established: its environment and its
-/// own control group ([`Environment::of_workload`]), recorded and never
+/// own control group ([`EnvironmentRecord::of_workload`]), recorded and never
 /// compared, and the system's load averages and run queue (`/proc/loadavg`)
 /// before and after it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Launch {
-    pub environment: Environment,
+    pub environment: EnvironmentRecord,
     pub workload_cgroup: Option<String>,
     pub load_before: Option<String>,
     pub load_after: Option<String>,
@@ -778,11 +1058,15 @@ pub fn load() -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
-/// The domain and version of [`tree_digest`]'s record stream, its first
-/// bytes, so no digest of another encoding can equal one of this.
-const TREE_DOMAIN: &[u8] = b"dcbor-gate source tree v1\0";
+/// The domain and version of one entry's record stream ([`tree_stream`]),
+/// its first bytes, so no digest of another encoding can equal one of this.
+const ENTRY_DOMAIN: &[u8] = b"dcbor-gate source entry v2\0";
 
-/// One entry of [`tree_digest`]'s stream: its path's raw bytes relative to
+/// The domain and version of a tree's stream of entry digests
+/// ([`tree_digest_of`]).
+const TREE_DOMAIN: &[u8] = b"dcbor-gate source tree v2\0";
+
+/// One record of a source stream: its path's raw bytes relative to
 /// the tree's root (never decoded), its kind, the kind's metadata and its
 /// payload, every variable field preceded by its length as eight
 /// little-endian bytes.
@@ -796,13 +1080,51 @@ fn tree_record(stream: &mut Vec<u8>, path: &[u8], kind: u8, metadata: &[u8], pay
     }
 }
 
-/// The record stream of the source state of `entries`, each a path's raw
-/// bytes and the entry found there, in byte order of the paths, prefixed by
-/// [`TREE_DOMAIN`]: a regular file (`f`) with its executable bit and its
-/// contents; a symbolic link (`l`) with its target's bytes, never followed;
-/// a listed path absent from the tree (`d`), with nothing.
-fn tree_stream(entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Vec<u8> {
+/// The digest of a tree's source state from each path's own digest
+/// ([`SourceState::digests`]), in byte order of the paths: [`TREE_DOMAIN`],
+/// then one record (`e`) per path carrying its digest. What a run retains
+/// (`sources.json`) recomputes its identity's source state by, and what
+/// [`SourceState::digest`] is.
+pub fn tree_digest_of(digests: &BTreeMap<String, String>) -> Result<String, String> {
     let mut stream = TREE_DOMAIN.to_vec();
+    for (path, digest) in digests {
+        tree_record(&mut stream, path.as_bytes(), b'e', &[], digest.as_bytes());
+    }
+    crate::process::sha256_bytes(&stream)
+}
+
+/// The digest of one regular file's entry at `path` ([`SourceState::digests`]):
+/// what a run's retained copy of a source file is held to against its
+/// retained per-path digests.
+pub(crate) fn file_entry_digest(
+    path: &str,
+    contents: &[u8],
+    executable: bool,
+) -> Result<String, String> {
+    entry_digest(
+        path.as_bytes(),
+        &TreeEntry::File {
+            executable,
+            contents: contents.to_vec(),
+        },
+    )
+}
+
+/// The digest of the one entry `entry` at `path`: its record stream
+/// ([`tree_stream`]) digested by the one digest authority.
+fn entry_digest(path: &[u8], entry: &TreeEntry) -> Result<String, String> {
+    let one = BTreeMap::from([(path.to_vec(), entry.clone())]);
+    crate::process::sha256_bytes(&tree_stream(&one))
+}
+
+/// The record stream of the entries `entries`, each a path's raw bytes and
+/// the entry found there, in byte order of the paths, prefixed by
+/// [`ENTRY_DOMAIN`]: a regular file (`f`) with its executable bit and its
+/// contents; a symbolic link (`l`) with its target's bytes, never followed;
+/// a listed path absent from the tree (`d`), with nothing. Each path's own
+/// digest is the digest of its one entry's stream ([`entry_digest`]).
+fn tree_stream(entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Vec<u8> {
+    let mut stream = ENTRY_DOMAIN.to_vec();
     for (path, entry) in entries {
         match entry {
             TreeEntry::File {
@@ -893,6 +1215,54 @@ impl SourceState {
         self
     }
 
+    /// The state written out as a tree at `at`, a directory this creates and
+    /// that must not exist: every file with its bytes and its executable bit
+    /// (mode 0755, else 0644, the only mode the state records), every link
+    /// with its target, never followed, the directories between them made
+    /// as needed. A state holding a deletion has no tree and is refused.
+    pub fn materialize(&self, at: &Path) -> Result<(), String> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(at).map_err(|error| format!("{}: {error}", at.display()))?;
+        for (path, entry) in &self.0 {
+            let target = at.join(std::ffi::OsStr::from_bytes(path));
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("{}: {error}", parent.display()))?;
+            }
+            match entry {
+                TreeEntry::File {
+                    executable,
+                    contents,
+                } => {
+                    std::fs::write(&target, contents)
+                        .and_then(|()| {
+                            std::fs::set_permissions(
+                                &target,
+                                std::fs::Permissions::from_mode(if *executable {
+                                    0o755
+                                } else {
+                                    0o644
+                                }),
+                            )
+                        })
+                        .map_err(|error| format!("{}: {error}", target.display()))?;
+                }
+                TreeEntry::Link(link) => {
+                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(link), &target)
+                        .map_err(|error| format!("{}: {error}", target.display()))?;
+                }
+                TreeEntry::Deleted => {
+                    return Err(format!(
+                        "{}: a deletion, which no tree holds",
+                        target.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The paths the state holds, its deletions left out.
     pub fn paths(&self) -> BTreeSet<Vec<u8>> {
         self.0
@@ -913,18 +1283,20 @@ impl SourceState {
             .collect()
     }
 
-    /// The state's digest: its record stream ([`tree_stream`]) digested by
-    /// the one digest authority ([`crate::process::sha256_bytes`]).
-    /// Timestamps and inode numbers are no part of it.
+    /// The state's digest: the digest of its paths' own digests
+    /// ([`tree_digest_of`] of [`Self::digests`]), so a run that retains its
+    /// per-path digests retains what its source state's digest is
+    /// recomputed from. Timestamps and inode numbers are no part of it.
     pub fn digest(&self) -> Result<String, String> {
-        crate::process::sha256_bytes(&tree_stream(&self.0))
+        tree_digest_of(&self.digests()?)
     }
 
     /// Every path's own digest, the record stream of that one entry, so its
     /// kind, mode, target and bytes, its deletion included, each change it:
     /// what a control side's source transition is checked path by path
-    /// against ([`crate::controls::Authorization`]). Refused for a path that
-    /// is not UTF-8, which no registered diff can name.
+    /// against ([`crate::controls::Authorization`]), and what a run's source
+    /// state is the digest of. Refused for a path that is not UTF-8, which
+    /// no registered diff can name and no retained record can hold.
     pub fn digests(&self) -> Result<BTreeMap<String, String>, String> {
         let mut digests = BTreeMap::new();
         for (path, entry) in &self.0 {
@@ -934,8 +1306,7 @@ impl SourceState {
                     String::from_utf8_lossy(path)
                 )
             })?;
-            let one = BTreeMap::from([(path.clone(), entry.clone())]);
-            digests.insert(name, crate::process::sha256_bytes(&tree_stream(&one))?);
+            digests.insert(name, entry_digest(path, entry)?);
         }
         Ok(digests)
     }
@@ -949,8 +1320,14 @@ pub fn tree_digest(root: &Path) -> Result<String, String> {
     SourceState::read(root)?.digest()
 }
 
-/// The identity of a run of `purpose` in `root`, now ([`RunIdentity`]).
-pub fn run_identity(root: &Path, purpose: &RunPurpose) -> Result<RunIdentity, String> {
+/// The identity of a run of `purpose`, now ([`RunIdentity`]), of the source
+/// state `tree_sha256` and the loop-bound policy `loop_policy_sha256` its
+/// validated execution bound ([`crate::process::KaniRun`]).
+pub fn run_identity(
+    purpose: &RunPurpose,
+    tree_sha256: &str,
+    loop_policy_sha256: &str,
+) -> Result<RunIdentity, String> {
     let id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
         .map_err(|error| format!("/proc/sys/kernel/random/uuid: {error}"))?
         .trim()
@@ -958,19 +1335,20 @@ pub fn run_identity(root: &Path, purpose: &RunPurpose) -> Result<RunIdentity, St
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("the clock is before the Unix epoch: {error}"))?;
-    Ok(RunIdentity {
+    RunIdentityRecord {
         version: RUNTIME_VERSION,
         id,
         purpose: purpose.name().to_string(),
         revision: purpose.revision().to_string(),
-        tree_sha256: tree_digest(root)?,
+        tree_sha256: tree_sha256.to_string(),
         build: arguments().join(" "),
-        loop_policy_sha256: crate::process::sha256(&root.join(POLICY))?,
+        loop_policy_sha256: loop_policy_sha256.to_string(),
         started: Instant {
             seconds: started.as_secs(),
             nanoseconds: started.subsec_nanos(),
         },
-    })
+    }
+    .validate()
 }
 
 /// What a run's log was when its manifest was written.
@@ -997,7 +1375,7 @@ pub enum LogRecord {
 /// description.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Manifest {
+pub struct ManifestDocument {
     pub version: u64,
     pub run: Option<String>,
     pub complete: bool,
@@ -1053,10 +1431,10 @@ fn record_files(directory: &Path) -> Result<Vec<String>, String> {
 /// The manifest of the run whose evidence is `evidence` and whose log is
 /// `log`, `None` when the run created none (a path another process holds is
 /// never the run's log), of identifier `run` when one was made
-/// ([`Manifest`]): every evidence file but the manifest itself digested,
+/// ([`ManifestDocument`]): every evidence file but the manifest itself digested,
 /// each that cannot be enumerated or digested recorded with why instead,
 /// never omitted silently.
-pub fn manifest_of(evidence: &Path, log: Option<&Path>, run: Option<&str>) -> Manifest {
+pub fn manifest_of(evidence: &Path, log: Option<&Path>, run: Option<&str>) -> ManifestDocument {
     let mut files = BTreeMap::new();
     let mut unreadable = BTreeMap::new();
     match record_files(evidence) {
@@ -1095,7 +1473,7 @@ pub fn manifest_of(evidence: &Path, log: Option<&Path>, run: Option<&str>) -> Ma
             },
         },
     };
-    Manifest {
+    ManifestDocument {
         version: RUNTIME_VERSION,
         run: run.map(str::to_string),
         complete: unreadable.is_empty() && matches!(log, LogRecord::Present { .. }),
@@ -1105,107 +1483,16 @@ pub fn manifest_of(evidence: &Path, log: Option<&Path>, run: Option<&str>) -> Ma
     }
 }
 
-/// Copy the records of the finished calibration run whose evidence is
-/// `evidence` (a run's `LOG.evidence`, its log beside it as `LOG`) into the
-/// tree at `root`, under [`CALIBRATION`]`/RUN`, its log as `kani.log` and its
-/// evidence as `evidence/`, every instrumented binary left out; then the
-/// copy's records must match the run's manifest exactly. Refused when the run
-/// is not a calibration's, when it has no manifest or one that does not match
-/// what it holds, when the destination exists, or when any record is not a
-/// regular file. The adopted run is what [`expectations`] may cite.
-pub fn adopt(evidence: &Path, root: &Path) -> Result<std::path::PathBuf, String> {
-    if !std::fs::symlink_metadata(evidence)
-        .map_err(|error| format!("{}: {error}", evidence.display()))?
-        .file_type()
-        .is_dir()
-    {
-        return Err(format!(
-            "{}: a run's evidence is a directory of its own, not a link",
-            evidence.display()
-        ));
-    }
-    let identity: RunIdentity = typed(
-        strict_json(
-            &std::fs::read(evidence.join("run.json"))
-                .map_err(|error| format!("{}/run.json: {error}", evidence.display()))?,
-        )?,
-        "run.json",
-    )?;
-    run_identifier(&identity.id)?;
-    if identity.purpose != "calibration" {
-        return Err(format!(
-            "run {}: its purpose is {}, not calibration: only a calibration is adopted",
-            identity.id, identity.purpose
-        ));
-    }
-    let log = evidence.with_extension("log");
-    // Staged beside its destination, so the adoption's last step is a rename
-    // within one directory of one filesystem.
-    std::fs::create_dir_all(root.join(CALIBRATION))
-        .map_err(|error| format!("{}: {error}", root.join(CALIBRATION).display()))?;
-    let base = contained(root, Path::new(CALIBRATION))?;
-    let staged = base.join(format!(".adopting-{}", identity.id));
-    let destination = base.join(&identity.id);
-    if std::fs::symlink_metadata(&destination).is_ok() {
-        return Err(format!("{}: already adopted", destination.display()));
-    }
-    std::fs::create_dir(&staged).map_err(|error| format!("{}: {error}", staged.display()))?;
-    let copied = (|| {
-        std::fs::copy(&log, staged.join("kani.log"))
-            .map_err(|error| format!("{}: {error}", log.display()))?;
-        for relative in record_files(evidence)? {
-            let target = staged.join("evidence").join(&relative);
-            std::fs::create_dir_all(target.parent().expect("a record has a directory"))
-                .map_err(|error| format!("{}: {error}", target.display()))?;
-            std::fs::copy(evidence.join(&relative), &target)
-                .map_err(|error| format!("{}: {error}", target.display()))?;
-        }
-        let (recorded, _) = read_manifest(&staged.join("evidence"), Some(&identity.id))?;
-        if recorded
-            != manifest_of(
-                &staged.join("evidence"),
-                Some(&staged.join("kani.log")),
-                Some(&identity.id),
-            )
-        {
-            return Err(format!(
-                "run {}: its records do not match its manifest",
-                identity.id
-            ));
-        }
-        // Only an accepted run is adopted; a rejected one stays where it
-        // ran, failure evidence and never a sample.
-        let staged_evidence = staged.join("evidence");
-        let records = Artifacts::Adopted {
-            evidence: &staged_evidence,
-            files: &recorded.files,
-        };
-        let judgement = strict_json(&records.read(&staged_evidence.join("judgement.json"))?)?;
-        if judgement != serde_json::json!({"status": "accepted"}) {
-            return Err(format!(
-                "run {}: its judgement is {judgement}, not accepted: a rejected run is not adopted",
-                identity.id
-            ));
-        }
-        std::fs::rename(&staged, &destination)
-            .map_err(|error| format!("{}: {error}", destination.display()))
-    })();
-    if copied.is_err() {
-        let _ = std::fs::remove_dir_all(&staged);
-    }
-    copied.map(|()| destination)
-}
-
 /// The manifest of the evidence directory `evidence` (`manifest.json`) and
 /// the digest of its bytes, read once, both of the one version: required to
 /// be of [`RUNTIME_VERSION`], to name run `run`, and to be complete with its
 /// log present: only such a run is evidence a prediction or a control side
 /// may cite.
-pub fn read_manifest(evidence: &Path, run: Option<&str>) -> Result<(Manifest, String), String> {
+pub fn read_manifest(evidence: &Path, run: Option<&str>) -> Result<ValidatedManifest, String> {
     let path = evidence.join("manifest.json");
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let digest = crate::process::sha256_bytes(&bytes)?;
-    let manifest: Manifest = typed(
+    let manifest: ManifestDocument = typed(
         strict_json(&bytes).map_err(|fault| format!("{}: {fault}", path.display()))?,
         "manifest.json",
     )?;
@@ -1234,7 +1521,60 @@ pub fn read_manifest(evidence: &Path, run: Option<&str>) -> Result<(Manifest, St
             manifest.unreadable
         ));
     }
-    Ok((manifest, digest))
+    let LogRecord::Present { sha256: log_sha256 } = manifest.log.clone() else {
+        unreachable!("a complete manifest records its log present");
+    };
+    Ok(ValidatedManifest {
+        run: run.to_string(),
+        log_sha256,
+        sha256: digest,
+        document: manifest,
+    })
+}
+
+/// A complete manifest ([`read_manifest`], its only maker): its run, its
+/// log's digest, the digest of its own bytes, and the document read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedManifest {
+    run: String,
+    log_sha256: String,
+    sha256: String,
+    document: ManifestDocument,
+}
+
+impl ValidatedManifest {
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    pub fn log_sha256(&self) -> &str {
+        &self.log_sha256
+    }
+
+    /// The digest of the manifest's own bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Every record it lists, by its path relative to the evidence, with its
+    /// digest.
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.document.files
+    }
+
+    pub fn document(&self) -> &ManifestDocument {
+        &self.document
+    }
+
+    /// The run's records read through this manifest, under `evidence`, its
+    /// instrumented binaries `binaries` ([`Artifacts::Manifested`]).
+    pub fn records<'a>(&'a self, evidence: &'a Path, binaries: Binaries) -> Artifacts<'a> {
+        Artifacts::Manifested {
+            evidence,
+            files: &self.document.files,
+            binaries,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1242,7 +1582,7 @@ pub fn read_manifest(evidence: &Path, run: Option<&str>) -> Result<(Manifest, St
 struct Document {
     version: u64,
     configuration: Configuration,
-    environment: Environment,
+    environment: EnvironmentRecord,
     models: BTreeMap<String, Model>,
     harnesses: BTreeMap<String, Prediction>,
 }
@@ -1290,22 +1630,71 @@ struct Reference {
 /// which a qualifying execution must share for the prediction to apply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Expectation {
-    pub milliseconds: u64,
-    pub transfer: String,
-    pub deadline_milliseconds: u64,
-    pub calibration_runs: BTreeSet<String>,
-    pub artifact_sha256: String,
-    pub verifier: serde_json::Value,
+    milliseconds: u64,
+    transfer: String,
+    deadline_milliseconds: u64,
+    calibration_runs: BTreeSet<String>,
+    artifact_sha256: String,
+    verifier: serde_json::Value,
 }
 
-/// The census's predictions, the environment they apply in, the bytes of
-/// their document and those bytes' digest.
+impl Expectation {
+    pub fn milliseconds(&self) -> u64 {
+        self.milliseconds
+    }
+
+    pub fn transfer(&self) -> &str {
+        &self.transfer
+    }
+
+    pub fn deadline_milliseconds(&self) -> u64 {
+        self.deadline_milliseconds
+    }
+
+    pub fn calibration_runs(&self) -> &BTreeSet<String> {
+        &self.calibration_runs
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    pub fn verifier(&self) -> &serde_json::Value {
+        &self.verifier
+    }
+}
+
+/// The census's validated predictions ([`expectations_of`], their only
+/// maker): the bytes of their document and those bytes' digest, the
+/// established environment they apply in, and each harness's prediction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expectations {
-    pub sha256: String,
-    pub bytes: Vec<u8>,
-    pub environment: Environment,
-    pub harnesses: BTreeMap<String, Expectation>,
+    sha256: String,
+    bytes: Vec<u8>,
+    environment: EstablishedEnvironment,
+    harnesses: BTreeMap<String, Expectation>,
+}
+
+impl Expectations {
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn environment(&self) -> &EstablishedEnvironment {
+        &self.environment
+    }
+
+    pub fn harness(&self, harness: &str) -> Option<&Expectation> {
+        self.harnesses.get(harness)
+    }
+
+    pub fn harnesses(&self) -> &BTreeMap<String, Expectation> {
+        &self.harnesses
+    }
 }
 
 /// The expectations of the tree at `root` ([`expectations_of`]), its
@@ -1314,194 +1703,6 @@ pub fn expectations(root: &Path, declared: &BTreeSet<String>) -> Result<Expectat
     let path = root.join(EXPECTATIONS);
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     expectations_of(root, &bytes, declared).map_err(|fault| format!("{}: {fault}", path.display()))
-}
-
-/// One verified calibration execution of one harness, as its adopted run's
-/// raw records establish it ([`calibration_sample`]).
-struct Sample {
-    run: String,
-    elapsed: std::time::Duration,
-    artifact_sha256: String,
-    verifier: serde_json::Value,
-    environment: Environment,
-    build: String,
-    loop_policy_sha256: String,
-}
-
-/// The execution of `harness` in the adopted calibration run `reference`
-/// under the tree at `root`, from its raw records alone: the run's directory
-/// must be `CALIBRATION/RUN`, contain no symbolic link and nothing outside
-/// itself, and hold exactly the files its manifest lists with their digests,
-/// the manifest's own digest the one cited; its identity must be a
-/// calibration's of that identifier; its report must class the harness
-/// [`Outcome::Pass`] ([`checked`]); and its solver execution record must
-/// carry the deadline its policy gave the harness and a normal exit, whose
-/// duration is the sample.
-fn calibration_sample(root: &Path, harness: &str, reference: &Reference) -> Result<Sample, String> {
-    let run = &reference.run;
-    run_identifier(run)?;
-    let directory = contained(root, &Path::new(CALIBRATION).join(run))?;
-    let evidence = contained(root, &Path::new(CALIBRATION).join(run).join("evidence"))?;
-    for (path, what) in [(&directory, "an adopted run"), (&evidence, "its evidence")] {
-        if !std::fs::symlink_metadata(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?
-            .file_type()
-            .is_dir()
-        {
-            return Err(format!("{}: {what} is not a directory", path.display()));
-        }
-    }
-    let (manifest, digest) = read_manifest(&evidence, Some(run))?;
-    if digest != reference.manifest_sha256 {
-        return Err(format!(
-            "{}: its bytes have digest {digest}, the prediction cites {}",
-            evidence.join("manifest.json").display(),
-            reference.manifest_sha256
-        ));
-    }
-    // Exactly its log and its evidence, nothing beside them, no link.
-    let top: BTreeSet<String> = std::fs::read_dir(&directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .map_err(|error| format!("{}: {error}", directory.display()))
-        })
-        .collect::<Result<_, String>>()?;
-    if top != BTreeSet::from(["evidence".to_string(), "kani.log".to_string()]) {
-        return Err(format!(
-            "run {run}: holds {top:?}, an adopted run is exactly kani.log and evidence/"
-        ));
-    }
-    let log = directory.join("kani.log");
-    if !std::fs::symlink_metadata(&log)
-        .map_err(|error| format!("{}: {error}", log.display()))?
-        .file_type()
-        .is_file()
-    {
-        return Err(format!("{}: not a regular file", log.display()));
-    }
-    let log_bytes = std::fs::read(&log).map_err(|error| format!("{}: {error}", log.display()))?;
-    let log_digest = crate::process::sha256_bytes(&log_bytes)?;
-    if manifest.log
-        != (LogRecord::Present {
-            sha256: log_digest.clone(),
-        })
-    {
-        return Err(format!(
-            "{}: its bytes have digest {log_digest}, the manifest records {:?}",
-            log.display(),
-            manifest.log
-        ));
-    }
-    let held: BTreeSet<String> = record_files(&evidence)?
-        .into_iter()
-        .filter(|relative| relative != "manifest.json")
-        .collect();
-    let listed: BTreeSet<String> = manifest.files.keys().cloned().collect();
-    if held != listed {
-        return Err(format!(
-            "run {run}: holds {:?} its manifest does not list, and lacks {:?} it lists",
-            held.difference(&listed).collect::<Vec<_>>(),
-            listed.difference(&held).collect::<Vec<_>>()
-        ));
-    }
-    // Every record read once and held to its manifest's digest, those bytes
-    // the ones interpreted below; each listed record checked whether read
-    // again or not.
-    let records = Artifacts::Adopted {
-        evidence: &evidence,
-        files: &manifest.files,
-    };
-    for relative in manifest.files.keys() {
-        records.read(&evidence.join(relative))?;
-    }
-    let json = |relative: &str| -> Result<serde_json::Value, String> {
-        let path = evidence.join(relative);
-        strict_json(&records.read(&path)?).map_err(|fault| format!("{}: {fault}", path.display()))
-    };
-    let identity: RunIdentity = typed(json("run.json")?, "run.json")?;
-    if identity.id != *run || identity.purpose != "calibration" {
-        return Err(format!(
-            "run {run}: run.json names run {} of purpose {}, not this calibration",
-            identity.id, identity.purpose
-        ));
-    }
-    let launch: Launch = typed(json("launch.json")?, "launch.json")?;
-    // The run's own judgement, as it was recorded when it ended.
-    let judgement = json("judgement.json")?;
-    if judgement != serde_json::json!({"status": "accepted"}) {
-        return Err(format!(
-            "run {run}: its judgement is {judgement}, not accepted: a rejected run supports no \
-             sample"
-        ));
-    }
-    // Its launcher's termination, reconciled with its report.
-    let ended = json("launcher.execution.json")?;
-    let termination = match (ended["exit_code"].as_i64(), ended["signal"].as_i64()) {
-        (Some(code), None) if ended["signal"].is_null() => Termination::Exited(
-            i32::try_from(code)
-                .map_err(|_| format!("run {run}: launcher.execution.json records exit {code}"))?,
-        ),
-        (None, Some(signal)) if ended["exit_code"].is_null() => {
-            Termination::Signaled(i32::try_from(signal).map_err(|_| {
-                format!("run {run}: launcher.execution.json records signal {signal}")
-            })?)
-        }
-        _ => {
-            return Err(format!(
-                "run {run}: launcher.execution.json is not one exit or one signal: {ended}"
-            ));
-        }
-    };
-    let report = String::from_utf8(log_bytes)
-        .map_err(|error| format!("{}: not UTF-8: {error}", log.display()))?;
-    check_calibration_termination(termination, &report)
-        .map_err(|fault| format!("run {run}: {fault}"))?;
-    let outcome = checked(&report)?
-        .into_iter()
-        .find(|(name, _)| name == harness)
-        .map(|(_, outcome)| outcome)
-        .ok_or_else(|| format!("run {run}: its report never checked {harness}"))?;
-    if outcome != Outcome::Pass {
-        return Err(format!(
-            "run {run}: its report classes {harness} {outcome}, not pass: only a verified \
-             execution is a calibration sample"
-        ));
-    }
-    // The whole run reconciled again from its adopted records: every
-    // launched harness's command, executables, artifact record, discovery,
-    // resolution, execution and report, and the function scope it applied.
-    let policy = json("loop-bounds.json")?;
-    let bounds = evidence.join("loop-bounds");
-    let reconciled = check_execution_evidence(&bounds, &policy, &report, records)
-        .map_err(|fault| format!("run {run}: {fault}"))?;
-    check_function_scope(&bounds, &policy, &reconciled.applied, false, records)
-        .map_err(|fault| format!("run {run}: {fault}"))?;
-    let execution_record = json("execution.json")?;
-    if execution_record["verifier"] != reconciled.verifier {
-        return Err(format!(
-            "run {run}: execution.json records the verifier {}, its evidence reconciles {}",
-            execution_record["verifier"], reconciled.verifier
-        ));
-    }
-    let elapsed = *reconciled
-        .completed
-        .get(harness)
-        .ok_or_else(|| format!("run {run}: {harness}'s solver did not end by a normal exit"))?;
-    let launched = reconciled
-        .launched
-        .get(harness)
-        .ok_or_else(|| format!("run {run}: {harness} was never launched"))?;
-    Ok(Sample {
-        run: run.clone(),
-        elapsed,
-        artifact_sha256: launched.artifact_sha256.clone(),
-        verifier: reconciled.verifier,
-        environment: launch.environment,
-        build: identity.build,
-        loop_policy_sha256: identity.loop_policy_sha256,
-    })
 }
 
 /// Whether `run` is a run identifier as a run's identity mints it: the
@@ -1606,12 +1807,7 @@ pub fn expectations_of(
             document.configuration.timing_boundary
         ));
     }
-    if !document.environment.known() {
-        return Err(format!(
-            "its environment holds an unknown fact, which establishes no equivalence: {:?}",
-            document.environment
-        ));
-    }
+    let environment = document.environment.establish()?;
     for (name, model) in &document.models {
         if model.rule != RULE {
             return Err(format!(
@@ -1637,7 +1833,7 @@ pub fn expectations_of(
         ));
     }
     let mut verifier: Option<serde_json::Value> = None;
-    let mut sampled: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
+    let mut sampled: BTreeMap<String, Vec<CalibrationSample>> = BTreeMap::new();
     for (harness, prediction) in &document.harnesses {
         let fault = |fault: String| format!("harness {harness}: {fault}");
         if !document.models.contains_key(&prediction.model) {
@@ -1655,30 +1851,40 @@ pub fn expectations_of(
                 prediction.calibration.len()
             )));
         }
-        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut samples: Vec<CalibrationSample> = Vec::with_capacity(SAMPLES);
         for reference in &prediction.calibration {
-            let sample = calibration_sample(root, harness, reference).map_err(fault)?;
-            let mismatch = if sample.build != document.configuration.build {
+            run_identifier(&reference.run).map_err(fault)?;
+            let directory =
+                contained(root, &Path::new(CALIBRATION).join(&reference.run)).map_err(fault)?;
+            let records = RunRecords::adopted(&directory).map_err(fault)?;
+            let sample = eligible_sample(&records, &reference.run, declared).map_err(fault)?;
+            if sample.manifest_sha256 != reference.manifest_sha256 {
+                return Err(fault(format!(
+                    "{}: its bytes have digest {}, the prediction cites {}",
+                    directory.join("evidence/manifest.json").display(),
+                    sample.manifest_sha256,
+                    reference.manifest_sha256
+                )));
+            }
+            // The document's envelope, then the harness's: each sample of
+            // another run than every earlier one and of their envelope
+            // ([`CalibrationSample::compatible`], the one comparison).
+            let mismatch = if sample.harness != *harness {
+                Some("a sample of another harness")
+            } else if sample.build != document.configuration.build {
                 Some("of another build")
             } else if sample.loop_policy_sha256 != document.configuration.loop_policy_sha256 {
                 Some("under another loop-bound policy")
-            } else if !sample.environment.equivalent(&document.environment) {
-                Some("of another or an unknown environment")
-            } else if samples
-                .iter()
-                .any(|earlier: &Sample| earlier.run == sample.run)
-            {
-                Some("a second sample of one run")
-            } else if samples
-                .first()
-                .is_some_and(|first: &Sample| first.artifact_sha256 != sample.artifact_sha256)
-            {
-                Some("of another instrumented binary than the harness's other samples")
+            } else if !sample.environment.equivalent(&environment) {
+                Some("of another environment")
             } else {
                 None
             };
             if let Some(mismatch) = mismatch {
                 return Err(fault(format!("run {} is {mismatch}", sample.run)));
+            }
+            for earlier in &samples {
+                earlier.compatible(&sample).map_err(fault)?;
             }
             match &verifier {
                 Some(first) if *first != sample.verifier => {
@@ -1694,35 +1900,13 @@ pub fn expectations_of(
         }
         sampled.insert(harness.clone(), samples);
     }
-    let spread = |samples: &[Sample]| {
-        let longest = samples
-            .iter()
-            .map(|sample| sample.elapsed)
-            .max()
-            .expect("every harness has its samples");
-        let shortest = samples
-            .iter()
-            .map(|sample| sample.elapsed)
-            .min()
-            .expect("every harness has its samples");
-        (longest, longest - shortest)
-    };
-    let envelope = sampled
-        .values()
-        .map(|samples| spread(samples).1)
-        .max()
-        .unwrap_or_default();
+    let fitted = fit(&sampled)?;
     let mut harnesses = BTreeMap::new();
     for (harness, prediction) in document.harnesses {
         let samples = sampled
             .remove(&harness)
             .expect("every harness's samples were read");
-        let (longest, own) = spread(&samples);
-        let computed = longest
-            .checked_add(own.max(envelope))
-            .and_then(ceiling_milliseconds)
-            .filter(|milliseconds| *milliseconds > 0)
-            .ok_or_else(|| format!("harness {harness}: its prediction does not fit"))?;
+        let computed = fitted[&harness];
         if prediction.milliseconds != computed {
             return Err(format!(
                 "harness {harness}: predicts {} ms, its calibration gives {computed} ms by {RULE}",
@@ -1748,9 +1932,50 @@ pub fn expectations_of(
     Ok(Expectations {
         sha256,
         bytes: bytes.to_vec(),
-        environment: document.environment,
+        environment,
         harnesses,
     })
+}
+
+/// The one prediction arithmetic of [`RULE`], which the predictions' reader
+/// checks a document by and a fitting writes one by: for each harness's
+/// [`SAMPLES`] eligible samples with durations `t`, `max(t)` plus the larger
+/// of its own spread `max(t) - min(t)` and the envelope's, the largest spread
+/// of any harness given, in checked integer seconds and nanoseconds, rounded
+/// up to whole milliseconds once, at the end. Refused when a harness has not
+/// exactly [`SAMPLES`] samples or a prediction does not fit in `u64`.
+pub fn fit(
+    sampled: &BTreeMap<String, Vec<CalibrationSample>>,
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut spreads = BTreeMap::new();
+    for (harness, samples) in sampled {
+        if samples.len() != SAMPLES {
+            return Err(format!(
+                "harness {harness}: {} samples, {RULE} takes {SAMPLES}",
+                samples.len()
+            ));
+        }
+        let durations = samples.iter().map(|sample| sample.elapsed);
+        let longest = durations.clone().max().expect("SAMPLES is not zero");
+        let shortest = durations.min().expect("SAMPLES is not zero");
+        spreads.insert(harness.as_str(), (longest, longest - shortest));
+    }
+    let envelope = spreads
+        .values()
+        .map(|(_, spread)| *spread)
+        .max()
+        .unwrap_or_default();
+    spreads
+        .into_iter()
+        .map(|(harness, (longest, own))| {
+            longest
+                .checked_add(own.max(envelope))
+                .and_then(ceiling_milliseconds)
+                .filter(|milliseconds| *milliseconds > 0)
+                .map(|milliseconds| (harness.to_string(), milliseconds))
+                .ok_or_else(|| format!("harness {harness}: its prediction does not fit"))
+        })
+        .collect()
 }
 
 /// A calibration's launcher termination reconciled with its report: Kani
@@ -1792,10 +2017,16 @@ pub fn check_expectations(
     expectations: &Expectations,
     applicability: Applicability<'_>,
 ) -> Result<(), String> {
-    if !launch.environment.equivalent(&expectations.environment) {
+    let established = launch
+        .environment
+        .establish()
+        .map_err(|fault| format!("run {}: {fault}: no prediction applies", identity.id()))?;
+    if !established.equivalent(&expectations.environment) {
         return Err(format!(
             "run {}: its environment {:?} is not the predictions' {:?}: no prediction applies",
-            identity.id, launch.environment, expectations.environment
+            identity.id(),
+            launch.environment,
+            expectations.environment.record()
         ));
     }
     // A control side runs what its authorization binds and nothing else: the
@@ -1803,22 +2034,22 @@ pub fn check_expectations(
     // and its one harness.
     if let Applicability::Control(authorization) = applicability {
         let record = authorization.record();
-        if identity.revision != record.expectations_sha256
-            || expectations.sha256 != record.expectations_sha256
+        if identity.revision() != record.expectations_sha256
+            || expectations.sha256() != record.expectations_sha256
         {
             return Err(format!(
                 "run {}: given the predictions {}, its {} authorization froze {}",
-                identity.id,
-                identity.revision,
+                identity.id(),
+                identity.revision(),
                 record.side.name(),
                 record.expectations_sha256
             ));
         }
-        if identity.tree_sha256 != record.source_sha256 {
+        if identity.tree_sha256() != record.source_sha256 {
             return Err(format!(
                 "run {}: ran the source state {}, its {} authorization binds {}",
-                identity.id,
-                identity.tree_sha256,
+                identity.id(),
+                identity.tree_sha256(),
                 record.side.name(),
                 record.source_sha256
             ));
@@ -1840,10 +2071,10 @@ pub fn check_expectations(
             .harnesses
             .get(name)
             .ok_or_else(|| format!("harness {name}: checked, but has no prediction"))?;
-        if expectation.calibration_runs.contains(&identity.id) {
+        if expectation.calibration_runs.contains(identity.id()) {
             return Err(format!(
                 "harness {name}: run {} is one its prediction was calibrated from",
-                identity.id
+                identity.id()
             ));
         }
         let launched = reconciled
@@ -2016,12 +2247,22 @@ pub struct Policy {
     pub harnesses: BTreeMap<String, serde_json::Value>,
 }
 
-/// The policy of the tree at `root` ([`policy_of`]).
+/// The policy of the tree at `root` ([`read_policy`]).
 pub fn policy(root: &Path, declared: &BTreeSet<String>) -> Result<Policy, String> {
+    read_policy(root, declared).map(|(_, policy)| policy)
+}
+
+/// The policy file of the tree at `root` read once: its bytes, whose digest
+/// is a run's loop-bound policy identity and which a run retains, and the
+/// policy those same bytes hold ([`policy_of`]).
+pub fn read_policy(root: &Path, declared: &BTreeSet<String>) -> Result<(Vec<u8>, Policy), String> {
     let path = root.join(POLICY);
-    let text =
-        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    policy_of(&text, declared).map_err(|fault| format!("{}: {fault}", path.display()))
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("{}: not UTF-8: {error}", path.display()))?;
+    let policy =
+        policy_of(text, declared).map_err(|fault| format!("{}: {fault}", path.display()))?;
+    Ok((bytes, policy))
 }
 
 /// The policy of the text `text`. Refused when it is not an object of
@@ -2242,29 +2483,51 @@ pub struct Reconciled {
     pub launched: BTreeMap<String, Launched>,
 }
 
-/// How a run's records are read when its evidence is reconciled: as the run
-/// left them, its instrumented binaries preserved beside each harness's
-/// records and their bytes held to their recorded digest; or as an adopted
-/// run holds them ([`adopt`]), its binaries recorded by digest alone and
-/// every record read once, its bytes held to the digest its manifest lists
-/// under `evidence` before they are interpreted, so a record changed between
-/// two opens is never checked in one version and read in another.
+/// Where a run's instrumented binaries are when its records are read: held
+/// beside each harness's records, as the run left them, each held to its
+/// recorded digest; or absent, recorded by digest alone, as an adopted run
+/// keeps them ([`adopt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binaries {
+    Held,
+    Absent,
+}
+
+/// How a run's records are read when its evidence is reconciled: live, as
+/// the run that is writing them left them, before it has a manifest, its
+/// binaries held; or through its complete manifest
+/// ([`ValidatedManifest::records`]), every record read once and its bytes
+/// held to the digest the manifest lists under `evidence` before they are
+/// interpreted, so a record changed between two opens is never checked in
+/// one version and read in another, its binaries held or absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Artifacts<'a> {
-    Preserved,
-    Adopted {
+    Live,
+    Manifested {
         evidence: &'a Path,
         files: &'a BTreeMap<String, String>,
+        binaries: Binaries,
     },
 }
 
 impl Artifacts<'_> {
+    /// Where the run's instrumented binaries are.
+    fn binaries(&self) -> Binaries {
+        match self {
+            Self::Live => Binaries::Held,
+            Self::Manifested { binaries, .. } => *binaries,
+        }
+    }
+
     /// The bytes of the record at `path`, read once: a run's read through its
     /// manifest held to the manifest's digest, a record the manifest does not
     /// list refused.
     pub(crate) fn read(&self, path: &Path) -> Result<Vec<u8>, String> {
         let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        if let Self::Adopted { evidence, files } = self {
+        if let Self::Manifested {
+            evidence, files, ..
+        } = self
+        {
             let relative = self.relative(evidence, path)?;
             let listed = files.get(&relative).ok_or_else(|| {
                 format!(
@@ -2283,14 +2546,19 @@ impl Artifacts<'_> {
         Ok(bytes)
     }
 
-    /// Whether the record at `path` is one of the run's: on disk as the run
-    /// left it, or listed by an adopted run's manifest.
-    fn holds(&self, path: &Path) -> bool {
+    /// Whether the record at `path` is one of the run's: on disk, for a live
+    /// run, only `NotFound` counting as its absence and every other failure
+    /// to inspect it refused; or listed by its manifest.
+    fn holds(&self, path: &Path) -> Result<bool, String> {
         match self {
-            Self::Preserved => path.exists(),
-            Self::Adopted { evidence, files } => self
-                .relative(evidence, path)
-                .is_ok_and(|relative| files.contains_key(&relative)),
+            Self::Live => match std::fs::symlink_metadata(path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(format!("{}: {error}", path.display())),
+            },
+            Self::Manifested {
+                evidence, files, ..
+            } => Ok(files.contains_key(&self.relative(evidence, path)?)),
         }
     }
 
@@ -2410,7 +2678,10 @@ pub fn check_execution_evidence(
         // owes. One refused before launch (its policy's resolution) owes none
         // and may report no verification result; one launched owes all of it,
         // verdict or not, validated before its report is read.
-        if !artifacts.holds(&at.join("solver.attempt")) {
+        if !artifacts
+            .holds(&at.join("solver.attempt"))
+            .map_err(|fault| format!("harness {name}: {fault}"))?
+        {
             if verified {
                 return Err(format!(
                     "harness {name}: its report has a verification result, but its solver was \
@@ -2473,8 +2744,8 @@ pub fn check_execution_evidence(
         let recorded_path = record["path"]
             .as_str()
             .ok_or_else(|| format!("harness {name}: artifact.json names no path"))?;
-        let names_the_copy = match artifacts {
-            Artifacts::Preserved => {
+        let names_the_copy = match artifacts.binaries() {
+            Binaries::Held => {
                 Path::new(recorded_path) == preserved
                     || std::fs::canonicalize(recorded_path)
                         .ok()
@@ -2483,7 +2754,7 @@ pub fn check_execution_evidence(
             }
             // The copy was the run's own, at its evidence path then; its
             // harness's directory and file name are what moved with it.
-            Artifacts::Adopted { .. } => recorded_path.ends_with(&format!(
+            Binaries::Absent => recorded_path.ends_with(&format!(
                 "/loop-bounds/{}/artifact.out",
                 name.replace("::", ".")
             )),
@@ -2507,8 +2778,8 @@ pub fn check_execution_evidence(
             .as_str()
             .filter(|digest| sha256_text(digest))
             .ok_or_else(|| format!("harness {name}: artifact.json records no digest"))?;
-        match artifacts {
-            Artifacts::Preserved => {
+        match artifacts.binaries() {
+            Binaries::Held => {
                 let actual = crate::process::sha256(&preserved)
                     .map_err(|fault| format!("harness {name}: {fault}"))?;
                 if actual != recorded_digest {
@@ -2518,15 +2789,23 @@ pub fn check_execution_evidence(
                     ));
                 }
             }
-            Artifacts::Adopted { .. } => {
-                if std::fs::symlink_metadata(&preserved).is_ok() {
+            Binaries::Absent => match std::fs::symlink_metadata(&preserved) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "harness {name}: {}: {error}: whether the adopted run holds its \
+                         instrumented binary is unknown",
+                        preserved.display()
+                    ));
+                }
+                Ok(_) => {
                     return Err(format!(
                         "harness {name}: an adopted run holds its instrumented binary {}; \
                          adoption records it by digest alone",
                         preserved.display()
                     ));
                 }
-            }
+            },
         }
         if !command.contains(&recorded_path.as_bytes()) {
             return Err(format!(
@@ -3169,527 +3448,21 @@ pub fn run(
     launcher: &Path,
 ) -> Result<(Vec<Row>, Vec<String>), String> {
     let declared = harnesses(&root.join("src"))?;
-    if declared.is_empty() {
-        return Err("the library declares no #[kani::proof] harness".to_string());
-    }
-    let loop_bounds = policy(root, &declared)?;
     let purpose = RunPurpose::Qualification(expectations(root, &declared)?);
-    let (termination, report) = crate::process::run_kani_purpose(
+    let workload = crate::process::Workload::exported()?;
+    let run = crate::process::KaniRequest {
         root,
-        &loop_bounds,
-        &purpose,
-        &Selection::All,
-        &declared,
+        purpose: &purpose,
+        selection: &Selection::All,
+        declared: &declared,
         target_dir,
+        launcher,
+        workload: &workload,
         log,
-        launcher,
-        &crate::process::Workload::exported()?,
-    )?;
+    }
+    .validate()?;
+    let (termination, report) = crate::process::execute_kani(run)?;
     Ok(rows(termination, &report, &declared))
-}
-
-/// The operational policy a calibration waits on before its first run, after
-/// the control run that preceded it: the system's load read every
-/// `interval_milliseconds` (`/proc/loadavg`), settled once `consecutive`
-/// readings in a row each show at most `max_running` runnable tasks and a
-/// one-minute load of at most `max_load1_hundredths` hundredths, refused
-/// when `limit` readings pass without it. A declared criterion with its
-/// justification, never a claim that the system is idle.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SettlingPolicy {
-    pub interval_milliseconds: u64,
-    pub consecutive: usize,
-    pub limit: usize,
-    pub max_running: u64,
-    pub max_load1_hundredths: u64,
-    pub justification: String,
-}
-
-/// The one settling policy of a calibration ([`SettlingPolicy`]).
-pub fn settling_policy() -> SettlingPolicy {
-    SettlingPolicy {
-        interval_milliseconds: 5_000,
-        consecutive: 6,
-        limit: 180,
-        max_running: 2,
-        max_load1_hundredths: 100,
-        justification: "a calibration's harness is one solver process: at most the sampler and \
-                        one other task runnable and a one-minute load of at most 1.00, held for \
-                        thirty seconds, leaves the control run's workload decayed and no other \
-                        workload contending; fifteen minutes without it refuses the calibration"
-            .to_string(),
-    }
-}
-
-/// One reading of the system's load while a calibration settles: when it was
-/// taken, `/proc/loadavg` as read, its one-minute load in hundredths and its
-/// runnable tasks, and whether it is within the policy.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Settled {
-    pub at: Instant,
-    pub loadavg: String,
-    pub load1_hundredths: u64,
-    pub running: u64,
-    pub within: bool,
-}
-
-/// The one-minute load in hundredths and the runnable tasks of a
-/// `/proc/loadavg` reading (`0.52 0.58 0.59 1/1234 5678`).
-fn loadavg_of(text: &str) -> Result<(u64, u64), String> {
-    let fields: Vec<&str> = text.split_whitespace().collect();
-    let malformed = || format!("not a /proc/loadavg reading: {text:?}");
-    let [load1, _, _, tasks, _] = fields[..] else {
-        return Err(malformed());
-    };
-    let (whole, fraction) = load1.split_once('.').ok_or_else(malformed)?;
-    if fraction.len() != 2 {
-        return Err(malformed());
-    }
-    let hundredths = whole
-        .parse::<u64>()
-        .ok()
-        .and_then(|whole| whole.checked_mul(100))
-        .zip(fraction.parse::<u64>().ok())
-        .and_then(|(whole, fraction)| whole.checked_add(fraction))
-        .ok_or_else(malformed)?;
-    let running = tasks
-        .split_once('/')
-        .and_then(|(running, _)| running.parse::<u64>().ok())
-        .ok_or_else(malformed)?;
-    Ok((hundredths, running))
-}
-
-/// The settling of the system under `policy`: readings from `sample`, a
-/// reading's time from `now`, `wait` between them, until `consecutive`
-/// readings in a row are within the policy, or `limit` have been read, or a
-/// reading cannot be taken. Every reading taken, and whether it settled.
-pub fn settle(
-    policy: &SettlingPolicy,
-    sample: &mut dyn FnMut() -> Result<String, String>,
-    now: &mut dyn FnMut() -> Result<Instant, String>,
-    wait: &mut dyn FnMut(std::time::Duration),
-) -> (Vec<Settled>, Result<(), String>) {
-    let mut observations: Vec<Settled> = Vec::new();
-    if policy.consecutive == 0 || policy.limit < policy.consecutive {
-        return (
-            observations,
-            Err(format!(
-                "a settling policy of {} consecutive readings within {} establishes nothing",
-                policy.consecutive, policy.limit
-            )),
-        );
-    }
-    while observations.len() < policy.limit {
-        if !observations.is_empty() {
-            wait(std::time::Duration::from_millis(
-                policy.interval_milliseconds,
-            ));
-        }
-        let reading = sample().and_then(|loadavg| {
-            let (load1_hundredths, running) = loadavg_of(&loadavg)?;
-            Ok(Settled {
-                at: now()?,
-                within: load1_hundredths <= policy.max_load1_hundredths
-                    && running <= policy.max_running,
-                loadavg: loadavg.trim().to_string(),
-                load1_hundredths,
-                running,
-            })
-        });
-        match reading {
-            Ok(settled) => observations.push(settled),
-            Err(fault) => return (observations, Err(format!("a load reading failed: {fault}"))),
-        }
-        let settled = observations.len() >= policy.consecutive
-            && observations[observations.len() - policy.consecutive..]
-                .iter()
-                .all(|settled| settled.within);
-        if settled {
-            return (observations, Ok(()));
-        }
-    }
-    let count = observations.len();
-    (
-        observations,
-        Err(format!(
-            "the system did not settle within {count} readings: {} consecutive within {} \
-             hundredths of load and {} runnable tasks were required",
-            policy.consecutive, policy.max_load1_hundredths, policy.max_running
-        )),
-    )
-}
-
-/// The control run a calibration follows, as its final record states it
-/// (`verdict.json`, `gate control evidence`): its logs, its identity, its
-/// commit and channel, and the digest of the record's bytes.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ControlRun {
-    pub logs: String,
-    pub identity: String,
-    pub commit: String,
-    pub channel: String,
-    pub verdict_sha256: String,
-}
-
-/// A control run's final record, as `gate control evidence` writes it once
-/// every control of its channel was judged.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ControlVerdict {
-    pub version: u64,
-    pub channel: String,
-    pub commit: String,
-    pub identity: String,
-    pub controls: usize,
-    pub faults: Vec<String>,
-}
-
-/// The control run whose logs are `logs`, required finished and passed, of
-/// `commit`: its final record read once and digested from those bytes, of
-/// [`RUNTIME_VERSION`], naming the run's own identity (`identity.txt`) and
-/// `commit`, with no fault. A run unfinished (no final record) or failed is
-/// refused.
-pub fn control_run(logs: &Path, commit: &str) -> Result<ControlRun, String> {
-    let path = logs.join("verdict.json");
-    let bytes = std::fs::read(&path).map_err(|error| {
-        format!(
-            "{}: {error}: the control run has not finished",
-            path.display()
-        )
-    })?;
-    let verdict_sha256 = crate::process::sha256_bytes(&bytes)?;
-    let verdict: ControlVerdict = typed(
-        strict_json(&bytes).map_err(|fault| format!("{}: {fault}", path.display()))?,
-        "verdict.json",
-    )?;
-    let identity_path = logs.join("identity.txt");
-    let identity = std::fs::read_to_string(&identity_path)
-        .map_err(|error| format!("{}: {error}", identity_path.display()))?
-        .trim()
-        .to_string();
-    let fault = if verdict.version != RUNTIME_VERSION {
-        Some(format!("is of version {}", verdict.version))
-    } else if verdict.identity != identity {
-        Some(format!(
-            "names the identity {}, the run's is {identity}",
-            verdict.identity
-        ))
-    } else if verdict.commit != commit {
-        Some(format!(
-            "is of commit {}, the calibration's is {commit}",
-            verdict.commit
-        ))
-    } else if verdict.controls == 0 || !verdict.faults.is_empty() {
-        Some(format!(
-            "records {} controls and the faults {:?}: the control run did not pass",
-            verdict.controls, verdict.faults
-        ))
-    } else {
-        None
-    };
-    if let Some(fault) = fault {
-        return Err(format!("{}: {fault}", path.display()));
-    }
-    Ok(ControlRun {
-        logs: logs.display().to_string(),
-        identity,
-        commit: verdict.commit,
-        channel: verdict.channel,
-        verdict_sha256,
-    })
-}
-
-/// A calibration's readiness, preserved before its first run
-/// (`readiness.json`): the control run it follows, or why none is
-/// established; the settling policy, every reading taken under it, and
-/// whether the calibration was ready.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Readiness {
-    pub version: u64,
-    pub control: Option<ControlRun>,
-    pub policy: SettlingPolicy,
-    pub observations: Vec<Settled>,
-    pub ready: bool,
-    pub error: Option<String>,
-}
-
-/// The time now as a run records it.
-fn now() -> Result<Instant, String> {
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("the clock is before the Unix epoch: {error}"))?;
-    Ok(Instant {
-        seconds: since.as_secs(),
-        nanoseconds: since.subsec_nanos(),
-    })
-}
-
-/// The readiness of a calibration of `commit` that follows the control run
-/// whose logs are `control_logs` ([`control_run`]), settled under `policy`
-/// ([`settle`]), preserved at `path` whether ready or not; refused unless
-/// both hold, every reading preserved beside why.
-pub fn readiness(
-    path: &Path,
-    control_logs: &Path,
-    commit: &str,
-    policy: &SettlingPolicy,
-    sample: &mut dyn FnMut() -> Result<String, String>,
-    clock: &mut dyn FnMut() -> Result<Instant, String>,
-    wait: &mut dyn FnMut(std::time::Duration),
-) -> Result<Readiness, String> {
-    let control = control_run(control_logs, commit);
-    let (observations, settled) = match &control {
-        Ok(_) => settle(policy, sample, clock, wait),
-        Err(_) => (Vec::new(), Ok(())),
-    };
-    let error = match (&control, &settled) {
-        (Err(fault), _) => Some(format!("no finished, passed control run: {fault}")),
-        (Ok(_), Err(fault)) => Some(fault.clone()),
-        (Ok(_), Ok(())) if observations.is_empty() => {
-            Some("no settling reading was taken".to_string())
-        }
-        (Ok(_), Ok(())) => None,
-    };
-    let receipt = Readiness {
-        version: RUNTIME_VERSION,
-        control: control.ok(),
-        policy: policy.clone(),
-        observations,
-        ready: error.is_none(),
-        error,
-    };
-    let encoded = serde_json::to_vec_pretty(&receipt)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    crate::process::create_evidence(path, &encoded)?;
-    match &receipt.error {
-        Some(fault) => Err(format!(
-            "{}: the calibration is not ready: {fault}",
-            path.display()
-        )),
-        None => Ok(receipt),
-    }
-}
-
-/// How one scheduled calibration execution of one harness ended: its
-/// harness's outcome as its report classes it; rejected by its run's own
-/// judgement, with why; or never run, with why.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum Observed {
-    Outcome { outcome: String },
-    Rejected { error: String },
-    NotRun { reason: String },
-}
-
-/// One scheduled execution of a calibration: its harness, its pass (the
-/// first observation of every harness is pass 1, each repetition the next),
-/// its log, and how it ended.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Scheduled {
-    pub harness: String,
-    pub pass: usize,
-    pub log: String,
-    pub observed: Observed,
-}
-
-/// A calibration's schedule as it ran (`calibration.json`, its last record):
-/// the plan's digest, the readiness it began from, and every scheduled
-/// execution.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Schedule {
-    pub version: u64,
-    pub plan_sha256: String,
-    pub readiness_sha256: String,
-    pub executions: Vec<Scheduled>,
-}
-
-/// A calibration of the harnesses the plan at `plan_path` names, in the
-/// copy `root` of the commit `LOGS/commit.txt` names, after the control run
-/// at `control_logs` ([`calibration`] under the system's load, clock and the
-/// exported workload).
-pub fn calibrate(
-    root: &Path,
-    plan_path: &Path,
-    target_dir: &Path,
-    logs: &Path,
-    launcher: &Path,
-    control_logs: &Path,
-) -> Result<Schedule, String> {
-    calibration(
-        root,
-        plan_path,
-        target_dir,
-        logs,
-        launcher,
-        control_logs,
-        &crate::process::Workload::exported()?,
-        &settling_policy(),
-        &mut || {
-            std::fs::read_to_string("/proc/loadavg")
-                .map_err(|error| format!("/proc/loadavg: {error}"))
-        },
-        &mut std::thread::sleep,
-    )
-}
-
-/// A calibration ([`calibrate`]): the plan validated once; readiness
-/// preserved before any run ([`readiness`]); then each planned harness, in
-/// the plan's order, checked alone by one invocation of the one Kani run
-/// (`process::kani`), its log `LOGS/calibration/HARNESS.PASS.log` and its
-/// evidence beside it, each with its own identity, launch environment and
-/// load before and after. Two passes: the first observes every harness once;
-/// the second repeats, to [`SAMPLES`] executions in all, only a harness
-/// whose every execution verified in an environment equivalent to its first
-/// one's. A harness that ended otherwise (a deadline, a signal, an
-/// unsupported construct, a failure, a bound refused, a rejected run) is
-/// left to diagnosis, never repeated, and nothing is retried. An execution
-/// that cannot be scheduled ends the schedule, every one not yet run
-/// recorded as never run. The schedule is preserved as the calibration's
-/// last record (`calibration.json`).
-#[allow(clippy::too_many_arguments)]
-pub fn calibration(
-    root: &Path,
-    plan_path: &Path,
-    target_dir: &Path,
-    logs: &Path,
-    launcher: &Path,
-    control_logs: &Path,
-    workload: &crate::process::Workload,
-    policy_of_settling: &SettlingPolicy,
-    sample: &mut dyn FnMut() -> Result<String, String>,
-    wait: &mut dyn FnMut(std::time::Duration),
-) -> Result<Schedule, String> {
-    let declared = harnesses(&root.join("src"))?;
-    let loop_bounds = policy(root, &declared)?;
-    let plan = plan(plan_path, &declared)?;
-    let commit_path = logs.join("commit.txt");
-    let commit = std::fs::read_to_string(&commit_path)
-        .map_err(|error| format!("{}: {error}", commit_path.display()))?
-        .trim()
-        .to_string();
-    let readiness_path = logs.join("readiness.json");
-    readiness(
-        &readiness_path,
-        control_logs,
-        &commit,
-        policy_of_settling,
-        sample,
-        &mut now,
-        wait,
-    )?;
-    let readiness_sha256 = crate::process::sha256(&readiness_path)?;
-    let directory = logs.join("calibration");
-    let planned: Vec<String> = plan.deadlines.keys().cloned().collect();
-    let plan_sha256 = plan.sha256.clone();
-    let purpose = RunPurpose::Calibration(plan);
-    let mut executions: Vec<Scheduled> = Vec::new();
-    let mut halted: Option<String> = std::fs::create_dir(&directory)
-        .err()
-        .map(|error| format!("{}: {error}", directory.display()));
-    // Each harness's first environment, and whether it remains eligible.
-    let mut first: BTreeMap<String, Environment> = BTreeMap::new();
-    let mut eligible: BTreeSet<String> = BTreeSet::new();
-    for pass in 1..=SAMPLES {
-        for harness in &planned {
-            if pass > 1 && !eligible.contains(harness) {
-                continue;
-            }
-            let log = directory.join(format!("{}.{pass}.log", harness.replace("::", ".")));
-            if let Some(reason) = &halted {
-                executions.push(Scheduled {
-                    harness: harness.clone(),
-                    pass,
-                    log: log.display().to_string(),
-                    observed: Observed::NotRun {
-                        reason: reason.clone(),
-                    },
-                });
-                continue;
-            }
-            let ran = crate::process::run_kani_purpose(
-                root,
-                &loop_bounds,
-                &purpose,
-                &Selection::one(harness),
-                &declared,
-                target_dir,
-                &log,
-                launcher,
-                workload,
-            );
-            let observed = match ran {
-                Ok((_, report)) => match checked(&report) {
-                    Ok(found) => match found.as_slice() {
-                        [(name, outcome)] if name == harness => Observed::Outcome {
-                            outcome: outcome.name().to_string(),
-                        },
-                        _ => Observed::Rejected {
-                            error: format!("its report checked {found:?}, not {harness} alone"),
-                        },
-                    },
-                    Err(fault) => Observed::Rejected { error: fault },
-                },
-                Err(error) => Observed::Rejected { error },
-            };
-            // A harness stays eligible while every execution verified and
-            // its environment is equivalent to its first one's.
-            let verified = observed
-                == Observed::Outcome {
-                    outcome: Outcome::Pass.name().to_string(),
-                };
-            let environment = std::fs::read(log.with_extension("evidence").join("launch.json"))
-                .ok()
-                .and_then(|bytes| strict_json(&bytes).ok())
-                .and_then(|value| typed::<Launch>(value, "launch.json").ok())
-                .map(|launch| launch.environment);
-            let compatible = match (environment, pass) {
-                (Some(environment), 1) => {
-                    let known = environment.known();
-                    first.insert(harness.clone(), environment);
-                    known
-                }
-                (Some(environment), _) => first
-                    .get(harness)
-                    .is_some_and(|initial| initial.equivalent(&environment)),
-                (None, _) => false,
-            };
-            if verified && compatible {
-                eligible.insert(harness.clone());
-            } else {
-                eligible.remove(harness);
-            }
-            // A run that left no evidence directory could not be scheduled:
-            // the schedule halts there.
-            if !log.with_extension("evidence").is_dir() {
-                halted = Some(match &observed {
-                    Observed::Rejected { error } => error.clone(),
-                    _ => format!("{}: no evidence was created", log.display()),
-                });
-            }
-            executions.push(Scheduled {
-                harness: harness.clone(),
-                pass,
-                log: log.display().to_string(),
-                observed,
-            });
-        }
-    }
-    let schedule = Schedule {
-        version: RUNTIME_VERSION,
-        plan_sha256,
-        readiness_sha256,
-        executions,
-    };
-    let encoded = serde_json::to_vec_pretty(&schedule)
-        .map_err(|error| format!("{}: {error}", logs.display()))?;
-    crate::process::create_evidence(&logs.join("calibration.json"), &encoded)?;
-    Ok(schedule)
 }
 
 /// Select the Kani a run launches: [`crate::process::kani_launcher`]'s one
@@ -3733,7 +3506,7 @@ pub fn identity(launcher_file: &Path) -> Result<Vec<(String, String)>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The invocation builds exactly the census's build: the library, its
@@ -3876,7 +3649,7 @@ mod tests {
         policy: &serde_json::Value,
         report: &str,
     ) -> Result<Reconciled, String> {
-        check_execution_evidence(root, policy, report, Artifacts::Preserved)
+        check_execution_evidence(root, policy, report, Artifacts::Live)
     }
 
     /// The verifier the fixture's evidence records ([`RunEvidence::new`]).
@@ -3889,11 +3662,11 @@ mod tests {
 
     /// An environment every fact of which is established: a scope whose
     /// limits are values, under the root, whose limits are verified absent.
-    fn fixture_environment() -> Environment {
+    fn fixture_environment() -> EnvironmentRecord {
         let value = |value: &str| LimitObservation::Value {
             value: value.to_string(),
         };
-        Environment {
+        EnvironmentRecord {
             cpu_model: Some("cpu".to_string()),
             cpus_allowed: Some("0-15".to_string()),
             cpuset_effective: Some("0-15".to_string()),
@@ -3902,6 +3675,11 @@ mod tests {
                     path: "/user.slice/run.scope".to_string(),
                     cpu_max: value("max 100000"),
                     memory_max: value("8589934592"),
+                },
+                Level {
+                    path: "/user.slice".to_string(),
+                    cpu_max: value("max 100000"),
+                    memory_max: value("max"),
                 },
                 Level {
                     path: "/".to_string(),
@@ -3916,15 +3694,26 @@ mod tests {
         }
     }
 
-    /// A run's identity of `purpose` and identifier `id`, under the tree at
-    /// `root`'s policy.
-    fn fixture_identity(root: &Path, id: &str, purpose: &str) -> RunIdentity {
-        RunIdentity {
+    /// The per-path digests of the fixture tree at `root` as a run retains
+    /// them (`sources.json`): its loop-bound policy file alone.
+    fn fixture_sources(root: &Path) -> BTreeMap<String, String> {
+        let policy = std::fs::read(root.join(POLICY)).unwrap();
+        BTreeMap::from([(
+            POLICY.to_string(),
+            file_entry_digest(POLICY, &policy, false).unwrap(),
+        )])
+    }
+
+    /// A run's identity record of `purpose` and identifier `id`, of the
+    /// document of digest `revision`, of the tree at `root`'s source state
+    /// ([`fixture_sources`]) and policy.
+    fn fixture_identity(root: &Path, id: &str, purpose: &str, revision: &str) -> RunIdentityRecord {
+        RunIdentityRecord {
             version: RUNTIME_VERSION,
             id: id.to_string(),
             purpose: purpose.to_string(),
-            revision: DIGEST.to_string(),
-            tree_sha256: DIGEST.to_string(),
+            revision: revision.to_string(),
+            tree_sha256: tree_digest_of(&fixture_sources(root)).unwrap(),
             build: arguments().join(" "),
             loop_policy_sha256: crate::process::sha256(&root.join(POLICY)).unwrap(),
             started: Instant {
@@ -3934,22 +3723,32 @@ mod tests {
         }
     }
 
+    /// The identifier of the qualifying run the post-validation fixtures use.
+    const QUALIFYING: &str = "00000000-0000-0000-0000-000000000009";
+
+    /// The identifier of the calibration run the post-validation fixtures'
+    /// predictions cite.
+    const CALIBRATING: &str = "00000000-0000-0000-0000-000000000001";
+
     /// Predictions of the fixture's harnesses in hand, `x` milliseconds for
     /// `a::x` and twice it for `a::y`, each calibrated on its fixture
-    /// artifact under the fixture verifier in run `run-1`.
+    /// artifact under the fixture verifier in run [`CALIBRATING`]: a
+    /// post-validation fixture of the owning module, for the checks that
+    /// consume validated predictions ([`check_expectations`]); the reader
+    /// itself is held by its own tests to valid evidence.
     fn predicted(x: u64) -> Expectations {
         let entry = |milliseconds: u64, artifact: &str| Expectation {
             milliseconds,
             transfer: "t".to_string(),
             deadline_milliseconds: milliseconds * DEADLINE_MARGIN,
-            calibration_runs: BTreeSet::from(["run-1".to_string()]),
+            calibration_runs: BTreeSet::from([CALIBRATING.to_string()]),
             artifact_sha256: artifact.to_string(),
             verifier: fixture_verifier(),
         };
         Expectations {
             sha256: DIGEST.to_string(),
             bytes: Vec::new(),
-            environment: fixture_environment(),
+            environment: fixture_environment().establish().unwrap(),
             harnesses: BTreeMap::from([
                 ("a::x".to_string(), entry(x, ARTIFACTS[0].2)),
                 ("a::y".to_string(), entry(2 * x, ARTIFACTS[1].2)),
@@ -3960,7 +3759,9 @@ mod tests {
     /// A qualifying run's identity and launch in the fixture environment.
     fn qualifying(root: &Path) -> (RunIdentity, Launch) {
         (
-            fixture_identity(root, "run-9", "qualification"),
+            fixture_identity(root, QUALIFYING, "qualification", DIGEST)
+                .validate()
+                .unwrap(),
             Launch {
                 environment: fixture_environment(),
                 workload_cgroup: Some("/user.slice/run-9.scope".to_string()),
@@ -4083,16 +3884,18 @@ mod tests {
             ..launch.clone()
         };
         let unknown_environment = Launch {
-            environment: Environment {
+            environment: EnvironmentRecord {
                 cpu_model: None,
                 ..fixture_environment()
             },
             ..launch.clone()
         };
-        let calibrating = RunIdentity {
-            id: "run-1".to_string(),
-            ..identity.clone()
-        };
+        let calibrating = RunIdentityRecord {
+            id: CALIBRATING.to_string(),
+            ..identity.record().clone()
+        }
+        .validate()
+        .unwrap();
         for (name, identity, launch, reconciled, fault) in [
             (
                 "artifact",
@@ -4120,14 +3923,14 @@ mod tests {
                 &identity,
                 &unknown_environment,
                 matching_clone(&matching),
-                "is not the predictions'",
+                "the environment is not established",
             ),
             (
                 "calibration-run",
                 &calibrating,
                 &launch,
                 matching_clone(&matching),
-                "run run-1 is one its prediction was calibrated from",
+                "run 00000000-0000-0000-0000-000000000001 is one its prediction was calibrated from",
             ),
         ] {
             let found = refused(
@@ -4195,31 +3998,123 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// `count` readings of a settled system under the production policy
+    /// ([`settling_policy`]), one interval apart from `from` on the wall
+    /// clock and from 0 on the monotonic clock.
+    fn settled_readings(from: Instant, count: usize) -> Vec<Settled> {
+        let policy = settling_policy();
+        (0..count)
+            .map(|at| Settled {
+                at: Instant {
+                    seconds: from.seconds + 5 * at as u64,
+                    nanoseconds: from.nanoseconds,
+                },
+                monotonic_milliseconds: at as u64 * policy.interval_milliseconds,
+                loadavg: "0.10 0.10 0.10 1/100 1".to_string(),
+                load1_hundredths: 10,
+                running: 1,
+                within: true,
+            })
+            .collect()
+    }
+
+    /// A readiness the one validator accepts ([`Readiness::validate`]),
+    /// made from real records: the fixture registry's text, and the native
+    /// control runs of the nightly and the stable channel of commit `c` as
+    /// `tests/controls.sh` leaves them ([`ControlRuns`]), each read by the
+    /// one validation with its final record's text; the workload lock
+    /// acquired after both finished; the production policy; and the seven
+    /// readings after it that settle it, spanning thirty seconds.
+    pub(crate) fn valid_readiness() -> Readiness {
+        static VALID: std::sync::OnceLock<Readiness> = std::sync::OnceLock::new();
+        VALID
+            .get_or_init(|| {
+                let scratch = Scratch::new("valid-readiness");
+                let root = scratch.0.join("tree");
+                let runs = ControlRuns::new(&root, &scratch.0);
+                let registry = crate::controls::registry(&root).unwrap();
+                let controls = runs
+                    .logs()
+                    .iter()
+                    .map(|logs| control_run(logs, "c", &registry).unwrap())
+                    .collect();
+                let acquired = now().unwrap();
+                Readiness {
+                    version: RUNTIME_VERSION,
+                    registry: registry.text,
+                    controls,
+                    workload_lock: Some(LockRecord {
+                        path: "/checkout/target/gate-workload.lock".to_string(),
+                        acquired,
+                    }),
+                    policy: settling_policy(),
+                    observations: settled_readings(acquired, settling_policy().consecutive),
+                    ready: true,
+                    error: None,
+                }
+            })
+            .clone()
+    }
+
     /// A tree of adopted calibration runs of the fixture's two harnesses, as
-    /// `adopt` lays them out and the gate writes their records.
-    struct CalibrationTree {
-        root: std::path::PathBuf,
+    /// `adopt` lays them out and the gate writes their records: each run a
+    /// calibration of one harness, given the plan both share
+    /// ([`CalibrationTree::PLAN`]) and a ready readiness. The tree the
+    /// predictions' reader and the control sides' tests read valid evidence
+    /// from.
+    pub(crate) struct CalibrationTree {
+        pub(crate) root: std::path::PathBuf,
     }
 
     impl CalibrationTree {
-        fn new(test: &str) -> Self {
-            Self {
-                root: policy_tree(&format!("calibration-{test}")),
+        /// The plan every fixture calibration was given.
+        const PLAN: &'static str = r#"{"version": 1, "purpose": "calibration", "harnesses": {
+            "a::x": {"limit_milliseconds": 60000, "reason": "the calibration's limit"},
+            "a::y": {"limit_milliseconds": 60000, "reason": "the calibration's limit"}}}"#;
+
+        pub(crate) fn new(test: &str) -> Self {
+            let root = policy_tree(&format!("calibration-{test}"));
+            // The source the census of the tree is read from: the fixture's
+            // two harnesses, beside every family's inclusion of its
+            // instances.
+            let write = |relative: &str, text: &str| {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            };
+            write(
+                "src/a.rs",
+                "#[kani::proof]\nfn x() {}\n#[kani::proof]\nfn y() {}\n",
+            );
+            for family in instances::FAMILIES {
+                write(family.file, &format!("{}\n", instances::inclusion(family)));
             }
+            Self { root }
         }
 
-        /// The adopted run `id` of purpose `purpose`, in which `a::x` ran for
-        /// `x` and `a::y` for `y` (seconds and nanoseconds) and `a::x`'s
-        /// report block reads `x_result`, `a::x` on artifact `x_artifact`:
-        /// the digest of its manifest.
-        fn run(
+        /// The census of the tree: the fixture's two harnesses.
+        pub(crate) fn census() -> BTreeSet<String> {
+            declared(&["a::x", "a::y"])
+        }
+
+        /// The readiness every fixture calibration was given: one the one
+        /// validator accepts ([`valid_readiness`]).
+        fn readiness() -> Vec<u8> {
+            serde_json::to_vec(&valid_readiness()).unwrap()
+        }
+
+        /// The adopted run `id` of purpose `purpose`, a calibration of
+        /// `harness` alone that ran for `elapsed` (seconds and nanoseconds),
+        /// its report block reading `result`, on artifact `artifact`: the
+        /// digest of its manifest.
+        pub(crate) fn run(
             &self,
             id: &str,
             purpose: &str,
-            x: (u64, u32),
-            y: (u64, u32),
-            x_result: &str,
-            x_artifact: &str,
+            harness: &str,
+            elapsed: (u64, u32),
+            result: &str,
+            artifact: &str,
         ) -> String {
             let directory = self.root.join(CALIBRATION).join(id);
             let evidence = directory.join("evidence");
@@ -4229,18 +4124,43 @@ mod tests {
                 std::fs::write(path, bytes).unwrap();
             };
             std::fs::create_dir_all(&evidence).unwrap();
-            let failed = usize::from(x_result == "FAILED");
+            let failed = usize::from(result == "FAILED");
             std::fs::write(
                 directory.join("kani.log"),
-                format!(
-                    "{}{}{}",
-                    block("a::x", x_result),
-                    block("a::y", "SUCCESSFUL"),
-                    summary(2 - failed, failed)
-                ),
+                format!("{}{}", block(harness, result), summary(1 - failed, failed)),
             )
             .unwrap();
-            let identity = fixture_identity(&self.root, id, purpose);
+            write(PLAN_RECORD, Self::PLAN.as_bytes());
+            write(READINESS_RECORD, &Self::readiness());
+            // The inputs the run's identity binds, as `process::kani` keeps
+            // them: its launcher, the tree's policy file, its per-path
+            // digests, and its invocation, its evidence at its own path then.
+            let then = format!("/runs/{id}.log.evidence");
+            write(LAUNCHER_RECORD, b"/kani/cargo-kani\n");
+            write(
+                LOOP_POLICY_RECORD,
+                &std::fs::read(self.root.join(POLICY)).unwrap(),
+            );
+            write(
+                SOURCES_RECORD,
+                &serde_json::to_vec(&fixture_sources(&self.root)).unwrap(),
+            );
+            let invocation = invocation_arguments(
+                &Selection::one(harness),
+                "/runs/target",
+                &format!("{then}/loop-bounds.json"),
+                &format!("{then}/loop-bounds"),
+            );
+            write(
+                INVOCATION_RECORD,
+                &serde_json::to_vec(&serde_json::json!({
+                    "launcher": "/kani/cargo-kani",
+                    "arguments": invocation,
+                }))
+                .unwrap(),
+            );
+            let revision = crate::process::sha256_bytes(Self::PLAN.as_bytes()).unwrap();
+            let identity = fixture_identity(&self.root, id, purpose, &revision);
             write("run.json", &serde_json::to_vec(&identity).unwrap());
             let launch = Launch {
                 environment: fixture_environment(),
@@ -4249,115 +4169,101 @@ mod tests {
                 load_after: None,
             };
             write("launch.json", &serde_json::to_vec(&launch).unwrap());
-            let read = policy_of(POLICY_TEXT, &declared(&["a::x", "a::y"])).unwrap();
-            let limits: BTreeMap<String, Deadline> = ["a::x", "a::y"]
-                .into_iter()
-                .map(|harness| {
-                    (
-                        harness.to_string(),
-                        Deadline {
-                            milliseconds: 60000,
-                            reason: "the calibration's limit".to_string(),
-                        },
-                    )
-                })
-                .collect();
+            let read = policy_of(POLICY_TEXT, &Self::census()).unwrap();
+            let plan = plan_of(Self::PLAN.as_bytes(), &Self::census()).unwrap();
             let policy = selected(
                 &read,
-                &limits,
-                &Selection::All,
-                &declared(&["a::x", "a::y"]),
+                plan.deadlines(),
+                &Selection::one(harness),
+                &Self::census(),
             )
             .unwrap();
             write("loop-bounds.json", &serde_json::to_vec(&policy).unwrap());
-            // Each harness's records as the driver writes them in the run's
+            // The harness's records as the driver writes them in the run's
             // evidence, at the run's own path then.
             let at_then = format!("/runs/{id}.log.evidence/loop-bounds");
-            for (harness, function, (seconds, nanoseconds), artifact) in
-                [("a.x", "f", x, x_artifact), ("a.y", "g", y, ARTIFACTS[1].2)]
-            {
-                let copy = format!("{at_then}/{harness}/artifact.out");
-                let record = |parts: &[&str]| {
-                    parts
-                        .iter()
-                        .flat_map(|part| part.bytes().chain([0]))
-                        .collect::<Vec<u8>>()
-                };
-                write(
-                    &format!("loop-bounds/{harness}/solver.attempt"),
-                    b"spawning\n",
-                );
-                let mut command = vec!["/kani/cbmc"];
-                if harness == "a.x" {
-                    command.extend(["--unwindset", "f.0:0"]);
-                }
-                command.extend([copy.as_str(), "--json-ui"]);
-                write(
-                    &format!("loop-bounds/{harness}/solver.arguments"),
-                    &record(&command),
-                );
-                write(
-                    &format!("loop-bounds/{harness}/solver.identity"),
-                    fixture_verifier().to_string().as_bytes(),
-                );
-                write(
-                    &format!("loop-bounds/{harness}/artifact.json"),
-                    serde_json::json!({"source": "/build/x", "path": copy, "sha256": artifact})
-                        .to_string()
-                        .as_bytes(),
-                );
-                write(
-                    &format!("loop-bounds/{harness}/discovery.arguments"),
-                    &record(&["goto-instrument", "--show-loops", "--json-ui", &copy]),
-                );
-                write(
-                    &format!("loop-bounds/{harness}/discovery.status"),
-                    b"exit status: 0\n",
-                );
-                write(&format!("loop-bounds/{harness}/discovery.stderr"), b"");
-                write(
-                    &format!("loop-bounds/{harness}/discovery.stdout"),
-                    serde_json::json!([
-                        {"program": "goto-instrument"},
-                        {"loops": [{
-                            "name": format!("{function}.0"),
-                            "sourceLocation": {"function": function, "file": "a.rs"},
-                        }]},
-                    ])
+            let name = harness.replace("::", ".");
+            let function = if harness == "a::x" { "f" } else { "g" };
+            let copy = format!("{at_then}/{name}/artifact.out");
+            let record = |parts: &[&str]| {
+                parts
+                    .iter()
+                    .flat_map(|part| part.bytes().chain([0]))
+                    .collect::<Vec<u8>>()
+            };
+            let at = |file: &str| format!("loop-bounds/{name}/{file}");
+            write(&at("solver.attempt"), b"spawning\n");
+            let mut command = vec!["/kani/cbmc"];
+            if harness == "a::x" {
+                command.extend(["--unwindset", "f.0:0"]);
+            }
+            command.extend([copy.as_str(), "--json-ui"]);
+            write(&at("solver.arguments"), &record(&command));
+            write(
+                &at("solver.identity"),
+                fixture_verifier().to_string().as_bytes(),
+            );
+            write(
+                &at("artifact.json"),
+                serde_json::json!({"source": "/build/x", "path": copy, "sha256": artifact})
                     .to_string()
                     .as_bytes(),
-                );
+            );
+            write(
+                &at("discovery.arguments"),
+                &record(&["goto-instrument", "--show-loops", "--json-ui", &copy]),
+            );
+            write(&at("discovery.status"), b"exit status: 0\n");
+            write(&at("discovery.stderr"), b"");
+            write(
+                &at("discovery.stdout"),
+                serde_json::json!([
+                    {"program": "goto-instrument"},
+                    {"loops": [{
+                        "name": format!("{function}.0"),
+                        "sourceLocation": {"function": function, "file": "a.rs"},
+                    }]},
+                ])
+                .to_string()
+                .as_bytes(),
+            );
+            let (seconds, nanoseconds) = elapsed;
+            write(
+                &at("solver.execution.json"),
+                serde_json::json!({
+                    "deadline_milliseconds": 60000,
+                    "elapsed": {"seconds": seconds, "nanoseconds": nanoseconds},
+                    "termination": {"kind": "exited", "code": 0},
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            if harness == "a::x" {
+                let entry = read.harnesses["a::x"].clone();
                 write(
-                    &format!("loop-bounds/{harness}/solver.execution.json"),
+                    &at("resolution.json"),
                     serde_json::json!({
-                        "deadline_milliseconds": 60000,
-                        "elapsed": {"seconds": seconds, "nanoseconds": nanoseconds},
-                        "termination": {"kind": "exited", "code": 0},
+                        "harness": "a::x",
+                        "policy": entry,
+                        "function_scope": [],
+                        "artifact": {"path": copy, "sha256": artifact},
+                        "warnings": [],
+                        "resolved": [{"selector": entry["loops"][0], "loop": "f.0", "location": {}}],
                     })
                     .to_string()
                     .as_bytes(),
                 );
             }
-            let entry = read.harnesses["a::x"].clone();
-            write(
-                "loop-bounds/a.x/resolution.json",
-                serde_json::json!({
-                    "harness": "a::x",
-                    "policy": entry,
-                    "function_scope": [],
-                    "artifact": {"path": format!("{at_then}/a.x/artifact.out"), "sha256": x_artifact},
-                    "warnings": [],
-                    "resolved": [{"selector": entry["loops"][0], "loop": "f.0", "location": {}}],
-                })
-                .to_string()
-                .as_bytes(),
-            );
             write("loop-bounds/function-scope.json", b"[]");
             write(
                 "execution.json",
-                serde_json::json!({"launcher": "/kani/cargo-kani", "verifier": fixture_verifier()})
-                    .to_string()
-                    .as_bytes(),
+                serde_json::json!({
+                    "launcher": "/kani/cargo-kani",
+                    "verifier": fixture_verifier(),
+                    "artifacts": {harness: artifact},
+                })
+                .to_string()
+                .as_bytes(),
             );
             write(
                 "launcher.execution.json",
@@ -4371,46 +4277,50 @@ mod tests {
                     .to_string()
                     .as_bytes(),
             );
-            let manifest = manifest_of(&evidence, Some(&directory.join("kani.log")), Some(id));
-            write("manifest.json", &serde_json::to_vec(&manifest).unwrap());
-            crate::process::sha256(&evidence.join("manifest.json")).unwrap()
+            readopted(&directory)
         }
 
-        /// Three verified calibrations of both harnesses: `a::x` in 1.0,
-        /// 1.1 and 1.2 s, `a::y` in 2.0, 2.05 and 2.1 s; their references.
-        fn three(&self) -> Vec<serde_json::Value> {
-            [
-                ("00000000-0000-0000-0000-000000000001", 0, 0),
-                (
-                    "00000000-0000-0000-0000-000000000002",
-                    100_000_000,
-                    50_000_000,
-                ),
-                (
-                    "00000000-0000-0000-0000-000000000003",
-                    200_000_000,
-                    100_000_000,
-                ),
-            ]
-            .into_iter()
-            .map(|(id, x, y)| {
-                let digest = self.run(
-                    id,
-                    "calibration",
-                    (1, x),
-                    (2, y),
-                    "SUCCESSFUL",
-                    ARTIFACTS[0].2,
-                );
-                serde_json::json!({"run": id, "manifest_sha256": digest})
-            })
-            .collect()
+        /// Three verified calibrations of each harness, each a run of its
+        /// own: `a::x` in 1.0, 1.1 and 1.2 s (runs 1 to 3), `a::y` in 2.0,
+        /// 2.05 and 2.1 s (runs 4 to 6); each harness's references.
+        pub(crate) fn three(&self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+            let runs = |harness: &str, first: u32, seconds: u64, spreads: [u32; 3]| {
+                spreads
+                    .into_iter()
+                    .zip(first..)
+                    .map(|(nanoseconds, number)| {
+                        let id = format!("00000000-0000-0000-0000-{number:012}");
+                        let digest = self.run(
+                            &id,
+                            "calibration",
+                            harness,
+                            (seconds, nanoseconds),
+                            "SUCCESSFUL",
+                            if harness == "a::x" {
+                                ARTIFACTS[0].2
+                            } else {
+                                ARTIFACTS[1].2
+                            },
+                        );
+                        serde_json::json!({"run": id, "manifest_sha256": digest})
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (
+                runs("a::x", 1, 1, [0, 100_000_000, 200_000_000]),
+                runs("a::y", 4, 2, [0, 50_000_000, 100_000_000]),
+            )
         }
 
-        /// The prediction document citing `references` for both harnesses,
-        /// predicting `x` and `y` milliseconds.
-        fn document(&self, references: &[serde_json::Value], x: u64, y: u64) -> serde_json::Value {
-            let prediction = |milliseconds: u64| {
+        /// The prediction document citing `x_references` for `a::x` and
+        /// `y_references` for `a::y`, predicting `x` and `y` milliseconds.
+        pub(crate) fn document(
+            &self,
+            (x_references, y_references): &(Vec<serde_json::Value>, Vec<serde_json::Value>),
+            x: u64,
+            y: u64,
+        ) -> serde_json::Value {
+            let prediction = |references: &[serde_json::Value], milliseconds: u64| {
                 serde_json::json!({
                     "model": "m",
                     "inputs": {"length": 1},
@@ -4428,18 +4338,186 @@ mod tests {
                 },
                 "environment": fixture_environment(),
                 "models": {"m": {"rule": RULE, "applicability": "this machine", "uncertainty": "spread"}},
-                "harnesses": {"a::x": prediction(x), "a::y": prediction(y)},
+                "harnesses": {
+                    "a::x": prediction(x_references, x),
+                    "a::y": prediction(y_references, y),
+                },
             })
         }
 
-        fn read(&self, document: &[u8]) -> Result<Expectations, String> {
-            expectations_of(&self.root, document, &declared(&["a::x", "a::y"]))
+        pub(crate) fn read(&self, document: &[u8]) -> Result<Expectations, String> {
+            expectations_of(&self.root, document, &Self::census())
         }
     }
 
     impl Drop for CalibrationTree {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The adopted run at `directory` given its manifest and acceptance
+    /// receipt anew, as adoption leaves them: its records' digests, then the
+    /// receipt naming the run and that manifest. The manifest's digest.
+    fn readopted(directory: &Path) -> String {
+        let evidence = directory.join("evidence");
+        let identity: RunIdentityRecord =
+            serde_json::from_slice(&std::fs::read(evidence.join("run.json")).unwrap()).unwrap();
+        let _ = std::fs::remove_file(evidence.join("manifest.json"));
+        let manifest = manifest_of(
+            &evidence,
+            Some(&directory.join("kani.log")),
+            Some(&identity.id),
+        );
+        std::fs::write(
+            evidence.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let digest = crate::process::sha256(&evidence.join("manifest.json")).unwrap();
+        std::fs::write(
+            directory.join(ADOPTION_RECORD),
+            serde_json::to_vec(&AdoptionReceipt {
+                version: RUNTIME_VERSION,
+                run: identity.id,
+                manifest_sha256: digest.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        digest
+    }
+
+    /// The JSON record at `path` rewritten by `change`.
+    fn edited(path: &Path, change: impl Fn(&mut serde_json::Value)) {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        change(&mut value);
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    /// An adopted calibration is a sample only when its identity is bound to
+    /// the records it kept of its inputs. Each relationship broken alone,
+    /// every digest, manifest and receipt made anew so only that
+    /// relationship is wrong, is refused by its own fault: a build the
+    /// invocation did not run, a loop-bound policy digest of another file, a
+    /// policy file whose selection is not the run's policy, a source state
+    /// its per-path digests do not digest to, per-path digests that do not
+    /// hold the policy file it read, an invocation of another harness, and a
+    /// launcher the records disagree on.
+    #[test]
+    fn a_sample_binds_its_identity_to_its_records() {
+        const RUN: &str = "00000000-0000-0000-0000-0000000000e1";
+        type Plant = fn(&Path);
+        /// The source state of the per-path digests `sources.json` holds,
+        /// recorded as the run's identity's.
+        fn rebind_tree(evidence: &Path) {
+            let sources: BTreeMap<String, String> =
+                serde_json::from_slice(&std::fs::read(evidence.join(SOURCES_RECORD)).unwrap())
+                    .unwrap();
+            let tree = tree_digest_of(&sources).unwrap();
+            edited(&evidence.join("run.json"), |identity| {
+                identity["tree_sha256"] = serde_json::json!(tree);
+            });
+        }
+        let cases: [(&str, Plant, &str); 7] = [
+            (
+                "build-unbound",
+                |evidence| {
+                    edited(&evidence.join("run.json"), |identity| {
+                        identity["build"] = serde_json::json!("kani --package other");
+                    })
+                },
+                "is not the invocation's build",
+            ),
+            (
+                "policy-digest-unbound",
+                |evidence| {
+                    edited(&evidence.join("run.json"), |identity| {
+                        identity["loop_policy_sha256"] = serde_json::json!(DIGEST);
+                    })
+                },
+                "its loop-policy.json has digest",
+            ),
+            (
+                // Another policy file, every digest that names it made
+                // consistent: only its selection is not the run's policy.
+                "policy-selection-unbound",
+                |evidence| {
+                    let other = br#"{"loops": [], "harnesses": []}"#;
+                    std::fs::write(evidence.join(LOOP_POLICY_RECORD), other).unwrap();
+                    edited(&evidence.join(SOURCES_RECORD), |sources| {
+                        sources[POLICY] =
+                            serde_json::json!(file_entry_digest(POLICY, other, false).unwrap());
+                    });
+                    let digest = crate::process::sha256_bytes(other).unwrap();
+                    edited(&evidence.join("run.json"), |identity| {
+                        identity["loop_policy_sha256"] = serde_json::json!(digest);
+                    });
+                    rebind_tree(evidence);
+                },
+                "is not the selection of its loop-policy.json",
+            ),
+            (
+                "tree-unbound",
+                |evidence| {
+                    edited(&evidence.join("run.json"), |identity| {
+                        identity["tree_sha256"] = serde_json::json!(DIGEST);
+                    })
+                },
+                "its sources.json digests to",
+            ),
+            (
+                "sources-policy-unbound",
+                |evidence| {
+                    edited(&evidence.join(SOURCES_RECORD), |sources| {
+                        sources[POLICY] = serde_json::json!(DIGEST);
+                    });
+                    rebind_tree(evidence);
+                },
+                "records the tree's loop-bound policy",
+            ),
+            (
+                "invocation-unbound",
+                |evidence| {
+                    edited(&evidence.join(INVOCATION_RECORD), |invocation| {
+                        let arguments = invocation["arguments"].as_array_mut().unwrap();
+                        let at = arguments.iter().position(|part| part == "a::x").unwrap();
+                        arguments[at] = serde_json::json!("a::y");
+                    })
+                },
+                "which are not the proof build's run of a::x alone",
+            ),
+            (
+                "launcher-unbound",
+                |evidence| {
+                    edited(&evidence.join("execution.json"), |execution| {
+                        execution["launcher"] = serde_json::json!("/other/cargo-kani");
+                    })
+                },
+                "its launcher record names /kani/cargo-kani",
+            ),
+        ];
+        for (name, plant, fault) in cases {
+            let tree = CalibrationTree::new(&format!("bound-{name}"));
+            tree.run(
+                RUN,
+                "calibration",
+                "a::x",
+                (1, 0),
+                "SUCCESSFUL",
+                ARTIFACTS[0].2,
+            );
+            let directory = tree.root.join(CALIBRATION).join(RUN);
+            let sample = || {
+                RunRecords::adopted(&directory)
+                    .and_then(|records| eligible_sample(&records, RUN, &CalibrationTree::census()))
+            };
+            sample().unwrap_or_else(|why| panic!("{name}: the fixture itself is refused: {why}"));
+            plant(&directory.join("evidence"));
+            readopted(&directory);
+            let found = refused(name, sample());
+            assert!(found.contains(fault), "{name}: {found}");
         }
     }
 
@@ -4455,16 +4533,16 @@ mod tests {
         let read = tree
             .read(&serde_json::to_vec(&tree.document(&references, 1400, 2300)).unwrap())
             .unwrap();
-        assert_eq!(read.environment, fixture_environment());
-        let x = &read.harnesses["a::x"];
+        assert_eq!(read.environment().record(), &fixture_environment());
+        let x = read.harness("a::x").unwrap();
         assert_eq!(
-            (x.milliseconds, x.deadline_milliseconds),
+            (x.milliseconds(), x.deadline_milliseconds()),
             (1400, 1400 * DEADLINE_MARGIN)
         );
-        assert_eq!(x.artifact_sha256, ARTIFACTS[0].2);
-        assert_eq!(x.verifier, fixture_verifier());
-        assert_eq!(x.calibration_runs.len(), SAMPLES);
-        assert_eq!(read.harnesses["a::y"].milliseconds, 2300);
+        assert_eq!(x.artifact_sha256(), ARTIFACTS[0].2);
+        assert_eq!(x.verifier(), &fixture_verifier());
+        assert_eq!(x.calibration_runs().len(), SAMPLES);
+        assert_eq!(read.harness("a::y").unwrap().milliseconds(), 2300);
         let found = refused(
             "predicted-otherwise",
             tree.read(&serde_json::to_vec(&tree.document(&references, 1399, 2300)).unwrap()),
@@ -4489,12 +4567,38 @@ mod tests {
     /// out, an unknown or another environment, a run cited twice, a run whose
     /// records were changed, extended or linked, a run identifier that
     /// leaves the calibration directory, a cited digest that is not the
-    /// manifest's, a qualification run cited, an unverified execution, and a
-    /// harness's samples of different artifacts.
+    /// manifest's, a qualification run cited, an unverified execution, a
+    /// harness's samples of different artifacts, a sample of another
+    /// harness, a kept plan that is not the identity's revision, a policy
+    /// deadline that is not the plan's limit, a malformed deadline beside a
+    /// valid one, a readiness with no reading, and a readiness short of a
+    /// required control run.
     #[test]
     fn an_unsupported_prediction_is_refused() {
         const FIRST: &str = "00000000-0000-0000-0000-000000000001";
-        let cases: [Unsupported; 14] = [
+        /// The evidence of the first run, its record `relative` rewritten by
+        /// `change` and its manifest and receipt re-made ([`readopted`]), so
+        /// every digest still holds and only the relationship planted is
+        /// wrong: the new manifest digest.
+        fn rewritten(
+            tree: &CalibrationTree,
+            relative: &str,
+            change: impl Fn(&mut Vec<u8>),
+        ) -> String {
+            let directory = tree.root.join(CALIBRATION).join(FIRST);
+            let path = directory.join("evidence").join(relative);
+            let mut bytes = std::fs::read(&path).unwrap();
+            change(&mut bytes);
+            std::fs::write(&path, bytes).unwrap();
+            readopted(&directory)
+        }
+        /// The document citing the first run by the manifest digest `digest`.
+        fn cited(mut document: serde_json::Value, digest: String) -> Vec<u8> {
+            document["harnesses"]["a::x"]["calibration"][0]["manifest_sha256"] =
+                serde_json::json!(digest);
+            serde_json::to_vec(&document).unwrap()
+        }
+        let cases: [Unsupported; 20] = [
             (
                 "nested-duplicate-key",
                 |_, document| {
@@ -4533,7 +4637,7 @@ mod tests {
                     document["environment"]["cpu_model"] = serde_json::Value::Null;
                     serde_json::to_vec(&document).unwrap()
                 },
-                "its environment holds an unknown fact",
+                "the environment is not established",
             ),
             (
                 "environment-other",
@@ -4542,7 +4646,7 @@ mod tests {
                         serde_json::json!({"state": "value", "value": "1"});
                     serde_json::to_vec(&document).unwrap()
                 },
-                "is of another or an unknown environment",
+                "is of another environment",
             ),
             (
                 "run-cited-twice",
@@ -4626,8 +4730,8 @@ mod tests {
                     let digest = tree.run(
                         id,
                         "qualification",
+                        "a::x",
                         (1, 0),
-                        (2, 0),
                         "SUCCESSFUL",
                         ARTIFACTS[0].2,
                     );
@@ -4635,30 +4739,101 @@ mod tests {
                         serde_json::json!({"run": id, "manifest_sha256": digest});
                     serde_json::to_vec(&document).unwrap()
                 },
-                "not this calibration",
+                "of purpose qualification",
             ),
             (
                 "unverified-cited",
                 |tree, mut document| {
                     let id = "00000000-0000-0000-0000-00000000000b";
                     let digest =
-                        tree.run(id, "calibration", (1, 0), (2, 0), "FAILED", ARTIFACTS[0].2);
+                        tree.run(id, "calibration", "a::x", (1, 0), "FAILED", ARTIFACTS[0].2);
                     document["harnesses"]["a::x"]["calibration"][0] =
                         serde_json::json!({"run": id, "manifest_sha256": digest});
                     serde_json::to_vec(&document).unwrap()
                 },
-                "classes a::x failed, not pass",
+                "a calibration sample is one verified execution of a::x alone",
             ),
             (
                 "artifacts-differ",
                 |tree, mut document| {
                     let id = "00000000-0000-0000-0000-00000000000c";
-                    let digest = tree.run(id, "calibration", (1, 0), (2, 0), "SUCCESSFUL", DIGEST);
+                    let digest = tree.run(id, "calibration", "a::x", (1, 0), "SUCCESSFUL", DIGEST);
                     document["harnesses"]["a::x"]["calibration"][2] =
                         serde_json::json!({"run": id, "manifest_sha256": digest});
                     serde_json::to_vec(&document).unwrap()
                 },
                 "of another instrumented binary than the harness's other samples",
+            ),
+            (
+                "another-harness-cited",
+                |_, mut document| {
+                    let y = document["harnesses"]["a::y"]["calibration"][0].clone();
+                    document["harnesses"]["a::x"]["calibration"][0] = y;
+                    serde_json::to_vec(&document).unwrap()
+                },
+                "is a sample of another harness",
+            ),
+            (
+                "plan-not-the-revision",
+                |tree, document| {
+                    let digest = rewritten(tree, PLAN_RECORD, |bytes| bytes.push(b'\n'));
+                    cited(document, digest)
+                },
+                "its plan.json has digest",
+            ),
+            (
+                "policy-deadline-not-the-plans",
+                |tree, document| {
+                    let digest = rewritten(tree, "loop-bounds.json", |bytes| {
+                        let mut policy: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                        policy["deadlines"][0]["milliseconds"] = serde_json::json!(1);
+                        *bytes = serde_json::to_vec(&policy).unwrap();
+                    });
+                    cited(document, digest)
+                },
+                "its policy gives a::x 1 ms",
+            ),
+            (
+                // A receipt that only says it is ready, with no reading.
+                "readiness-fabricated",
+                |tree, document| {
+                    let digest = rewritten(tree, READINESS_RECORD, |bytes| {
+                        let mut readiness = valid_readiness();
+                        readiness.observations.clear();
+                        *bytes = serde_json::to_vec(&readiness).unwrap();
+                    });
+                    cited(document, digest)
+                },
+                "its 0 readings settle at None, not at its last",
+            ),
+            (
+                "readiness-without-stable",
+                |tree, document| {
+                    let digest = rewritten(tree, READINESS_RECORD, |bytes| {
+                        let mut readiness = valid_readiness();
+                        readiness.controls.pop();
+                        *bytes = serde_json::to_vec(&readiness).unwrap();
+                    });
+                    cited(document, digest)
+                },
+                "a calibration follows exactly",
+            ),
+            (
+                // One valid deadline beside a malformed one: never read as
+                // a selection of one harness.
+                "deadline-malformed-beside",
+                |tree, document| {
+                    let digest = rewritten(tree, "loop-bounds.json", |bytes| {
+                        let mut policy: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                        policy["deadlines"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"harness": "a::y"}));
+                        *bytes = serde_json::to_vec(&policy).unwrap();
+                    });
+                    cited(document, digest)
+                },
+                "missing field `milliseconds`",
             ),
         ];
         for (name, plant, fault) in cases {
@@ -4683,20 +4858,31 @@ mod tests {
         }}"#;
         let plan = plan_of(valid.as_bytes(), &declared(&["a::x", "a::y"])).unwrap();
         let digest = crate::process::sha256_bytes(valid.as_bytes()).unwrap();
-        assert_eq!(plan.bytes, valid.as_bytes());
+        assert_eq!(plan.bytes(), valid.as_bytes());
+        assert_eq!(plan.sha256(), digest);
         assert_eq!(
-            plan.deadlines["a::x"],
+            plan.deadlines()["a::x"],
             Deadline {
                 milliseconds: 1_800_000,
                 reason: "the previous window".to_string(),
             }
         );
-        let purpose = RunPurpose::Calibration(plan);
+        let ready = Ready {
+            sha256: DIGEST.to_string(),
+            bytes: b"ready".to_vec(),
+        };
+        let purpose = RunPurpose::Calibration { plan, ready };
         assert_eq!(
             (purpose.name(), purpose.revision()),
             ("calibration", digest.as_str())
         );
-        assert_eq!(purpose.document(), ("plan.json", valid.as_bytes()));
+        assert_eq!(
+            purpose.documents(),
+            [
+                (PLAN_RECORD, valid.as_bytes()),
+                (READINESS_RECORD, b"ready".as_slice())
+            ]
+        );
         for (text, fault) in [
             (
                 valid.replace("a::x", "a::z"),
@@ -4772,49 +4958,89 @@ mod tests {
         );
     }
 
-    /// A finished calibration is adopted whole into the tree, every
-    /// instrumented binary left out, its copy matching its manifest; a
-    /// qualification, a second adoption, and records that no longer match
-    /// their manifest are refused.
+    /// The finished run `id` of `harness`, of `purpose`, its report reading
+    /// `result`, laid out as `process::kani` leaves it: its log at
+    /// `RUNS/ID.log` and its evidence beside it, the instrumented binary
+    /// preserved. Its evidence directory.
+    pub(crate) fn finished_run(
+        tree: &CalibrationTree,
+        id: &str,
+        purpose: &str,
+        harness: &str,
+        result: &str,
+    ) -> std::path::PathBuf {
+        let built = CalibrationTree::new(&format!("finished-{id}"));
+        let artifact = if harness == "a::x" {
+            ARTIFACTS[0].2
+        } else {
+            ARTIFACTS[1].2
+        };
+        built.run(id, purpose, harness, (1, 0), result, artifact);
+        let adopted = built.root.join(CALIBRATION).join(id);
+        let runs = tree.root.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let evidence = runs.join(format!("{id}.evidence"));
+        std::fs::copy(adopted.join("kani.log"), runs.join(format!("{id}.log"))).unwrap();
+        std::fs::rename(adopted.join("evidence"), &evidence).unwrap();
+        std::fs::write(
+            evidence
+                .join("loop-bounds")
+                .join(harness.replace("::", "."))
+                .join("artifact.out"),
+            "binary",
+        )
+        .unwrap();
+        evidence
+    }
+
+    /// The record `relative` of the run whose evidence is `evidence`
+    /// rewritten by `change`, its manifest re-made, so every digest holds
+    /// and only the record's content is planted.
+    fn remanifested(evidence: &Path, relative: &str, change: impl Fn(&mut Vec<u8>)) {
+        let path = evidence.join(relative);
+        let mut bytes = std::fs::read(&path).unwrap();
+        change(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+        let identity: RunIdentityRecord =
+            serde_json::from_slice(&std::fs::read(evidence.join("run.json")).unwrap()).unwrap();
+        std::fs::remove_file(evidence.join("manifest.json")).unwrap();
+        let manifest = manifest_of(
+            evidence,
+            Some(&evidence.with_extension("log")),
+            Some(&identity.id),
+        );
+        std::fs::write(
+            evidence.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A finished calibration that is a sample is adopted whole into the
+    /// tree, every instrumented binary left out, by the one eligibility
+    /// authority ([`eligible_sample`]); a qualification, a second adoption,
+    /// a rejected run, a run whose harness failed verification though its
+    /// execution was recorded and accepted, an identifier that is no run's,
+    /// and records that no longer match their manifest are refused, and
+    /// nothing is left of a refused one.
     #[test]
     fn a_calibration_is_adopted_whole_and_once() {
+        /// The refusal `result` must be, named `case`: refused outright,
+        /// nothing published.
+        fn refused(case: &str, result: Result<std::path::PathBuf, Adoption>) -> String {
+            match result {
+                Err(Adoption::Refused(why)) => why,
+                other => panic!("{case}: {other:?}, not a refusal"),
+            }
+        }
         let tree = CalibrationTree::new("adopt");
-        let source = tree.root.join("runs");
-        std::fs::create_dir_all(&source).unwrap();
-        let judged = |id: &str, purpose: &str, status: &str| {
-            let evidence = source.join(format!("{id}.evidence"));
-            let log = source.join(format!("{id}.log"));
-            std::fs::create_dir_all(evidence.join("loop-bounds/a.x")).unwrap();
-            std::fs::write(&log, "report\n").unwrap();
-            std::fs::write(
-                evidence.join("judgement.json"),
-                serde_json::json!({"status": status}).to_string(),
-            )
-            .unwrap();
-            std::fs::write(
-                evidence.join("run.json"),
-                serde_json::to_vec(&fixture_identity(&tree.root, id, purpose)).unwrap(),
-            )
-            .unwrap();
-            std::fs::write(evidence.join("loop-bounds/a.x/artifact.out"), "binary").unwrap();
-            std::fs::write(evidence.join("loop-bounds/a.x/artifact.json"), "{}").unwrap();
-            let manifest = manifest_of(&evidence, Some(&log), Some(id));
-            std::fs::write(
-                evidence.join("manifest.json"),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
-            evidence
-        };
-        let finished = |id: &str, purpose: &str| judged(id, purpose, "accepted");
-        let rejected = judged(
-            "00000000-0000-0000-0000-0000000000a4",
+        let calibration = finished_run(
+            &tree,
+            "00000000-0000-0000-0000-0000000000a1",
             "calibration",
-            "rejected",
+            "a::x",
+            "SUCCESSFUL",
         );
-        let found = refused("rejected-adopted", adopt(&rejected, &tree.root));
-        assert!(found.contains("a rejected run is not adopted"), "{found}");
-        let calibration = finished("00000000-0000-0000-0000-0000000000a1", "calibration");
         let adopted = adopt(&calibration, &tree.root).unwrap();
         assert!(adopted.join("kani.log").is_file());
         assert!(
@@ -4827,30 +5053,90 @@ mod tests {
                 .join("evidence/loop-bounds/a.x/artifact.out")
                 .exists()
         );
+        eligible_sample(
+            &RunRecords::adopted(&adopted).unwrap(),
+            "00000000-0000-0000-0000-0000000000a1",
+            &CalibrationTree::census(),
+        )
+        .unwrap();
         let again = refused("adopted-twice", adopt(&calibration, &tree.root));
         assert!(again.contains("already adopted"), "{again}");
-        let qualification = finished("00000000-0000-0000-0000-0000000000a2", "qualification");
+        let qualification = finished_run(
+            &tree,
+            "00000000-0000-0000-0000-0000000000a2",
+            "qualification",
+            "a::x",
+            "SUCCESSFUL",
+        );
         let found = refused("qualification-adopted", adopt(&qualification, &tree.root));
         assert!(found.contains("only a calibration is adopted"), "{found}");
+        let rejected = finished_run(
+            &tree,
+            "00000000-0000-0000-0000-0000000000a4",
+            "calibration",
+            "a::x",
+            "SUCCESSFUL",
+        );
+        remanifested(&rejected, "judgement.json", |bytes| {
+            *bytes = br#"{"status": "rejected", "error": "e"}"#.to_vec();
+        });
+        let found = refused("rejected-adopted", adopt(&rejected, &tree.root));
+        assert!(found.contains("not accepted"), "{found}");
+        let failed = finished_run(
+            &tree,
+            "00000000-0000-0000-0000-0000000000a5",
+            "calibration",
+            "a::x",
+            "FAILED",
+        );
+        let found = refused("failed-verification-adopted", adopt(&failed, &tree.root));
+        assert!(
+            found.contains("a calibration sample is one verified execution of a::x alone"),
+            "{found}"
+        );
         // An identifier that is no run's names no path: refused before any
         // directory is made from it.
-        let outside = finished("../outside", "calibration");
+        let outside = tree.root.join("runs/outside.evidence");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("run.json"),
+            serde_json::to_vec(&fixture_identity(
+                &tree.root,
+                "../outside",
+                "calibration",
+                DIGEST,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
         let found = refused("adopted-outside", adopt(&outside, &tree.root));
         assert!(
             found.contains("\"../outside\" is not a run identifier"),
             "adopted-outside: {found}"
         );
         assert!(!tree.root.join("tests/data/proofs/outside").exists());
-        let changed = finished("00000000-0000-0000-0000-0000000000a3", "calibration");
+        let changed = finished_run(
+            &tree,
+            "00000000-0000-0000-0000-0000000000a3",
+            "calibration",
+            "a::x",
+            "SUCCESSFUL",
+        );
         std::fs::write(changed.join("loop-bounds/a.x/artifact.json"), "changed").unwrap();
         let found = refused("changed-adopted", adopt(&changed, &tree.root));
-        assert!(found.contains("do not match its manifest"), "{found}");
+        assert!(found.contains("the manifest records"), "{found}");
+        for refused_run in ["a2", "a3", "a4", "a5"] {
+            let id = format!("00000000-0000-0000-0000-0000000000{refused_run}");
+            assert!(!tree.root.join(CALIBRATION).join(&id).exists(), "{id}");
+        }
+        let staging: Vec<String> = std::fs::read_dir(tree.root.join(CALIBRATION))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".adopting-"))
+            .collect();
         assert!(
-            !tree
-                .root
-                .join(CALIBRATION)
-                .join("00000000-0000-0000-0000-0000000000a3")
-                .exists()
+            staging.is_empty(),
+            "a refused adoption left its staging: {staging:?}"
         );
     }
 
@@ -5490,8 +5776,8 @@ mod tests {
         let a_y = [BTreeSet::from(["a::y".to_string()])];
         let none = [BTreeSet::new()];
         write(entry(serde_json::json!(["a::y"])));
-        check_function_scope(&root, &run, &a_y, true, Artifacts::Preserved).unwrap();
-        check_function_scope(&root, &run, &a_y, false, Artifacts::Preserved).unwrap();
+        check_function_scope(&root, &run, &a_y, true, Artifacts::Live).unwrap();
+        check_function_scope(&root, &run, &a_y, false, Artifacts::Live).unwrap();
         for (record, applied, suite, fault) in [
             (
                 entry(serde_json::json!(["nonexistent"])),
@@ -5545,15 +5831,14 @@ mod tests {
             write(record.clone());
             let found = refused(
                 &format!("function scope {record}"),
-                check_function_scope(&root, &run, applied, suite, Artifacts::Preserved),
+                check_function_scope(&root, &run, applied, suite, Artifacts::Live),
             );
             assert!(found.contains(fault), "{record}: {found}");
         }
         write(entry(serde_json::json!([])));
-        check_function_scope(&root, &run, &none, false, Artifacts::Preserved).unwrap();
+        check_function_scope(&root, &run, &none, false, Artifacts::Live).unwrap();
         std::fs::remove_file(root.join("function-scope.json")).unwrap();
-        let missing =
-            check_function_scope(&root, &run, &a_y, true, Artifacts::Preserved).unwrap_err();
+        let missing = check_function_scope(&root, &run, &a_y, true, Artifacts::Live).unwrap_err();
         assert!(missing.contains("function-scope.json"), "{missing}");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -6202,8 +6487,8 @@ mod tests {
 
     /// An environment of the processor, affinity and cpuset of the fixture
     /// with the limits of the group `leaf` of `scratch`.
-    fn observed(scratch: &Scratch, leaf: &str) -> Environment {
-        Environment {
+    fn observed(scratch: &Scratch, leaf: &str) -> EnvironmentRecord {
+        EnvironmentRecord {
             cpu_model: Some("cpu".to_string()),
             cpus_allowed: Some("0-15".to_string()),
             cpuset_effective: effective_cpuset(&scratch.0, leaf),
@@ -6238,11 +6523,11 @@ mod tests {
             LimitObservation::Absent { .. }
         ));
         assert_eq!(environment.cpuset_effective.as_deref(), Some("0-15"));
-        assert!(environment.known(), "{environment:#?}");
+        assert!(environment.establish().is_ok(), "{environment:#?}");
         let other = observed(&scratch, "/a/c");
         assert_ne!(environment, other, "the scopes' paths are recorded");
         assert!(
-            environment.equivalent(&other),
+            equivalent(&environment, &other),
             "scopes of other names under equal limits are not equivalent"
         );
     }
@@ -6257,7 +6542,7 @@ mod tests {
         let baseline = Scratch::new("cgroup-baseline");
         hierarchy(&baseline, "b");
         let reference = observed(&baseline, "/a/b");
-        assert!(reference.known());
+        assert!(reference.establish().is_ok());
         type Plant = fn(&Scratch);
         let cases: [(&str, Plant, &str); 5] = [
             (
@@ -6320,11 +6605,11 @@ mod tests {
                 "{name}: no unavailable limit naming {fault:?}: {environment:#?}"
             );
             assert!(
-                !environment.known(),
+                environment.establish().is_err(),
                 "{name}: established: {environment:#?}"
             );
             assert!(
-                !environment.equivalent(&reference) && !reference.equivalent(&environment),
+                !equivalent(&environment, &reference) && !equivalent(&reference, &environment),
                 "{name}: an unestablished environment was equivalent"
             );
         }
@@ -6340,35 +6625,57 @@ mod tests {
                 if reason.contains("/a does not enable the cpu controller")),
             "{environment:#?}"
         );
-        assert!(environment.known(), "{environment:#?}");
+        assert!(environment.establish().is_ok(), "{environment:#?}");
         assert!(
-            !environment.equivalent(&reference),
+            !equivalent(&environment, &reference),
             "an absent limit compared equal to a value"
         );
         for (cpus_allowed, cpuset) in [("", "0-15"), ("0-15", ""), ("3-1", "0-15")] {
-            let environment = Environment {
+            let environment = EnvironmentRecord {
                 cpus_allowed: Some(cpus_allowed.to_string()),
                 cpuset_effective: Some(cpuset.to_string()),
                 ..reference.clone()
             };
             assert!(
-                !environment.known(),
+                environment.establish().is_err(),
                 "the CPU sets {cpus_allowed:?}, {cpuset:?} established"
             );
         }
-        let blank = Environment {
+        let blank = EnvironmentRecord {
             cpu_model: Some(" ".to_string()),
             ..reference.clone()
         };
-        assert!(!blank.known(), "a blank processor model established");
-        let rootless = Environment {
+        assert!(
+            blank.establish().is_err(),
+            "a blank processor model established"
+        );
+        let rootless = EnvironmentRecord {
             levels: reference.levels[..2].to_vec(),
             ..reference.clone()
         };
         assert!(
-            !rootless.known(),
+            rootless.establish().is_err(),
             "a hierarchy without its root established"
         );
+        // A stored record is held to what a live observation is: a value
+        // that is no valid limit, or a hierarchy that is no ancestry, read
+        // back from evidence, establishes nothing.
+        let mut forged = reference.clone();
+        forged.levels[0].cpu_max = LimitObservation::Value {
+            value: "garbage".to_string(),
+        };
+        let found = refused("stored-limit-malformed", forged.establish());
+        assert!(found.contains("/a/b cpu.max is Value"), "{found}");
+        let mut reordered = reference.clone();
+        reordered.levels.swap(0, 1);
+        let found = refused("stored-ancestry-reordered", reordered.establish());
+        assert!(found.contains("are not the ancestry of"), "{found}");
+    }
+
+    /// Whether the environments `one` and `other` are both established and
+    /// equivalent.
+    fn equivalent(one: &EnvironmentRecord, other: &EnvironmentRecord) -> bool {
+        matches!((one.establish(), other.establish()), (Ok(one), Ok(other)) if one.equivalent(&other))
     }
 
     /// The source digest distinguishes what a delimiter-only framing or a
@@ -6381,11 +6688,19 @@ mod tests {
             contents: contents.to_vec(),
         };
         let digest = |entries: Vec<(&str, TreeEntry)>| {
-            let state: BTreeMap<Vec<u8>, TreeEntry> = entries
-                .into_iter()
-                .map(|(path, entry)| (path.as_bytes().to_vec(), entry))
-                .collect();
-            crate::process::sha256_bytes(&tree_stream(&state)).unwrap()
+            let state = SourceState(
+                entries
+                    .into_iter()
+                    .map(|(path, entry)| (path.as_bytes().to_vec(), entry))
+                    .collect(),
+            );
+            let digest = state.digest().unwrap();
+            assert_eq!(
+                digest,
+                tree_digest_of(&state.digests().unwrap()).unwrap(),
+                "a state's digest is not the digest of its paths' digests"
+            );
+            digest
         };
         for (name, one, other) in [
             (
@@ -6428,7 +6743,8 @@ mod tests {
             digest(vec![("a", file(b"1", true)), ("b", file(b"2", false))]),
             "the enumeration's order changed the digest"
         );
-        assert!(tree_stream(&BTreeMap::new()).starts_with(TREE_DOMAIN));
+        assert!(tree_stream(&BTreeMap::new()).starts_with(ENTRY_DOMAIN));
+        assert_ne!(ENTRY_DOMAIN, TREE_DOMAIN);
         // Read from a tree: a link is its target, never followed; a deletion
         // is recorded only against a listing of another state.
         let scratch = Scratch::new("source-state");
@@ -6454,6 +6770,28 @@ mod tests {
         );
     }
 
+    /// A live run's record is absent only when the system says it is not
+    /// found: one under a directory that cannot be searched is a fault, never
+    /// taken for a harness that was never launched.
+    #[test]
+    fn a_live_record_is_absent_only_when_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("live-holds");
+        let path = scratch.write("a.x/solver.attempt", "spawning\n");
+        assert_eq!(Artifacts::Live.holds(&path), Ok(true));
+        assert_eq!(
+            Artifacts::Live.holds(&scratch.0.join("a.x/none")),
+            Ok(false)
+        );
+        std::fs::set_permissions(
+            scratch.0.join("a.x"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let found = refused("record-uninspectable", Artifacts::Live.holds(&path));
+        assert!(found.contains("Permission denied"), "{found}");
+    }
+
     /// A document is the bytes read once: its digest and its interpretation
     /// are of that buffer, whatever its path holds afterwards.
     #[test]
@@ -6473,59 +6811,460 @@ mod tests {
         assert_eq!(read.deadlines["a::x"].milliseconds, 1000);
     }
 
-    /// A control run is cited only when finished and passed, of the
-    /// calibration's commit and naming its own identity; a calibration is
-    /// ready only once the system settled under the policy, every reading
-    /// kept in its receipt whether it was ready or not.
+    /// The fixture registry's rows: a native control of each channel a
+    /// calibration requires, a Miri control of the nightly channel and a
+    /// Kani control, the last two outside a calibration's prerequisite.
+    const REGISTRY: &[&str] = &[
+        "n\ttests/data/controls/n.patch\tnative\tnightly\tdcbor\tall\tlib\ta::b\t-\tfailed\tboom",
+        "s\ttests/data/controls/s.patch\tnative\tstable\tdcbor\tall\tlib\ta::c\t-\tfailed\tboom",
+        "m\ttests/data/controls/m.patch\ttree\tnightly\tdcbor\tcustom-std-collections\tlib\ta::d\t-\tundefined_behavior\tUndefined Behavior",
+        "k\ttests/data/controls/k.patch\tkani\tkani\tdcbor\t-\tlib\ta::x\t-\tfailed\ta planted failure",
+    ];
+
+    /// The native control runs a calibration of commit `c` follows, laid out
+    /// as `tests/controls.sh` leaves them: the registry ([`REGISTRY`]) under
+    /// `root`, and under `logs` one log directory per channel, each with its
+    /// commit, its identity, every selected control's evidence seen red and
+    /// green in a restored copy, and its final record made by the one maker
+    /// ([`control_verdict`]).
+    pub(crate) struct ControlRuns {
+        pub(crate) nightly: std::path::PathBuf,
+        pub(crate) stable: std::path::PathBuf,
+    }
+
+    impl ControlRuns {
+        pub(crate) fn new(root: &Path, logs: &Path) -> Self {
+            let write = |path: &Path, text: &str| {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            };
+            let mut table = REGISTRY.join("\n");
+            table.push('\n');
+            write(&root.join(crate::controls::TABLE), &table);
+            for name in ["n", "s", "m", "k"] {
+                write(
+                    &root.join(format!("tests/data/controls/{name}.patch")),
+                    "--- src/a.rs\n+++ src/a.rs\n@@ -1 +1 @@\n-pub fn a() {}\n+pub fn a() { panic!() }\n",
+                );
+            }
+            let controls = crate::controls::registry(root).unwrap().controls;
+            let run = |channel: &str| {
+                let directory = logs.join(format!("controls-{channel}"));
+                write(&directory.join("commit.txt"), "c\n");
+                write(
+                    &directory.join("identity.txt"),
+                    &format!("identity-{channel}\n"),
+                );
+                for control in crate::controls::selected(
+                    &controls,
+                    channel,
+                    &[crate::controls::Runner::Native],
+                ) {
+                    let evidence = crate::controls::directory(&directory, control);
+                    for (file, text) in [
+                        ("red.judged", "refused\n"),
+                        ("green.judged", "restored\n"),
+                        ("before.sha256", "a\n"),
+                        ("planted.sha256", "b\n"),
+                        ("after.sha256", "a\n"),
+                    ] {
+                        write(&evidence.join(file), text);
+                    }
+                }
+                Self::record(root, &directory, channel);
+                directory
+            };
+            Self {
+                nightly: run("nightly"),
+                stable: run("stable"),
+            }
+        }
+
+        /// The final record of the native run of `channel` at `directory`,
+        /// written again by the one maker.
+        pub(crate) fn record(root: &Path, directory: &Path, channel: &str) {
+            let verdict = control_verdict(root, directory, channel, &["native"]).unwrap();
+            let _ = std::fs::remove_file(directory.join("verdict.json"));
+            std::fs::write(
+                directory.join("verdict.json"),
+                serde_json::to_vec_pretty(&verdict).unwrap(),
+            )
+            .unwrap();
+        }
+
+        pub(crate) fn logs(&self) -> [&Path; 2] {
+            [&self.nightly, &self.stable]
+        }
+    }
+
+    /// A control run is cited only complete against its registry: finished,
+    /// passed, of the calibration's commit and its own identity, of the
+    /// registry the calibration's copy holds, judging exactly the controls
+    /// that registry selects for its channel and runners, and recording
+    /// exactly its results' faults. An unfinished run, a failed control, a
+    /// run of another commit or registry, a run short of a selected control
+    /// and a record whose faults were cleared are each refused.
     #[test]
-    fn a_calibration_is_ready_only_after_a_passed_control_run_and_settling() {
-        let scratch = Scratch::new("readiness");
-        let control = scratch.0.join("controls");
-        scratch.write("controls/identity.txt", "identity\n");
-        let verdict = |faults: Vec<String>, commit: &str| {
-            serde_json::to_string(&ControlVerdict {
-                version: RUNTIME_VERSION,
-                channel: "nightly".to_string(),
-                commit: commit.to_string(),
-                identity: "identity".to_string(),
-                controls: 9,
-                faults,
-            })
-            .unwrap()
-        };
-        let unfinished = refused("control-unfinished", control_run(&control, "c"));
-        assert!(
-            unfinished.contains("the control run has not finished"),
-            "{unfinished}"
+    fn a_control_run_is_cited_only_complete_against_its_registry() {
+        let scratch = Scratch::new("control-runs");
+        let root = scratch.0.join("tree");
+        let runs = ControlRuns::new(&root, &scratch.0);
+        let registry = crate::controls::registry(&root).unwrap();
+        let cite = |logs: &Path, commit: &str| control_run(logs, commit, &registry);
+        let cited = cite(&runs.nightly, "c").unwrap();
+        assert_eq!(
+            cited
+                .results
+                .iter()
+                .map(|result| (result.control.as_str(), result.runner.as_str()))
+                .collect::<Vec<_>>(),
+            [("n", "native")],
+            "the nightly native run judges its one native control, not the Miri or the Kani one"
         );
-        scratch.write(
-            "controls/verdict.json",
-            &verdict(vec!["x: not seen red".to_string()], "c"),
-        );
-        let failed = refused("control-failed", control_run(&control, "c"));
-        assert!(failed.contains("the control run did not pass"), "{failed}");
-        scratch.write("controls/verdict.json", &verdict(Vec::new(), "other"));
-        let other = refused("control-other-commit", control_run(&control, "c"));
-        assert!(other.contains("is of commit other"), "{other}");
-        scratch.write("controls/verdict.json", &verdict(Vec::new(), "c"));
-        let cited = control_run(&control, "c").unwrap();
         assert_eq!(
             cited.verdict_sha256,
-            crate::process::sha256(&control.join("verdict.json")).unwrap()
+            crate::process::sha256(&runs.nightly.join("verdict.json")).unwrap()
         );
+        assert_eq!(cited.registry_sha256, registry.sha256);
+        assert_eq!(
+            cited.verdict.as_bytes(),
+            std::fs::read(runs.nightly.join("verdict.json")).unwrap(),
+            "the cited run does not retain its final record's text"
+        );
+        let found = refused("control-other-commit", cite(&runs.nightly, "d"));
+        assert!(
+            found.contains("is of commit c, the calibration's is d"),
+            "{found}"
+        );
+        // A control not seen red: its own result's fault, the run failed.
+        std::fs::write(runs.nightly.join("n/red.judged"), "n: pass\n").unwrap();
+        ControlRuns::record(&root, &runs.nightly, "nightly");
+        let found = refused("control-failed", cite(&runs.nightly, "c"));
+        assert!(found.contains("the control run did not pass"), "{found}");
+        std::fs::write(runs.nightly.join("n/red.judged"), "refused\n").unwrap();
+        ControlRuns::record(&root, &runs.nightly, "nightly");
+        // The record edited: a selected control's result removed, or the
+        // faults cleared while a result keeps one.
+        let path = runs.nightly.join("verdict.json");
+        let kept = std::fs::read(&path).unwrap();
+        let rewrite = |change: &dyn Fn(&mut ControlVerdict)| {
+            let mut verdict: ControlVerdict = serde_json::from_slice(&kept).unwrap();
+            change(&mut verdict);
+            std::fs::write(&path, serde_json::to_vec(&verdict).unwrap()).unwrap();
+        };
+        rewrite(&|verdict| verdict.results[0].control = "s".to_string());
+        let found = refused("control-substituted", cite(&runs.nightly, "c"));
+        assert!(found.contains("judged [(\"s\", \"native\")]"), "{found}");
+        rewrite(&|verdict| verdict.results.clear());
+        let found = refused("control-short", cite(&runs.nightly, "c"));
+        assert!(
+            found.contains("the registry selects [(\"n\", \"native\")]"),
+            "{found}"
+        );
+        rewrite(&|verdict| {
+            verdict.results[0]
+                .faults
+                .push("n: not seen red".to_string())
+        });
+        let found = refused("control-faults-cleared", cite(&runs.nightly, "c"));
+        assert!(found.contains("the control run did not pass"), "{found}");
+        std::fs::write(&path, &kept).unwrap();
+        cite(&runs.nightly, "c").unwrap();
+        // The registry changed after the run.
+        let other = crate::controls::Registry {
+            sha256: DIGEST.to_string(),
+            ..registry.clone()
+        };
+        let found = refused(
+            "control-other-registry",
+            control_run(&runs.nightly, "c", &other),
+        );
+        assert!(found.contains("ran the registry"), "{found}");
+        std::fs::remove_file(&path).unwrap();
+        let found = refused("control-unfinished", cite(&runs.nightly, "c"));
+        assert!(
+            found.contains("the control run has not finished"),
+            "{found}"
+        );
+    }
+
+    /// A calibration is ready only after both required control runs, with
+    /// the workload lock held, once the system settled; its receipt is kept
+    /// whether ready or not, and a ready one's bytes are the [`Ready`] every
+    /// calibration run keeps. A missing control run, another holder of the
+    /// workload lock and an unsettled system each refuse it.
+    #[test]
+    fn a_calibration_is_ready_only_after_its_control_runs_and_settling() {
+        let scratch = Scratch::new("readiness");
+        let root = scratch.0.join("tree");
+        let runs = ControlRuns::new(&root, &scratch.0);
+        let lock_path = scratch.0.join("gate-workload.lock");
+        let lock = WorkloadLock::acquire(&lock_path).unwrap();
+        let found = refused("lock-held", WorkloadLock::acquire(&lock_path).map(|_| ()));
+        assert!(found.contains("another gate workload holds it"), "{found}");
         let policy = SettlingPolicy {
-            interval_milliseconds: 1,
+            interval_milliseconds: 10,
             consecutive: 2,
+            min_span_milliseconds: 10,
             limit: 4,
             max_running: 2,
             max_load1_hundredths: 100,
             justification: "test".to_string(),
         };
-        let mut clock = || {
-            Ok(Instant {
-                seconds: 1,
-                nanoseconds: 0,
-            })
+        let calm = || Ok::<_, String>("0.10 0.10 0.10 1/100 1".to_string());
+        let logs = runs.logs();
+        let prerequisites = |control_logs| Prerequisites {
+            root: &root,
+            commit: "c",
+            control_logs,
+            lock: &lock,
+        };
+        let ready = readiness(
+            &scratch.0.join("ready.json"),
+            &prerequisites(&logs),
+            &policy,
+            &mut { calm },
+            &mut TestClocks::stepping(10),
+        )
+        .unwrap();
+        assert_eq!(
+            ready.bytes,
+            std::fs::read(scratch.0.join("ready.json")).unwrap()
+        );
+        assert_eq!(
+            ready.sha256,
+            crate::process::sha256(&scratch.0.join("ready.json")).unwrap()
+        );
+        let receipt: Readiness = serde_json::from_slice(&ready.bytes).unwrap();
+        receipt.validate(Some("c")).unwrap();
+        assert_eq!(receipt.observations.len(), 2);
+        assert_eq!(
+            receipt
+                .workload_lock
+                .as_ref()
+                .map(|lock| lock.path.as_str()),
+            lock_path.to_str()
+        );
+        assert_eq!(
+            receipt.registry,
+            crate::controls::registry(&root).unwrap().text
+        );
+        let found = refused("readiness-other-commit", receipt.validate(Some("d")));
+        assert!(
+            found.contains("is of commit c, the calibration's is d"),
+            "{found}"
+        );
+        // Only the nightly run: not the prerequisite.
+        let found = refused(
+            "readiness-nightly-only",
+            readiness(
+                &scratch.0.join("nightly-only.json"),
+                &prerequisites(&logs[..1]),
+                &policy,
+                &mut { calm },
+                &mut TestClocks::stepping(10),
+            ),
+        );
+        assert!(found.contains("a calibration follows exactly"), "{found}");
+        // An unsettled system: the receipt kept with every reading.
+        let found = refused(
+            "readiness-unsettled",
+            readiness(
+                &scratch.0.join("unsettled.json"),
+                &prerequisites(&logs),
+                &policy,
+                &mut || Ok("3.00 1 1 1/1 1".to_string()),
+                &mut TestClocks::stepping(10),
+            ),
+        );
+        assert!(found.contains("is not ready"), "{found}");
+        let kept: Readiness =
+            serde_json::from_slice(&std::fs::read(scratch.0.join("unsettled.json")).unwrap())
+                .unwrap();
+        assert!(!kept.ready && kept.observations.len() == 4 && kept.controls.len() == 2);
+        // A control run unfinished: nothing is settled.
+        std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
+        let found = refused(
+            "readiness-control-unfinished",
+            readiness(
+                &scratch.0.join("unfinished.json"),
+                &prerequisites(&logs),
+                &policy,
+                &mut { calm },
+                &mut TestClocks::stepping(10),
+            ),
+        );
+        assert!(found.contains("no finished, passed control run"), "{found}");
+    }
+
+    /// The retained final record of `run` rewritten by `change`, its digest
+    /// and every fact the run records made consistent with it again, so only
+    /// the record's relationship to the registry is planted.
+    fn reverdict(run: &mut ControlRun, change: impl Fn(&mut ControlVerdict)) {
+        let mut verdict: ControlVerdict = serde_json::from_str(&run.verdict).unwrap();
+        change(&mut verdict);
+        run.verdict = serde_json::to_string_pretty(&verdict).unwrap();
+        run.verdict_sha256 = crate::process::sha256_bytes(run.verdict.as_bytes()).unwrap();
+        run.identity = verdict.identity;
+        run.commit = verdict.commit;
+        run.channel = verdict.channel;
+        run.runners = verdict.runners;
+        run.registry_sha256 = verdict.registry_sha256;
+        run.results = verdict.results;
+        run.finished = verdict.finished;
+    }
+
+    /// A kept readiness establishes nothing by saying it is ready: the one
+    /// validator recomputes every control run from the registry text and the
+    /// final records it retains. A receipt not ready or with no reading; one
+    /// short of a required run; one whose retained final record, its digest
+    /// and its facts made consistent, widens its runners, renames a control,
+    /// judges one twice, records a fault or names another registry; one
+    /// whose registry text was changed; one whose recorded facts are not its
+    /// final record's; one whose control run finished after the lock was
+    /// acquired, or whose lock was acquired after settling began, or that
+    /// held none; and one with a reading that does not read as recorded, a
+    /// reading early, a window short of the minimum span, more readings than
+    /// its limit, or readings past its settling point is each refused.
+    #[test]
+    fn a_kept_readiness_is_held_to_the_one_validator() {
+        valid_readiness().validate(Some("c")).unwrap();
+        type Plant = fn(&mut Readiness);
+        let cases: [(&str, Plant, &str); 19] = [
+            ("not-ready", |r| r.ready = false, "not ready"),
+            ("no-reading", |r| r.observations.clear(), "settle at None"),
+            (
+                "stable-missing",
+                |r| {
+                    r.controls.pop();
+                },
+                "a calibration follows exactly",
+            ),
+            (
+                "runner-widened",
+                |r| reverdict(&mut r.controls[0], |v| v.runners.push("tree".to_string())),
+                "the registry selects [(\"n\", \"native\"), (\"m\", \"tree\")]",
+            ),
+            (
+                "control-renamed",
+                |r| {
+                    reverdict(&mut r.controls[0], |v| {
+                        v.results[0].control = "s".to_string()
+                    })
+                },
+                "judged [(\"s\", \"native\")], the registry selects [(\"n\", \"native\")]",
+            ),
+            (
+                "control-twice",
+                |r| {
+                    reverdict(&mut r.controls[0], |v| {
+                        let again = v.results[0].clone();
+                        v.results.push(again);
+                    })
+                },
+                "judged [(\"n\", \"native\"), (\"n\", \"native\")]",
+            ),
+            (
+                "control-failed",
+                |r| {
+                    reverdict(&mut r.controls[1], |v| {
+                        v.results[0].faults.push("s: not seen red".to_string());
+                        v.faults = crate::controls::faults(&v.results);
+                    })
+                },
+                "the control run did not pass",
+            ),
+            (
+                "registries-differ",
+                |r| reverdict(&mut r.controls[1], |v| v.registry_sha256 = "0".repeat(64)),
+                "ran the registry 0000",
+            ),
+            (
+                "registry-altered",
+                |r| r.registry.push_str("# altered after the runs\n"),
+                "ran the registry",
+            ),
+            (
+                "facts-unbound",
+                |r| r.controls[0].results[0].control = "s".to_string(),
+                "the nightly control run's recorded facts are not what its verdict records",
+            ),
+            (
+                "finished-after-lock",
+                |r| reverdict(&mut r.controls[0], |v| v.finished.seconds += 3600),
+                "the nightly control run finished at",
+            ),
+            (
+                "lock-after-settling",
+                |r| {
+                    if let Some(lock) = r.workload_lock.as_mut() {
+                        lock.acquired.seconds += 3600;
+                    }
+                },
+                "after its first reading",
+            ),
+            (
+                "no-lock",
+                |r| r.workload_lock = None,
+                "it held no workload lock",
+            ),
+            (
+                "reading-misrecorded",
+                |r| r.observations[3].loadavg = "3.00 1 1 9/100 1".to_string(),
+                "reading 3 records load 10 hundredths",
+            ),
+            (
+                "reading-early",
+                |r| r.observations[4].monotonic_milliseconds -= 1,
+                "reading 4 came 4999 ms after",
+            ),
+            (
+                "span-unreachable",
+                |r| r.policy.min_span_milliseconds = 30_001,
+                "cannot span its minimum span",
+            ),
+            (
+                "beyond-limit",
+                |r| {
+                    r.observations = settled_readings(r.observations[0].at, 8);
+                    r.policy.limit = 7;
+                },
+                "8 readings, its policy's limit is 7",
+            ),
+            (
+                "past-settling",
+                |r| r.observations = settled_readings(r.observations[0].at, 8),
+                "settle at Some(6), not at its last",
+            ),
+            (
+                "policy-unjustified",
+                |r| r.policy.justification = " ".to_string(),
+                "no justification",
+            ),
+        ];
+        for (name, plant, fault) in cases {
+            let mut readiness = valid_readiness();
+            plant(&mut readiness);
+            let found = refused(name, readiness.validate(Some("c")));
+            assert!(found.contains(fault), "{name}: {found}");
+        }
+    }
+
+    /// Settling reads the system until a window of consecutive readings, all
+    /// within the policy and spanning its minimum span, ends, each reading
+    /// at least an interval after the one before it on the monotonic clock;
+    /// a policy that can establish nothing reads nothing, its arithmetic
+    /// checked.
+    #[test]
+    fn settling_holds_its_interval_its_window_and_its_span() {
+        let policy = SettlingPolicy {
+            interval_milliseconds: 10,
+            consecutive: 2,
+            min_span_milliseconds: 10,
+            limit: 4,
+            max_running: 2,
+            max_load1_hundredths: 100,
+            justification: "test".to_string(),
         };
         let readings = |loads: &'static [&'static str]| {
             let mut at = 0;
@@ -6538,7 +7277,7 @@ mod tests {
                 reading
             }
         };
-        let mut waited = Vec::new();
+        let mut clocks = TestClocks::stepping(10);
         let (observations, settled) = settle(
             &policy,
             &mut readings(&[
@@ -6546,100 +7285,172 @@ mod tests {
                 "0.50 1.00 1.00 1/100 1",
                 "0.40 1.00 1.00 2/100 1",
             ]),
-            &mut clock,
-            &mut |duration| waited.push(duration),
+            &mut clocks,
         );
         assert_eq!(settled, Ok(()));
         assert_eq!(
             observations
                 .iter()
-                .map(|settled| settled.within)
+                .map(|settled| (settled.within, settled.monotonic_milliseconds))
                 .collect::<Vec<_>>(),
-            [false, true, true]
+            [(false, 0), (true, 10), (true, 20)]
         );
-        assert_eq!(waited.len(), 2);
+        assert_eq!(clocks.waited, 2);
+        // Four consecutive readings within the policy and spanning thirty:
+        // settled at the fourth, never earlier.
+        let (observations, spanned) = settle(
+            &SettlingPolicy {
+                consecutive: 4,
+                min_span_milliseconds: 30,
+                ..policy.clone()
+            },
+            &mut readings(&["0.10 1 1 1/1 1"; 4]),
+            &mut TestClocks::stepping(10),
+        );
+        assert_eq!(spanned, Ok(()));
+        assert_eq!(
+            observations
+                .last()
+                .map(|settled| settled.monotonic_milliseconds),
+            Some(30)
+        );
         let (observations, unsettled) = settle(
             &policy,
             &mut readings(&["3.00 1 1 1/1 1"; 4]),
-            &mut clock,
-            &mut |_| {},
+            &mut TestClocks::stepping(10),
         );
         assert_eq!(observations.len(), 4);
+        let found = refused("settling-unsettled", unsettled);
         assert!(
-            unsettled
-                .unwrap_err()
-                .contains("did not settle within 4 readings")
+            found.contains("did not settle within 4 readings"),
+            "{found}"
         );
+        let (_, early) = settle(
+            &policy,
+            &mut readings(&["0.10 1 1 1/1 1"; 4]),
+            &mut TestClocks::stepping(3),
+        );
+        let found = refused("settling-early", early);
+        assert!(found.contains("reading 1 came 3 ms after"), "{found}");
         let (_, unreadable) = settle(
             &policy,
             &mut readings(&["garbage"]),
-            &mut clock,
-            &mut |_| {},
+            &mut TestClocks::stepping(10),
         );
-        assert!(
-            unreadable
-                .unwrap_err()
-                .contains("not a /proc/loadavg reading")
-        );
-        // The receipt, kept whether ready or not.
-        let found = refused(
-            "readiness-unsettled",
-            readiness(
-                &scratch.0.join("unsettled.json"),
-                &control,
-                "c",
-                &policy,
-                &mut readings(&["3.00 1 1 1/1 1"; 4]),
-                &mut clock,
-                &mut |_| {},
+        let found = refused("settling-unreadable", unreadable);
+        assert!(found.contains("not a /proc/loadavg reading"), "{found}");
+        for (name, invalid, fault) in [
+            (
+                "one-reading",
+                SettlingPolicy {
+                    consecutive: 1,
+                    ..policy.clone()
+                },
+                "span no time",
             ),
-        );
-        assert!(found.contains("is not ready"), "{found}");
-        let kept: Readiness =
-            serde_json::from_slice(&std::fs::read(scratch.0.join("unsettled.json")).unwrap())
-                .unwrap();
-        assert!(!kept.ready && kept.observations.len() == 4 && kept.control.is_some());
-        let none = SettlingPolicy {
-            consecutive: 0,
-            ..policy.clone()
-        };
-        let found = refused(
-            "readiness-no-settling",
-            readiness(
-                &scratch.0.join("none.json"),
-                &control,
-                "c",
-                &none,
-                &mut readings(&[]),
-                &mut clock,
-                &mut |_| {},
+            (
+                "no-interval",
+                SettlingPolicy {
+                    interval_milliseconds: 0,
+                    ..policy.clone()
+                },
+                "no interval",
             ),
-        );
-        assert!(found.contains("establishes nothing"), "{found}");
-        let found = refused(
-            "readiness-control-unfinished",
-            readiness(
-                &scratch.0.join("unfinished.json"),
-                &scratch.0.join("absent"),
-                "c",
-                &policy,
+            (
+                "limit-short",
+                SettlingPolicy {
+                    limit: 1,
+                    ..policy.clone()
+                },
+                "below its consecutive",
+            ),
+            (
+                "no-span",
+                SettlingPolicy {
+                    min_span_milliseconds: 0,
+                    ..policy.clone()
+                },
+                "no minimum span",
+            ),
+            (
+                "span-unreachable",
+                SettlingPolicy {
+                    min_span_milliseconds: 11,
+                    ..policy.clone()
+                },
+                "cannot span its minimum span",
+            ),
+            (
+                "span-overflow",
+                SettlingPolicy {
+                    interval_milliseconds: u64::MAX,
+                    consecutive: 3,
+                    ..policy.clone()
+                },
+                "does not fit in u64",
+            ),
+            (
+                "unjustified",
+                SettlingPolicy {
+                    justification: " ".to_string(),
+                    ..policy.clone()
+                },
+                "no justification",
+            ),
+        ] {
+            let (observations, settled) = settle(
+                &invalid,
                 &mut readings(&["0.10 1 1 1/1 1"; 4]),
-                &mut clock,
-                &mut |_| {},
-            ),
+                &mut TestClocks::stepping(10),
+            );
+            assert!(observations.is_empty(), "{name}");
+            let found = refused(name, settled);
+            assert!(
+                found.contains("establishes nothing") && found.contains(fault),
+                "{name}: {found}"
+            );
+        }
+        settling_policy().validate().unwrap();
+        assert!(
+            !settling_policy()
+                .justification
+                .contains("no other workload"),
+            "the policy claims what it cannot establish"
         );
-        assert!(found.contains("no finished, passed control run"), "{found}");
-        let ready = readiness(
-            &scratch.0.join("ready.json"),
-            &control,
-            "c",
-            &policy,
-            &mut readings(&["0.10 1 1 1/1 1"; 4]),
-            &mut clock,
-            &mut |_| {},
-        )
-        .unwrap();
-        assert!(ready.ready && ready.observations.len() == 2);
+    }
+
+    /// A test's clocks: the system's wall clock, so its readings follow the
+    /// control runs and the lock they are ordered against, and a monotonic
+    /// clock that a wait advances by `step` milliseconds, every wait counted.
+    pub(crate) struct TestClocks {
+        step: u64,
+        monotonic: u64,
+        waited: usize,
+    }
+
+    impl TestClocks {
+        pub(crate) fn stepping(step: u64) -> Self {
+            Self {
+                step,
+                monotonic: 0,
+                waited: 0,
+            }
+        }
+    }
+
+    impl Clocks for TestClocks {
+        fn now(&mut self) -> Result<Instant, String> {
+            now()
+        }
+
+        fn monotonic_milliseconds(&mut self) -> Result<u64, String> {
+            Ok(self.monotonic)
+        }
+
+        fn wait(&mut self, _: std::time::Duration) {
+            self.monotonic += self.step;
+            self.waited += 1;
+        }
     }
 
     /// A tree, a Kani launcher standing in for `cargo kani` and the
@@ -6693,7 +7504,43 @@ mod tests {
             }
         }
 
-        /// The launcher of this fixture's runs: each harness given
+        /// Predictions of every harness of the fixture's census, each
+        /// calibrated on its own fixture artifact under `verifier` in
+        /// `environment`, `milliseconds` predicting each: a post-validation
+        /// fixture for runs of the whole census.
+        fn census_predictions(
+            &self,
+            environment: EstablishedEnvironment,
+            verifier: &serde_json::Value,
+            milliseconds: impl Fn(&str) -> u64,
+        ) -> Expectations {
+            Expectations {
+                sha256: crate::process::sha256_bytes(b"predictions").unwrap(),
+                bytes: b"predictions".to_vec(),
+                environment,
+                harnesses: self
+                    .declared()
+                    .into_iter()
+                    .map(|harness| {
+                        let expectation = Expectation {
+                            milliseconds: milliseconds(&harness),
+                            transfer: "t".to_string(),
+                            deadline_milliseconds: 1000,
+                            calibration_runs: BTreeSet::new(),
+                            artifact_sha256: crate::process::sha256_bytes(
+                                format!("{harness} instrumented binary").as_bytes(),
+                            )
+                            .unwrap(),
+                            verifier: verifier.clone(),
+                        };
+                        (harness, expectation)
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The launcher of this fixture's runs: each harness it is given,
+        /// or every harness of the census when it is given none, given
         /// `deadline` milliseconds, those of `failing` failing.
         fn launcher(
             &self,
@@ -6702,23 +7549,27 @@ mod tests {
             failing: &str,
             plant: &str,
         ) -> std::path::PathBuf {
+            let census = self.declared().into_iter().collect::<Vec<_>>().join(" ");
             let path = self.scratch.write(
                 &format!("bin/{name}"),
                 &format!(
                     r#"#!/bin/sh
 set -eu
 sleep 0.3
-harness= bounds=
+harnesses= bounds=
 while [ $# -gt 0 ]; do
   case "$1" in
-    --harness) harness=$2; shift ;;
+    --harness) harnesses="$harnesses $2"; shift ;;
     --loop-bounds-evidence) bounds=$2; shift ;;
   esac
   shift
 done
+[ -n "$harnesses" ] || harnesses="{census}"
 evidence=$(dirname "$bounds")
 {plant}
-d="$bounds/$harness"
+verified=0 failures=0
+for harness in $harnesses; do
+d="$bounds/$(printf %s "$harness" | sed 's/::/./g')"
 mkdir -p "$d"
 printf '%s instrumented binary' "$harness" > "$d/artifact.out"
 sha=$(sha256sum < "$d/artifact.out" | cut -d' ' -f1)
@@ -6731,13 +7582,16 @@ printf 'exit status: 0\n' > "$d/discovery.status"
 : > "$d/discovery.stderr"
 printf '[{{"program": "goto-instrument"}}, {{"loops": []}}]' > "$d/discovery.stdout"
 printf '{{"deadline_milliseconds": {deadline}, "elapsed": {{"seconds": 0, "nanoseconds": 5000000}}, "termination": {{"kind": "exited", "code": 0}}}}' > "$d/solver.execution.json"
-printf '[]' > "$bounds/function-scope.json"
 case "$harness" in
   {failing}) result=FAILED failed=1 ;;
   *) result=SUCCESSFUL failed=0 ;;
 esac
-printf 'Checking harness %s...\nSUMMARY:\n ** %s of 3 failed\n\nVERIFICATION:- %s\nManual Harness Summary:\nComplete - %s successfully verified harnesses, %s failures, 1 total.\n' "$harness" "$failed" "$result" $((1 - failed)) "$failed"
-exit "$failed"
+printf 'Checking harness %s...\nSUMMARY:\n ** %s of 3 failed\n\nVERIFICATION:- %s\n' "$harness" "$failed" "$result"
+verified=$((verified + 1 - failed)) failures=$((failures + failed))
+done
+printf '[]' > "$bounds/function-scope.json"
+printf 'Manual Harness Summary:\nComplete - %s successfully verified harnesses, %s failures, %s total.\n' "$verified" "$failures" $((verified + failures))
+exit $((failures > 0))
 "#
                 ),
             );
@@ -6764,27 +7618,148 @@ exit "$failed"
             (path, read)
         }
 
-        /// One run of `purpose` checking `harness` alone, logged at `log`.
+        /// A settling policy the fixture's readings meet at once: two
+        /// readings one millisecond apart.
+        fn settling() -> SettlingPolicy {
+            SettlingPolicy {
+                interval_milliseconds: 1,
+                consecutive: 2,
+                min_span_milliseconds: 1,
+                limit: 2,
+                max_running: u64::MAX,
+                max_load1_hundredths: u64::MAX,
+                justification: "test".to_string(),
+            }
+        }
+
+        /// The native control runs of commit `c` the fixture's calibrations
+        /// follow, the registry in its tree ([`ControlRuns`]), and the
+        /// commit recorded in its logs.
+        fn control_runs(&self) -> ControlRuns {
+            self.scratch.write("logs/commit.txt", "c\n");
+            ControlRuns::new(&self.root, &self.scratch.0)
+        }
+
+        /// The fixture's workload lock.
+        fn lock_path(&self) -> std::path::PathBuf {
+            self.scratch.0.join("gate-workload.lock")
+        }
+
+        /// The readiness of a calibration that follows the fixture's control
+        /// runs, made by the one maker ([`readiness`]) with the workload lock
+        /// held.
+        fn ready(&self) -> Ready {
+            let runs = self.control_runs();
+            let lock = WorkloadLock::acquire(&self.lock_path()).unwrap();
+            readiness(
+                &self.scratch.0.join("ready.json"),
+                &Prerequisites {
+                    root: &self.root,
+                    commit: "c",
+                    control_logs: &runs.logs(),
+                    lock: &lock,
+                },
+                &Self::settling(),
+                &mut || Ok("0.10 0.10 0.10 1/100 1".to_string()),
+                &mut TestClocks::stepping(1),
+            )
+            .unwrap()
+        }
+
+        /// A calibration of the fixture's plan at `plan` by `launcher`,
+        /// after `control_logs`, its records under the fixture's logs, its
+        /// last record written as in operation.
+        fn calibrate(
+            &self,
+            plan: &Path,
+            launcher: &Path,
+            control_logs: &[&Path],
+        ) -> Result<Schedule, String> {
+            self.calibrate_recording(
+                plan,
+                launcher,
+                control_logs,
+                &crate::process::create_evidence,
+            )
+        }
+
+        /// A calibration as [`Self::calibrate`] runs one, its last record
+        /// written by `record`.
+        fn calibrate_recording(
+            &self,
+            plan: &Path,
+            launcher: &Path,
+            control_logs: &[&Path],
+            record: &calibration::RecordWriter<'_>,
+        ) -> Result<Schedule, String> {
+            calibration(
+                CalibrationRequest {
+                    root: &self.root,
+                    plan,
+                    target_dir: &self.target,
+                    logs: &self.logs,
+                    launcher,
+                    control_logs,
+                    workload_lock: &self.lock_path(),
+                },
+                Runtime {
+                    workload: &self.workload,
+                    settling: &Self::settling(),
+                    sample: &mut || Ok("0.10 0.10 0.10 1/100 1".to_string()),
+                    clocks: &mut TestClocks::stepping(1),
+                    record,
+                },
+            )
+        }
+
+        /// The schedule the calibration kept (`calibration.json`).
+        fn schedule(&self) -> Schedule {
+            typed(
+                strict_json(&std::fs::read(self.logs.join("calibration.json")).unwrap()).unwrap(),
+                "calibration.json",
+            )
+            .unwrap()
+        }
+
+        /// One run of `purpose` checking `selection`, logged at `log`.
         fn run(
             &self,
             purpose: &RunPurpose,
-            harness: &str,
+            selection: &Selection,
             log: &str,
             launcher: &Path,
             workload: &crate::process::Workload,
         ) -> Result<(Termination, String), String> {
+            self.execute(purpose, selection, log, launcher, workload, &|_| {})
+        }
+
+        /// One run of `purpose` checking `selection`, logged at `log`: its
+        /// request validated, `between` given its reserved evidence before
+        /// the one invocation executes it.
+        fn execute(
+            &self,
+            purpose: &RunPurpose,
+            selection: &Selection,
+            log: &str,
+            launcher: &Path,
+            workload: &crate::process::Workload,
+            between: &dyn Fn(&Path),
+        ) -> Result<(Termination, String), String> {
             let declared = self.declared();
-            crate::process::run_kani_purpose(
-                &self.root,
-                &policy(&self.root, &declared).unwrap(),
+            let log = self.logs.join(log);
+            let run = crate::process::KaniRequest {
+                root: &self.root,
                 purpose,
-                &Selection::one(harness),
-                &declared,
-                &self.target,
-                &self.logs.join(log),
+                selection,
+                declared: &declared,
+                target_dir: &self.target,
                 launcher,
                 workload,
-            )
+                log: &log,
+            }
+            .validate()?;
+            between(run.evidence());
+            crate::process::execute_kani(run)
         }
 
         /// The JSON record `relative` of the run logged at `log`.
@@ -6801,7 +7776,7 @@ exit "$failed"
         }
 
         /// The manifest of the run logged at `log`.
-        fn manifest(&self, log: &str) -> Manifest {
+        fn manifest(&self, log: &str) -> ManifestDocument {
             typed(self.record(log, "manifest.json"), "manifest.json").unwrap()
         }
     }
@@ -6822,72 +7797,63 @@ exit "$failed"
         let fixture = KaniFixture::new("calibration");
         let launcher = fixture.launcher("cargo-kani", 60000, "y", "");
         let (plan_path, _) = fixture.plan(60000);
-        fixture.scratch.write("logs/commit.txt", "c\n");
-        fixture.scratch.write("controls/identity.txt", "identity\n");
-        fixture.scratch.write(
-            "controls/verdict.json",
-            &serde_json::to_string(&ControlVerdict {
-                version: RUNTIME_VERSION,
-                channel: "nightly".to_string(),
-                commit: "c".to_string(),
-                identity: "identity".to_string(),
-                controls: 9,
-                faults: Vec::new(),
-            })
-            .unwrap(),
+        let runs = fixture.control_runs();
+        let schedule = fixture
+            .calibrate(&plan_path, &launcher, &runs.logs())
+            .unwrap();
+        assert_eq!(
+            schedule,
+            fixture.schedule(),
+            "the kept schedule is not the one returned"
         );
-        let settling = SettlingPolicy {
-            interval_milliseconds: 1,
-            consecutive: 1,
-            limit: 1,
-            max_running: u64::MAX,
-            max_load1_hundredths: u64::MAX,
-            justification: "test".to_string(),
-        };
-        let schedule = calibration(
-            &fixture.root,
-            &plan_path,
-            &fixture.target,
-            &fixture.logs,
-            &launcher,
-            &fixture.scratch.0.join("controls"),
-            &fixture.workload,
-            &settling,
-            &mut || Ok("0.10 0.10 0.10 1/100 1".to_string()),
-            &mut |_| {},
-        )
-        .unwrap();
-        let pass = Outcome::Pass.name().to_string();
-        let failed = Outcome::Failed.name().to_string();
-        let ran: Vec<(String, usize, Observed)> = schedule
+        let ran: Vec<(&str, usize, &Observed)> = schedule
             .executions
             .iter()
-            .map(|run| (run.harness.clone(), run.pass, run.observed.clone()))
+            .map(|run| (run.harness.as_str(), run.pass, &run.observed))
             .collect();
-        assert_eq!(
-            ran,
-            [
+        assert_eq!(ran.len(), 2 * SAMPLES, "{ran:#?}");
+        let mut sampled = BTreeSet::new();
+        for at in [0, 2, 4] {
+            match ran[at] {
                 (
-                    "x".to_string(),
-                    1,
-                    Observed::Outcome {
-                        outcome: pass.clone()
-                    }
-                ),
-                ("y".to_string(), 1, Observed::Outcome { outcome: failed }),
-                (
-                    "x".to_string(),
-                    2,
-                    Observed::Outcome {
-                        outcome: pass.clone()
-                    }
-                ),
-                ("x".to_string(), 3, Observed::Outcome { outcome: pass }),
-            ],
-            "a failed first observation was repeated, or a verified one was not"
+                    "x",
+                    pass,
+                    Observed::Sample {
+                        run,
+                        manifest_sha256,
+                    },
+                ) if pass == at / 2 + 1 => {
+                    assert!(
+                        sampled.insert((run, manifest_sha256)),
+                        "a sample reused: {ran:#?}"
+                    );
+                }
+                _ => panic!("a verified harness was not sampled at every pass: {ran:#?}"),
+            }
+        }
+        assert!(
+            matches!(ran[1], ("y", 1, Observed::Ineligible { reason })
+                if reason.contains("a calibration sample is one verified execution of y alone")),
+            "a failed execution was a sample: {ran:#?}"
         );
+        for at in [3, 5] {
+            assert!(
+                matches!(ran[at], ("y", _, Observed::Withheld { reason }) if reason.contains("pass 1 of y")),
+                "a failed first observation was repeated, or its repetition went unrecorded: \
+                 {ran:#?}"
+            );
+        }
+        assert_eq!(
+            schedule.incomplete,
+            BTreeSet::from(["y".to_string()]),
+            "an incomplete calibration was reported complete"
+        );
+        assert!(schedule.faults.is_empty(), "{:?}", schedule.faults);
+        assert!(!schedule.complete());
+        let journal = std::fs::read_to_string(fixture.logs.join("calibration.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 2 * SAMPLES, "{journal}");
         let logs = ["calibration/x.1.log", "calibration/y.1.log"];
-        let identities: Vec<RunIdentity> = logs
+        let identities: Vec<RunIdentityRecord> = logs
             .iter()
             .map(|log| typed(fixture.record(log, "run.json"), "run.json").unwrap())
             .collect();
@@ -6895,6 +7861,7 @@ exit "$failed"
             identities[0].id, identities[1].id,
             "two runs shared one identity"
         );
+        let readiness = std::fs::read(fixture.logs.join(READINESS_RECORD)).unwrap();
         for (log, identity) in logs.iter().zip(&identities) {
             let launch: Launch = typed(fixture.record(log, "launch.json"), "launch.json").unwrap();
             assert!(
@@ -6902,9 +7869,15 @@ exit "$failed"
                 "{log}: {launch:?}"
             );
             assert!(
-                launch.environment.known(),
+                launch.environment.establish().is_ok(),
                 "{log}: {:#?}",
                 launch.environment
+            );
+            let evidence = fixture.logs.join(log).with_extension("evidence");
+            assert_eq!(
+                std::fs::read(evidence.join(READINESS_RECORD)).unwrap(),
+                readiness,
+                "{log}: a calibration run did not keep its readiness"
             );
             let kept = std::fs::read(
                 fixture
@@ -6927,17 +7900,353 @@ exit "$failed"
         assert!(fixture.logs.join("calibration.json").is_file());
         // A kept document changed afterwards fails its manifest.
         let evidence = fixture.logs.join("calibration/x.1.evidence");
-        let manifest = fixture.manifest("calibration/x.1.log");
+        let manifest = read_manifest(&evidence, Some(&identities[0].id)).unwrap();
         std::fs::write(evidence.join("plan.json"), b"{}").unwrap();
-        let records = Artifacts::Adopted {
-            evidence: &evidence,
-            files: &manifest.files,
-        };
+        let records = manifest.records(&evidence, Binaries::Held);
         let found = refused(
             "document-mutated",
             records.read(&evidence.join("plan.json")),
         );
         assert!(found.contains("the manifest records"), "{found}");
+    }
+
+    /// A Kani run's request is validated, and every input it binds read,
+    /// before anything of the run is reserved: a selection of no harness, a
+    /// harness no `#[kani::proof]` declares, a launcher that no longer
+    /// resolves to itself, an empty census, a calibration of more than one
+    /// harness, a qualification of less than the whole census, a harness
+    /// its purpose gives no deadline, and a tree whose policy cannot be read
+    /// are each refused with nothing reserved; a valid request reserves its
+    /// evidence, and its validation binds the tree's policy and source state.
+    #[test]
+    fn a_kani_request_is_validated_before_anything_is_reserved() {
+        let fixture = KaniFixture::new("request");
+        let launcher = fixture.launcher("cargo-kani", 60000, "none", "");
+        let (_, plan) = fixture.plan(60000);
+        let ready = fixture.ready();
+        let purpose = RunPurpose::Calibration {
+            plan,
+            ready: ready.clone(),
+        };
+        let only_x = RunPurpose::Calibration {
+            plan: plan_of(
+                br#"{"version": 1, "purpose": "calibration", "harnesses": {
+                    "x": {"limit_milliseconds": 60000, "reason": "fixture"}}}"#,
+                &fixture.declared(),
+            )
+            .unwrap(),
+            ready,
+        };
+        let qualification = RunPurpose::Qualification(fixture.census_predictions(
+            fixture_environment().establish().unwrap(),
+            &fixture_verifier(),
+            |_| 1000,
+        ));
+        let declared = fixture.declared();
+        let none = BTreeSet::new();
+        let validated = |purpose: &RunPurpose,
+                         selection: &Selection,
+                         declared: &BTreeSet<String>,
+                         launcher: &Path,
+                         log: &str| {
+            crate::process::KaniRequest {
+                root: &fixture.root,
+                purpose,
+                selection,
+                declared,
+                target_dir: &fixture.target,
+                launcher,
+                workload: &fixture.workload,
+                log: &fixture.logs.join(log),
+            }
+            .validate()
+            .map(|_| ())
+        };
+        let linked = fixture.scratch.0.join("bin/linked-kani");
+        std::os::unix::fs::symlink(&launcher, &linked).unwrap();
+        let both = Selection::Only(declared.clone());
+        for (name, purpose, selection, census, launcher, fault) in [
+            (
+                "selects-nothing",
+                &purpose,
+                Selection::Only(BTreeSet::new()),
+                &declared,
+                launcher.as_path(),
+                "selects no harness",
+            ),
+            (
+                "undeclared",
+                &purpose,
+                Selection::one("z"),
+                &declared,
+                launcher.as_path(),
+                "harness z: declared by no #[kani::proof]",
+            ),
+            (
+                "launcher-moved",
+                &purpose,
+                Selection::one("x"),
+                &declared,
+                linked.as_path(),
+                "now resolves to",
+            ),
+            (
+                "census-empty",
+                &purpose,
+                Selection::All,
+                &none,
+                launcher.as_path(),
+                "declares no #[kani::proof] harness",
+            ),
+            (
+                "calibration-two",
+                &purpose,
+                both.clone(),
+                &declared,
+                launcher.as_path(),
+                "a calibration run checks exactly one harness",
+            ),
+            (
+                "qualification-partial",
+                &qualification,
+                Selection::one("x"),
+                &declared,
+                launcher.as_path(),
+                "a qualification checks the whole census",
+            ),
+            (
+                "unplanned",
+                &only_x,
+                Selection::one("y"),
+                &declared,
+                launcher.as_path(),
+                "the run's purpose gives no deadline: [\"y\"]",
+            ),
+        ] {
+            let found = refused(name, validated(purpose, &selection, census, launcher, name));
+            assert!(found.contains(fault), "{name}: {found}");
+        }
+        let policy_path = fixture.root.join(POLICY);
+        let policy_text = std::fs::read(&policy_path).unwrap();
+        std::fs::remove_file(&policy_path).unwrap();
+        let found = refused(
+            "policy-unreadable",
+            validated(
+                &purpose,
+                &Selection::one("x"),
+                &declared,
+                &launcher,
+                "policy",
+            ),
+        );
+        std::fs::write(&policy_path, &policy_text).unwrap();
+        assert!(found.contains("loop-bounds.json"), "{found}");
+        let reserved = || -> Vec<String> {
+            let mut found: Vec<String> = std::fs::read_dir(&fixture.logs)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".evidence"))
+                .collect();
+            found.sort();
+            found
+        };
+        assert!(
+            reserved().is_empty(),
+            "a refused request reserved {:?}",
+            reserved()
+        );
+        validated(
+            &purpose,
+            &Selection::one("x"),
+            &declared,
+            &launcher,
+            "valid.log",
+        )
+        .unwrap();
+        validated(
+            &qualification,
+            &Selection::All,
+            &declared,
+            &launcher,
+            "census.log",
+        )
+        .unwrap();
+        assert_eq!(reserved(), ["census.evidence", "valid.evidence"]);
+        let found = refused(
+            "reserved-twice",
+            validated(
+                &purpose,
+                &Selection::one("x"),
+                &declared,
+                &launcher,
+                "valid.log",
+            ),
+        );
+        assert!(found.contains("valid.evidence: File exists"), "{found}");
+        // What validation bound is what the run records: the policy file's
+        // bytes as read, and the source state its per-path digests are of.
+        fixture
+            .execute(
+                &purpose,
+                &Selection::one("x"),
+                "bound.log",
+                &launcher,
+                &fixture.workload,
+                &|_| std::fs::write(fixture.root.join("src/other.rs"), "").unwrap(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        std::fs::remove_file(fixture.root.join("src/other.rs")).unwrap();
+        let identity: RunIdentityRecord =
+            typed(fixture.record("bound.log", "run.json"), "run.json").unwrap();
+        let sources: BTreeMap<String, String> =
+            typed(fixture.record("bound.log", SOURCES_RECORD), SOURCES_RECORD).unwrap();
+        assert_eq!(identity.tree_sha256, tree_digest_of(&sources).unwrap());
+        assert!(!sources.contains_key("src/other.rs"));
+        assert_eq!(
+            std::fs::read(fixture.logs.join("bound.evidence").join(LOOP_POLICY_RECORD)).unwrap(),
+            policy_text
+        );
+        assert_eq!(
+            identity.loop_policy_sha256,
+            crate::process::sha256_bytes(&policy_text).unwrap()
+        );
+    }
+
+    /// A calibration holds the checkout's workload lock until its last
+    /// record is written: while `calibration.json` is being written another
+    /// acquisition is refused, and once the calibration returned one
+    /// succeeds.
+    #[test]
+    fn a_calibration_holds_the_workload_lock_through_its_last_record() {
+        let fixture = KaniFixture::new("lock-through-last-record");
+        let launcher = fixture.launcher("cargo-kani", 60000, "none", "");
+        let (plan_path, _) = fixture.plan(60000);
+        let runs = fixture.control_runs();
+        let lock_path = fixture.lock_path();
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let record = |path: &Path, bytes: &[u8]| {
+            attempts
+                .borrow_mut()
+                .push(WorkloadLock::acquire(&lock_path).map(|_| ()));
+            crate::process::create_evidence(path, bytes)
+        };
+        let schedule = fixture
+            .calibrate_recording(&plan_path, &launcher, &runs.logs(), &record)
+            .unwrap();
+        assert!(schedule.complete(), "{schedule:#?}");
+        let attempts = attempts.into_inner();
+        assert!(
+            matches!(attempts.as_slice(), [Err(fault)] if fault.contains("another gate workload holds it")),
+            "lock-released-early: another workload acquired the lock while the calibration wrote \
+             its last record: {attempts:?}"
+        );
+        WorkloadLock::acquire(&lock_path).unwrap();
+    }
+
+    /// A calibration's schedule is its last record whatever failed: its
+    /// readiness refused (a control run missing, another gate workload
+    /// holding the lock, or the receipt unpreservable beside a refused
+    /// prerequisite, both faults kept), or its journal not reservable, each
+    /// records every planned execution as never run, keeps every fault,
+    /// writes `calibration.json`, and reports the calibration failed;
+    /// nothing runs.
+    #[test]
+    fn a_failed_calibration_still_records_its_schedule() {
+        let planned = |schedule: &Schedule| {
+            schedule
+                .executions
+                .iter()
+                .map(|run| (run.harness.clone(), run.pass))
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<(String, usize)> = (1..=SAMPLES)
+            .flat_map(|pass| [("x".to_string(), pass), ("y".to_string(), pass)])
+            .collect();
+        type Plant = fn(&KaniFixture, &ControlRuns) -> Option<std::fs::File>;
+        let cases: [(&str, Plant, &[&str], bool); 4] = [
+            (
+                "control-run-missing",
+                |_, runs| {
+                    std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
+                    None
+                },
+                &["the control run has not finished"],
+                false,
+            ),
+            (
+                "workload-competing",
+                |fixture, _| {
+                    let held = std::fs::File::create(fixture.lock_path()).unwrap();
+                    held.try_lock().unwrap();
+                    Some(held)
+                },
+                &["another gate workload holds it"],
+                false,
+            ),
+            (
+                // The prerequisite refused and its receipt unpreservable:
+                // neither fault hides the other.
+                "readiness-unrecordable",
+                |fixture, runs| {
+                    std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
+                    std::fs::write(fixture.logs.join(READINESS_RECORD), "another run's\n").unwrap();
+                    None
+                },
+                &[
+                    "the control run has not finished",
+                    "the readiness was not preserved either",
+                    "readiness.json: File exists",
+                ],
+                false,
+            ),
+            (
+                "journal-unreservable",
+                |fixture, _| {
+                    std::fs::write(fixture.logs.join("calibration.jsonl"), "another run's\n")
+                        .unwrap();
+                    None
+                },
+                &["calibration.jsonl: File exists"],
+                true,
+            ),
+        ];
+        for (name, plant, faults, ready) in cases {
+            let fixture = KaniFixture::new(&format!("failed-{name}"));
+            let launcher = fixture.launcher("cargo-kani", 60000, "none", "exit 99");
+            let (plan_path, _) = fixture.plan(60000);
+            let runs = fixture.control_runs();
+            let _held = plant(&fixture, &runs);
+            let found = refused(name, fixture.calibrate(&plan_path, &launcher, &runs.logs()));
+            let kept = fixture.schedule();
+            for fault in faults {
+                assert!(found.contains(fault), "{name}: {fault}: {found}");
+                assert!(
+                    kept.faults.iter().any(|recorded| recorded.contains(fault)),
+                    "{name}: {fault}: {kept:#?}"
+                );
+            }
+            assert_eq!(planned(&kept), expected, "{name}: {kept:#?}");
+            assert!(
+                kept.executions
+                    .iter()
+                    .all(|run| matches!(run.observed, Observed::NotRun { .. })),
+                "{name}: an execution ran: {kept:#?}"
+            );
+            assert_eq!(kept.readiness_sha256.is_some(), ready, "{name}");
+            assert!(kept.plan_sha256.is_some() && !kept.complete(), "{name}");
+            assert!(
+                !fixture.logs.join("calibration").exists(),
+                "{name}: a run was scheduled"
+            );
+            if name == "journal-unreservable" {
+                assert_eq!(
+                    std::fs::read_to_string(fixture.logs.join("calibration.jsonl")).unwrap(),
+                    "another run's\n",
+                    "another run's journal was written to"
+                );
+            }
+        }
     }
 
     /// Every failure after a run's evidence directory exists leaves its
@@ -6951,12 +8260,17 @@ exit "$failed"
         let fixture = KaniFixture::new("finalization");
         let launcher = fixture.launcher("cargo-kani", 60000, "none", "");
         let (_, plan) = fixture.plan(60000);
-        let purpose = RunPurpose::Calibration(plan);
+        let ready = fixture.ready();
+        let purpose = RunPurpose::Calibration {
+            plan,
+            ready: ready.clone(),
+        };
         let judged = |log: &str| fixture.record(log, "judgement.json");
+        let x = Selection::one("x");
         // An accepted calibration, whose environment the predictions below
         // are of.
         fixture
-            .run(&purpose, "x", "accepted.log", &launcher, &fixture.workload)
+            .run(&purpose, &x, "accepted.log", &launcher, &fixture.workload)
             .unwrap();
         assert_eq!(
             judged("accepted.log"),
@@ -6965,28 +8279,21 @@ exit "$failed"
         let launch: Launch =
             typed(fixture.record("accepted.log", "launch.json"), "launch.json").unwrap();
         let verifier = fixture.record("accepted.log", "execution.json")["verifier"].clone();
-        // Before the identity: the tree's policy gone.
-        let policy_path = fixture.root.join(POLICY);
-        let policy_text = std::fs::read(&policy_path).unwrap();
         let declared = fixture.declared();
-        let read_policy = policy(&fixture.root, &declared).unwrap();
-        std::fs::remove_file(&policy_path).unwrap();
+        // Before the identity: the run's own plan record unwritable once
+        // its evidence was reserved.
         let found = refused(
             "before-identity",
-            crate::process::run_kani_purpose(
-                &fixture.root,
-                &read_policy,
+            fixture.execute(
                 &purpose,
-                &Selection::one("x"),
-                &declared,
-                &fixture.target,
-                &fixture.logs.join("identity.log"),
+                &x,
+                "identity.log",
                 &launcher,
                 &fixture.workload,
+                &|evidence| std::fs::create_dir(evidence.join(PLAN_RECORD)).unwrap(),
             ),
         );
-        std::fs::write(&policy_path, policy_text).unwrap();
-        assert!(found.contains("loop-bounds.json"), "{found}");
+        assert!(found.contains(PLAN_RECORD), "{found}");
         let manifest = fixture.manifest("identity.log");
         assert_eq!(judged("identity.log")["status"], "rejected");
         assert_eq!(
@@ -6995,36 +8302,55 @@ exit "$failed"
         );
         assert!(!manifest.complete);
         assert!(
-            manifest.files.contains_key("plan.json") && !manifest.files.contains_key("run.json")
+            manifest.files.contains_key(LAUNCHER_RECORD)
+                && !manifest.files.contains_key("run.json")
         );
-        // Before the log: a harness the plan gives no limit.
-        let unplanned = RunPurpose::Calibration(Plan {
-            deadlines: BTreeMap::from([(
-                "x".to_string(),
-                Deadline {
-                    milliseconds: 1,
-                    reason: "r".to_string(),
-                },
-            )]),
-            ..match &purpose {
-                RunPurpose::Calibration(plan) => plan.clone(),
-                _ => unreachable!(),
-            }
-        });
+        // Before the log: the run's invocation record unwritable.
         let found = refused(
             "before-log",
-            fixture.run(&unplanned, "y", "log.log", &launcher, &fixture.workload),
+            fixture.execute(
+                &purpose,
+                &x,
+                "log.log",
+                &launcher,
+                &fixture.workload,
+                &|evidence| std::fs::create_dir(evidence.join(INVOCATION_RECORD)).unwrap(),
+            ),
         );
-        assert!(found.contains("gives no deadline"), "{found}");
+        assert!(found.contains(INVOCATION_RECORD), "{found}");
         let manifest = fixture.manifest("log.log");
         assert!(manifest.run.is_some() && manifest.log == LogRecord::Missing && !manifest.complete);
         assert!(!fixture.logs.join("log.log").exists());
+        // A harness the plan gives no limit is refused before anything of
+        // the run is reserved.
+        let only_x = plan_of(
+            br#"{"version": 1, "purpose": "calibration", "harnesses": {
+                "x": {"limit_milliseconds": 60000, "reason": "fixture"}}}"#,
+            &declared,
+        )
+        .unwrap();
+        let unplanned = RunPurpose::Calibration {
+            plan: only_x,
+            ready,
+        };
+        let found = refused(
+            "unplanned",
+            fixture.run(
+                &unplanned,
+                &Selection::one("y"),
+                "unplanned.log",
+                &launcher,
+                &fixture.workload,
+            ),
+        );
+        assert!(found.contains("gives no deadline"), "{found}");
+        assert!(!fixture.logs.join("unplanned.evidence").exists());
         // At the spawn: no confinement to launch it.
         let found = refused(
             "at-spawn",
             fixture.run(
                 &purpose,
-                "x",
+                &x,
                 "spawn.log",
                 &launcher,
                 &crate::process::Workload::at("/nonexistent/confine"),
@@ -7049,7 +8375,7 @@ exit "$failed"
             "at-reconciliation",
             fixture.run(
                 &purpose,
-                "x",
+                &x,
                 "reconcile.log",
                 &unrecorded,
                 &fixture.workload,
@@ -7066,31 +8392,20 @@ exit "$failed"
                 .files
                 .contains_key("launch.json")
         );
-        // At the predictions: an execution over its prediction keeps its
-        // reconciled execution, its rejection and its manifest.
-        let artifact = crate::process::sha256_bytes(b"x instrumented binary").unwrap();
-        let predicted = Expectations {
-            sha256: crate::process::sha256_bytes(b"predictions").unwrap(),
-            bytes: b"predictions".to_vec(),
-            environment: launch.environment.clone(),
-            harnesses: BTreeMap::from([(
-                "x".to_string(),
-                Expectation {
-                    milliseconds: 0,
-                    transfer: "t".to_string(),
-                    deadline_milliseconds: 1000,
-                    calibration_runs: BTreeSet::new(),
-                    artifact_sha256: artifact,
-                    verifier,
-                },
-            )]),
-        };
+        // At the predictions: a qualification of the whole census whose `x`
+        // ran over its prediction keeps its reconciled execution, its
+        // rejection and its manifest.
+        let predicted = fixture.census_predictions(
+            launch.environment.establish().unwrap(),
+            &verifier,
+            |harness| if harness == "x" { 0 } else { 1000 },
+        );
         let qualifying = fixture.launcher("qualifying", 1000, "none", "");
         let found = refused(
             "over-prediction",
             fixture.run(
                 &RunPurpose::Qualification(predicted),
-                "x",
+                &Selection::All,
                 "overrun.log",
                 &qualifying,
                 &fixture.workload,
@@ -7114,13 +8429,7 @@ exit "$failed"
         );
         let found = refused(
             "judgement-unwritable",
-            fixture.run(
-                &purpose,
-                "x",
-                "judgement.log",
-                &judgement,
-                &fixture.workload,
-            ),
+            fixture.run(&purpose, &x, "judgement.log", &judgement, &fixture.workload),
         );
         assert!(found.contains("judgement.json"), "{found}");
         assert!(
@@ -7138,7 +8447,7 @@ exit "$failed"
         );
         let found = refused(
             "manifest-unwritable",
-            fixture.run(&purpose, "x", "manifest.log", &manifest, &fixture.workload),
+            fixture.run(&purpose, &x, "manifest.log", &manifest, &fixture.workload),
         );
         assert!(
             found.contains("the run's manifest was not written"),
@@ -7154,31 +8463,39 @@ exit "$failed"
         let moving = fixture.launcher("moving", 60000, "none", "printf '// x\\n' >> src/lib.rs");
         let found = refused(
             "source-moved",
-            fixture.run(&purpose, "x", "moved.log", &moving, &fixture.workload),
+            fixture.run(&purpose, &x, "moved.log", &moving, &fixture.workload),
         );
         std::fs::write(&library, source).unwrap();
         assert!(found.contains("the run is of no one source"), "{found}");
         assert_eq!(judged("moved.log")["status"], "rejected");
-        // None of the failed runs is a sample: adoption refuses each that
-        // has an identity, and a sample is never fitted from one.
+        // The accepted calibration is a sample by the one authority; none of
+        // the failed runs is one, and adoption refuses each outright.
+        ran_sample(&fixture.logs.join("accepted.log"), &declared).unwrap();
         for log in [
             "log.log",
             "spawn.log",
             "reconcile.log",
             "overrun.log",
             "judgement.log",
+            "manifest.log",
+            "moved.log",
         ] {
+            let sample = ran_sample(&fixture.logs.join(log), &declared);
+            assert!(
+                sample.is_err(),
+                "{log}: a failed run is a sample: {sample:?}"
+            );
             let evidence = fixture.logs.join(log).with_extension("evidence");
             let adopted = adopt(&evidence, &fixture.root);
             assert!(
-                adopted.is_err(),
+                matches!(adopted, Err(Adoption::Refused(_))),
                 "{log}: a failed run was adopted: {adopted:?}"
             );
         }
-        let found = refused(
-            "before-identity-adopted",
-            adopt(&fixture.logs.join("identity.evidence"), &fixture.root),
+        let adopted = adopt(&fixture.logs.join("identity.evidence"), &fixture.root);
+        assert!(
+            matches!(&adopted, Err(Adoption::Refused(why)) if why.contains("run.json")),
+            "before-identity-adopted: {adopted:?}"
         );
-        assert!(found.contains("run.json"), "{found}");
     }
 }

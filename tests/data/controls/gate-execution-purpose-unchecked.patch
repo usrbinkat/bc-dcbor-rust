@@ -1,0 +1,11 @@
+--- tests/gate/src/process.rs
++++ tests/gate/src/process.rs
+@@ -366,7 +366,7 @@
+                 ));
+             }
+             (RunPurpose::Calibration { .. }, Selection::Only(harnesses))
+-                if harnesses.len() == 1 => {}
++                if !harnesses.is_empty() => {}
+             (RunPurpose::Calibration { .. }, selection) => {
+                 return Err(format!(
+                     "a calibration run checks exactly one harness, the run selects {selection:?}"

@@ -2705,6 +2705,21 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "test-only drain nesting instrumentation; the shipped drain has no comparison",
     ),
     (
+        "crate::bounded::policy::record",
+        "claim",
+        "a recording counter's claim limit; indexes derived from it are bounds-checked slice indexes, no policy",
+    ),
+    (
+        "crate::bounded::policy::record",
+        "raise",
+        "a monotone verified-prefix counter; read back only through bounds-checked slice ranges, no policy",
+    ),
+    (
+        "crate::bounded::policy::record",
+        "boundary",
+        "clamps the verified prefix to the claimed count before a checked `get` range, no policy",
+    ),
+    (
         "crate::bounded",
         "write_extent",
         "const evaluation: a write extent checked at compile time (E0080)",

@@ -1,11 +1,11 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -504,7 +504,7 @@
-         // digest of; then its identity before anything launches: what it is
-         // for, that revision, and the tree's source state it ran.
-         let (name, document) = purpose.document();
--        create_evidence(&evidence.join(name), document)?;
-+        let _ = (name, document);
-         let identity = crate::proofs::run_identity(root, purpose)?;
-         identified = Some(identity.id.clone());
-         let encoded = serde_json::to_vec_pretty(&identity)
+@@ -591,7 +591,7 @@
+         // anything launches: what it is for, that revision, and the tree's
+         // source state it ran.
+         for (name, document) in purpose.documents() {
+-            create_evidence(&evidence.join(name), document)?;
++            let _ = (name, document);
+         }
+         let identity = crate::proofs::run_identity(purpose, &run.tree_sha256, &run.policy_sha256)?;
+         identified = Some(identity.id().to_string());

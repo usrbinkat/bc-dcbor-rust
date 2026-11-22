@@ -1,0 +1,13 @@
+--- tests/gate/src/proofs/eligibility.rs
++++ tests/gate/src/proofs/eligibility.rs
+@@ -447,9 +447,7 @@
+     let invocation: Invocation = typed(json(INVOCATION_RECORD)?, INVOCATION_RECORD)?;
+     let structured = match invocation.arguments.as_slice() {
+         [.., target, _, policy_path, _, bounds]
+-            if invocation.arguments
+-                == invocation_arguments(&Selection::one(&harness), target, policy_path, bounds)
+-                && target.starts_with('/')
++            if target.starts_with('/')
+                 && policy_path
+                     .strip_suffix("/loop-bounds.json")
+                     .is_some_and(|directory| {

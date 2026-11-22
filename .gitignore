@@ -102,6 +102,10 @@ test_overhaul.md
 # Python bytecode from the recorder and mutation-evidence controls.
 __pycache__/
 
+# The lock adoptions into the checkout serialize on (tests/gate
+# `proofs::adoption::ADOPTION_LOCK`).
+tests/data/proofs/calibration/.adoption.lock
+
 # cargo-mutants output.
 mutants.out/
 mutants.out.old/

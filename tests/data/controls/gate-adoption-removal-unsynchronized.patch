@@ -1,0 +1,17 @@
+--- tests/gate/src/proofs/adoption.rs
++++ tests/gate/src/proofs/adoption.rs
+@@ -238,13 +238,7 @@
+     match written {
+         Ok(()) => Ok(()),
+         Err(error) => Err(match std::fs::remove_file(&path) {
+-            Ok(()) => match sync(destination) {
+-                Ok(()) => error,
+-                Err(removal) => format!(
+-                    "{error}; {}: the receipt removal was not synchronized: {removal}",
+-                    destination.display()
+-                ),
+-            },
++            Ok(()) => error,
+             Err(removal) => format!(
+                 "{error}; {}: the receipt whose durability was not established could not be \
+                  removed: {removal}",

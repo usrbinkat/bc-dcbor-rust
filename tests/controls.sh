@@ -26,24 +26,36 @@
 # builds and checks it (`control run`, tests/gate/src/controls.rs) as it
 # does a native one.
 #
-# Usage: tests/controls.sh {nightly|stable|kani}
+# The runners named after the channel scope the run to their controls
+# (`gate control list`, `controls::selected`), every runner when none is
+# named: a calibration's readiness requires the native controls of the
+# nightly and the stable channel exactly (tests/gate `proofs::REQUIRED_CONTROLS`),
+# each run's final record naming its channel, its runners and every selected
+# control's result (`gate control evidence`, `verdict.json`). The run holds
+# the checkout's workload lock (target/gate-workload.lock) exclusively from
+# before its first control to its verdict: no other control run, proof run
+# or calibration of the checkout runs beside it.
+#
+# Usage: tests/controls.sh {nightly|stable|kani} [RUNNER...]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
 source tests/gate-common.sh
 own_process_group "$@"
 : "${DCBOR_CONFIGURATION:?run in the configured development shell}"
-for tool in cargo rustc patch time sha256sum git tar find xargs; do
+for tool in cargo rustc patch time sha256sum git tar find xargs flock; do
 	if ! command -v "$tool" >/dev/null; then
 		printf 'controls prerequisite missing from PATH: %s. Re-enter the project development shell.\n' "$tool" >&2
 		exit 127
 	fi
 done
-if (($# != 1)); then
-	echo "usage: tests/controls.sh {nightly|stable|kani}" >&2
+if (($# < 1)); then
+	echo "usage: tests/controls.sh {nightly|stable|kani} [RUNNER...]" >&2
 	exit 2
 fi
 channel="$1"
+shift
+requested=("$@")
 release="$(rustc -V)" || exit 2
 case "$channel" in
 nightly | stable)
@@ -63,12 +75,22 @@ kani)
 	fi
 	;;
 *)
-	echo "usage: tests/controls.sh {nightly|stable|kani}" >&2
+	echo "usage: tests/controls.sh {nightly|stable|kani} [RUNNER...]" >&2
 	exit 2
 	;;
 esac
 gate_prepare || exit 2
 miri_models || exit 2
+runners=("${requested[@]}")
+if ((${#runners[@]} == 0)); then
+	runners=(native kani "${MIRI_MODELS[@]}")
+fi
+mkdir -p "$PWD/target" || exit 2
+exec 8>"$PWD/target/gate-workload.lock" || exit 2
+if ! flock --nonblock 8; then
+	echo "another gate workload holds target/gate-workload.lock; nothing was run" >&2
+	exit 2
+fi
 logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls log directory}/controls-$channel}"
 # A run's evidence is created once: an existing log directory is another
 # run's, never overwritten. Its parents are created as needed; the directory
@@ -76,7 +98,7 @@ logs="${CONTROL_LOG_DIR:-${TMPDIR:?required, or CONTROL_LOG_DIR: the controls lo
 mkdir -p "$(dirname "$logs")" || exit 2
 mkdir "$logs" || exit 2
 
-listed="$(gate control list "$PWD" "$channel" native kani "${MIRI_MODELS[@]}")" || {
+listed="$(gate control list "$PWD" "$channel" "${runners[@]}")" || {
 	event "FAIL the controls' table is refused; nothing was run"
 	exit 1
 }
@@ -110,6 +132,7 @@ if [[ "$channel" == kani ]]; then
 fi
 {
 	printf 'channel\t%s\n' "$channel"
+	printf 'runner\t%s\n' "${runners[@]}"
 	if [[ -n "$kani_identity" ]]; then
 		printf '%s\n' "$kani_identity"
 	fi
@@ -251,10 +274,10 @@ if ! still_at_commit; then
 	event "FAIL the checkout moved off $commit during the run"
 	status=1
 fi
-# The verdict over every control of one test of this channel, native or under
-# a Miri model: each seen red, then green again, in a copy restored to its
-# digest.
-if ! gate control evidence "$PWD" "$logs" "$channel"; then
+# The verdict over every selected control of one test of this channel and
+# these runners: each seen red, then green again, in a copy restored to its
+# digest; and the run's final record (`verdict.json`).
+if ! gate control evidence "$PWD" "$logs" "$channel" "${runners[@]}"; then
 	status=1
 fi
 event "DONE ${#controls[@]} controls of one test of $commit under $channel; status $status"

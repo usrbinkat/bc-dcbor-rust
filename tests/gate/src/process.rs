@@ -280,65 +280,157 @@ pub fn run_test(
     ))
 }
 
-/// One `cargo kani` run of a control side's one harness alone in `root`
-/// ([`crate::proofs::arguments`], then `--harness HARNESS --exact`, which
-/// kani-driver's `VerificationArgs` declares: the filter matching only that
-/// fully qualified name), held to `expectations` under the side's validated
-/// `authorization` ([`crate::controls::Authorization`]), its artifacts under
-/// `target_dir`, one thread (no `-j`: `NumThreads::NoMultithreading`),
-/// colour off, its standard output and error logged to `log`: its
-/// termination and its log's text.
-#[allow(clippy::too_many_arguments)]
-pub fn run_kani(
-    root: &Path,
-    declared: &std::collections::BTreeSet<String>,
-    expectations: crate::proofs::Expectations,
-    authorization: crate::controls::Authorization,
-    target_dir: &Path,
-    log: &Path,
-    launcher: &Path,
-) -> Result<(Termination, String), String> {
-    let harness = authorization.record().harness.clone();
-    if !declared.contains(&harness) {
-        return Err(format!(
-            "harness {harness}: declared by no #[kani::proof] of {}",
-            root.display()
-        ));
-    }
-    let policy = crate::proofs::policy(root, declared)?;
-    kani(
-        root,
-        &policy,
-        &crate::proofs::RunPurpose::Control(expectations, Box::new(authorization)),
-        &crate::proofs::Selection::one(&harness),
-        declared,
-        target_dir,
-        log,
-        launcher,
-        &Workload::exported()?,
-    )
+/// What one `cargo kani` run is asked to execute: in the tree at `root`, for
+/// `purpose`, the harnesses `selection` names of the census `declared`, its
+/// artifacts under `target_dir`, by the run's selected `launcher`, launched
+/// as a `workload`, its standard output and error logged to `log` and its
+/// evidence reserved beside it (`LOG.evidence`). Data alone: only its
+/// validation ([`KaniRequest::validate`]) makes the run the one invocation
+/// executes ([`KaniRun`]).
+#[derive(Clone, Copy)]
+pub struct KaniRequest<'a> {
+    pub root: &'a Path,
+    pub purpose: &'a crate::proofs::RunPurpose,
+    pub selection: &'a crate::proofs::Selection,
+    pub declared: &'a std::collections::BTreeSet<String>,
+    pub target_dir: &'a Path,
+    pub launcher: &'a Path,
+    pub workload: &'a Workload,
+    pub log: &'a Path,
 }
 
-/// One `cargo kani` run in `root` of the harnesses `selection` names, every
-/// one of the census when it names all ([`crate::proofs::arguments`], no
-/// harness filter), for `purpose`, under `policy` ([`crate::proofs::policy`]),
-/// launched as a `workload`, as [`run_kani`] runs one: the proof suite's
-/// evidence run, or one calibration execution.
-#[allow(clippy::too_many_arguments)]
-pub fn run_kani_purpose(
-    root: &Path,
-    policy: &crate::proofs::Policy,
-    purpose: &crate::proofs::RunPurpose,
-    selection: &crate::proofs::Selection,
-    declared: &std::collections::BTreeSet<String>,
-    target_dir: &Path,
-    log: &Path,
-    launcher: &Path,
-    workload: &Workload,
-) -> Result<(Termination, String), String> {
-    kani(
-        root, policy, purpose, selection, declared, target_dir, log, launcher, workload,
-    )
+/// A validated Kani run ([`KaniRequest::validate`], its only maker), what
+/// [`execute_kani`] consumes: the request, and every input its validation
+/// bound once: the tree's loop-bound policy file as read and its digest; the
+/// run's selected policy, every selected harness with its purpose's
+/// deadline; every source path's own digest and the source state they are
+/// the digest of; and its evidence directory, reserved exclusively.
+pub struct KaniRun<'a> {
+    request: KaniRequest<'a>,
+    policy_bytes: Vec<u8>,
+    policy_sha256: String,
+    selected: serde_json::Value,
+    sources: BTreeMap<String, String>,
+    tree_sha256: String,
+    evidence: PathBuf,
+}
+
+impl<'a> KaniRequest<'a> {
+    /// The request validated, refused before anything of the run is
+    /// reserved: its launcher still the canonical path it was selected as
+    /// ([`crate::proofs::selected_launcher`]); a census that declares a
+    /// harness; a selection the purpose admits, of declared harnesses alone
+    /// (a qualification the whole census; a calibration exactly one
+    /// harness; a control side exactly the one its authorization binds);
+    /// the tree's policy file read once ([`crate::proofs::read_policy`]) and
+    /// every selected harness given its purpose's deadline
+    /// ([`crate::proofs::selected`]); the tree's source state read once, and
+    /// a control side's the state its authorization binds. Then, last, its
+    /// evidence directory reserved: created exclusively, owned by the run.
+    pub fn validate(self) -> Result<KaniRun<'a>, String> {
+        use crate::proofs::{RunPurpose, Selection};
+        let canonical = std::fs::canonicalize(self.launcher)
+            .map_err(|error| format!("{}: {error}", self.launcher.display()))?;
+        if canonical != self.launcher {
+            return Err(format!(
+                "the selected launcher {} now resolves to {}",
+                self.launcher.display(),
+                canonical.display()
+            ));
+        }
+        if self.declared.is_empty() {
+            return Err(format!(
+                "the library of {} declares no #[kani::proof] harness",
+                self.root.display()
+            ));
+        }
+        if let Selection::Only(harnesses) = self.selection {
+            if harnesses.is_empty() {
+                return Err("a Kani run that selects no harness checks nothing".to_string());
+            }
+            if let Some(undeclared) = harnesses
+                .iter()
+                .find(|harness| !self.declared.contains(*harness))
+            {
+                return Err(format!(
+                    "harness {undeclared}: declared by no #[kani::proof] of {}",
+                    self.root.display()
+                ));
+            }
+        }
+        match (self.purpose, self.selection) {
+            (RunPurpose::Qualification(_), Selection::All) => {}
+            (RunPurpose::Qualification(_), selection) => {
+                return Err(format!(
+                    "a qualification checks the whole census, the run selects {selection:?}"
+                ));
+            }
+            (RunPurpose::Calibration { .. }, Selection::Only(harnesses))
+                if harnesses.len() == 1 => {}
+            (RunPurpose::Calibration { .. }, selection) => {
+                return Err(format!(
+                    "a calibration run checks exactly one harness, the run selects {selection:?}"
+                ));
+            }
+            (RunPurpose::Control { authorization, .. }, selection) => {
+                let record = authorization.record();
+                if *selection != Selection::one(&record.harness) {
+                    return Err(format!(
+                        "a {} side authorizes harness {} alone, the run selects {selection:?}",
+                        record.side.name(),
+                        record.harness
+                    ));
+                }
+            }
+        }
+        let (policy_bytes, policy) = crate::proofs::read_policy(self.root, self.declared)?;
+        let policy_sha256 = sha256_bytes(&policy_bytes)?;
+        let selected = crate::proofs::selected(
+            &policy,
+            &self.purpose.deadlines(),
+            self.selection,
+            self.declared,
+        )?;
+        let sources = crate::proofs::SourceState::read(self.root)?.digests()?;
+        let tree_sha256 = crate::proofs::tree_digest_of(&sources)?;
+        if let RunPurpose::Control { authorization, .. } = self.purpose {
+            let record = authorization.record();
+            if tree_sha256 != record.source_sha256 {
+                return Err(format!(
+                    "{}: its source state is {tree_sha256}, the {} side was authorized on {}",
+                    self.root.display(),
+                    record.side.name(),
+                    record.source_sha256
+                ));
+            }
+        }
+        let evidence = self.log.with_extension("evidence");
+        std::fs::create_dir(&evidence)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        Ok(KaniRun {
+            request: self,
+            policy_bytes,
+            policy_sha256,
+            selected,
+            sources,
+            tree_sha256,
+            evidence,
+        })
+    }
+}
+
+impl KaniRun<'_> {
+    /// The run's reserved evidence directory.
+    pub fn evidence(&self) -> &Path {
+        &self.evidence
+    }
+}
+
+/// The one `cargo kani` invocation of the validated run `run`, consumed:
+/// the proof suite's evidence run, one calibration execution, or one control
+/// side ([`kani`]). Its termination and its log's text.
+pub fn execute_kani(run: KaniRun<'_>) -> Result<(Termination, String), String> {
+    kani(&run)
 }
 
 /// The Kani a run selects: `cargo-kani` as `PATH` resolves it, canonical
@@ -453,95 +545,98 @@ fn digest_of(output: &std::process::Output, what: &str) -> Result<String, String
     }
 }
 
-/// The one `cargo kani` invocation: the run's selected `launcher` with the
-/// build's own arguments, then `--harness HARNESS --exact` for a run of one
-/// harness, then the target directory, then the run's loop-bound policy and
-/// its evidence. The run's evidence is reserved beside its log, at
-/// `LOG.evidence/`, and created exclusively, as the log is: `launcher`, the
-/// program spawned; `loop-bounds.json`, the policy of the harnesses the run
-/// checks ([`crate::proofs::selected`]), which Kani reads; `loop-bounds/`,
-/// the directory Kani writes each harness's loop discovery, resolution,
-/// solver command, executables and launch into (`--loop-bounds-evidence`);
-/// and, once the run ends, `execution.json`, the launcher and the verifier
-/// its harnesses ran. Refused before anything runs when any of them exists
-/// or the launcher no longer is the canonical path it was selected as; and
-/// after the run when its evidence does not reconcile with its policy and
-/// its report ([`crate::proofs::check_execution_evidence`]), so neither the
-/// suite nor a control can take a verdict the evidence does not support.
-#[allow(clippy::too_many_arguments)]
-fn kani(
-    root: &Path,
-    policy_of_root: &crate::proofs::Policy,
-    purpose: &crate::proofs::RunPurpose,
-    selection: &crate::proofs::Selection,
-    declared: &std::collections::BTreeSet<String>,
-    target_dir: &Path,
-    log: &Path,
-    launcher: &Path,
-    workload: &Workload,
-) -> Result<(Termination, String), String> {
-    let canonical = std::fs::canonicalize(launcher)
-        .map_err(|error| format!("{}: {error}", launcher.display()))?;
-    if canonical != launcher {
-        return Err(format!(
-            "the selected launcher {} now resolves to {}",
-            launcher.display(),
-            canonical.display()
-        ));
-    }
-    let evidence = log.with_extension("evidence");
-    std::fs::create_dir(&evidence).map_err(|error| format!("{}: {error}", evidence.display()))?;
+/// The one `cargo kani` invocation of the validated run `run`: its selected
+/// launcher with the build's own arguments, then `--harness HARNESS
+/// --exact` for each harness of an explicit selection, then the target
+/// directory, then the run's loop-bound policy and its evidence. Into its
+/// reserved evidence (`LOG.evidence/`, [`KaniRequest::validate`]), each
+/// record created exclusively, as the log is: `launcher`, the program
+/// spawned; the documents it was given; its identity (`run.json`) of the
+/// source state and policy its validation bound; a control side's
+/// authorization; `loop-policy.json`, the tree's policy file as read, and
+/// `sources.json`, every source path's digest, the records its identity's
+/// policy and source state digests are of; `loop-bounds.json`, its selected
+/// policy, which Kani reads; `invocation.json`, the launcher and every
+/// argument; `loop-bounds/`, the directory Kani writes each harness's loop
+/// discovery, resolution, solver command, executables and launch into
+/// (`--loop-bounds-evidence`); and, once the run ends, `execution.json`, the
+/// launcher, the verifier and each launched harness's artifact. Refused
+/// after the run when its source state moved, or when its evidence does not
+/// reconcile with its policy and its report
+/// ([`crate::proofs::check_execution_evidence`]), so neither the suite nor a
+/// control can take a verdict the evidence does not support.
+fn kani(run: &KaniRun<'_>) -> Result<(Termination, String), String> {
+    let KaniRequest {
+        root,
+        purpose,
+        selection,
+        target_dir,
+        launcher,
+        workload,
+        log,
+        ..
+    } = run.request;
+    let evidence = &run.evidence;
     // From here every outcome, a setup failure included, leaves its
     // judgement and the manifest of what the run recorded.
     let mut identified: Option<String> = None;
     let mut log_created = false;
     let result = (|| {
         create_evidence(
-            &evidence.join("launcher"),
+            &evidence.join(crate::proofs::LAUNCHER_RECORD),
             format!("{}\n", launcher.display()).as_bytes(),
         )?;
-        // The document the run was given, the very bytes its revision is the
-        // digest of; then its identity before anything launches: what it is
-        // for, that revision, and the tree's source state it ran.
-        let (name, document) = purpose.document();
-        create_evidence(&evidence.join(name), document)?;
-        let identity = crate::proofs::run_identity(root, purpose)?;
-        identified = Some(identity.id.clone());
-        let encoded = serde_json::to_vec_pretty(&identity)
+        // The documents the run was given, the very bytes its revision is the
+        // digest of (and a calibration's readiness); then its identity before
+        // anything launches: what it is for, that revision, and the tree's
+        // source state it ran.
+        for (name, document) in purpose.documents() {
+            create_evidence(&evidence.join(name), document)?;
+        }
+        let identity = crate::proofs::run_identity(purpose, &run.tree_sha256, &run.policy_sha256)?;
+        identified = Some(identity.id().to_string());
+        let encoded = serde_json::to_vec_pretty(identity.record())
             .map_err(|error| format!("{}: {error}", evidence.display()))?;
         create_evidence(&evidence.join("run.json"), &encoded)?;
-        // A control side's authorization, kept before it launches, and the
-        // run held to it: its one harness, on the source state it binds.
-        if let crate::proofs::RunPurpose::Control(_, authorization) = purpose {
-            let record = authorization.record();
-            if *selection != crate::proofs::Selection::one(&record.harness) {
-                return Err(format!(
-                    "a {} side authorizes harness {} alone, the run selects {selection:?}",
-                    record.side.name(),
-                    record.harness
-                ));
-            }
-            if identity.tree_sha256 != record.source_sha256 {
-                return Err(format!(
-                    "{}: its source state is {}, the {} side was authorized on {}",
-                    root.display(),
-                    identity.tree_sha256,
-                    record.side.name(),
-                    record.source_sha256
-                ));
-            }
-            let encoded = serde_json::to_vec_pretty(record)
+        // A control side's authorization, kept before it launches (the source
+        // state it binds and its one harness were held to by validation).
+        if let crate::proofs::RunPurpose::Control { authorization, .. } = purpose {
+            let encoded = serde_json::to_vec_pretty(authorization.record())
                 .map_err(|error| format!("{}: {error}", evidence.display()))?;
             create_evidence(&evidence.join("authorization.json"), &encoded)?;
         }
+        // The inputs the identity's digests are of, as validation read them.
+        create_evidence(
+            &evidence.join(crate::proofs::LOOP_POLICY_RECORD),
+            &run.policy_bytes,
+        )?;
+        let encoded = serde_json::to_vec_pretty(&run.sources)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join(crate::proofs::SOURCES_RECORD), &encoded)?;
         let policy = evidence.join("loop-bounds.json");
-        let selected =
-            crate::proofs::selected(policy_of_root, &purpose.deadlines(), selection, declared)?;
-        let encoded = serde_json::to_vec_pretty(&selected)
+        let encoded = serde_json::to_vec_pretty(&run.selected)
             .map_err(|error| format!("{}: {error}", policy.display()))?;
         create_evidence(&policy, &encoded)?;
         let bounds = evidence.join("loop-bounds");
         std::fs::create_dir(&bounds).map_err(|error| format!("{}: {error}", bounds.display()))?;
+        let text = |path: &Path| {
+            path.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: a path that is not UTF-8", path.display()))
+        };
+        let arguments = crate::proofs::invocation_arguments(
+            selection,
+            &text(target_dir)?,
+            &text(&policy)?,
+            &text(&bounds)?,
+        );
+        let invocation = serde_json::json!({
+            "launcher": text(launcher)?,
+            "arguments": arguments,
+        });
+        let encoded = serde_json::to_vec_pretty(&invocation)
+            .map_err(|error| format!("{}: {error}", evidence.display()))?;
+        create_evidence(&evidence.join(crate::proofs::INVOCATION_RECORD), &encoded)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -555,19 +650,7 @@ fn kani(
         command
             .current_dir(root)
             .env("TERM", "dumb")
-            .args(crate::proofs::arguments());
-        if let crate::proofs::Selection::Only(harnesses) = selection {
-            for harness in harnesses {
-                command.args(["--harness", harness.as_str(), "--exact"]);
-            }
-        }
-        command
-            .arg("--target-dir")
-            .arg(target_dir)
-            .arg("--loop-bounds")
-            .arg(&policy)
-            .arg("--loop-bounds-evidence")
-            .arg(&bounds)
+            .args(&arguments)
             .stdout(file)
             .stderr(error);
         // Spawned, not run to its end, so the workload's own control group is
@@ -575,10 +658,13 @@ fn kani(
         let load_before = crate::proofs::load();
         let (launched, (environment, workload_cgroup)) = match command.spawn() {
             Ok(mut child) => {
-                let found = crate::proofs::Environment::of_workload(&mut child);
+                let found = crate::proofs::EnvironmentRecord::of_workload(&mut child);
                 (child.wait(), found)
             }
-            Err(error) => (Err(error), (crate::proofs::Environment::unknown(), None)),
+            Err(error) => (
+                Err(error),
+                (crate::proofs::EnvironmentRecord::unknown(), None),
+            ),
         };
         let launched = launched.map_err(|error| format!("{}: {error}", launcher.display()));
         let launch = crate::proofs::Launch {
@@ -604,12 +690,12 @@ fn kani(
         // tree that differs from the one its identity names ran no one
         // source. A change made and undone while it ran is not detected.
         let after = crate::proofs::tree_digest(root)?;
-        if after != identity.tree_sha256 {
+        if after != identity.tree_sha256() {
             return Err(format!(
                 "{}: its source state was {} when the run began and {after} when it ended: the \
                  run is of no one source",
                 root.display(),
-                identity.tree_sha256
+                identity.tree_sha256()
             ));
         }
         let status = launched?;
@@ -624,17 +710,17 @@ fn kani(
             std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
         let reconciled = crate::proofs::check_execution_evidence(
             &bounds,
-            &selected,
+            &run.selected,
             &text,
-            crate::proofs::Artifacts::Preserved,
+            crate::proofs::Artifacts::Live,
         )
         .map_err(|fault| format!("{}: {fault}", log.display()))?;
         crate::proofs::check_function_scope(
             &bounds,
-            &selected,
+            &run.selected,
             &reconciled.applied,
             *selection == crate::proofs::Selection::All,
-            crate::proofs::Artifacts::Preserved,
+            crate::proofs::Artifacts::Live,
         )
         .map_err(|fault| format!("{}: {fault}", log.display()))?;
         // The reconciled execution, written once reconciliation succeeded:
@@ -658,7 +744,7 @@ fn kani(
         // control side to their predictions, a control side's artifact being
         // its copy's own build.
         match purpose {
-            crate::proofs::RunPurpose::Calibration(_) => {
+            crate::proofs::RunPurpose::Calibration { .. } => {
                 crate::proofs::check_calibration_termination(termination, &text)
                     .map_err(|fault| format!("{}: {fault}", log.display()))?;
             }
@@ -672,7 +758,10 @@ fn kani(
                 )
                 .map_err(|fault| format!("{}: {fault}", log.display()))?;
             }
-            crate::proofs::RunPurpose::Control(expectations, authorization) => {
+            crate::proofs::RunPurpose::Control {
+                expectations,
+                authorization,
+            } => {
                 crate::proofs::check_expectations(
                     &identity,
                     &launch,
@@ -688,9 +777,9 @@ fn kani(
     // The judgement, then the manifest, attempted whatever the judgement's own
     // write did: the run's last record, describing exactly what it holds, its
     // identity named only when one was made.
-    let judged = record_judgement(&evidence, result);
+    let judged = record_judgement(evidence, result);
     let manifest =
-        crate::proofs::manifest_of(&evidence, log_created.then_some(log), identified.as_deref());
+        crate::proofs::manifest_of(evidence, log_created.then_some(log), identified.as_deref());
     let written = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("{}: {error}", evidence.display()))
         .and_then(|encoded| create_evidence(&evidence.join("manifest.json"), &encoded));

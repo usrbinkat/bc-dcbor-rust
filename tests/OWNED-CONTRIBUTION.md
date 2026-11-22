@@ -101,15 +101,18 @@ Each refuses to run when a diff under `tests/data/controls` has no row in the
 table, and a control counts only when its own test, run alone, fails with its
 planned outcome naming its pattern (`tests/gate`, `controls`).
 
-Calibrate the proof harnesses after a finished, passed control run of the same
-clean commit, adopt each accepted run into the checkout, commit the adopted
-runs and the predictions fitted from them (`tests/data/proofs/expectations.json`),
-then qualify the census at that commit; the proof gate runs on a copy of the
-commit, so only committed calibration evidence reaches it (`tests/data/README.md`,
-Proof runtime evidence):
+Calibrate the proof harnesses after the native control runs of the nightly and
+the stable channel have finished and passed on the same clean commit, with no
+other gate workload running. Adopt each sample into the checkout, then commit
+the adopted runs and the predictions fitted from them
+(`tests/data/proofs/expectations.json`). Qualify the census at that commit: the
+proof gate runs on a copy of the commit, so only committed calibration evidence
+reaches it (`tests/data/README.md`, Proof runtime evidence):
 
 ```sh
-nix develop .#custom-std -c env PROOF_LOG_DIR=<log directory> bash tests/proofs.sh calibrate <plan> <control log directory>
+nix develop .#custom-std -c env CONTROL_LOG_DIR=<nightly log directory> bash tests/controls.sh nightly native
+nix develop .#stable -c env CONTROL_LOG_DIR=<stable log directory> bash tests/controls.sh stable native
+nix develop .#custom-std -c env PROOF_LOG_DIR=<log directory> bash tests/proofs.sh calibrate <plan> <nightly log directory> <stable log directory>
 nix develop .#custom-std -c cargo run --quiet --manifest-path tests/gate/Cargo.toml --bin gate -- proofs-adopt <log directory>/calibration/<harness>.<n>.evidence "$PWD"
 nix develop .#custom-std -c env PROOF_LOG_DIR=<log directory> bash tests/proofs.sh
 ```

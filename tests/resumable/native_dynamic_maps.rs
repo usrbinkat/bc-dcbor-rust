@@ -313,7 +313,12 @@ fn the_permutation_moves_unequal_entries_in_every_order_without_replay() {
                 (*order).map(|rank| rank as u64),
                 "lengths {lengths:?}, order {order:?}: an entry is not in its bucket"
             );
-            prepare_matrix(&table, Ok(&expected));
+            prepare_matrix_named(
+                &format!("permutation lengths {lengths:?}, bucket order {order:?}"),
+                &table,
+                Ok(&expected),
+                shape(&table),
+            );
         }
     }
 }

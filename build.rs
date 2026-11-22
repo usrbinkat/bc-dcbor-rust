@@ -13,17 +13,22 @@
 //! or any number of version directories but one, fails the build naming
 //! what it found.
 //!
-//! It also writes the Kani harness instances of `tests/data/proofs/
-//! instances.rs`, the one declaration the gate's census reads too, each
-//! family's into `$OUT_DIR/proof_instances/`, which the family's file
-//! includes under `cfg(kani)`.
+//! In a Kani build alone it also writes the Kani harness instances of
+//! `tests/data/proofs/instances.rs`, the one declaration the gate's census
+//! reads too, each family's into `$OUT_DIR/proof_instances/`, which the
+//! family's file includes under `cfg(kani)`. `cargo kani` compiles build
+//! scripts with `--cfg=kani_host` (kani-driver `call_cargo.rs`,
+//! `cargo_config_args`, under `-Ztarget-applies-to-host`); every other build
+//! neither reads nor needs the verification data: the declaration's module
+//! is compiled out with the generation.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The one declaration of the Kani harness instances, shared with the
-/// gate's census.
+/// gate's census; loaded in a Kani build alone.
+#[cfg(kani_host)]
 #[path = "tests/data/proofs/instances.rs"]
 mod instances;
 
@@ -33,6 +38,7 @@ const UNICODE_DATA: &str = "data/unicode";
 /// Each family's instances ([`instances::FAMILIES`]) written to
 /// `$OUT_DIR/proof_instances/`, for its file to include; a declaration
 /// [`instances::instances`] refuses fails the build naming its fault.
+#[cfg(kani_host)]
 fn proof_instances(out_dir: &Path) {
     println!("cargo:rerun-if-changed=tests/data/proofs/instances.rs");
     let directory = out_dir.join("proof_instances");
@@ -98,6 +104,7 @@ fn main() {
     let target = out_dir.join("unicode_assigned.rs");
     fs::write(&target, out)
         .unwrap_or_else(|error| panic!("{} cannot be written: {error}", target.display()));
+    #[cfg(kani_host)]
     proof_instances(&out_dir);
 }
 

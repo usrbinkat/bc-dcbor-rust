@@ -1,11 +1,11 @@
---- tests/gate/src/proofs.rs
-+++ tests/gate/src/proofs.rs
-@@ -3659,7 +3659,7 @@
-                     .is_some_and(|initial| initial.equivalent(&environment)),
-                 (None, _) => false,
-             };
--            if verified && compatible {
-+            if compatible {
-                 eligible.insert(harness.clone());
-             } else {
-                 eligible.remove(harness);
+--- tests/gate/src/proofs/calibration.rs
++++ tests/gate/src/proofs/calibration.rs
+@@ -399,7 +399,7 @@
+                         }
+                     },
+                 };
+-                if !matches!(observed, Observed::Sample { .. }) {
++                if matches!(observed, Observed::Rejected { .. }) {
+                     withheld.insert(
+                         harness.clone(),
+                         format!("pass {pass} of {harness} was {observed:?}"),

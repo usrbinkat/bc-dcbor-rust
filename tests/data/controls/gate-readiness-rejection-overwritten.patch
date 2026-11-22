@@ -1,0 +1,14 @@
+--- tests/gate/src/proofs/readiness.rs
++++ tests/gate/src/proofs/readiness.rs
+@@ -826,9 +826,8 @@
+             "{}: the readiness was not preserved: {unrecorded}",
+             path.display()
+         )),
+-        (Some(fault), Err(unrecorded)) => Err(format!(
+-            "{}: the calibration is not ready: {fault}; the readiness was not preserved \
+-             either: {unrecorded}",
++        (Some(_), Err(unrecorded)) => Err(format!(
++            "{}: the readiness was not preserved: {unrecorded}",
+             path.display()
+         )),
+     }

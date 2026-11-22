@@ -9,14 +9,19 @@
 # source, one results row each, proved only when it verified, and the
 # verdict. Run from the proof shell, which puts `cargo kani` on PATH.
 #
-# With `calibrate PLAN CONTROL_LOGS`, the run is a calibration instead (`gate
-# proofs-calibrate`, tests/gate/src/proofs.rs `calibration`): ready only once
-# the control run whose log directory is CONTROL_LOGS finished and passed on
-# this commit (its `verdict.json`) and the system settled under the declared
-# policy (`readiness.json`); then each harness the plan names (`plan_of`)
-# checked alone, one Kani run each, under its plan's operational limit,
-# measured and qualifying nothing, each run's records adoptable as
-# calibration evidence (`gate proofs-adopt LOGS/calibration/H.N.evidence`).
+# With `calibrate PLAN NIGHTLY_LOGS STABLE_LOGS`, the run is a calibration
+# instead (`gate proofs-calibrate`, tests/gate/src/proofs.rs `calibration`):
+# ready only once the native control runs of the nightly and the stable
+# channel whose log directories are NIGHTLY_LOGS and STABLE_LOGS finished
+# and passed on this commit, every control the registry selects for them
+# judged (their `verdict.json`, `proofs::REQUIRED_CONTROLS`), no other gate
+# workload runs (the calibration holds target/gate-workload.lock itself) and
+# the system settled under the declared policy (`readiness.json`); then each
+# harness the plan names (`plan_of`) checked alone, one Kani run each, under
+# its plan's operational limit, measured and qualifying nothing, each run's
+# records adoptable as calibration evidence (`gate proofs-adopt
+# LOGS/calibration/H.N.evidence`). A qualification holds the workload lock
+# here, for its whole run.
 #
 # Evidence is of a commit: the tree must be clean, and Kani runs on a copy of
 # it (`copy_of`), never the checkout, at one location, target/proof-source,
@@ -25,7 +30,7 @@
 # (target/proof-source.lock) for the whole run: a second proof run is
 # refused, never interleaved with this one's copy or workload.
 #
-# Usage: tests/proofs.sh [calibrate PLAN CONTROL_LOGS]
+# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
@@ -39,15 +44,15 @@ for tool in cargo cargo-kani rustc sha256sum git tar flock realpath; do
     fi
 done
 plan=""
-control_logs=""
+control_logs=()
 case "$#:${1:-}" in
     0:) ;;
-    3:calibrate)
+    4:calibrate)
         plan="$(realpath -e "$2")" || exit 2
-        control_logs="$(realpath -e "$3")" || exit 2
+        control_logs=("$(realpath -e "$3")" "$(realpath -e "$4")") || exit 2
         ;;
     *)
-        echo "usage: tests/proofs.sh [calibrate PLAN CONTROL_LOGS]" >&2
+        echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS]" >&2
         exit 2
         ;;
 esac
@@ -62,6 +67,14 @@ exec 9> "$PWD/target/proof-source.lock" || exit 2
 if ! flock --nonblock 9; then
     event "FAIL another proof run holds target/proof-source.lock; nothing was run"
     exit 2
+fi
+workload_lock="$PWD/target/gate-workload.lock"
+if [[ -z "$plan" ]]; then
+    exec 8> "$workload_lock" || exit 2
+    if ! flock --nonblock 8; then
+        event "FAIL another gate workload holds target/gate-workload.lock; nothing was run"
+        exit 2
+    fi
 fi
 source_copy="$PWD/target/proof-source"
 copy_of "$source_copy" "$commit" || exit 2
@@ -82,7 +95,8 @@ kani_identity="$(gate proofs-identity "$launcher")" || {
 }
 echo "identity: $(cat "$logs/identity.txt")"
 if [[ -n "$plan" ]]; then
-    gate proofs-calibrate "$source_copy" "$PWD/target/kani" "$logs" "$launcher" "$plan" "$control_logs"
+    gate proofs-calibrate "$source_copy" "$PWD/target/kani" "$logs" "$launcher" "$plan" \
+        "$workload_lock" "${control_logs[@]}"
     status=$?
     if ! still_at_commit; then
         event "FAIL the checkout moved off $commit during the run"

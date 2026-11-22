@@ -790,7 +790,19 @@ pub fn prepare_matrix_bounded(
     bound: dcbor::bounded::encoding::Shape,
 ) {
     let name = format!("prepare {bound:?}, expected {expected:?}");
-    refusal_matrix(&name, rigor(), |fault| {
+    prepare_matrix_named(&name, source, expected, bound);
+}
+
+/// A preparation fixture whose input order or traversal contract distinguishes
+/// it from other fixtures with the same shape and canonical output.
+#[cfg(any(feature = "derive", feature = "hashbrown"))]
+pub fn prepare_matrix_named(
+    name: &str,
+    source: &dyn Schema,
+    expected: Expected<'_>,
+    bound: dcbor::bounded::encoding::Shape,
+) {
+    refusal_matrix(name, rigor(), |fault| {
         prepare_run(source, &expected, fault, bound)
     });
 }

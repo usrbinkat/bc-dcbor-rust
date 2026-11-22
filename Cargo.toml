@@ -6,17 +6,17 @@
 # tests and the gate tool (tests/gate) each depend on them, and the tests
 # never on the gate nor the gate on them.
 members = [
-    ".",
-    "dcbor-derive",
-    "tests/record",
-    "tests/model-bounds",
-    "tests/census",
-    "tests/refinement",
-    "tests/support",
-    "tests/gate",
-    # The CDDL every derive emits checked against the decoders' accepted
-    # domain, with an independent validator (`cddl`) as the oracle.
-    "tests/cddl",
+  ".",
+  "dcbor-derive",
+  "tests/record",
+  "tests/model-bounds",
+  "tests/census",
+  "tests/refinement",
+  "tests/support",
+  "tests/gate",
+  # The CDDL every derive emits checked against the decoders' accepted
+  # domain, with an independent validator (`cddl`) as the oracle.
+  "tests/cddl",
 ]
 # The fuzz crate builds with cargo-fuzz on nightly; it is its own package.
 exclude = ["fuzz"]
@@ -32,17 +32,18 @@ exclude = ["fuzz"]
 loom = "=0.7.2"
 shuttle = "=0.9.9"
 
+# Compatible transitive consumers use the same bucket-access fork as dcbor.
+[patch.crates-io]
+hashbrown = { git = "https://github.com/usrbinkat/hashbrown", rev = "ccb26a32445a94dbf228acf518efa216c6dbfeef" }
+
 # Each checker's cfg is set by RUSTFLAGS alone (`--cfg loom`, `--cfg
 # shuttle`), and the proof harnesses' by `cargo kani` (`cfg(kani)`,
-# src/bounded/proofs.rs); any other unknown cfg is a defect. A dropped
+# src/bounded/proofs.rs, and `cfg(kani_host)` for build scripts, build.rs);
+# any other unknown cfg is a defect. A dropped
 # `#[must_use]` value is a defect too: a driver's stop, a drain's or a
 # cleanup's result left unread is a failure no run reports.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "deny", check-cfg = [
-    "cfg(loom)",
-    "cfg(shuttle)",
-    "cfg(kani)",
-] }
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(kani)", "cfg(kani_host)"] }
 unused_must_use = "deny"
 
 # The refinement machine (tests/refinement) replays every recorded run's
@@ -69,16 +70,16 @@ readme = "README.md"
 license = "BSD-2-Clause-Patent"
 documentation = "https://docs.rs/dcbor"
 keywords = [
-    "encoding",
-    "cbor",
-    "binary",
-    "format",
-    "serialization",
+  "encoding",
+  "cbor",
+  "binary",
+  "format",
+  "serialization",
 ] # Up to five
 categories = [
-    "data-structures",
-    "encoding",
-    "no-std",
+  "data-structures",
+  "encoding",
+  "no-std",
 ] # https://crates.io/category_slugs
 
 [dependencies]

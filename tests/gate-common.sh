@@ -283,38 +283,34 @@ copy_of() {
 	git -C "$PWD" archive "$2" | tar -x -C "$1"
 }
 
-# The one invocation of a planted diff: `patch_diff DIFF DIR [FLAG...]` runs
-# DIFF against the tree at DIR, a copy of a commit (`copy_of`), exactly
-# (`-p0`, no fuzz), the flags naming its direction or a dry run. GNU patch
-# places a hunk whose trailing context is shorter than its leading context
-# only at the file's end, and one whose leading context is shorter only at
-# its start, so every hunk carries equal context on both sides, which the
-# gate's table check refuses otherwise (tests/gate `controls::hunk_faults`).
-# The applier, the reverser and the preflight below are this one command.
+# The one invocation of a planted diff: `patch_diff DIRECTION DIFF DIR` runs
+# DIFF against the tree at DIR, a copy of a commit (`copy_of`), through the
+# gate tool (`gate patch`, tests/gate `controls::patch`), which a red side's
+# authorization reverses the diff by too: exactly (`-p0`, no fuzz), applied,
+# reversed or checked. The applier, the reverser and the preflight below are
+# this one command, so `gate_prepare` comes first.
 patch_diff() {
-	local diff="$1" directory="$2"
-	shift 2
-	patch -d "$directory" -p0 --batch --fuzz=0 --no-backup-if-mismatch --quiet "$@" <"$diff"
+	gate patch "$1" "$2" "$3"
 }
 
 # The one applier of a planted diff: `apply_diff DIFF DIR` applies DIFF to
 # the copy at DIR. The copy is discarded with the diff in it; nothing is
 # reverted, since no tree a gate keeps is ever changed.
 apply_diff() {
-	patch_diff "$1" "$2"
+	patch_diff apply "$1" "$2"
 }
 
 # The one reverser of a planted diff: `revert_diff DIFF DIR` reverses DIFF in
 # the copy at DIR, exactly as `apply_diff` applied it, so a control is seen
 # green again in the same copy it was seen red in.
 revert_diff() {
-	patch_diff "$1" "$2" -R
+	patch_diff reverse "$1" "$2"
 }
 
 # Whether `apply_diff DIFF DIR` would apply DIFF to the copy at DIR: the same
 # command run dry, changing nothing.
 check_diff() {
-	patch_diff "$1" "$2" --dry-run
+	patch_diff check "$1" "$2"
 }
 
 # Every planted control diff (tests/data/controls, every runner and channel)

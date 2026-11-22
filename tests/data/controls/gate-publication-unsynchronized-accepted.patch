@@ -1,0 +1,12 @@
+--- tests/gate/src/proofs/adoption.rs
++++ tests/gate/src/proofs/adoption.rs
+@@ -154,7 +154,8 @@
+         }));
+     }
+     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+-    sync(destination)
++    let _ = sync(destination);
++    Ok::<(), String>(())
+         .and_then(|()| sync(parent))
+         .map_err(|error| Adoption::Unsynchronized {
+             destination: destination.to_path_buf(),

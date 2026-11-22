@@ -449,7 +449,12 @@ mod key_order {
                     reached.contains(collision),
                     "{first:?} then {second:?}, {site}: no {collision:?} recorded"
                 );
-                prepare_matrix(source, Err(BoundedError::DuplicateKey));
+                prepare_matrix_named(
+                    &format!("colliding {first:?} then {second:?}, {site}"),
+                    source,
+                    Err(BoundedError::DuplicateKey),
+                    shape(source),
+                );
             }
         }
     }
@@ -474,7 +479,12 @@ mod key_order {
                     "{site}: distinct keys recorded {collision:?}"
                 );
             }
-            prepare_matrix(source, Ok(&expected));
+            prepare_matrix_named(
+                &format!("distinct numeric keys, {site}"),
+                source,
+                Ok(&expected),
+                shape(source),
+            );
         }
     }
 }

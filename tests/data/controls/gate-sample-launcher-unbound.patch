@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/eligibility.rs
++++ tests/gate/src/proofs/eligibility.rs
+@@ -494,7 +494,7 @@
+         .and_then(|text| text.strip_suffix('\n'))
+         .ok_or_else(|| fault(format!("its {LAUNCHER_RECORD} record is not one line")))?;
+     let execution = json("execution.json")?;
+-    if invocation.launcher != launcher || execution["launcher"] != launcher {
++    if invocation.launcher != launcher {
+         return Err(fault(format!(
+             "its launcher record names {launcher}, {INVOCATION_RECORD} {} and execution.json {}",
+             invocation.launcher, execution["launcher"]

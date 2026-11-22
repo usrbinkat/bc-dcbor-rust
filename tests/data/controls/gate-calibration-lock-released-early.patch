@@ -1,0 +1,14 @@
+--- tests/gate/src/proofs/calibration.rs
++++ tests/gate/src/proofs/calibration.rs
+@@ -219,10 +219,10 @@
+         .cloned()
+         .collect();
+     let path = request.logs.join("calibration.json");
++    drop(lock);
+     let written = serde_json::to_vec_pretty(&built)
+         .map_err(|error| format!("{}: {error}", path.display()))
+         .and_then(|encoded| (runtime.record)(&path, &encoded));
+-    drop(lock);
+     let mut faults = built.faults.clone();
+     if let Err(error) = written {
+         faults.push(format!(

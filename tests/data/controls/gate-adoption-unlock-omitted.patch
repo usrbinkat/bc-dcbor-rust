@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/adoption.rs
++++ tests/gate/src/proofs/adoption.rs
+@@ -102,7 +102,7 @@
+     lock: std::fs::File,
+     outcome: Result<PathBuf, Adoption>,
+ ) -> Result<PathBuf, Adoption> {
+-    match lock.unlock() {
++    match { drop(lock); Ok::<(), std::io::Error>(()) } {
+         Ok(()) => outcome,
+         Err(error) => Err(Adoption::ReleaseFailed {
+             outcome: Box::new(outcome),

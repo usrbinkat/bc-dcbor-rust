@@ -314,8 +314,14 @@ fn a_stabilized_text_survives_every_boundary_and_refuses_what_it_does_not_assign
     let assigned = dcbor::CBOR::from("\u{1fa8a}").to_cbor_data();
     let unassigned = dcbor::CBOR::from("\u{378}").to_cbor_data();
     let decomposed = [0x63, b'e', 0xcc, 0x81];
-    dcbor_test_support::uniform::<StabilizedText>("an assigned code point", &assigned);
-    dcbor_test_support::certified::<StabilizedText>("an unassigned code point", &unassigned);
+    dcbor_test_support::uniform::<StabilizedText>(
+        "an assigned code point-construction-certification",
+        &assigned,
+    );
+    dcbor_test_support::certified::<StabilizedText>(
+        "an unassigned code point-construction-certification",
+        &unassigned,
+    );
     for (name, wire, expected) in [
         (
             "an assigned code point",
@@ -348,9 +354,12 @@ fn a_minimal_big_integer_survives_every_boundary_and_refuses_a_non_minimal_encod
     let big = [0xc2, 0x49, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
     let plain = [0x01];
     let tagged = [0xc2, 0x41, 0x01];
-    dcbor_test_support::uniform::<MinimalBigInt>("2^64", &big);
-    dcbor_test_support::uniform::<MinimalBigInt>("one", &plain);
-    dcbor_test_support::certified::<MinimalBigInt>("one as a bignum", &tagged);
+    dcbor_test_support::uniform::<MinimalBigInt>("2^64-construction-certification", &big);
+    dcbor_test_support::uniform::<MinimalBigInt>("one-construction-certification", &plain);
+    dcbor_test_support::certified::<MinimalBigInt>(
+        "one as a bignum-construction-certification",
+        &tagged,
+    );
     for (name, wire, expected) in [
         ("2^64", big.as_slice(), Expected::Complete),
         ("one", plain.as_slice(), Expected::Complete),

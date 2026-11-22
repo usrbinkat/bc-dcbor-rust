@@ -193,9 +193,12 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      control list ROOT CHANNEL RUNNER... | \
                      control run baseline|red|green ROOT TARGET LOGS NAME native|kani LAUNCHER|- | \
                      control judge red|green ROOT LOGS NAME RUNNER OUTCOME LOG | \
-                     control evidence ROOT LOGS CHANNEL | \
+                     control evidence ROOT LOGS CHANNEL RUNNER... | \
+                     patch apply|reverse|check DIFF DIRECTORY | tree-digest ROOT | \
                      classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs-identity LAUNCHER | \
                      proofs ROOT TARGET LOGS LAUNCHER | \
+                     proofs-calibrate ROOT TARGET LOGS LAUNCHER PLAN WORKLOAD_LOCK CONTROL_LOGS... | \
+                     proofs-adopt EVIDENCE ROOT | \
                      miri models | \
                      miri inventory LOG OUT | \
                      miri coverage NATIVE OUT DIFF RUN... | miri results ROOT LOGS MODEL... | \
@@ -1014,31 +1017,20 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
                 configuration,
             )
         }
-        // The verdict over a control run, and its final record
-        // (`verdict.json`, `proofs::ControlVerdict`), written once whatever
-        // the verdict: what a calibration's readiness cites.
-        ["control", "evidence", root, logs, channel] => {
+        // The verdict over a control run of `channel` under `runners`, and its
+        // final record (`verdict.json`, `proofs::ControlVerdict`): the
+        // registry's digest, every selected control's result, every fault,
+        // written once whatever the verdict: what a calibration's readiness
+        // cites. A run that selected nothing is a fault.
+        ["control", "evidence", root, logs, channel, runners @ ..] if !runners.is_empty() => {
             let logs = Path::new(logs);
-            let table = controls::read(Path::new(root)).map_err(Broken)?;
-            let faults = controls::evidence(&table, logs, channel);
-            let counted = table
-                .iter()
-                .filter(|control| {
-                    control.runner.runs_one_test() && control.toolchain.as_deref() == Some(*channel)
-                })
-                .count();
-            let record = dcbor_gate::proofs::ControlVerdict {
-                version: dcbor_gate::proofs::RUNTIME_VERSION,
-                channel: channel.to_string(),
-                commit: contents(&logs.join("commit.txt"))?.trim().to_string(),
-                identity: contents(&logs.join("identity.txt"))?.trim().to_string(),
-                controls: counted,
-                faults: faults.clone(),
-            };
+            let record =
+                dcbor_gate::proofs::control_verdict(Path::new(root), logs, channel, runners)
+                    .map_err(Broken)?;
             let encoded = serde_json::to_vec_pretty(&record)
                 .map_err(|error| Broken(format!("{}: {error}", logs.display())))?;
             dcbor_gate::process::record(&logs.join("verdict.json"), &encoded).map_err(Broken)?;
-            Ok(verdict(&faults))
+            Ok(verdict(&record.faults))
         }
         ["classify", runner, kind, status, log] => {
             let kind = suite_kind(kind)?;
@@ -1093,12 +1085,13 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             found.extend(faults);
             Ok(verdict(&found))
         }
-        // A calibration of the harnesses a plan names, after the control run
-        // whose logs are `control_logs`: each harness checked alone under its
+        // A calibration of the harnesses a plan names, holding the checkout's
+        // workload lock, after the control runs whose logs follow it
+        // (`proofs::REQUIRED_CONTROLS`): each harness checked alone under its
         // plan's operational limit, qualifying nothing and writing no results
         // row (`proofs::calibration`). Each scheduled execution is printed;
-        // the command fails unless every one verified, since only a verified
-        // execution is a calibration sample.
+        // the command fails unless the schedule is complete, every planned
+        // harness with its samples and nothing failed.
         [
             "proofs-calibrate",
             root,
@@ -1106,25 +1099,39 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             logs,
             launcher,
             plan,
-            control_logs,
-        ] => {
+            workload_lock,
+            control_logs @ ..,
+        ] if !control_logs.is_empty() => {
             let launcher =
                 dcbor_gate::proofs::selected_launcher(Path::new(launcher)).map_err(Broken)?;
-            let schedule = dcbor_gate::proofs::calibrate(
-                Path::new(root),
-                Path::new(plan),
-                Path::new(target_dir),
-                Path::new(logs),
-                &launcher,
-                Path::new(control_logs),
-            )
-            .map_err(Broken)?;
-            let mut unverified = Vec::new();
+            let control_logs: Vec<&Path> = control_logs.iter().map(Path::new).collect();
+            let schedule =
+                match dcbor_gate::proofs::calibrate(dcbor_gate::proofs::CalibrationRequest {
+                    root: Path::new(root),
+                    plan: Path::new(plan),
+                    target_dir: Path::new(target_dir),
+                    logs: Path::new(logs),
+                    launcher: &launcher,
+                    control_logs: &control_logs,
+                    workload_lock: Path::new(workload_lock),
+                }) {
+                    Ok(schedule) => schedule,
+                    Err(faults) => return Ok(verdict(&[faults])),
+                };
             for execution in &schedule.executions {
                 let observed = match &execution.observed {
-                    dcbor_gate::proofs::Observed::Outcome { outcome } => outcome.clone(),
+                    dcbor_gate::proofs::Observed::Sample {
+                        run,
+                        manifest_sha256,
+                    } => format!("sample: run {run}, manifest {manifest_sha256}"),
+                    dcbor_gate::proofs::Observed::Ineligible { reason } => {
+                        format!("no sample: {reason}")
+                    }
                     dcbor_gate::proofs::Observed::Rejected { error } => {
                         format!("rejected: {error}")
+                    }
+                    dcbor_gate::proofs::Observed::Withheld { reason } => {
+                        format!("withheld: {reason}")
                     }
                     dcbor_gate::proofs::Observed::NotRun { reason } => format!("not run: {reason}"),
                 };
@@ -1132,14 +1139,33 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
                     "{}\tpass {}\t{observed}\t{}",
                     execution.harness, execution.pass, execution.log
                 );
-                if observed != dcbor_gate::outcome::Outcome::Pass.name() {
-                    unverified.push(format!(
-                        "harness {} pass {}: {observed}, not a sample",
-                        execution.harness, execution.pass
-                    ));
+            }
+            let incomplete: Vec<String> = schedule
+                .incomplete
+                .iter()
+                .map(|harness| {
+                    format!(
+                        "harness {harness}: fewer than {} independent samples: its calibration \
+                         is incomplete",
+                        dcbor_gate::proofs::SAMPLES
+                    )
+                })
+                .collect();
+            Ok(verdict(&incomplete))
+        }
+        // The one invocation of a planted diff (`controls::patch`): the diff
+        // at `diff`, read once, applied to, reversed in, or checked against
+        // the copy at `directory`.
+        ["patch", direction, diff, directory] => {
+            let direction = controls::Direction::parse(direction).map_err(Broken)?;
+            let bytes = std::fs::read(diff).map_err(|error| Broken(format!("{diff}: {error}")))?;
+            match controls::patch(&bytes, Path::new(directory), direction) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(fault) => {
+                    eprintln!("{fault}");
+                    Ok(ExitCode::from(1))
                 }
             }
-            Ok(verdict(&unverified))
         }
         // The source state of the copy at `root` (`copy_of`), the one digest
         // of a tree's kinds, modes, link targets and bytes
@@ -1153,11 +1179,17 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
         }
         // A finished calibration's records copied into the tree, where a
         // prediction may cite them.
+        // A finished calibration run adopted (`proofs::adopt`): its
+        // destination printed once established; a refusal, or a publication
+        // whose durability was not established, fails the command naming it.
         ["proofs-adopt", evidence, root] => {
-            let adopted =
-                dcbor_gate::proofs::adopt(Path::new(evidence), Path::new(root)).map_err(Broken)?;
-            println!("{}", adopted.display());
-            Ok(ExitCode::SUCCESS)
+            match dcbor_gate::proofs::adopt(Path::new(evidence), Path::new(root)) {
+                Ok(adopted) => {
+                    println!("{}", adopted.display());
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(fault) => Ok(verdict(&[fault.to_string()])),
+            }
         }
         ["miri", "models"] => {
             print_lines(&miri::MIRI_MODELS);

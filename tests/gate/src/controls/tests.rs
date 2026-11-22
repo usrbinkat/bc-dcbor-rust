@@ -353,14 +353,25 @@ fn every_native_control_is_seen_red_then_green_in_its_restored_copy() {
     std::fs::create_dir_all(&native).expect("a fixture directory");
     let write =
         |file: &str, text: &str| std::fs::write(native.join(file), text).expect("a fixture file");
-    let controls = vec![one(NATIVE), one(FIXTURE)];
+    let controls = vec![one(NATIVE), one(FIXTURE), one(MIRI)];
+    let native_only = [Runner::Native];
+    let every = [Runner::Native, Runner::Miri("tree")];
     write("red.judged", "refused\n");
     write("green.judged", "restored\n");
     write("before.sha256", "a\n");
     write("planted.sha256", "b\n");
     write("after.sha256", "a\n");
-    assert_eq!(evidence(&controls, &logs, "nightly"), Vec::<String>::new());
-    let stable = evidence(&controls, &logs, "stable");
+    // One result per selected control of the channel and runners, in the
+    // table's order: the nightly native run judges `c` alone, passed.
+    assert_eq!(
+        evidence(&controls, &logs, "nightly", &native_only),
+        [ControlResult {
+            control: "c".to_string(),
+            runner: "native".to_string(),
+            faults: Vec::new(),
+        }]
+    );
+    let stable = faults(&evidence(&controls, &logs, "stable", &native_only));
     assert!(
         stable
             .iter()
@@ -368,23 +379,38 @@ fn every_native_control_is_seen_red_then_green_in_its_restored_copy() {
         "{stable:#?}"
     );
     // A Miri control's evidence is its own model's directory: the native
-    // control's files are not it.
-    let miri = vec![one(MIRI)];
-    let unrun = evidence(&miri, &logs, "nightly");
+    // control's files are not it, and only a run of its runner selects it.
+    let scoped: Vec<(String, String)> = evidence(&controls, &logs, "nightly", &every)
+        .into_iter()
+        .map(|result| (result.control, result.runner))
+        .collect();
+    assert_eq!(
+        scoped,
+        [
+            ("c".to_string(), "native".to_string()),
+            ("u".to_string(), "tree".to_string())
+        ]
+    );
+    let unrun = faults(&evidence(
+        &controls,
+        &logs,
+        "nightly",
+        &[Runner::Miri("tree")],
+    ));
     assert!(
         unrun
             .iter()
             .any(|fault| fault.contains("u under tree: never run")),
         "{unrun:#?}"
     );
-    assert_eq!(directory(&logs, &miri[0]), logs.join("u-tree"));
+    assert_eq!(directory(&logs, &controls[2]), logs.join("u-tree"));
     write(
         "red.judged",
         "c: pass, where the planted defect's refusal is failed\n",
     );
     write("after.sha256", "b\n");
     write("planted.sha256", "a\n");
-    let faults = evidence(&controls, &logs, "nightly");
+    let faults = faults(&evidence(&controls, &logs, "nightly", &native_only));
     std::fs::remove_dir_all(&logs).expect("the fixture removed");
     assert!(
         faults.iter().any(|fault| fault.contains("not seen red")),

@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/calibration.rs
++++ tests/gate/src/proofs/calibration.rs
+@@ -101,7 +101,7 @@
+     fn reserve(path: &Path) -> (Option<Self>, Result<(), String>) {
+         let file = match std::fs::OpenOptions::new()
+             .write(true)
+-            .create_new(true)
++            .create(true).append(true)
+             .open(path)
+         {
+             Ok(file) => file,

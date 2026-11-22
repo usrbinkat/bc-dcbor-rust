@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/readiness.rs
++++ tests/gate/src/proofs/readiness.rs
+@@ -42,7 +42,7 @@
+             .truncate(false)
+             .open(path)
+             .map_err(|error| format!("{}: {error}", path.display()))?;
+-        match file.try_lock() {
++        match Ok::<(), std::fs::TryLockError>(()) {
+             Ok(()) => Ok(Self {
+                 path: path.to_path_buf(),
+                 acquired: super::now()?,
