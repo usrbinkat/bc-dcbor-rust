@@ -171,14 +171,14 @@ pub const SIGABRT: i32 = 6;
 /// `SIGSEGV`.
 pub const SIGSEGV: i32 = 11;
 
-/// loom's refusal of its bound (`loom` 0.7.2 `rt/path.rs`,
+/// loom's refusal of its bound (`loom` 0.7.3 `rt/path.rs`,
 /// `assert_path_len!`).
 pub const LOOM_BOUND: &str = "Model exceeded maximum number of branches";
-/// shuttle's refusal of its bound (`shuttle-engine` 0.1.7
+/// shuttle's refusal of its bound (`shuttle-engine` 0.1.8
 /// `runtime/execution.rs`).
 pub const SHUTTLE_BOUND: &str = "exceeded max_steps bound";
 /// The generator crate's report of a coroutine at its guard page, before it
-/// aborts (`generator` 0.8.11 `stack/overflow_unix.rs`).
+/// aborts (`generator` 0.8.12 `stack/overflow_unix.rs`).
 pub const LOOM_OVERFLOW: &str = "has overflowed its stack";
 
 /// The refusal message of `checker`'s bound.

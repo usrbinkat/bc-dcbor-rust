@@ -19,15 +19,15 @@ dcbor = { path = "../..", default-features = false, features = ["std", "derive"]
 # The independent oracle: an RFC 8610 implementation validating CBOR bytes
 # against CDDL text (`validate_cbor_from_slice`). Pinned by revision, the
 # identity: usrbinkat/cddl branch fix/cbor-range-bytes-and-foreign-tags at
-# fbba0a7, anweiss/cddl main c4c8d29 plus five commits (the fourth and fifth
-# change the fork's own tests only). Two correct the
+# 3fa1433, anweiss/cddl main c4c8d29 plus six commits (the fourth and fifth
+# change the fork's own tests only; the sixth pins pest 2.9.6). Two correct the
 # validator where release 0.10.7 admitted items RFC 8610 refuses: a byte
 # string matched against an integer range by its length without `.size`
 # (Section 2.2.2.1, 3.8.1), and any tag other than 0, 1, 33 or a bignum tag
 # satisfying every prelude type (Appendix D); the third, `unsigned` and
 # `integer` admitting their bignum tags, is what the tag fix rests on. The
 # feature citations below were read at release 0.10.7 (938a931); each
-# feature still exists at fbba0a7 (its Cargo.toml [features]), and the
+# feature still exists at 3fa1433 (its Cargo.toml [features]), and the
 # cited lines are not re-read there. Each feature enabled, and why:
 # - std: the validator module exists only under it (src/lib.rs:530), and
 #   without it the build script refuses unless a no_std parser is generated
@@ -45,13 +45,7 @@ dcbor = { path = "../..", default-features = false, features = ["std", "derive"]
 # Not enabled: csv-validate, freezer, ast-comments, ast-parent, each gating
 # modules or variants outside the CBOR path (src/validator/csv_validator.rs:2,
 # src/validator/cbor.rs:1530 and :1552).
-cddl = { git = "https://github.com/usrbinkat/cddl.git", rev = "fbba0a775449ffc6a56623c7926d936be035323d", default-features = false, features = [
-    "std",
-    "cbor",
-    "json",
-    "additional-controls",
-    "ast-span",
-] }
+cddl = { git = "https://github.com/usrbinkat/cddl.git", rev = "3fa143374fb58a19a9d7882444d4293cd7ce8b7e", default-features = false, features = ["std", "cbor", "json", "additional-controls", "ast-span"] }
 
 [lints]
 workspace = true

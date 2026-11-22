@@ -41,7 +41,7 @@ serde_json = "1"
 # data in (`rows::normative_faults`): the requirement and features the
 # library's census uses (the root manifest's dev-dependency), so the lock
 # holds one syn.
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 # `renameat2(2)` with `RENAME_NOREPLACE`, which publishes an adopted
 # calibration run atomically under a name that must not exist
 # (`proofs::adoption::publish`); and `setsid(2)`, which the launcher tests

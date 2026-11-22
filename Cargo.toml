@@ -29,8 +29,8 @@ exclude = ["fuzz"]
 # (loom's exhaustive search, branch store and thread limit, shuttle's seeded
 # PCT scheduler and step bound).
 [workspace.dependencies]
-loom = "=0.7.2"
-shuttle = "=0.9.9"
+loom = "=0.7.3"
+shuttle = "=0.9.10"
 
 # Compatible transitive consumers use the same bucket-access fork as dcbor.
 [patch.crates-io]
@@ -100,7 +100,7 @@ hex = { version = "^0.4.3", default-features = true }
 # `MinimalBigInt` (src/minimal_bigint.rs) holds its encoding's bytes, not
 # num-bigint's digits, and converts to and from num-bigint at the symbolic
 # edge only.
-num-bigint = { version = "0.4.8", default-features = false, optional = true }
+num-bigint = { version = "0.5.1", default-features = false, optional = true }
 thiserror = { version = "^2.0", default-features = false, optional = true }
 # Exact: src/bounded/text.rs restates this release's composition algorithm
 # over its character primitives; another release is adopted only after the
@@ -131,7 +131,7 @@ indoc = "^2.0.0"
 # proc-macro2's span locations, and scans items' tokens through quote.
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 version-sync = "^0.9.0"
 
 # Each model checker is a dependency only under its cfg, and then replaces

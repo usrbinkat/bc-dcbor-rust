@@ -3440,9 +3440,14 @@ mod tests {
             let ty = &item.self_ty;
             let ty = quote::quote!(#ty).to_string();
             match &item.trait_ {
-                Some((negative, path, _)) => format!(
+                // syn 3 keeps a negative impl's `!` in the impl's modifiers.
+                Some((path, _)) => format!(
                     "<{ty} as {}{}>",
-                    if negative.is_some() { "!" } else { "" },
+                    if item.modifiers.polarity.is_some() {
+                        "!"
+                    } else {
+                        ""
+                    },
                     quote::quote!(#path)
                 ),
                 None => ty,

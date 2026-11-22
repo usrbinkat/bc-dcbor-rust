@@ -2128,7 +2128,7 @@ impl UnsafeImpls {
 
 impl<'ast> Visit<'ast> for UnsafeImpls {
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        if let (Some(unsafety), Some((_, path, _))) = (&item.unsafety, &item.trait_)
+        if let (Some(unsafety), Some((path, _))) = (&item.unsafety, &item.trait_)
             && let Some(last) = path.segments.last()
             && UNSAFE_TRAITS.iter().any(|(name, _)| last.ident == *name)
         {
