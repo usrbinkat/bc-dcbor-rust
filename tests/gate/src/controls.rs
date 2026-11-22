@@ -1163,8 +1163,22 @@ pub fn observe(
         Ok(executable) => executable,
         Err(log) => return Ok((Outcome::BuildRefused, log)),
     };
-    let (termination, text) =
-        crate::process::run_test(&executable, test, &[], &logs.join(format!("{side}.log")))?;
+    // The test runs with the target directory it was built into, as under
+    // `cargo test`: a test that builds (trybuild, through `cargo metadata`)
+    // writes there, outside the copy, whose digest is its source alone
+    // (`proofs::SourceState`).
+    let target_dir = target_dir.to_str().ok_or_else(|| {
+        format!(
+            "{}: a target directory that is not UTF-8",
+            target_dir.display()
+        )
+    })?;
+    let (termination, text) = crate::process::run_test(
+        &executable,
+        test,
+        &[("CARGO_TARGET_DIR", target_dir.to_string())],
+        &logs.join(format!("{side}.log")),
+    )?;
     Ok((outcome::native(Kind::Test, termination, &text), text))
 }
 
