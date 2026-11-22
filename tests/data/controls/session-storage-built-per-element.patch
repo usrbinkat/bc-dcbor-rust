@@ -1,11 +1,11 @@
---- src/bounded/policy/record.rs
-+++ src/bounded/policy/record.rs
-@@ -354,7 +354,7 @@
+--- src/sync.rs
++++ src/sync.rs
+@@ -152,7 +152,7 @@
  #[cfg(not(any(loom, shuttle)))]
- unsafe fn zeroed<T>(len: usize, _make: impl FnMut() -> T) -> Box<[T]> {
-     // SAFETY: forwarded from the caller: all-zero bytes are a valid `T`.
--    unsafe { Box::<[T]>::new_zeroed_slice(len).assume_init() }
+ pub(crate) unsafe fn zeroed<T>(len: usize, _make: impl FnMut() -> T) -> alloc::boxed::Box<[T]> {
+     // SAFETY: the caller establishes the zero representation of every element.
+-    unsafe { alloc::boxed::Box::<[T]>::new_zeroed_slice(len).assume_init() }
 +    core::iter::repeat_with(_make).take(len).collect()
  }
-
- /// [`zeroed`] under a model checker: each element constructed with `make`.
+ 
+ /// Construct recording storage with the selected model's atomic constructors.

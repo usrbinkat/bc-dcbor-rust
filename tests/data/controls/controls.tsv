@@ -630,8 +630,8 @@ checkpoint-full-snapshots-construction	tests/data/controls/checkpoint-full-snaps
 # the obligations of the snapshot before it.
 checkpoint-obligation-edit-dropped	tests/data/controls/checkpoint-obligation-edit-dropped.patch	native	nightly	dcbor-refinement	dcbor/std	lib	history::tests::obligation_edits_and_large_reordered_custody_reconstruct_exactly	-	failed	reconstructed checkpoints differ from the checkpoints pushed
 # A session's permit records and slots built element by element
-# (policy/record.rs, `zeroed`): each array is allocated uninitialized and
-# written one element at a time, with no zeroed allocation.
+# (src/sync.rs, `zeroed`): each array is constructed one element at a time,
+# with no zeroed allocation.
 session-storage-built-per-element	tests/data/controls/session-storage-built-per-element.patch	native	nightly	dcbor-test-support	dcbor/std	lib	tests::a_session_allocates_its_records_and_slots_zeroed	-	failed	a session's records and slots are not each one zeroed allocation
 # A gate that owns no process group (tests/gate-common.sh,
 # `own_process_group`): stopping it leaves its children and theirs running.
