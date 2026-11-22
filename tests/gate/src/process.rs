@@ -129,6 +129,44 @@ fn build_report(stdout: &[u8], stderr: &[u8]) -> String {
     report
 }
 
+/// A test binary as `cargo test` built it, and the directory of the package
+/// it is a target of: the working directory and `CARGO_MANIFEST_DIR` cargo
+/// runs it with, which a test locating its own package reads (trybuild's
+/// `cargo::manifest_dir`, then `cargo metadata` in that directory). The gate
+/// runs every test binary as cargo would ([`run_once`]), so a test that
+/// reads its package's directory reads the copy's, never the caller's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestExecutable {
+    pub path: PathBuf,
+    pub package: PathBuf,
+}
+
+impl TestExecutable {
+    /// The test executable a `cargo test --message-format json` build
+    /// message reports: a `compiler-artifact` of the test profile with an
+    /// `executable`, its package the directory of its `manifest_path`.
+    /// None for any other message; refused when such an artifact names no
+    /// manifest path, since its test would run without its package.
+    pub fn of_message(message: &serde_json::Value) -> Result<Option<Self>, String> {
+        if message["reason"] != "compiler-artifact" || message["profile"]["test"] != true {
+            return Ok(None);
+        }
+        let Some(path) = message["executable"].as_str() else {
+            return Ok(None);
+        };
+        let manifest = message["manifest_path"].as_str().ok_or_else(|| {
+            format!("test executable {path}: its build message names no manifest_path")
+        })?;
+        let package = Path::new(manifest).parent().ok_or_else(|| {
+            format!("test executable {path}: manifest_path {manifest} names no directory")
+        })?;
+        Ok(Some(Self {
+            path: PathBuf::from(path),
+            package: package.to_path_buf(),
+        }))
+    }
+}
+
 /// The RUSTFLAGS of `checker`'s build, the caller's own before them.
 pub fn flags(checker: Checker) -> String {
     let own = std::env::var("RUSTFLAGS").unwrap_or_default();
@@ -144,7 +182,7 @@ pub fn build(
     root: &Path,
     checker: Checker,
     log: &Path,
-) -> Result<BTreeMap<String, PathBuf>, String> {
+) -> Result<BTreeMap<String, TestExecutable>, String> {
     let targets = dcbor_model_bounds::targets();
     let mut command = controlled("cargo")?;
     command
@@ -173,10 +211,7 @@ pub fn build(
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if message["reason"] != "compiler-artifact" || message["profile"]["test"] != true {
-            continue;
-        }
-        let Some(executable) = message["executable"].as_str() else {
+        let Some(executable) = TestExecutable::of_message(&message)? else {
             continue;
         };
         let kinds = &message["target"]["kind"];
@@ -192,9 +227,7 @@ pub fn build(
                 .to_string()
         };
         if targets.contains(&name.as_str())
-            && executables
-                .insert(name.clone(), PathBuf::from(executable))
-                .is_some()
+            && executables.insert(name.clone(), executable).is_some()
         {
             return Err(format!("two executables of target {name}"));
         }
@@ -223,7 +256,7 @@ pub fn build_target(
     target: &str,
     target_dir: &Path,
     log: &Path,
-) -> Result<Result<PathBuf, String>, String> {
+) -> Result<Result<TestExecutable, String>, String> {
     let mut command = controlled("cargo")?;
     command
         .current_dir(root)
@@ -253,15 +286,15 @@ pub fn build_target(
     if !output.status.success() {
         return Ok(Err(report));
     }
-    crate::reach::executable(&String::from_utf8_lossy(&output.stdout))
-        .map(|found| Ok(PathBuf::from(found)))
+    crate::reach::executable(&String::from_utf8_lossy(&output.stdout)).map(Ok)
 }
 
 /// One run of `test` alone in `executable` (`--exact`, one thread, output
-/// uncaptured), its environment `environment` beside the controlled one and
-/// `TERM=dumb`, logged to `log`: its termination and its log's text.
+/// uncaptured), in its package as cargo runs it ([`run_once`]), its
+/// environment `environment` beside the controlled one and `TERM=dumb`,
+/// logged to `log`: its termination and its log's text.
 pub fn run_test(
-    executable: &Path,
+    executable: &TestExecutable,
     test: &str,
     environment: &[(&str, String)],
     log: &Path,
@@ -792,16 +825,23 @@ fn kani(run: &KaniRun<'_>) -> Result<(Termination, String), String> {
     }
 }
 
-/// The models of `checker` the `target` binary `executable` lists.
-pub fn list(checker: Checker, target: &str, executable: &Path) -> Result<Vec<Listed>, String> {
-    let output = controlled(executable)?
+/// The models of `checker` the `target` binary `executable` lists, listed
+/// in its package as cargo runs it.
+pub fn list(
+    checker: Checker,
+    target: &str,
+    executable: &TestExecutable,
+) -> Result<Vec<Listed>, String> {
+    let output = controlled(&executable.path)?
+        .current_dir(&executable.package)
+        .env("CARGO_MANIFEST_DIR", &executable.package)
         .args(["--list", "--format", "terse"])
         .output()
-        .map_err(|error| format!("{}: {error}", executable.display()))?;
+        .map_err(|error| format!("{}: {error}", executable.path.display()))?;
     if !output.status.success() {
         return Err(format!(
             "{} --list: {}",
-            executable.display(),
+            executable.path.display(),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -938,14 +978,20 @@ pub(crate) fn time_report(
 /// The exact libtest selection must acknowledge its start in the log before
 /// the exec chain's termination is attributed to it. Failure before that
 /// acknowledgement leaves termination unavailable, including early signals.
+///
+/// The test runs in its package as `cargo test` runs it: its working
+/// directory and `CARGO_MANIFEST_DIR` the package's directory
+/// ([`TestExecutable`]). GNU time opens its report from that directory, so
+/// the report's path is made absolute first.
 fn run_once(
     workload: &Workload,
-    executable: &Path,
+    executable: &TestExecutable,
     test: &str,
     environment: &[(&str, String)],
     log: &Path,
 ) -> Result<Measured, String> {
-    let measure = log.with_extension("measure");
+    let measure = std::path::absolute(log.with_extension("measure"))
+        .map_err(|error| format!("{}: {error}", log.display()))?;
     let file = std::fs::File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
     let error = file
         .try_clone()
@@ -955,7 +1001,9 @@ fn run_once(
         .args(["-f", "%M %e", "-o"])
         .arg(&measure)
         .arg(workload.launcher())
-        .arg(executable)
+        .arg(&executable.path)
+        .current_dir(&executable.package)
+        .env("CARGO_MANIFEST_DIR", &executable.package)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .stdout(file)
         .stderr(error);
@@ -1011,7 +1059,7 @@ fn marked<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 }
 
 /// Whether `listed` runs on a sized stack, by its runner's own description.
-pub fn sized(executable: &Path, listed: &Listed, log: &Path) -> Result<bool, String> {
+pub fn sized(executable: &TestExecutable, listed: &Listed, log: &Path) -> Result<bool, String> {
     // A description is read from its log; its measurement is no part of it.
     let Measured {
         termination, text, ..
@@ -1037,7 +1085,7 @@ pub fn sized(executable: &Path, listed: &Listed, log: &Path) -> Result<bool, Str
 /// One run of `listed` at `bound` and `stack` (each unset when `None`),
 /// classified ([`outcome::model`]).
 pub fn run(
-    executable: &Path,
+    executable: &TestExecutable,
     listed: &Listed,
     bound: Option<usize>,
     stack: Option<usize>,
@@ -1176,13 +1224,16 @@ mod tests {
     /// launcher execs into the test inside the workload's scope, so the
     /// measuring process is never in the kill domain; the run keeps its
     /// measurement and the test's own termination, an exit status or the
-    /// signal that killed it.
+    /// signal that killed it. The test runs in its package as `cargo test`
+    /// runs it, its working directory and `CARGO_MANIFEST_DIR` the
+    /// package's, whatever the caller's own directory is.
     #[test]
     fn a_measured_run_records_how_its_confined_test_ended() {
         use crate::outcome::Termination;
         let directory =
             std::env::temp_dir().join(format!("dcbor-gate-measured-run-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let package = directory.join("package");
+        std::fs::create_dir_all(&package).unwrap();
         let script = directory.join("test.sh");
         std::fs::write(
             &script,
@@ -1190,9 +1241,15 @@ mod tests {
              printf 'test t ... \\n'\n\
              case \"$DCBOR_TEST_END\" in exit) exit 7 ;; kill) kill -KILL $$ ;; esac\n\
              cut -d: -f3 /proc/self/cgroup\n\
-             cut -d: -f3 /proc/$PPID/cgroup\n",
+             cut -d: -f3 /proc/$PPID/cgroup\n\
+             pwd -P\n\
+             printf '%s\\n' \"$CARGO_MANIFEST_DIR\"\n",
         )
         .unwrap();
+        let executable = |path: std::path::PathBuf| super::TestExecutable {
+            path,
+            package: package.clone(),
+        };
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1203,7 +1260,7 @@ mod tests {
         let run = |end: &str| {
             super::run_once(
                 &launcher,
-                &script,
+                &executable(script.clone()),
                 "t",
                 &[
                     ("DCBOR_GATE_MEMORY", "64M".to_string()),
@@ -1215,7 +1272,7 @@ mod tests {
         };
         let missing = super::run_once(
             &launcher,
-            &directory.join("nonexistent"),
+            &executable(directory.join("nonexistent")),
             "t",
             &[("DCBOR_GATE_MEMORY", "64M".to_string())],
             &directory.join("missing.log"),
@@ -1233,9 +1290,20 @@ mod tests {
         } = run("report");
         assert_eq!(termination, Ok(Termination::Exited(0)), "{text}");
         let lines: Vec<&str> = text.lines().skip(1).collect();
-        let [test, parent] = lines[..] else {
+        let [test, parent, working, manifest] = lines[..] else {
             panic!("the test reported {text:?}");
         };
+        let package_path = std::fs::canonicalize(&package).unwrap();
+        assert_eq!(
+            std::path::Path::new(working),
+            package_path,
+            "package-unentered: a test ran outside its package's directory"
+        );
+        assert_eq!(
+            std::path::Path::new(manifest),
+            package,
+            "package-unnamed: a test ran without its package's CARGO_MANIFEST_DIR"
+        );
         assert!(
             test != caller && test.ends_with(".scope"),
             "a measured test ran in its caller's cgroup {caller}: {test}"

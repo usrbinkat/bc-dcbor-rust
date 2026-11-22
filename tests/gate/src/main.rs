@@ -146,8 +146,8 @@
 //!                   Miri judgements, published to OUTPUT
 //!                   (`mutation::miri_verdict`)
 //!   reach executable MESSAGES
-//!                   the one test executable a cargo build's JSON MESSAGES
-//!                   name (`reach::executable`)
+//!                   the path of the one test executable a cargo build's
+//!                   JSON MESSAGES name (`reach::executable`)
 //!   reach regions ROOT EXPORT
 //!                   the code regions under ROOT/src an llvm-cov EXPORT
 //!                   records executed, as JSON (`reach::regions`)
@@ -300,7 +300,7 @@ fn models_of(
     root: &Path,
     logs: &Path,
     checkers: &[Checker],
-) -> Result<Vec<(Listed, PathBuf)>, Broken> {
+) -> Result<Vec<(Listed, process::TestExecutable)>, Broken> {
     let mut found = Vec::new();
     for &checker in checkers {
         let executables = process::build(root, checker, &logs.join(format!("build-{checker}.log")))
@@ -1334,7 +1334,12 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             })
         }
         ["reach", "executable", messages] => {
-            println!("{}", reach::executable(&contents(Path::new(messages))?)?);
+            println!(
+                "{}",
+                reach::executable(&contents(Path::new(messages))?)?
+                    .path
+                    .display()
+            );
             Ok(ExitCode::SUCCESS)
         }
         ["reach", "regions", root, export] => {

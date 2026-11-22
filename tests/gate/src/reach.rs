@@ -121,8 +121,9 @@ fn index_of(value: u64, what: &str) -> Result<usize, String> {
 }
 
 /// The one test executable a `cargo test --no-run --message-format=json`
-/// build reported in `messages`.
-pub fn executable(messages: &str) -> Result<String, String> {
+/// build reported in `messages`, with its package's directory
+/// ([`crate::process::TestExecutable::of_message`]).
+pub fn executable(messages: &str) -> Result<crate::process::TestExecutable, String> {
     let mut found = Vec::new();
     for line in messages
         .lines()
@@ -131,21 +132,8 @@ pub fn executable(messages: &str) -> Result<String, String> {
     {
         let message: serde_json::Value =
             serde_json::from_str(line).map_err(|error| format!("a build message: {error}"))?;
-        let artifact =
-            message.get("reason").and_then(|reason| reason.as_str()) == Some("compiler-artifact");
-        let test = message
-            .get("profile")
-            .and_then(|profile| profile.get("test"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        if let (true, true, Some(executable)) = (
-            artifact,
-            test,
-            message
-                .get("executable")
-                .and_then(|executable| executable.as_str()),
-        ) {
-            found.push(executable.to_string());
+        if let Some(executable) = crate::process::TestExecutable::of_message(&message)? {
+            found.push(executable);
         }
     }
     match found.as_slice() {
@@ -913,13 +901,15 @@ mod tests {
         );
     }
 
-    /// The one test executable of a build is found; none, or two, is
-    /// refused.
+    /// The one test executable of a build is found, with the directory of
+    /// the package it is a target of; none, or two, is refused, and so is
+    /// a test artifact that names no package manifest.
     #[test]
     fn a_build_reports_exactly_one_test_executable() {
         let artifact = |executable: &str, test: bool| {
             serde_json::json!({
                 "reason": "compiler-artifact",
+                "manifest_path": "/copy/dcbor-derive/Cargo.toml",
                 "profile": {"test": test},
                 "executable": executable
             })
@@ -931,7 +921,25 @@ mod tests {
             artifact("/t/build-script", false),
             serde_json::json!({"reason": "build-finished", "success": true})
         );
-        assert_eq!(executable(&messages), Ok("/t/owned_input-1".to_string()));
+        assert_eq!(
+            executable(&messages),
+            Ok(crate::process::TestExecutable {
+                path: "/t/owned_input-1".into(),
+                package: "/copy/dcbor-derive".into(),
+            }),
+            "package-unrecorded: a test executable lost its package's directory"
+        );
+        let unplaced = serde_json::json!({
+            "reason": "compiler-artifact",
+            "profile": {"test": true},
+            "executable": "/t/unplaced-1"
+        })
+        .to_string();
+        assert!(
+            executable(&unplaced)
+                .unwrap_err()
+                .contains("names no manifest_path")
+        );
         let two = format!("{}\n{}\n", artifact("/t/a", true), artifact("/t/b", true));
         assert!(
             executable(&two)
