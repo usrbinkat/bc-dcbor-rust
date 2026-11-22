@@ -98,6 +98,14 @@
 //!                   `#[kani::proof]` of the source, proved when it verified,
 //!                   published under the identity in LOGS, then the verdict;
 //!                   status 1, each fault named (`proofs::run`)
+//!   proofs-discover ROOT TARGET LOGS LAUNCHER HARNESS...
+//!                   each HARNESS of the library under ROOT compiled by the
+//!                   Kani LAUNCHER names, its instrumented binary preserved
+//!                   and its loops inventoried by the driver under
+//!                   LOGS/kani.evidence/loop-bounds, which is printed;
+//!                   nothing is verified and no results row is written;
+//!                   status 1 unless every harness's discovery holds
+//!                   (`proofs::discover`, `proofs::check_discovery`)
 //!   miri inventory LOG OUT
 //!                   the inventory the run's LOG reports, written to OUT;
 //!                   status 1 when a line of it is malformed
@@ -197,6 +205,7 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      patch apply|reverse|check DIFF DIRECTORY | tree-digest ROOT | \
                      classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs-identity LAUNCHER | \
                      proofs ROOT TARGET LOGS LAUNCHER | \
+                     proofs-discover ROOT TARGET LOGS LAUNCHER HARNESS... | \
                      proofs-calibrate ROOT TARGET LOGS LAUNCHER PLAN WORKLOAD_LOCK CONTROL_LOGS... | \
                      proofs-adopt EVIDENCE ROOT | \
                      miri models | \
@@ -1084,6 +1093,36 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             let mut found = rows::verdict(&published);
             found.extend(faults);
             Ok(verdict(&found))
+        }
+        // A discovery of the harnesses named (`proofs::discover`): each
+        // compiled, its instrumented binary preserved and its loops
+        // inventoried by the driver, nothing verified, no results row
+        // written. The directory of the driver's per-harness records is
+        // printed; the command fails unless every harness's discovery holds.
+        [
+            "proofs-discover",
+            root,
+            target_dir,
+            logs,
+            launcher,
+            harnesses @ ..,
+        ] if !harnesses.is_empty() => {
+            let launcher =
+                dcbor_gate::proofs::selected_launcher(Path::new(launcher)).map_err(Broken)?;
+            let selection: Vec<String> = harnesses.iter().map(ToString::to_string).collect();
+            match dcbor_gate::proofs::discover(
+                Path::new(root),
+                Path::new(target_dir),
+                &Path::new(logs).join("kani.log"),
+                &launcher,
+                &selection,
+            ) {
+                Ok(records) => {
+                    println!("{}", records.display());
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(fault) => Ok(verdict(&[fault])),
+            }
         }
         // A calibration of the harnesses a plan names, holding the checkout's
         // workload lock, after the control runs whose logs follow it

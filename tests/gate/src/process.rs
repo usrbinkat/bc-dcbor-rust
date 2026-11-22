@@ -354,7 +354,8 @@ impl<'a> KaniRequest<'a> {
     /// ([`crate::proofs::selected_launcher`]); a census that declares a
     /// harness; a selection the purpose admits, of declared harnesses alone
     /// (a qualification the whole census; a calibration exactly one
-    /// harness; a control side exactly the one its authorization binds);
+    /// harness; a control side exactly the one its authorization binds; a
+    /// discovery exactly the harnesses it was made for);
     /// the tree's policy file read once ([`crate::proofs::read_policy`]) and
     /// every selected harness given its purpose's deadline
     /// ([`crate::proofs::selected`]); the tree's source state read once, and
@@ -412,6 +413,15 @@ impl<'a> KaniRequest<'a> {
                         "a {} side authorizes harness {} alone, the run selects {selection:?}",
                         record.side.name(),
                         record.harness
+                    ));
+                }
+            }
+            (RunPurpose::Discovery(discovery), selection) => {
+                if *selection != Selection::Only(discovery.selection().clone()) {
+                    return Err(format!(
+                        "a discovery checks exactly the harnesses it was made for, {:?}, the run \
+                         selects {selection:?}",
+                        discovery.selection()
                     ));
                 }
             }
@@ -741,6 +751,14 @@ fn kani(run: &KaniRun<'_>) -> Result<(Termination, String), String> {
         };
         let text =
             std::fs::read_to_string(log).map_err(|error| format!("{}: {error}", log.display()))?;
+        // A discovery is judged by its discovery records alone: its solvers
+        // were stopped at their deadline, so its report, termination and
+        // solver records establish nothing and are not reconciled.
+        if let crate::proofs::RunPurpose::Discovery(discovery) = purpose {
+            crate::proofs::check_discovery(&bounds, discovery, crate::proofs::Artifacts::Live)
+                .map_err(|fault| format!("{}: {fault}", log.display()))?;
+            return Ok((termination, text));
+        }
         let reconciled = crate::proofs::check_execution_evidence(
             &bounds,
             &run.selected,
@@ -804,6 +822,8 @@ fn kani(run: &KaniRun<'_>) -> Result<(Termination, String), String> {
                 )
                 .map_err(|fault| format!("{}: {fault}", log.display()))?;
             }
+            // Judged, and returned, by its discovery records above.
+            crate::proofs::RunPurpose::Discovery(_) => {}
         }
         Ok((termination, text))
     })();

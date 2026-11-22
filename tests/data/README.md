@@ -143,8 +143,8 @@ capacity (`support::CAPACITY`) was measured to need: the session preallocated be
 runs, never an expected accounting total. No test states one; each is a row of its family's record.
 
 `bash tests/record-evidence.sh record-budgets` records every budget record of the run's layer
-(`DCBOR_RIGOR`, `fast` unless set), then checks each with recording disabled, and reports how many of
-the inventory it recorded; the exhaustive layer's records are recorded by a run with
+(`DCBOR_RIGOR`, `fast` unless set), then checks each with recording disabled, and reports how many
+of the inventory it recorded; the exhaustive layer's records are recorded by a run with
 `DCBOR_RIGOR=exhaustive` where that layer's execution is authorized, and the inventory is held only
 by both runs together. `gate budgets` names every record to hold, one line each: its file name, its
 projection's features, its test target and exact test, and its rigor layer and witness size. That
@@ -215,15 +215,15 @@ its allocations' capacities (`History::retained_bytes`), must be within the late
 deltas' own vector at its growth bound, and an allowance `History::push` accumulates group by group
 from each checkpoint and the one before it, independently of the deltas stored: a changed group its
 edit record and its whole new report, an appended group its group and its report, an unchanged group
-nothing. A run whose checkpoints retain more fails at its finalization (`the run's checkpoint storage
-exceeds its edits`), so the bound holds in every workload that takes checkpoints, the B-tree
-occupancy round trips and constructions (`tests/owned_btree.rs`) among them, never in a chosen few.
-`checkpoint_storage_is_its_edits_on_changing_custody` attributes those bytes by the allocator: four
-owners' groups changed by the refinement crate's fixed edit sequence (obligation work changed,
-settled away and newly admitted, permits rotated and reversed, groups swapped), at a size whose
-allocations the heap observer holds whole, observed only across the pushes; their live bytes must
-equal `History::retained_bytes`, every checkpoint must reconstruct exactly, the storage must be
-within the changes, and dropping the history must release every byte.
+nothing. A run whose checkpoints retain more fails at its finalization
+(`the run's checkpoint storage exceeds its edits`), so the bound holds in every workload that takes
+checkpoints, the B-tree occupancy round trips and constructions (`tests/owned_btree.rs`) among them,
+never in a chosen few. `checkpoint_storage_is_its_edits_on_changing_custody` attributes those bytes
+by the allocator: four owners' groups changed by the refinement crate's fixed edit sequence
+(obligation work changed, settled away and newly admitted, permits rotated and reversed, groups
+swapped), at a size whose allocations the heap observer holds whole, observed only across the
+pushes; their live bytes must equal `History::retained_bytes`, every checkpoint must reconstruct
+exactly, the storage must be within the changes, and dropping the history must release every byte.
 
 Every turn of a recorded driver collects the whole custody it holds and every checkpoint is replayed
 through the machine, so a run's cost grows with its turns times its live custody. The replay reads
@@ -231,18 +231,18 @@ each checkpoint's boundary from its delta and lends each reconstructed checkpoin
 (`machine::Checkpoints`, `history.rs` `Replay`), never a copy per checkpoint. The machine indexes
 what it holds live (unended acquisitions, obligations still holding work, by identity and by
 acquisition, and live permits), so a checkpoint, an acquisition's end and quiescence read the
-custody held there, not every identity the session ever minted; the first divergence each rule
-names is unchanged (`tests/refinement/src/tests.rs`). The refinement and support crates build
-optimized in the dev profile (`Cargo.toml`, `[profile.dev.package.*]`, only `opt-level`), debug
-assertions and overflow checks kept; the library under test keeps its own profile. Each recorded
-run reports where its time went (`support::Phases`: the body and within it each custody
-collection and checkpoint stored, the finalization and within it the correspondence, the session's
-finish, the refinement replay and the storage bound, and the evidence inspections), timed to a
-stage's unwind and printed on standard error by a run that fails; the B-tree families print them per
-fixture. They are wall-clock diagnostics: no record, receipt or decision reads them. Measured at
-exhaustive rigor and minimal witnesses on the uncommitted tree, the 143-entry occupancy round trip
-(31,007 turns) took 129.6 s in the debug build, 93.6 s of it in replay and 32.1 s in collection,
-and 11.8 s with both crates optimized (replay 4.6 s, collection 6.0 s).
+custody held there, not every identity the session ever minted; the first divergence each rule names
+is unchanged (`tests/refinement/src/tests.rs`). The refinement and support crates build optimized in
+the dev profile (`Cargo.toml`, `[profile.dev.package.*]`, only `opt-level`), debug assertions and
+overflow checks kept; the library under test keeps its own profile. Each recorded run reports where
+its time went (`support::Phases`: the body and within it each custody collection and checkpoint
+stored, the finalization and within it the correspondence, the session's finish, the refinement
+replay and the storage bound, and the evidence inspections), timed to a stage's unwind and printed
+on standard error by a run that fails; the B-tree families print them per fixture. They are
+wall-clock diagnostics: no record, receipt or decision reads them. Measured at exhaustive rigor and
+minimal witnesses on the uncommitted tree, the 143-entry occupancy round trip (31,007 turns) took
+129.6 s in the debug build, 93.6 s of it in replay and 32.1 s in collection, and 11.8 s with both
+crates optimized (replay 4.6 s, collection 6.0 s).
 
 ### Matrix cost evidence
 
@@ -337,11 +337,11 @@ renamed or unreached function cannot drop its bound silently. Which function-sco
 owes follows from its loop discovery, which must have exited successfully, have run as
 `goto-instrument --show-loops --json-ui` on the harness's preserved binary, and hold exactly one
 inventory, an empty one included, and no reported error or record of unknown kind
-(`proofs::discovered`): an empty, substituted or failed discovery cannot remove a bound. Kani resolves the selectors
-against each harness's instrumented goto binary immediately before CBMC runs on it
-(`nix/kani-driver-loop-bounds.patch`, `kani-driver/src/loop_bounds.rs`); unwinding assertions stay
-on, so a bound too small for an execution of the domain fails the harness. A resolution checks the
-function, file, loop count and symbol; it cannot see two loops of one function exchange numbers,
+(`proofs::discovered`): an empty, substituted or failed discovery cannot remove a bound. Kani
+resolves the selectors against each harness's instrumented goto binary immediately before CBMC runs
+on it (`nix/kani-driver-loop-bounds.patch`, `kani-driver/src/loop_bounds.rs`); unwinding assertions
+stay on, so a bound too small for an execution of the domain fails the harness. A resolution checks
+the function, file, loop count and symbol; it cannot see two loops of one function exchange numbers,
 and the bound's soundness rests on the unwinding assertion.
 
 The decode, string and header harnesses check their domains one constant size at a time, so each
@@ -355,118 +355,128 @@ generated code asserts the file's domain constants equal the axes' largest value
 refuses a file that does not include its instances once or a written harness that shares an
 instance's name.
 
-Every Kani run of a gate keeps its evidence beside its log, `LOG.evidence/`, each file created
-once: the launcher it ran (the run's one selection, `gate proofs-identity`), the policy it was
-given, and per harness the instrumented binary it was checked on, copied before anything read it
+Every Kani run of a gate keeps its evidence beside its log, `LOG.evidence/`, each file created once:
+the launcher it ran (the run's one selection, `gate proofs-identity`), the policy it was given, and
+per harness the instrumented binary it was checked on, copied before anything read it
 (`artifact.out`, with its build path and digest in `artifact.json`), the loop discovery's
-invocation, status and streams for every harness, the resolution of the bounds that apply to it,
-the solver's command and executables and its
-launch attempt, then `execution.json`, the launcher, the verifier and each launched harness's
-artifact digest, written once the evidence reconciled. The preserved binary
-is what a replay or an inspection of a harness's loops reads: the shared `target/kani` build
-directory is rewritten by every later run. A run's verdicts count only when that evidence reconciles with its policy and
-report (`proofs::check_execution_evidence`): the preserved bytes have their recorded digest, the
-solver ran on them, and a bounded harness's resolution names them, for the proof suite and every
-Kani control alike.
+invocation, status and streams for every harness, the resolution of the bounds that apply to it, the
+solver's command and executables and its launch attempt, then `execution.json`, the launcher, the
+verifier and each launched harness's artifact digest, written once the evidence reconciled. The
+preserved binary is what a replay or an inspection of a harness's loops reads: the shared
+`target/kani` build directory is rewritten by every later run. A run's verdicts count only when that
+evidence reconciles with its policy and report (`proofs::check_execution_evidence`): the preserved
+bytes have their recorded digest, the solver ran on them, and a bounded harness's resolution names
+them, for the proof suite and every Kani control alike.
 
 ## Proof runtime evidence
 
-Every Kani run the gate judges runs on a copy of a clean commit (`tests/gate-common.sh`,
-`copy_of`), never the checkout: the proof gate's at one location, `target/proof-source`, held
-under an exclusive lock (`target/proof-source.lock`) for its whole run, so a calibration's and a
-qualification's builds share their source paths and so their instrumented binaries; a control's
-at its own copy. The gate never asks git what a tree holds. A run's source identity is the digest
-of the copy's source state (`proofs::SourceState`, `proofs::tree_digest`, the one implementation
-the scripts' `tree_digest` and `gate tree-digest` also are): a versioned record stream
-(`dcbor-gate source tree v1`) of every entry in byte order of its raw path, each field
-length-delimited, a regular file with its executable bit and bytes, a symbolic link with its
-target, never followed, a path another state lists recorded as deleted; any other kind refuses
-the digest. It is read before the run launches and again when it ends; a source that moved
-refuses the run, though a change made and undone while it ran is not detected.
+Every Kani run the gate judges runs on a copy of a clean commit (`tests/gate-common.sh`, `copy_of`),
+never the checkout: the proof gate's at one location, `target/proof-source`, held under an exclusive
+lock (`target/proof-source.lock`) for its whole run, so a calibration's and a qualification's builds
+share their source paths and so their instrumented binaries; a control's at its own copy. The gate
+never asks git what a tree holds. A run's source identity is the digest of the copy's source state
+(`proofs::SourceState`, `proofs::tree_digest`, the one implementation the scripts' `tree_digest` and
+`gate tree-digest` also are): a versioned record stream (`dcbor-gate source tree v1`) of every entry
+in byte order of its raw path, each field length-delimited, a regular file with its executable bit
+and bytes, a symbolic link with its target, never followed, a path another state lists recorded as
+deleted; any other kind refuses the digest. It is read before the run launches and again when it
+ends; a source that moved refuses the run, though a change made and undone while it ran is not
+detected.
 
-A run's evidence directory, `LOG.evidence/`, is created exclusively, and from then on every
-outcome is judged (`process::kani`): the documents the run was given, kept before anything
-launches (`plan.json` and the calibration's `readiness.json` for a calibration,
-`expectations.json` otherwise), the plan or predictions the very bytes its identity's revision
-(`run.json`) is the digest of; the identity; for a control side its
-authorization (`authorization.json`); the launch's environment and load before and after
-(`launch.json`); the launcher's ending (`launcher.execution.json`); the reconciled execution; then
-`judgement.json`, accepted or rejected with why, written whatever failed; then `manifest.json`,
-attempted whatever the judgement's own write did. The manifest names the run's identifier only
-when one was made, records the log as present with its digest, missing (the run never created
-it) or unreadable, digests every record or names each it could not, and says whether it is
-complete. A manifest that cannot be written fails the run, accepted or not; a storage failure
-neither record survives is returned, never claimed durable. Each document is read once, its
-digest and its interpretation of the same bytes (`process::sha256_bytes`, the one digest
-authority beside `process::sha256`), and a finished run's records are read through its complete
-manifest (`proofs::ValidatedManifest`), each record's bytes held to its listed digest before they
-are interpreted, its instrumented binaries held to their digests where the run left them or, in an
-adopted run, required absent (`proofs::Artifacts`, `proofs::Binaries`). A live record counts as
-absent only when the system reports it not found; any other failure to inspect it is a fault.
+A run's evidence directory, `LOG.evidence/`, is created exclusively, and from then on every outcome
+is judged (`process::kani`): the documents the run was given, kept before anything launches
+(`plan.json` and the calibration's `readiness.json` for a calibration, `expectations.json`
+otherwise), the plan or predictions the very bytes its identity's revision (`run.json`) is the
+digest of; the identity; for a control side its authorization (`authorization.json`); the launch's
+environment and load before and after (`launch.json`); the launcher's ending
+(`launcher.execution.json`); the reconciled execution; then `judgement.json`, accepted or rejected
+with why, written whatever failed; then `manifest.json`, attempted whatever the judgement's own
+write did. The manifest names the run's identifier only when one was made, records the log as
+present with its digest, missing (the run never created it) or unreadable, digests every record or
+names each it could not, and says whether it is complete. A manifest that cannot be written fails
+the run, accepted or not; a storage failure neither record survives is returned, never claimed
+durable. Each document is read once, its digest and its interpretation of the same bytes
+(`process::sha256_bytes`, the one digest authority beside `process::sha256`), and a finished run's
+records are read through its complete manifest (`proofs::ValidatedManifest`), each record's bytes
+held to its listed digest before they are interpreted, its instrumented binaries held to their
+digests where the run left them or, in an adopted run, required absent (`proofs::Artifacts`,
+`proofs::Binaries`). A live record counts as absent only when the system reports it not found; any
+other failure to inspect it is a fault.
 
 Every persisted record is read into a validated type only its validator makes: a run's identity
-(`RunIdentityRecord::validate`), a plan (`plan_of`), predictions (`expectations_of`), a
-manifest (`read_manifest`), an environment (`EnvironmentRecord::establish`), a readiness
+(`RunIdentityRecord::validate`), a plan (`plan_of`), predictions (`expectations_of`), a manifest
+(`read_manifest`), an environment (`EnvironmentRecord::establish`), a readiness
 (`Readiness::validate`) and a sample (`eligible_sample`); nothing is trusted because a record says
 so.
 
 A workload's environment (`proofs::EnvironmentRecord`) is its processor model, its affinity, the
-effective cpuset of its nearest cpuset-enabled group, and its group and every ancestor through
-`/`, each with its path and its `cpu.max` and `memory.max` observed as a validated value, an
-absence cgroup v2 establishes with its reason (the root keeps neither; a group whose parent's
-`cgroup.subtree_control` does not enable the controller has none of its files), or unavailable
-with why (a permission failure, a group that disappeared, a malformed value, a file missing
-though its controller is enabled). Absence is never unlimited. A record, whether just observed or
-read back from evidence, is established by one validator (`EnvironmentRecord::establish`): every
-value valid for its file, every absence with its reason, the levels exactly one group's ancestry
-through `/`. Only established environments are compared (`EstablishedEnvironment::equivalent`):
-their constraints equal, the ancestors' limits in order; the paths, transient scope names among
-them, are provenance.
+effective cpuset of its nearest cpuset-enabled group, and its group and every ancestor through `/`,
+each with its path and its `cpu.max` and `memory.max` observed as a validated value, an absence
+cgroup v2 establishes with its reason (the root keeps neither; a group whose parent's
+`cgroup.subtree_control` does not enable the controller has none of its files), or unavailable with
+why (a permission failure, a group that disappeared, a malformed value, a file missing though its
+controller is enabled). Absence is never unlimited. A record, whether just observed or read back
+from evidence, is established by one validator (`EnvironmentRecord::establish`): every value valid
+for its file, every absence with its reason, the levels exactly one group's ancestry through `/`.
+Only established environments are compared (`EstablishedEnvironment::equivalent`): their constraints
+equal, the ancestors' limits in order; the paths, transient scope names among them, are provenance.
 
-Every control run's final record (`LOGS/verdict.json`, `proofs::ControlVerdict`) is written by
-one maker (`gate control evidence ROOT LOGS CHANNEL RUNNER...`, `proofs::control_verdict`): its
-channel and runners, the digest of the registry's bytes (`controls::registry`), one result per
-control the registry selects for that channel and those runners (`controls::selected`), each with
-its faults, and every fault. `tests/controls.sh CHANNEL [RUNNER...]` runs that selection, every
-runner when none is named, holding the checkout's workload lock (`target/gate-workload.lock`) for
-its whole run.
+Every control run's final record (`LOGS/verdict.json`, `proofs::ControlVerdict`) is written by one
+maker (`gate control evidence ROOT LOGS CHANNEL RUNNER...`, `proofs::control_verdict`): its channel
+and runners, the digest of the registry's bytes (`controls::registry`), one result per control the
+registry selects for that channel and those runners (`controls::selected`), each with its faults,
+and every fault. `tests/controls.sh CHANNEL [RUNNER...]` runs that selection, every runner when none
+is named, holding the checkout's workload lock (`target/gate-workload.lock`) for its whole run.
 
-A calibration's readiness (`readiness.json`) is established and validated by one validator,
-live and whenever a kept receipt is read (`Readiness::validate`). It requires:
+A calibration's readiness (`readiness.json`) is established and validated by one validator, live and
+whenever a kept receipt is read (`Readiness::validate`). It requires:
 
-- exactly the native control runs of the nightly and stable channels
-  (`proofs::REQUIRED_CONTROLS`), each finished, of the calibration's commit and of the registry
-  the calibration's copy holds, judging exactly the controls that registry selects, every result
-  passed and its faults recorded exactly (`proofs::control_run`);
-- the workload lock held by the calibration itself (`proofs::WorkloadLock`), so no control or
-  proof run of the checkout competes with it;
-- a valid settling policy (`proofs::settling_policy`): seven readings of `/proc/loadavg` at least
-  5 s apart on the monotonic clock, spanning at least 30 s, each with at most two runnable tasks
-  and a one-minute load of at most 1.00, refused after 180 readings. It is an operational
-  criterion with checked arithmetic, and meeting it does not establish that nothing contends;
-- the readings settling at the last one, every reading recomputed from its `/proc/loadavg`
-  text.
+- exactly the native control runs of the nightly and stable channels (`proofs::REQUIRED_CONTROLS`),
+  each finished, of the calibration's commit and of the registry the calibration's copy holds,
+  judging exactly the controls that registry selects, every result passed and its faults recorded
+  exactly (`proofs::control_run`);
+- the workload lock held by the calibration itself (`proofs::WorkloadLock`), so no control or proof
+  run of the checkout competes with it;
+- a valid settling policy (`proofs::settling_policy`): seven readings of `/proc/loadavg` at least 5
+  s apart on the monotonic clock, spanning at least 30 s, each with at most two runnable tasks and a
+  one-minute load of at most 1.00, refused after 180 readings. It is an operational criterion with
+  checked arithmetic, and meeting it does not establish that nothing contends;
+- the readings settling at the last one, every reading recomputed from its `/proc/loadavg` text.
 
 A receipt that only says it is ready establishes nothing.
 
 A calibration (`tests/proofs.sh calibrate PLAN NIGHTLY_LOGS STABLE_LOGS`, `proofs::calibration`)
 validates its plan once and establishes its readiness. It then checks each planned harness alone,
-one Kani run each with its own identity, environment and load (`LOGS/calibration/HARNESS.N.log`
-and its evidence), in two passes: every harness once, then, to `proofs::SAMPLES` executions, only
-a harness whose every execution was a sample.
+one Kani run each with its own identity, environment and load (`LOGS/calibration/HARNESS.N.log` and
+its evidence), in two passes: every harness once, then, to `proofs::SAMPLES` executions, only a
+harness whose every execution was a sample.
+
+A discovery (`tests/proofs.sh discover HARNESS...`, `gate proofs-discover`, `proofs::discover`) is
+the one source of a loop-bound selector's `function`, `file`, `loops_in_function` and `loop`: one
+Kani run through the one invocation, holding the workload lock like a qualification, of exactly the
+harnesses its record names (`discovery.json`, `proofs::discovery_of`, its digest the run's revision,
+purpose `discovery`). Each harness is given `proofs::DISCOVERY_MILLISECONDS`: the driver preserves
+the instrumented binary and writes its loop discovery before it spawns CBMC, so the solver is
+stopped at once and nothing is verified. The run is judged by its discovery records alone
+(`proofs::check_discovery`): every selected harness's directory, its preserved binary held to its
+digest, and a discovery of that binary that exited successfully and holds one inventory
+(`discovered`, the validator every run's reconciliation applies). It writes no results row, is never
+a calibration sample (`eligible_sample`) and is never adopted. Its selectors are copied into the
+policy before any calibration, whose samples bind the policy's digest;
+`gate-discovery-purpose-status-unchecked`, `gate-discovery-selection-unchecked` and
+`gate-discovery-sampled` are its registered controls.
 
 An execution is a sample by the one authority (`proofs::eligible_sample`), which adoption and the
 predictions' reader apply as well. It must be of a run and a manifest no earlier execution of the
-calibration was, and in its harness's envelope (`CalibrationSample::compatible`: build,
-loop-bound policy, instrumented binary, verifier and environment) against every earlier sample of
-it.
+calibration was, and in its harness's envelope (`CalibrationSample::compatible`: build, loop-bound
+policy, instrumented binary, verifier and environment) against every earlier sample of it.
 
 Every planned execution is recorded as it ends, in a journal reserved exclusively
 (`calibration.jsonl`): a sample, no sample with why, rejected, withheld, or never run. Nothing is
-retried. An execution that could not be scheduled, or a journal that cannot be reserved or
-written, halts the schedule as a fault. Whatever failed, the schedule is attempted as the
-calibration's last record (`calibration.json`); it is complete only when every planned harness
-has its samples and nothing failed.
+retried. An execution that could not be scheduled, or a journal that cannot be reserved or written,
+halts the schedule as a fault. Whatever failed, the schedule is attempted as the calibration's last
+record (`calibration.json`); it is complete only when every planned harness has its samples and
+nothing failed.
 
 A sample alone is adopted (`gate proofs-adopt LOGS/calibration/HARNESS.N.evidence ROOT`,
 `proofs::adopt`):
@@ -495,16 +505,16 @@ copy's source state and each path's digest, and the transition it was validated 
   (`SourceState::materialize`), the diff applied there by the one patch invocation
   (`controls::patch`, `gate patch`), and the result read back.
 - **Red side.** It must cite its verified baseline, the same diff bytes and the same predictions,
-  and its copy's complete source state must equal that planted state path for path. Every
-  creation, deletion, mode change and link is checked as GNU patch makes it.
+  and its copy's complete source state must equal that planted state path for path. Every creation,
+  deletion, mode change and link is checked as GNU patch makes it.
 - **Restored green side.** It must cite the same baseline and equal it in every path, and its
   harness's artifact must equal the baseline's (`proofs::check_expectations`).
 
 A deadline, a signal, a timing excess, an unsupported construct or another failure than the
 control's is no detection.
 
-Each enforcement is a registered control, its check weakened by one plant and refused by the
-case it lets through (`controls/controls.tsv`):
+Each enforcement is a registered control, its check weakened by one plant and refused by the case it
+lets through (`controls/controls.tsv`):
 
 - **Run records:** `gate-unavailable-limit-absent`, `gate-rejection-manifest-omitted`,
   `gate-document-unretained`, `gate-manifest-record-unverified`, `gate-record-absence-assumed`,
@@ -784,15 +794,15 @@ before acknowledging readiness; no workload starts before that acknowledgement. 
 SIGTERM and escalates to SIGKILL after one second, including for descendants that ignore SIGTERM.
 The single-use launch marker is consumed before work starts, and an orphaned supervised launch exits
 without starting work (`an_orphaned_supervised_launch_starts_no_work`). The supervisor installs its
-signal handler before spawning and retains an early stop until the child's PID is available.
-Every workload a gate runs (each cargo test, build, run, Miri, Kani, fuzz and mutation command, the
+signal handler before spawning and retains an early stop until the child's PID is available. Every
+workload a gate runs (each cargo test, build, run, Miri, Kani, fuzz and mutation command, the
 coverage tools, the gate tool's own builds, test, model and proof runs) is launched by the one
 workload launcher, `tests/workload.sh`, in a transient scope of its own of the user's systemd
 manager (`systemd-run --scope`, which execs the workload in place, keeping its PID, parent, group,
 session and exit status or signal), capped at `DCBOR_GATE_MEMORY` (default `48G`, `gate_memory`)
 with no swap and `OOMPolicy=continue`. Scripts start each workload with the `confined` prefix
-(`gate_confinement`); the gate tool launches each run through `process::Workload`, the launcher
-the gate exports. The gate's own processes (its supervisor, watcher and script, and the gate tool
+(`gate_confinement`); the gate tool launches each run through `process::Workload`, the launcher the
+gate exports. The gate's own processes (its supervisor, watcher and script, and the gate tool
 waiting on a run to record its judgement) stay outside every workload's scope, so a memory-cgroup
 kill chooses its victim among the workload's processes alone: the recorder survives a runaway
 checker whatever the kernel chooses inside the scope. A run so killed is classified as it ended (a
@@ -800,46 +810,43 @@ Kani harness whose CBMC is killed reports no results, `NoVerdict`); without a ru
 no gate starts. `a_gate_survives_its_workload_killed_for_memory` runs a gate whose workload, capped
 at 64 MiB, doubles a string toward 256 MiB: it requires the workload's scope apart from the gate's
 own cgroup, its `memory.max` and a `memory.swap.max` of 0, its `OOMPolicy` read back as `continue`
-(read, not observed: systemd applies it after the kill and records nothing under `continue`; it
-only keeps systemd from ending the rest of the workload's tree, every process of which, a
-kani-driver as much as its CBMC, remains an eligible victim, so nothing relies on a survivor's
-report), the kernel's `oom_kill` count of the workload's scope read from outside as 1 where the
-workload read 0 before it grew (a holder process the workload leaves in its scope keeps the scope's
-cgroup until it is read; the holder is itself an eligible victim, and were it killed the scope's
-cgroup would be gone and the outside read would fail the test, never pass it), the
-grown process ended by SIGKILL (status 137), and the gate then released to a successful exit with
-nothing left running. `a_workload_runs_capped_apart_from_its_caller` (tests/gate, `process`)
-requires the same of a run the gate tool launches, and its terminating signal passed through;
+(read, not observed: systemd applies it after the kill and records nothing under `continue`; it only
+keeps systemd from ending the rest of the workload's tree, every process of which, a kani-driver as
+much as its CBMC, remains an eligible victim, so nothing relies on a survivor's report), the
+kernel's `oom_kill` count of the workload's scope read from outside as 1 where the workload read 0
+before it grew (a holder process the workload leaves in its scope keeps the scope's cgroup until it
+is read; the holder is itself an eligible victim, and were it killed the scope's cgroup would be
+gone and the outside read would fail the test, never pass it), the grown process ended by SIGKILL
+(status 137), and the gate then released to a successful exit with nothing left running.
+`a_workload_runs_capped_apart_from_its_caller` (tests/gate, `process`) requires the same of a run
+the gate tool launches, and its terminating signal passed through;
 `a_measured_run_records_how_its_confined_test_ended` requires of the measured runs (`run_once`,
 every native control's and model's test) GNU time in the caller's cgroup as the parent of the
-process the launcher execs into the test inside the workload's scope, the measurement kept, and
-the test's exit status and killing signal recorded as the run's termination. The test's
-termination and measurement are read from time's report (`process::report`, the forms GNU time
-1.10 writes): the termination only from a well-formed report whose ending line names a signal of 1
-to 64 or an exit of 1 to 255 (none for an exit of 0) and agrees with time's own status (128 + N,
-computed checked, for a signal; N for an exit); the measurement only from a line of a validated
-peak and seconds. A report missing, unreadable (time exits 125 and runs nothing) or malformed
-leaves both unavailable; a well-formed report that disagrees with time's status leaves the
-termination unavailable and keeps its measurement. Every such error names time's own status,
-which is never taken for the test's; a control's or model's run whose test termination is
-unavailable is not judged, and a model run without its measurement is refused.
-`a_measurement_report_is_read_exactly` covers each form and each defect, out-of-range and
-overflowing numbers among them; the measured-run test covers an unreadable report through GNU time
-itself. The measurement is of that one
-process over its exec chain (the launcher's bash, `systemd-run` registering the scope, then the
-test): its peak resident size is the chain's maximum and its seconds include the scope's
-registration, neither the test's alone.
-`every_gate_workload_is_confined` is a regression check of limited coverage: a line of a gate or
-of the common definitions holding one of nine literal workload spellings (`cargo test`, `cargo
-build`, `cargo run`, `cargo miri`, `cargo fuzz build`, `cargo fuzz run`, `cargo-mutants mutants`
-and the two coverage tools) must hold the `confined` prefix. It parses no shell: another spelling,
-a program named by a variable, a command split across lines, or a second command on a confined
-line escapes it. The confinement of each execution site is what the launch-path tests above
-establish. `gate-memory-unconfined.patch` empties the prefix,
-`gate-oom-stops-scope.patch` sets `OOMPolicy=stop`, `gate-workload-unconfined.patch` launches the
-gate tool's runs without the launcher, and `gate-workload-census-unconfined.patch` drops the prefix
-from one Miri gate baseline run; each is refused by its test.
-`gate-process-group-unowned.patch` makes the gate own no group;
+process the launcher execs into the test inside the workload's scope, the measurement kept, and the
+test's exit status and killing signal recorded as the run's termination. The test's termination and
+measurement are read from time's report (`process::report`, the forms GNU time 1.10 writes): the
+termination only from a well-formed report whose ending line names a signal of 1 to 64 or an exit of
+1 to 255 (none for an exit of 0) and agrees with time's own status (128 + N, computed checked, for a
+signal; N for an exit); the measurement only from a line of a validated peak and seconds. A report
+missing, unreadable (time exits 125 and runs nothing) or malformed leaves both unavailable; a
+well-formed report that disagrees with time's status leaves the termination unavailable and keeps
+its measurement. Every such error names time's own status, which is never taken for the test's; a
+control's or model's run whose test termination is unavailable is not judged, and a model run
+without its measurement is refused. `a_measurement_report_is_read_exactly` covers each form and each
+defect, out-of-range and overflowing numbers among them; the measured-run test covers an unreadable
+report through GNU time itself. The measurement is of that one process over its exec chain (the
+launcher's bash, `systemd-run` registering the scope, then the test): its peak resident size is the
+chain's maximum and its seconds include the scope's registration, neither the test's alone.
+`every_gate_workload_is_confined` is a regression check of limited coverage: a line of a gate or of
+the common definitions holding one of nine literal workload spellings (`cargo test`, `cargo build`,
+`cargo run`, `cargo miri`, `cargo fuzz build`, `cargo fuzz run`, `cargo-mutants mutants` and the two
+coverage tools) must hold the `confined` prefix. It parses no shell: another spelling, a program
+named by a variable, a command split across lines, or a second command on a confined line escapes
+it. The confinement of each execution site is what the launch-path tests above establish.
+`gate-memory-unconfined.patch` empties the prefix, `gate-oom-stops-scope.patch` sets
+`OOMPolicy=stop`, `gate-workload-unconfined.patch` launches the gate tool's runs without the
+launcher, and `gate-workload-census-unconfined.patch` drops the prefix from one Miri gate baseline
+run; each is refused by its test. `gate-process-group-unowned.patch` makes the gate own no group;
 `a_stopped_gate_leaves_no_process_running` (tests/gate, `launchers`) stops a gate holding a child
 and a grandchild by SIGTERM, SIGINT, SIGHUP and SIGKILL and requires none left running. It also
 checks normal gate exit, with cooperative and SIGTERM-resistant descendants in each case. Test waits
@@ -858,28 +865,27 @@ Bash DEBUG tracing pauses the boundary process with SIGSTOP; the test observes i
 before signaling the supervisor and resuming the boundary process. The copied supervisor source is
 unchanged. Every boundary requires no workload PID recorded yet; a missing boundary fails
 qualification rather than counting as a successful interruption. At the watcher and readiness
-boundaries the gate is positively observed waiting for readiness (`awaiting_readiness`): its
-leader, the held watcher's parent, sleeps in read(2) on standard input (`/proc/PID/syscall`, which
-reports `running` for any runnable task, so an unscheduled gate is never taken for a blocked one),
-and that standard input is the pipe the held watcher's standard output writes; a gate that records
-work first fails at once. `a_gate_starts_its_work_once_its_watcher_is_ready` makes the same
-observation, then releases the watcher and requires the gate to start its work and exit normally
-with nothing left running. The unowned control is registered against each of the three
-interruption tests. Narrower controls each remove one mechanism:
-`gate-watcher-parent-unwatched.patch` makes the watcher loop without reading its gate's parent, so
-a supervisor killed by SIGKILL leaves the group running, refused by
-`a_stopped_gate_leaves_no_process_running`; `gate-watcher-ready-before-handler.patch` publishes
-readiness before the watcher installs its handler, and `gate-readiness-wait-bypassed.patch` makes
-the gate skip the readiness read, so in both the gate starts its work while the watcher is held at
-its handler installation, refused by `a_gate_starts_its_work_once_its_watcher_is_ready`. The
-fixture's session is created by
-`setsid(2)` in the spawned child before it execs bash (`libc`, a dev-dependency), with no host
-program. Process inspection propagates unexpected errors instead of treating
-them as absence. Cleanup rescans and kills remaining fixture processes until the supervisor is
-reaped and no live fixture process remains, with a bounded deadline; cleanup failure fails the test
-or is reported alongside an existing panic. `gate-process-group-uncalled.patch` drops the call from
-`tests/controls.sh`; `every_gate_owns_its_process_group` requires every script sourcing
-`tests/gate-common.sh` to call it on the next line.
+boundaries the gate is positively observed waiting for readiness (`awaiting_readiness`): its leader,
+the held watcher's parent, sleeps in read(2) on standard input (`/proc/PID/syscall`, which reports
+`running` for any runnable task, so an unscheduled gate is never taken for a blocked one), and that
+standard input is the pipe the held watcher's standard output writes; a gate that records work first
+fails at once. `a_gate_starts_its_work_once_its_watcher_is_ready` makes the same observation, then
+releases the watcher and requires the gate to start its work and exit normally with nothing left
+running. The unowned control is registered against each of the three interruption tests. Narrower
+controls each remove one mechanism: `gate-watcher-parent-unwatched.patch` makes the watcher loop
+without reading its gate's parent, so a supervisor killed by SIGKILL leaves the group running,
+refused by `a_stopped_gate_leaves_no_process_running`; `gate-watcher-ready-before-handler.patch`
+publishes readiness before the watcher installs its handler, and
+`gate-readiness-wait-bypassed.patch` makes the gate skip the readiness read, so in both the gate
+starts its work while the watcher is held at its handler installation, refused by
+`a_gate_starts_its_work_once_its_watcher_is_ready`. The fixture's session is created by `setsid(2)`
+in the spawned child before it execs bash (`libc`, a dev-dependency), with no host program. Process
+inspection propagates unexpected errors instead of treating them as absence. Cleanup rescans and
+kills remaining fixture processes until the supervisor is reaped and no live fixture process
+remains, with a bounded deadline; cleanup failure fails the test or is reported alongside an
+existing panic. `gate-process-group-uncalled.patch` drops the call from `tests/controls.sh`;
+`every_gate_owns_its_process_group` requires every script sourcing `tests/gate-common.sh` to call it
+on the next line.
 
 `acquisition-drop-unsettled.patch` makes a record acquisition token dropped holding credit settle
 nothing (`reclamation/owned.rs`, `Acquisition`'s `Drop`): its `Pending`, the owning custody of both
@@ -962,13 +968,13 @@ finish is refused live: it must fail naming `the run's recording is no evidence:
 `a plan record, cut None: the run's recording is no evidence: Live(6)`; green with the patch
 reversed.
 
-`storage-tenant-short-of-peak.patch` sizes the storage-resumption fixture's pool for a tenant of
-4 KiB (`tests/resumable/native_schedules.rs`, the `tenant` bytes the capacity is computed from; the
+`storage-tenant-short-of-peak.patch` sizes the storage-resumption fixture's pool for a tenant of 4
+KiB (`tests/resumable/native_schedules.rs`, the `tenant` bytes the capacity is computed from; the
 tenant the fixture occupies stays its typed 128 KiB, `Tenant<{ 32 * 1024 }>`). Released, it leaves
 the blocked decode short of its peak, so no release lets the same decode finish; the fixture's
 capacity check against the unobstructed decode's measured peak must refuse it first, naming
-`cannot hold the decode's peak`. Seen red: `the pool of 69901 bytes cannot hold the decode's peak of
-133893`; green with the patch reversed.
+`cannot hold the decode's peak`. Seen red:
+`the pool of 69901 bytes cannot hold the decode's peak of 133893`; green with the patch reversed.
 
 `invalidation-last-cause-kept.patch` makes a session's invalidation keep its last cause instead of
 its first (`src/bounded/policy/record.rs`, `exhaust`). Four workers over one pool of eight permit
@@ -992,9 +998,9 @@ records ran out then reaches the caller as the operation's own refusal, its caus
 `the stop returned is not the recording's loss by Permits`. Seen red: the body returned
 `Driver("the operation failed: Refused(Unrecorded)")`. The event-slot witness is refused by the same
 plant, every driver's turn reading through `lost`: the copy outgrowing its slots returns no loss by
-`Events`, its checkpoints refused as no evidence (`a checkpoint's recording is no evidence:
-Exhausted`) and its turn observation failing as a defect, and
-`a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots` must fail naming
+`Events`, its checkpoints refused as no evidence
+(`a checkpoint's recording is no evidence: Exhausted`) and its turn observation failing as a defect,
+and `a_driver_stops_at_the_turn_its_recording_runs_out_of_event_slots` must fail naming
 `the stop returned is not the recording's loss by Events`. Seen red: the stop returned was
 `Defect("Some(\"Progress\"); driver diagnostic: turn observation panicked: ...")`; both green with
 the patch reversed.
@@ -1086,37 +1092,36 @@ exercises it:
   under a third family. Its spends then carry an identity of that family, which the refinement
   machine refuses at finalization: the run must fail naming `does not refine the protocol`, the
   machine's refusal in both finalization reports (`settled`'s, and `describe`'s when the run also
-  recorded defects, here its checkpoints' `DuplicateBound`). Seen red: `observation 247: obligation
-  4.1 was never admitted`.
+  recorded defects, here its checkpoints' `DuplicateBound`). Seen red:
+  `observation 247: obligation 4.1 was never admitted`.
 
 `retirement-record-left-unqueued.patch` links a retired record into the scope queue without moving
 its custody from `Handle` to `Queued` or publishing the `Queued` custody event (`reclamation.rs`,
 `Reclaimer::enqueue`). `a_stopped_decoder_queues_every_record_it_held` (the support crate's
 `lifecycle.rs` tests) steps a typed decode until it holds records of its own beside its input's and
 retires it as `Retirement::Stopped` through the one orchestration. The queue's removal requires
-every record it takes to be `Queued` (`Reclaimer::step`), so the stopped decoder's drain refuses
-the first record it removes, before the orchestration's own comparison of the stopped decoder's
-`Handle` records is reached; the terminal drain the drop runs refuses it again during the unwind,
-which aborts the test's process. The run must end `abnormal_termination`, naming
+every record it takes to be `Queued` (`Reclaimer::step`), so the stopped decoder's drain refuses the
+first record it removes, before the orchestration's own comparison of the stopped decoder's `Handle`
+records is reached; the terminal drain the drop runs refuses it again during the unwind, which
+aborts the test's process. The run must end `abnormal_termination`, naming
 `custody.get() == Holder::Queued`. A test process killed by SIGABRT is that outcome wherever it is
 classified (`outcome::native`, and `outcome::model` for every signal but loom's named stack
-overflow, which delegates to it), never an ordinary `failed`; every caller that requires a pass
-(the Miri gate's native baseline, the reach map, the budget recorder) refuses it as before. An
-aborted process prints no libtest summary, so its report is judged its one test's only when the
-abort is classified so and libtest selected and started exactly that test (`controls::alone`); a
-run ended by any other signal or exit without a summary is no refusal, and restored-green still
-requires a completed summary (`controls::restored`). Seen red: signal 6, the assertion reported
-twice.
+overflow, which delegates to it), never an ordinary `failed`; every caller that requires a pass (the
+Miri gate's native baseline, the reach map, the budget recorder) refuses it as before. An aborted
+process prints no libtest summary, so its report is judged its one test's only when the abort is
+classified so and libtest selected and started exactly that test (`controls::alone`); a run ended by
+any other signal or exit without a summary is no refusal, and restored-green still requires a
+completed summary (`controls::restored`). Seen red: signal 6, the assertion reported twice.
 
 The five `pending-settle-wrong-origin-*` rows run the same patch as `pending-settle-wrong-origin`
 through the decode scope's four-family provenance cases (`reclamation/owned.rs`): the grant's write
 admitted under a, its release under b, its storage under c, its cleanup under d. Every settlement
 lands in a detached family, so a's ledgers record no consumption or forfeit, which each case's
-per-family check names first. The patch detaches the origin held admissions store
-(`Limits::origin`, which `admit_held_at` keeps) and leaves each acquisition its minting family's
-origin (`Limits::acquisition`): `Acquisition::minted` refuses an origin of another family than the
-identity it mints, so a patch detaching both is refused at the first bind (`Refused(Unrecorded)`)
-and never reaches the obligations the control is about. S1 then names
+per-family check names first. The patch detaches the origin held admissions store (`Limits::origin`,
+which `admit_held_at` keeps) and leaves each acquisition its minting family's origin
+(`Limits::acquisition`): `Acquisition::minted` refuses an origin of another family than the identity
+it mints, so a patch detaching both is refused at the first bind (`Refused(Unrecorded)`) and never
+reaches the obligations the control is about. S1 then names
 `A after the resume: held, observed in the slots`. A defect settling into the performing policy's
 family cannot be planted: held credit owns its origin and no settlement path receives a budget's
 origin.
@@ -1138,56 +1143,57 @@ resumed turn's first pair left uncompared, refused by the long-key harness
 (`key-resumed-pair-skipped`), and `undefined` (simple 23) decoded as `null`, refused by the scalar
 profile harness (`decode-simple-undefined-accepted`). A Kani control is judged by the one harness
 its row names, checked alone (`tests/gate/src/controls.rs`, `checked_alone`). Before its diff is
-applied, `tests/controls.sh` checks that harness on the unmutated copy (`gate control run
-baseline`): it must verify alone (`controls::verified`), or the control is failed by name, its red
-and green sides never run, since a planted defect in a harness with no verdict on the commit (no
-results, the deadline, CBMC out of memory, a failure, a short bound) shows nothing of the defect.
-`controls::evidence` requires each Kani control's `baseline.judged` to read `verified` beside its
-red and green judgements. `kani-control-baseline-unrequired.patch` drops that requirement, refused
-by `a_kani_control_is_evidence_only_over_a_verified_baseline`; `kani-baseline-no-verdict-accepted.patch`
-accepts a baseline of any outcome, refused by `a_kani_refusal_is_judged_by_its_one_harness`.
+applied, `tests/controls.sh` checks that harness on the unmutated copy
+(`gate control run baseline`): it must verify alone (`controls::verified`), or the control is failed
+by name, its red and green sides never run, since a planted defect in a harness with no verdict on
+the commit (no results, the deadline, CBMC out of memory, a failure, a short bound) shows nothing of
+the defect. `controls::evidence` requires each Kani control's `baseline.judged` to read `verified`
+beside its red and green judgements. `kani-control-baseline-unrequired.patch` drops that
+requirement, refused by `a_kani_control_is_evidence_only_over_a_verified_baseline`;
+`kani-baseline-no-verdict-accepted.patch` accepts a baseline of any outcome, refused by
+`a_kani_refusal_is_judged_by_its_one_harness`.
 
 Every Kani run, a control's and the proof suite's, gives each harness it checks a deadline of
-`proofs::DEADLINE_MARGIN` (2, the operator's operational margin) times that harness's expected
-CBMC run time (`proofs/expectations.json`, one entry per harness of the census: the milliseconds
-and their support, a prediction from evidence, never a measurement copied in as it stands;
+`proofs::DEADLINE_MARGIN` (2, the operator's operational margin) times that harness's expected CBMC
+run time (`proofs/expectations.json`, one entry per harness of the census: the milliseconds and
+their support, a prediction from evidence, never a measurement copied in as it stands;
 `proofs::EXPECTATIONS`, `proofs::selected`). The driver applies each harness's deadline from the
 run's policy and refuses a global `--harness-timeout` beside it. Every spawned CBMC run records one
 timing record (`solver.execution.json`): its deadline, its duration as integer seconds and
 nanoseconds from immediately after spawn to its end (its output read and its exit reaped, the
 deadline's detection, or an execution error; compilation, instrumentation, preservation and loop
-discovery before it, rendering after), and how it ended: its exit code or its signal, kept apart
-and never read as running out of memory; the deadline, with CBMC's last status message and the
-time of its termination and reaping measured apart; or the driver's execution error. The gate
-reconciles every launched harness's evidence whole, its verdict or none (`proofs::execution`,
+discovery before it, rendering after), and how it ended: its exit code or its signal, kept apart and
+never read as running out of memory; the deadline, with CBMC's last status message and the time of
+its termination and reaping measured apart; or the driver's execution error. The gate reconciles
+every launched harness's evidence whole, its verdict or none (`proofs::execution`,
 `proofs::termination_agrees`): the record must exist, carry the deadline the run's policy gave, and
 agree with the report. Only a normal exit, whatever its code (CBMC exits nonzero for a harness Kani
 verifies), permits a verification result read from properties, and only it is a completed run. A
-signal gives no verdict whatever CBMC printed: the driver reports it as `CBMC failed: terminated by
-signal N` without interpreting properties, and the gate requires that header, a report classified
-as no verdict, and neither a verification nor a failed-property summary, so a signalled run never
-qualifies a proof or a control's detection. A deadline likewise, under its own header; a launched
-harness whose report reaches no verdict is refused once its evidence is validated. The gate then
-compares a completed run's duration, not the report's rendered time, against the expectation
-(`proofs::check_expectations`): equality passes, a nanosecond more fails the run though it met its
-deadline. A run killed at its deadline has no verdict. Either outcome shows that the harness is
-wrongly sized for its expectation, that the expectation is wrong, or that the code it checks
-regressed. An expectation is never raised solely to turn a failed run green: a correction needs
-its own justification, the failed run's evidence is kept, and the run is repeated. Each of these
-checks is a registered control, its check weakened by one plant and refused by the test case the
-plant lets through: `gate-signal-verdict-accepted`, `gate-verdictless-evidence-bypassed`,
-`gate-function-scope-claim-unreconciled`, `gate-discovery-status-unchecked`,
-`gate-discovery-inventories-uncounted`, `gate-expectation-milliseconds-only`,
-`gate-execution-deadline-unreconciled`, `gate-instance-axis-gap-accepted` and
-`gate-census-inclusion-unchecked` (`controls/controls.tsv`). A CBMC run whose
-results Kani does not use (the deadline reached, an exit or signal without results, results
-reported without CBMC's overall status) or that Kani
-reports unsound (a quantifier the solver dropped) is no verdict (`outcome::kani_without_verdict`,
-`Outcome::NoVerdict`), though Kani counts it among its failures: never a pass, never a control's
-refusal. A checker killed by a signal, an empty selection, an incomplete report, or an exit status
-contradicting the report also provides no verdict. The run classifier uses the proof suite's
-per-harness parser to check report completeness. `kani-no-verdict-judged-failed.patch` reads every
-explicit no-results report as Kani counts it; `a_kani_run_is_classed_by_its_summary` and
+signal gives no verdict whatever CBMC printed: the driver reports it as
+`CBMC failed: terminated by signal N` without interpreting properties, and the gate requires that
+header, a report classified as no verdict, and neither a verification nor a failed-property summary,
+so a signalled run never qualifies a proof or a control's detection. A deadline likewise, under its
+own header; a launched harness whose report reaches no verdict is refused once its evidence is
+validated. The gate then compares a completed run's duration, not the report's rendered time,
+against the expectation (`proofs::check_expectations`): equality passes, a nanosecond more fails the
+run though it met its deadline. A run killed at its deadline has no verdict. Either outcome shows
+that the harness is wrongly sized for its expectation, that the expectation is wrong, or that the
+code it checks regressed. An expectation is never raised solely to turn a failed run green: a
+correction needs its own justification, the failed run's evidence is kept, and the run is repeated.
+Each of these checks is a registered control, its check weakened by one plant and refused by the
+test case the plant lets through: `gate-signal-verdict-accepted`,
+`gate-verdictless-evidence-bypassed`, `gate-function-scope-claim-unreconciled`,
+`gate-discovery-status-unchecked`, `gate-discovery-inventories-uncounted`,
+`gate-expectation-milliseconds-only`, `gate-execution-deadline-unreconciled`,
+`gate-instance-axis-gap-accepted` and `gate-census-inclusion-unchecked` (`controls/controls.tsv`). A
+CBMC run whose results Kani does not use (the deadline reached, an exit or signal without results,
+results reported without CBMC's overall status) or that Kani reports unsound (a quantifier the
+solver dropped) is no verdict (`outcome::kani_without_verdict`, `Outcome::NoVerdict`), though Kani
+counts it among its failures: never a pass, never a control's refusal. A checker killed by a signal,
+an empty selection, an incomplete report, or an exit status contradicting the report also provides
+no verdict. The run classifier uses the proof suite's per-harness parser to check report
+completeness. `kani-no-verdict-judged-failed.patch` reads every explicit no-results report as Kani
+counts it; `a_kani_run_is_classed_by_its_summary` and
 `every_harness_unchecked_or_misreported_is_named` require each report kani-driver renders for one,
 in 0.68.0 and on main, classed as no verdict. The scalar profile harness checks symbolic bytes and
 input length, restricting only the head's major type to unsigned, negative or simple (0, 1, 7).
@@ -1195,16 +1201,15 @@ CBMC's symbolic execution does not prune the decoder's dispatch on the major typ
 assumption: run whole, it expanded the byte-string, text, array, map and tagged arms, their
 recursion, and the values they build and destroy (in the retained trace, B-tree traversal and
 teardown, vector growth and release, key encoding, UTF-8 and NFC checks far outnumber the scalar
-arms), until CBMC held 118 GB and the host ran out of memory. Those five arms are functions of
-their own in `src/decode.rs`, behavior unchanged, and the harness replaces each with a stub that
-fails a check and ends the path (`decode/proofs.rs`, `arm_reached`): a successful verdict is also
-the proof that no scalar input reaches any of them. With them unreachable there is no recursion and
-no loop: an unwind bound of 1, its unwinding assertions enabled. The harness forgets the returned
-decoded value because this property checks acceptance, not destruction; the decoder's own cleanup
-of a value it refuses (`UnusedData`) remains part of the checked code.
-`decode-scalar-reaches-item-arm.patch` decodes an unsigned head through the tagged-item arm,
-refused by the stub's check. No proof is established until the harness produces a successful
-verdict.
+arms), until CBMC held 118 GB and the host ran out of memory. Those five arms are functions of their
+own in `src/decode.rs`, behavior unchanged, and the harness replaces each with a stub that fails a
+check and ends the path (`decode/proofs.rs`, `arm_reached`): a successful verdict is also the proof
+that no scalar input reaches any of them. With them unreachable there is no recursion and no loop:
+an unwind bound of 1, its unwinding assertions enabled. The harness forgets the returned decoded
+value because this property checks acceptance, not destruction; the decoder's own cleanup of a value
+it refuses (`UnusedData`) remains part of the checked code. `decode-scalar-reaches-item-arm.patch`
+decodes an unsigned head through the tagged-item arm, refused by the stub's check. No proof is
+established until the harness produces a successful verdict.
 
 The key comparison harnesses (`bounded/decode/comparison/proofs.rs`) drive a whole comparison for a
 constant number of turns, the reference schedule's most for keys of at most 67 bytes
@@ -1214,8 +1219,8 @@ driver 58 times and the turn's pair loop (`comparison.rs`, `compare_step`) 118 t
 iteration each, and did not finish symbolic execution in 30 minutes. The short-key harness, keys of
 at most four bytes, takes `kani::unwind(6)`, its loops' most iterations and their exits; its
 unwinding assertions stay enabled, so a bound short of a reachable iteration fails it. Measured on
-the uncommitted change: the long-key harness verified, 0 of 623 checks failed (5 unreachable), 14.4 s
-of symbolic execution and 67.7 s of verification; the short-key harness, 0 of 597 (2 unreachable),
+the uncommitted change: the long-key harness verified, 0 of 623 checks failed (5 unreachable), 14.4
+s of symbolic execution and 67.7 s of verification; the short-key harness, 0 of 597 (2 unreachable),
 15.2 s.
 
 The binary32 test runs the run's layer's domain (`DCBOR_RIGOR`): every pattern under `exhaustive`,

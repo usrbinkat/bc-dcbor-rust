@@ -911,6 +911,149 @@ esac
     drop(held);
 }
 
+/// A discovery (`tests/proofs.sh discover HARNESS...`) runs the gate tool's
+/// `proofs-discover` on the clean commit's copy with every named harness,
+/// holding the checkout's workload lock for its whole run; beside another
+/// holder of that lock nothing runs, and with no harness named the script
+/// refuses its usage. The committed script runs in a scratch repository, its
+/// ownership, confinement, clean-commit check and copy real; the gate tool
+/// and the toolchain are recorders.
+#[test]
+fn a_discovery_holds_the_workload_lock() {
+    const GATE: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GATE_CALLS"
+case "$1" in
+unicode-version) echo 18.0.0 ;;
+dcbor-draft) echo draft ;;
+proofs-build) echo kani --package dcbor ;;
+proofs-identity)
+	(set -o noclobber && printf '%s\n' /fixture/cargo-kani >"$2") || exit 2
+	printf 'kani-launcher\t/fixture/cargo-kani\nkani-version\tcargo-kani 0.0.0-fixture\n'
+	;;
+proofs-discover)
+	if flock --nonblock "$LOCK" true; then echo free; else echo held; fi >>"$GATE_CALLS"
+	;;
+*) exit 2 ;;
+esac
+"#;
+    const RUSTC: &str = "#!/bin/sh\n\
+        case \"$*\" in\n\
+        -vV) printf 'rustc 0.0.0-fixture\\nhost: fixturehost\\n' ;;\n\
+        '--print sysroot') echo /fixture/sysroot ;;\n\
+        *) echo rustc 0.0.0-fixture ;;\n\
+        esac\n";
+    let scratch = Scratch::new("proofs-discover");
+    let repo = scratch.0.join("repo");
+    let write = |relative: &str, text: &str, mode: u32| {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    for script in ["proofs.sh", "gate-common.sh", "workload.sh"] {
+        write(
+            &format!("tests/{script}"),
+            &std::fs::read_to_string(tests().join(script)).unwrap(),
+            0o755,
+        );
+    }
+    write(".gitignore", "target/\n", 0o644);
+    write("file.txt", "a\n", 0o644);
+    write("target/gate-tool/fixturehost/debug/gate", GATE, 0o755);
+    scratch.executable("bin/cargo", "#!/bin/sh\nexit 0\n");
+    scratch.executable("bin/cargo-kani", "#!/bin/sh\nexit 0\n");
+    scratch.executable("bin/rustc", RUSTC);
+    let git = |arguments: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@localhost",
+            ])
+            .args(arguments)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    let path = format!(
+        "{}:{}",
+        scratch.0.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let lock = repo.join("target/gate-workload.lock");
+    let run = |name: &str, arguments: &[&str]| {
+        let calls = scratch.0.join(format!("calls-{name}"));
+        let output = Command::new("bash")
+            .arg("tests/proofs.sh")
+            .args(arguments)
+            .current_dir(&repo)
+            .env("PATH", &path)
+            .env("DCBOR_CONFIGURATION", "fixture")
+            .env("PROOF_LOG_DIR", scratch.0.join(format!("logs-{name}")))
+            .env("GATE_CALLS", &calls)
+            .env("LOCK", &lock)
+            .env_remove("DCBOR_GATE_SUPERVISOR")
+            .env_remove("DCBOR_GATE_MEMORY")
+            .env_remove("DCBOR_GATE_WORKLOAD")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            output.status,
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            report,
+        )
+    };
+    let (status, calls, report) = run("held", &["discover", "a::x", "b::y"]);
+    assert_eq!(status.code(), Some(0), "{report}");
+    let copy = repo.join("target/proof-source").display().to_string();
+    let logs = scratch.0.join("logs-held").display().to_string();
+    let discovered = format!(
+        "proofs-discover {copy} {}/target/kani {logs} {logs}/kani-launcher a::x b::y",
+        repo.display()
+    );
+    let lines: Vec<&str> = calls.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == discovered)
+        .unwrap_or_else(|| panic!("the discovery was not run as {discovered}: {calls}"));
+    assert_eq!(
+        lines.get(at + 1),
+        Some(&"held"),
+        "discovery-unlocked: a discovery ran without the workload lock held: {calls}"
+    );
+    // Another gate workload holds the checkout's lock: nothing runs.
+    let held = std::fs::File::create(&lock).unwrap();
+    held.try_lock().unwrap();
+    let (status, calls, report) = run("competing", &["discover", "a::x"]);
+    assert_eq!(status.code(), Some(2), "{report}");
+    assert!(
+        !calls.contains("proofs-discover"),
+        "discovery-competing: a discovery ran beside another workload: {calls}"
+    );
+    assert!(
+        report.contains("another gate workload holds target/gate-workload.lock"),
+        "{report}"
+    );
+    drop(held);
+    let (status, calls, report) = run("unnamed", &["discover"]);
+    assert_eq!(status.code(), Some(2), "{report}");
+    assert!(report.contains("usage: tests/proofs.sh"), "{report}");
+    assert!(!calls.contains("proofs-discover"), "{calls}");
+}
+
 /// Budget recording requires exactly one receipt in each phase, including
 /// when multiple receipts share libtest's output line. The fixture gate
 /// accepts the test outcome so receipt validation is exercised independently.

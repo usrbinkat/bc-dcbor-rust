@@ -165,12 +165,22 @@ pub const RUNTIME_VERSION: u64 = 1;
 pub const PURPOSE_CALIBRATION: &str = "calibration";
 pub const PURPOSE_QUALIFICATION: &str = "qualification";
 pub const PURPOSE_CONTROL: &str = "control";
+pub const PURPOSE_DISCOVERY: &str = "discovery";
 
 /// The records a run keeps of the documents it was given, beside its
 /// identity ([`RunPurpose::documents`]).
 pub const PLAN_RECORD: &str = "plan.json";
 pub const READINESS_RECORD: &str = "readiness.json";
 pub const EXPECTATIONS_RECORD: &str = "expectations.json";
+pub const DISCOVERY_RECORD: &str = "discovery.json";
+
+/// The deadline every harness of a discovery is given, and why: the driver
+/// writes a harness's loop discovery (`discovery.*`) before it spawns CBMC
+/// (nix/kani-driver-loop-bounds.patch, `loop_bounds.rs` `discover` before
+/// `launch`), so a discovery has nothing to wait for once CBMC starts.
+pub const DISCOVERY_MILLISECONDS: u64 = 1;
+pub const DISCOVERY_REASON: &str = "discovery only: the driver records loop discovery before CBMC \
+     starts; the solver is stopped at once and nothing is verified";
 
 /// The records a run keeps of the inputs its validated execution bound
 /// (`process::kani`): the program it launched; the tree's loop-bound policy
@@ -441,6 +451,65 @@ impl Ready {
     }
 }
 
+/// A validated discovery ([`discovery_of`], its only maker): the harnesses a
+/// discovery run compiles and inventories the loops of, the bytes of its
+/// record (the harnesses sorted, one per line, each ended by a newline) and
+/// those bytes' digest, the run's revision. A discovery verifies nothing, is
+/// never a sample and is never adopted; what it establishes is each
+/// harness's preserved instrumented binary and the driver's loop discovery
+/// of it, from which the loop-bound policy's selectors are copied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Discovery {
+    selection: BTreeSet<String>,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl Discovery {
+    /// The harnesses it discovers.
+    pub fn selection(&self) -> &BTreeSet<String> {
+        &self.selection
+    }
+
+    /// The digest of its record's bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// The discovery of `harnesses` of the census `declared`: refused when it
+/// selects no harness, names one twice, or names one no `#[kani::proof]` of
+/// the source declares, before anything runs.
+pub fn discovery_of(
+    harnesses: &[String],
+    declared: &BTreeSet<String>,
+) -> Result<Discovery, String> {
+    if harnesses.is_empty() {
+        return Err("a discovery selects no harness".to_string());
+    }
+    let mut selection = BTreeSet::new();
+    for harness in harnesses {
+        if !declared.contains(harness) {
+            return Err(format!(
+                "harness {harness}: selected for discovery, but declared by no #[kani::proof] of \
+                 the source"
+            ));
+        }
+        if !selection.insert(harness.clone()) {
+            return Err(format!("harness {harness}: selected for discovery twice"));
+        }
+    }
+    let bytes: Vec<u8> = selection
+        .iter()
+        .flat_map(|harness| harness.bytes().chain([b'\n']))
+        .collect();
+    Ok(Discovery {
+        sha256: crate::process::sha256_bytes(&bytes)?,
+        bytes,
+        selection,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunPurpose {
     Calibration {
@@ -452,6 +521,7 @@ pub enum RunPurpose {
         expectations: Expectations,
         authorization: Box<crate::controls::Authorization>,
     },
+    Discovery(Discovery),
 }
 
 /// Which instrumented binary a prediction applies to at a run: exactly its
@@ -473,12 +543,13 @@ impl RunPurpose {
             Self::Calibration { .. } => PURPOSE_CALIBRATION,
             Self::Qualification(_) => PURPOSE_QUALIFICATION,
             Self::Control { .. } => PURPOSE_CONTROL,
+            Self::Discovery(_) => PURPOSE_DISCOVERY,
         }
     }
 
     /// The documents the run was given, as its evidence keeps them before it
-    /// launches, each by its file name and bytes: the plan or the
-    /// predictions first, whose digest is the run's revision
+    /// launches, each by its file name and bytes: the plan, the predictions
+    /// or the discovery's selection first, whose digest is the run's revision
     /// ([`Self::revision`]), then a calibration's readiness.
     pub fn documents(&self) -> Vec<(&'static str, &[u8])> {
         match self {
@@ -488,24 +559,41 @@ impl RunPurpose {
             Self::Qualification(expectations) | Self::Control { expectations, .. } => {
                 vec![(EXPECTATIONS_RECORD, &expectations.bytes)]
             }
+            Self::Discovery(discovery) => vec![(DISCOVERY_RECORD, &discovery.bytes)],
         }
     }
 
-    /// The digest of the plan or the predictions the run was given.
+    /// The digest of the plan, the predictions or the discovery's selection
+    /// the run was given.
     pub fn revision(&self) -> &str {
         match self {
             Self::Calibration { plan, .. } => &plan.sha256,
             Self::Qualification(expectations) | Self::Control { expectations, .. } => {
                 &expectations.sha256
             }
+            Self::Discovery(discovery) => &discovery.sha256,
         }
     }
 
     /// Every harness's deadline, built once for each purpose: a
     /// calibration's limit as its plan states it, a qualification's or a
-    /// control side's [`DEADLINE_MARGIN`] times its prediction.
+    /// control side's [`DEADLINE_MARGIN`] times its prediction, a
+    /// discovery's [`DISCOVERY_MILLISECONDS`] for each harness it selects.
     pub fn deadlines(&self) -> BTreeMap<String, Deadline> {
         match self {
+            Self::Discovery(discovery) => discovery
+                .selection
+                .iter()
+                .map(|harness| {
+                    (
+                        harness.clone(),
+                        Deadline {
+                            milliseconds: DISCOVERY_MILLISECONDS,
+                            reason: DISCOVERY_REASON.to_string(),
+                        },
+                    )
+                })
+                .collect(),
             Self::Calibration { plan, .. } => plan.deadlines.clone(),
             Self::Qualification(expectations) | Self::Control { expectations, .. } => expectations
                 .harnesses
@@ -973,8 +1061,13 @@ impl RunIdentityRecord {
             ));
         }
         run_identifier(&self.id)?;
-        if ![PURPOSE_CALIBRATION, PURPOSE_QUALIFICATION, PURPOSE_CONTROL]
-            .contains(&self.purpose.as_str())
+        if ![
+            PURPOSE_CALIBRATION,
+            PURPOSE_QUALIFICATION,
+            PURPOSE_CONTROL,
+            PURPOSE_DISCOVERY,
+        ]
+        .contains(&self.purpose.as_str())
         {
             return fault(format!("no run has the purpose {:?}", self.purpose));
         }
@@ -2467,6 +2560,135 @@ fn discovered(
     inventory_functions(&read("discovery.stdout")?)
 }
 
+/// Harness `name`'s instrumented binary as its evidence under `at` preserves
+/// it, the driver's copy made before anything read it: its record
+/// (`artifact.json`) names that copy (`artifact.out`) and an absolute build
+/// path, and records a digest, which the copy's bytes have where the run's
+/// binaries are held, and which an adopted run, whose binaries are absent,
+/// records alone. The copy's recorded path and its digest.
+fn preserved_artifact(
+    name: &str,
+    at: &Path,
+    artifacts: Artifacts<'_>,
+) -> Result<(String, String), String> {
+    let preserved = at.join("artifact.out");
+    let path = at.join("artifact.json");
+    let record = strict_json(
+        &artifacts
+            .read(&path)
+            .map_err(|fault| format!("harness {name}: {fault}"))?,
+    )
+    .map_err(|fault| format!("harness {name}: artifact.json: {fault}"))?;
+    let recorded_path = record["path"]
+        .as_str()
+        .ok_or_else(|| format!("harness {name}: artifact.json names no path"))?;
+    let names_the_copy = match artifacts.binaries() {
+        Binaries::Held => {
+            Path::new(recorded_path) == preserved
+                || std::fs::canonicalize(recorded_path)
+                    .ok()
+                    .zip(std::fs::canonicalize(&preserved).ok())
+                    .is_some_and(|(recorded, copy)| recorded == copy)
+        }
+        // The copy was the run's own, at its evidence path then; its
+        // harness's directory and file name are what moved with it.
+        Binaries::Absent => recorded_path.ends_with(&format!(
+            "/loop-bounds/{}/artifact.out",
+            name.replace("::", ".")
+        )),
+    };
+    if !names_the_copy {
+        return Err(format!(
+            "harness {name}: artifact.json names {recorded_path}, not its preserved \
+             artifact.out {}",
+            preserved.display()
+        ));
+    }
+    if !record["source"]
+        .as_str()
+        .is_some_and(|source| source.starts_with('/'))
+    {
+        return Err(format!(
+            "harness {name}: artifact.json records no absolute build path"
+        ));
+    }
+    let recorded_digest = record["sha256"]
+        .as_str()
+        .filter(|digest| sha256_text(digest))
+        .ok_or_else(|| format!("harness {name}: artifact.json records no digest"))?;
+    match artifacts.binaries() {
+        Binaries::Held => {
+            let actual = crate::process::sha256(&preserved)
+                .map_err(|fault| format!("harness {name}: {fault}"))?;
+            if actual != recorded_digest {
+                return Err(format!(
+                    "harness {name}: the preserved artifact's bytes have digest {actual}, \
+                     artifact.json records {recorded_digest}"
+                ));
+            }
+        }
+        Binaries::Absent => match std::fs::symlink_metadata(&preserved) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "harness {name}: {}: {error}: whether the adopted run holds its \
+                     instrumented binary is unknown",
+                    preserved.display()
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "harness {name}: an adopted run holds its instrumented binary {}; \
+                     adoption records it by digest alone",
+                    preserved.display()
+                ));
+            }
+        },
+    }
+    Ok((recorded_path.to_string(), recorded_digest.to_string()))
+}
+
+/// What a discovery run's evidence under `directory` (its
+/// `--loop-bounds-evidence`) must hold, its own judgement: for every harness
+/// `discovery` selects, a directory of the driver's, its preserved
+/// instrumented binary ([`preserved_artifact`]) and a loop discovery of that
+/// binary that exited successfully and holds one valid inventory
+/// ([`discovered`], the one validator of a discovery, which every other run's
+/// reconciliation applies too). A discovery's solver is stopped at its
+/// deadline ([`DISCOVERY_MILLISECONDS`]), so its report, its termination, its
+/// solver records and its function scope are no part of it. Each harness's
+/// artifact digest, by harness.
+pub fn check_discovery(
+    directory: &Path,
+    discovery: &Discovery,
+    artifacts: Artifacts<'_>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut found = BTreeMap::new();
+    for name in &discovery.selection {
+        let at = harness_evidence(directory, name);
+        let kind = match std::fs::symlink_metadata(&at) {
+            Ok(metadata) => metadata.file_type(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "harness {name}: the run left no evidence of it ({})",
+                    at.display()
+                ));
+            }
+            Err(error) => return Err(format!("harness {name}: {}: {error}", at.display())),
+        };
+        if !kind.is_dir() {
+            return Err(format!(
+                "harness {name}: {} is not a directory of the driver's",
+                at.display()
+            ));
+        }
+        let (path, digest) = preserved_artifact(name, &at, artifacts)?;
+        discovered(&at, &path, artifacts).map_err(|fault| format!("harness {name}: {fault}"))?;
+        found.insert(name.clone(), digest);
+    }
+    Ok(found)
+}
+
 /// What a run's evidence reconciles to ([`check_execution_evidence`]): the
 /// verifier its harnesses ran, `solver.identity`'s value (`null` when no
 /// harness reached verification), and, for each function-scoped selector of
@@ -2736,77 +2958,11 @@ pub fn check_execution_evidence(
             Some(_) => {}
             None => verifier = Some(identity),
         }
-        // The binary the harness ran on: the copy its evidence preserves, its
-        // record naming that file, its bytes the recorded digest, and the
-        // solver's command naming it.
-        let preserved = at.join("artifact.out");
-        let record = json("artifact.json")?;
-        let recorded_path = record["path"]
-            .as_str()
-            .ok_or_else(|| format!("harness {name}: artifact.json names no path"))?;
-        let names_the_copy = match artifacts.binaries() {
-            Binaries::Held => {
-                Path::new(recorded_path) == preserved
-                    || std::fs::canonicalize(recorded_path)
-                        .ok()
-                        .zip(std::fs::canonicalize(&preserved).ok())
-                        .is_some_and(|(recorded, copy)| recorded == copy)
-            }
-            // The copy was the run's own, at its evidence path then; its
-            // harness's directory and file name are what moved with it.
-            Binaries::Absent => recorded_path.ends_with(&format!(
-                "/loop-bounds/{}/artifact.out",
-                name.replace("::", ".")
-            )),
-        };
-        if !names_the_copy {
-            return Err(format!(
-                "harness {name}: artifact.json names {recorded_path}, not its preserved \
-                 artifact.out {}",
-                preserved.display()
-            ));
-        }
-        if !record["source"]
-            .as_str()
-            .is_some_and(|source| source.starts_with('/'))
-        {
-            return Err(format!(
-                "harness {name}: artifact.json records no absolute build path"
-            ));
-        }
-        let recorded_digest = record["sha256"]
-            .as_str()
-            .filter(|digest| sha256_text(digest))
-            .ok_or_else(|| format!("harness {name}: artifact.json records no digest"))?;
-        match artifacts.binaries() {
-            Binaries::Held => {
-                let actual = crate::process::sha256(&preserved)
-                    .map_err(|fault| format!("harness {name}: {fault}"))?;
-                if actual != recorded_digest {
-                    return Err(format!(
-                        "harness {name}: the preserved artifact's bytes have digest {actual}, \
-                         artifact.json records {recorded_digest}"
-                    ));
-                }
-            }
-            Binaries::Absent => match std::fs::symlink_metadata(&preserved) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "harness {name}: {}: {error}: whether the adopted run holds its \
-                         instrumented binary is unknown",
-                        preserved.display()
-                    ));
-                }
-                Ok(_) => {
-                    return Err(format!(
-                        "harness {name}: an adopted run holds its instrumented binary {}; \
-                         adoption records it by digest alone",
-                        preserved.display()
-                    ));
-                }
-            },
-        }
+        // The binary the harness ran on: the copy its evidence preserves
+        // ([`preserved_artifact`]), and the solver's command naming it.
+        let (recorded_path, recorded_digest) = preserved_artifact(&name, &at, artifacts)?;
+        let recorded_path = recorded_path.as_str();
+        let recorded_digest = recorded_digest.as_str();
         if !command.contains(&recorded_path.as_bytes()) {
             return Err(format!(
                 "harness {name}: the solver ran on another binary than the preserved \
@@ -3463,6 +3619,39 @@ pub fn run(
     .validate()?;
     let (termination, report) = crate::process::execute_kani(run)?;
     Ok(rows(termination, &report, &declared))
+}
+
+/// One discovery run of `selection`, harnesses of the library under `root`
+/// ([`discovery_of`]), through the one Kani invocation under the tree's
+/// policy, its artifacts in `target_dir`, its report logged to `log`, judged
+/// by its discovery records alone ([`check_discovery`]). The directory the
+/// driver wrote each harness's records into (`LOG.evidence/loop-bounds`).
+pub fn discover(
+    root: &Path,
+    target_dir: &Path,
+    log: &Path,
+    launcher: &Path,
+    selection: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let declared = harnesses(&root.join("src"))?;
+    let discovery = discovery_of(selection, &declared)?;
+    let only = Selection::Only(discovery.selection.clone());
+    let purpose = RunPurpose::Discovery(discovery);
+    let workload = crate::process::Workload::exported()?;
+    let run = crate::process::KaniRequest {
+        root,
+        purpose: &purpose,
+        selection: &only,
+        declared: &declared,
+        target_dir,
+        launcher,
+        workload: &workload,
+        log,
+    }
+    .validate()?;
+    let bounds = run.evidence().join("loop-bounds");
+    crate::process::execute_kani(run)?;
+    Ok(bounds)
 }
 
 /// Select the Kani a run launches: [`crate::process::kani_launcher`]'s one
@@ -6160,6 +6349,109 @@ pub(crate) mod tests {
         }
     }
 
+    /// A discovery selects declared harnesses, each once, and at least one:
+    /// its record is the selection sorted, one harness per line, its digest
+    /// the run's revision, and each harness's deadline the discovery's own.
+    /// An empty, a repeated and an undeclared selection are each refused.
+    #[test]
+    fn a_discovery_selects_declared_harnesses_once() {
+        let census = declared(&["a::x", "a::y"]);
+        let discovery = discovery_of(&["a::y".to_string(), "a::x".to_string()], &census).unwrap();
+        assert_eq!(discovery.bytes, b"a::x\na::y\n");
+        assert_eq!(
+            discovery.sha256(),
+            crate::process::sha256_bytes(b"a::x\na::y\n").unwrap()
+        );
+        let purpose = RunPurpose::Discovery(discovery.clone());
+        assert_eq!(
+            (purpose.name(), purpose.revision()),
+            (PURPOSE_DISCOVERY, discovery.sha256())
+        );
+        assert_eq!(
+            purpose.documents(),
+            [(DISCOVERY_RECORD, b"a::x\na::y\n".as_slice())]
+        );
+        let deadlines = purpose.deadlines();
+        assert_eq!(deadlines.keys().collect::<Vec<_>>(), ["a::x", "a::y"]);
+        assert!(deadlines.values().all(|deadline| {
+            deadline.milliseconds() == DISCOVERY_MILLISECONDS
+                && deadline.reason() == DISCOVERY_REASON
+        }));
+        for (name, selection, fault) in [
+            ("discovery-empty", vec![], "a discovery selects no harness"),
+            (
+                "discovery-duplicate",
+                vec!["a::x".to_string(), "a::x".to_string()],
+                "harness a::x: selected for discovery twice",
+            ),
+            (
+                "discovery-undeclared",
+                vec!["a::z".to_string()],
+                "harness a::z: selected for discovery, but declared by no #[kani::proof]",
+            ),
+        ] {
+            let found = refused(name, discovery_of(&selection, &census));
+            assert!(found.contains(fault), "{name}: {found}");
+        }
+    }
+
+    /// A discovery is judged by its discovery records alone: every selected
+    /// harness's directory, its preserved artifact and its discovery of that
+    /// artifact, exited successfully and holding one inventory. A missing
+    /// `discovery.stdout`, a nonzero `discovery.status`, a `discovery.stdout`
+    /// that is not JSON and a harness the run left no directory for are each
+    /// refused by their own fault.
+    #[test]
+    fn a_discovery_is_judged_by_its_discovery_records() {
+        let discovery = discovery_of(
+            &["a::x".to_string(), "a::y".to_string()],
+            &declared(&["a::x", "a::y"]),
+        )
+        .unwrap();
+        let evidence = RunEvidence::new("discovery-records");
+        assert_eq!(
+            check_discovery(&evidence.root, &discovery, Artifacts::Live).unwrap(),
+            BTreeMap::from([
+                ("a::x".to_string(), ARTIFACTS[0].2.to_string()),
+                ("a::y".to_string(), ARTIFACTS[1].2.to_string()),
+            ])
+        );
+        let cases: [Disagreement; 4] = [
+            (
+                "discovery-stdout-missing",
+                |evidence| {
+                    std::fs::remove_file(evidence.root.join("a.x").join("discovery.stdout"))
+                        .unwrap();
+                },
+                "a.x/discovery.stdout",
+            ),
+            (
+                "discovery-status-nonzero",
+                |evidence| evidence.write("a.y", "discovery.status", b"exit status: 1\n"),
+                "harness a::y: the loop discovery did not exit successfully: exit status: 1",
+            ),
+            (
+                "discovery-stdout-not-json",
+                |evidence| evidence.write("a.x", "discovery.stdout", b"no inventory"),
+                "harness a::x: the loop inventory is not JSON",
+            ),
+            (
+                "discovery-harness-missing",
+                |evidence| std::fs::remove_dir_all(evidence.root.join("a.y")).unwrap(),
+                "harness a::y: the run left no evidence of it",
+            ),
+        ];
+        for (name, plant, fault) in cases {
+            let evidence = RunEvidence::new(name);
+            plant(&evidence);
+            let found = refused(
+                name,
+                check_discovery(&evidence.root, &discovery, Artifacts::Live),
+            );
+            assert!(found.contains(fault), "{name}: {found}");
+        }
+    }
+
     /// Every disagreement between the policy given, the resolution recorded
     /// and the command spawned is refused, though the report's lines are
     /// unchanged.
@@ -7915,7 +8207,8 @@ exit $((failures > 0))
     /// harness no `#[kani::proof]` declares, a launcher that no longer
     /// resolves to itself, an empty census, a calibration of more than one
     /// harness, a qualification of less than the whole census, a harness
-    /// its purpose gives no deadline, and a tree whose policy cannot be read
+    /// its purpose gives no deadline, a discovery run of another selection
+    /// than the one it was made for, and a tree whose policy cannot be read
     /// are each refused with nothing reserved; a valid request reserves its
     /// evidence, and its validation binds the tree's policy and source state.
     #[test]
@@ -7943,6 +8236,8 @@ exit $((failures > 0))
             |_| 1000,
         ));
         let declared = fixture.declared();
+        let discovering =
+            RunPurpose::Discovery(discovery_of(&["x".to_string()], &declared).unwrap());
         let none = BTreeSet::new();
         let validated = |purpose: &RunPurpose,
                          selection: &Selection,
@@ -8021,6 +8316,14 @@ exit $((failures > 0))
                 &declared,
                 launcher.as_path(),
                 "the run's purpose gives no deadline: [\"y\"]",
+            ),
+            (
+                "discovery-foreign",
+                &discovering,
+                Selection::one("y"),
+                &declared,
+                launcher.as_path(),
+                "a discovery checks exactly the harnesses it was made for",
             ),
         ] {
             let found = refused(name, validated(purpose, &selection, census, launcher, name));
@@ -8496,6 +8799,65 @@ exit $((failures > 0))
         assert!(
             matches!(&adopted, Err(Adoption::Refused(why)) if why.contains("run.json")),
             "before-identity-adopted: {adopted:?}"
+        );
+    }
+
+    /// A discovery runs through the one Kani invocation: it keeps its
+    /// selection beside its identity, of purpose discovery and that
+    /// selection's digest; gives each harness the discovery's deadline; is
+    /// accepted on its discovery records with its manifest complete; and is
+    /// never a calibration sample, nor adopted.
+    #[test]
+    fn a_discovery_run_is_kept_and_is_never_a_sample() {
+        let fixture = KaniFixture::new("discovery");
+        let launcher = fixture.launcher("cargo-kani", DISCOVERY_MILLISECONDS, "none", "");
+        let declared = fixture.declared();
+        let discovery = discovery_of(&["x".to_string()], &declared).unwrap();
+        let purpose = RunPurpose::Discovery(discovery.clone());
+        fixture
+            .run(
+                &purpose,
+                &Selection::one("x"),
+                "discovery.log",
+                &launcher,
+                &fixture.workload,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.record("discovery.log", "judgement.json"),
+            serde_json::json!({"status": "accepted"})
+        );
+        let identity: RunIdentityRecord =
+            typed(fixture.record("discovery.log", "run.json"), "run.json").unwrap();
+        assert_eq!(
+            (identity.purpose.as_str(), identity.revision.as_str()),
+            (PURPOSE_DISCOVERY, discovery.sha256())
+        );
+        let evidence = fixture.logs.join("discovery.evidence");
+        assert_eq!(
+            std::fs::read(evidence.join(DISCOVERY_RECORD)).unwrap(),
+            b"x\n"
+        );
+        assert_eq!(
+            fixture.record("discovery.log", "loop-bounds.json")["deadlines"],
+            serde_json::json!([{
+                "harness": "x",
+                "milliseconds": DISCOVERY_MILLISECONDS,
+                "reason": DISCOVERY_REASON,
+            }])
+        );
+        assert!(evidence.join("loop-bounds/x/discovery.stdout").is_file());
+        assert!(fixture.manifest("discovery.log").complete);
+        let sample = ran_sample(&fixture.logs.join("discovery.log"), &declared);
+        let found = refused("discovery-sampled", sample);
+        assert!(
+            found.contains("of purpose discovery"),
+            "discovery-sampled: {found}"
+        );
+        let adopted = adopt(&evidence, &fixture.root);
+        assert!(
+            matches!(&adopted, Err(Adoption::Refused(why)) if why.contains("only a calibration is adopted")),
+            "discovery-adopted: {adopted:?}"
         );
     }
 }

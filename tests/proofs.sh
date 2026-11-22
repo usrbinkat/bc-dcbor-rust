@@ -23,6 +23,14 @@
 # LOGS/calibration/H.N.evidence`). A qualification holds the workload lock
 # here, for its whole run.
 #
+# With `discover HARNESS...`, the run is a discovery (`gate proofs-discover`,
+# tests/gate/src/proofs.rs `discover`): each named harness compiled by the
+# proof build, its instrumented binary preserved and its loops inventoried
+# by the driver (LOGS/kani.evidence/loop-bounds/H/discovery.*, before CBMC
+# starts), nothing verified and no results row written; what the loop-bound
+# policy's selectors are copied from. It holds the workload lock here, for
+# its whole run, as a qualification does.
+#
 # Evidence is of a commit: the tree must be clean, and Kani runs on a copy of
 # it (`copy_of`), never the checkout, at one location, target/proof-source,
 # so a calibration's and a qualification's builds share their paths and so
@@ -30,7 +38,7 @@
 # (target/proof-source.lock) for the whole run: a second proof run is
 # refused, never interleaved with this one's copy or workload.
 #
-# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS]
+# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS...]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
@@ -45,16 +53,22 @@ for tool in cargo cargo-kani rustc sha256sum git tar flock realpath; do
 done
 plan=""
 control_logs=()
+discover=()
+usage() {
+    echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS...]" >&2
+    exit 2
+}
 case "$#:${1:-}" in
     0:) ;;
     4:calibrate)
         plan="$(realpath -e "$2")" || exit 2
         control_logs=("$(realpath -e "$3")" "$(realpath -e "$4")") || exit 2
         ;;
-    *)
-        echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS]" >&2
-        exit 2
+    *:discover)
+        (($# >= 2)) || usage
+        discover=("${@:2}")
         ;;
+    *) usage ;;
 esac
 gate_prepare || exit 2
 logs="${PROOF_LOG_DIR:-${TMPDIR:?required, or PROOF_LOG_DIR: the log directory of the proof gate}/proofs}"
@@ -89,6 +103,9 @@ kani_identity="$(gate proofs-identity "$launcher")" || {
     printf '%s\n' "$kani_identity"
     printf 'build\t%s\n' "$(gate proofs-build)"
     printf 'commit\t%s\n' "$commit"
+    if ((${#discover[@]} > 0)); then
+        printf 'discover\t%s\n' "${discover[@]}"
+    fi
 } | identity "$logs" || {
     event "FAIL the run's identity could not be written; nothing was run"
     exit 2
@@ -103,6 +120,16 @@ if [[ -n "$plan" ]]; then
         status=1
     fi
     event "DONE calibration of $commit; status $status; records $logs"
+    exit "$status"
+fi
+if ((${#discover[@]} > 0)); then
+    gate proofs-discover "$source_copy" "$PWD/target/kani" "$logs" "$launcher" "${discover[@]}"
+    status=$?
+    if ! still_at_commit; then
+        event "FAIL the checkout moved off $commit during the run"
+        status=1
+    fi
+    event "DONE discovery of $commit; status $status; records $logs/kani.evidence/loop-bounds"
     exit "$status"
 fi
 gate proofs "$source_copy" "$PWD/target/kani" "$logs" "$launcher"
