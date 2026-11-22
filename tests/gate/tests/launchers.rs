@@ -895,6 +895,29 @@ esac
         scoped_to(&recorded, "scoped", "kani"),
         "a scoped run did not keep its runners: {recorded}"
     );
+    // A run of named controls runs each named control's sides and writes no
+    // final record; a name the channel and runners do not select runs
+    // nothing.
+    let (status, sides, report, recorded) = run_with("only", "0", &["kani", "--only", "x"]);
+    assert_eq!(status.code(), Some(0), "{report}");
+    assert_eq!(
+        sides,
+        ["baseline", "red", "green"],
+        "only-unrun: a named control's sides were not run: {report}"
+    );
+    assert!(
+        !recorded
+            .lines()
+            .any(|line| line.starts_with("control evidence ")),
+        "only-recorded: a run of named controls wrote a channel's final record: {recorded}"
+    );
+    let (status, sides, report, _) = run_with("only-unknown", "0", &["kani", "--only", "y"]);
+    assert_eq!(status.code(), Some(2), "{report}");
+    assert!(
+        sides.is_empty(),
+        "only-unknown: a run naming no registered control ran {sides:?}"
+    );
+    assert!(report.contains("--only names no control"), "{report}");
     // Another gate workload holds the checkout's lock: nothing runs.
     let held = std::fs::File::create(repo.join("target/gate-workload.lock")).unwrap();
     held.try_lock().unwrap();
