@@ -32,8 +32,7 @@ pub use super::stable::Admitted;
 pub(crate) use owned::admits_its_production_representation;
 pub(crate) use owned::{AbortOnUnwind, EMPTIED, ScopeRef, slot_place};
 pub use owned::{
-    Acquisition, AcquisitionStage, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition,
-    scope_bound,
+    Acquisition, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition, scope_bound,
 };
 #[cfg(test)]
 #[cfg(feature = "std")]

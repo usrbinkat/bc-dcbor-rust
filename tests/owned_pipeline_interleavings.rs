@@ -431,10 +431,9 @@ fn cuts(
 /// with the second: the second publishes its exact bytes and the scope
 /// recovers everything. Each boundary is classed by `classes::prepare` of
 /// the first preparation's state where the cut retires it, which reads the
-/// operation's own fields, its record's acquisition stage, the scope's
-/// outstanding record count and its queue's drain state, never the
-/// survivor's state; an interleaving's classes
-/// are its own, each classed from its own uncut run. The fast layer retires
+/// operation's own fields, the scope's outstanding record count and its
+/// queue's drain state, never the survivor's state; an interleaving's
+/// classes are its own, each classed from its own uncut run. The fast layer retires
 /// at the first boundary of each class and at every unclassified one, the
 /// exhaustive layer at every boundary ([`cuts`]); the exhaustive layer then
 /// requires every member of a class, in one interleaving, to retire with

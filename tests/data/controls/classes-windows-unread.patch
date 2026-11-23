@@ -1,6 +1,6 @@
 --- tests/support/classes.rs
 +++ tests/support/classes.rs
-@@ -514,7 +514,7 @@
+@@ -512,7 +512,7 @@
          bytes: arena(&position.bytes),
          holes: arena(&position.holes),
          cursors: arena(&position.cursor_storage),

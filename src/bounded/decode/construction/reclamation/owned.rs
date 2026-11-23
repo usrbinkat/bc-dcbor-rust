@@ -881,30 +881,7 @@ where
 {
 }
 
-/// Where an [`Acquisition`] stands in [`ScopeRef::allocate_step`], each
-/// stage cleaned up differently: idle, it holds nothing; admitting, its head
-/// stage has bound it to the record's scope (a scope reference it ends) and
-/// holds the head's admissions in its pending credit (forfeited), no block
-/// granted; granted, it also holds the granted block whose owner stage has
-/// not run (freed unowned, its release prepaid).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AcquisitionStage {
-    Idle,
-    Admitting,
-    Granted,
-}
-
 impl<T: Reclaim<A>, A: TerminalAllocator> Acquisition<'_, T, A> {
-    /// The token's stage ([`AcquisitionStage`]), read from its own fields
-    /// alone. Allocation-free.
-    pub fn stage(&self) -> AcquisitionStage {
-        match (&self.scope, self.granted) {
-            (_, Some(_)) => AcquisitionStage::Granted,
-            (Some(_), None) => AcquisitionStage::Admitting,
-            (None, None) => AcquisitionStage::Idle,
-        }
-    }
-
     pub const fn new() -> Self {
         Self {
             scope: None,

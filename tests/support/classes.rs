@@ -23,8 +23,8 @@ use dcbor::bounded::Limits;
 use dcbor::bounded::decode::construction::in_place::{BufferObservation, Session};
 use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reduction};
 use dcbor::bounded::decode::construction::{
-    AcquisitionStage, ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase,
-    Position, QueueObservation, TypedPosition,
+    ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase, Position,
+    QueueObservation, TypedPosition,
 };
 use dcbor::bounded::decode::cursor::Phase as ParserPhase;
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
@@ -120,20 +120,19 @@ enum Initialized {
     Partial,
 }
 
-/// The operation's own part of a class: its record's acquisition stage,
-/// whether its record is allocated, how much of its prefix is written
-/// ([`Initialized`]), whether it is cancelling or finished, and how many
-/// records its scope holds. The operation's cleanup reads each: an
-/// acquisition's cleanup ends what its stage holds (the scope reference and
-/// pending credit of its head stage, a block granted and not yet owned), a
-/// record's cleanup releases its written prefix, and the scope's drain
-/// releases every record it holds, from where its queue stands (the active
-/// record's remaining calls, the records queued behind it, a removal unit
-/// already admitted).
+/// The operation's own part of a class: whether its record is allocated, how
+/// much of its prefix is written ([`Initialized`]), whether it is cancelling
+/// or finished, and how many records its scope holds and where its queue
+/// stands. The operation's cleanup reads each: a record's cleanup releases
+/// its written prefix, and the scope's drain releases every record it holds,
+/// from where its queue stands (the active record's remaining calls, the
+/// records queued behind it, a removal unit already admitted). Where the
+/// record's acquisition stands changes nothing the cleanup admits: every
+/// cleanup step cancels the acquisition first, admitting nothing whatever
+/// it holds (`Operation::step`, `Acquisition::cancel_into`).
 #[derive(Debug)]
 #[expect(dead_code, reason = "read through the rendering that is the class")]
 struct Operation<D> {
-    acquisition: AcquisitionStage,
     queue: QueueObservation,
     allocated: bool,
     initialized: Initialized,
@@ -156,7 +155,6 @@ fn operation_with<D, E: Debug>(
     format!(
         "{:?}",
         Operation {
-            acquisition: position.acquisition,
             queue: position.queue,
             allocated: position.allocated,
             initialized,

@@ -559,12 +559,10 @@ window-end-omitted	tests/data/controls/window-end-omitted.patch	native	nightly	d
 window-remint-on-retry	tests/data/controls/window-remint-on-retry.patch	native	nightly	dcbor	all	fast	held_credit	preparation_repeated_refusal_admits_the_window_exactly_once	-	failed	refusal replaced the credit-free acquisition
 window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly	dcbor	all	fast	held_credit	preparation_continues_a_window_across_families	-	failed	does not refine the protocol
 # The preparation's cleanup class (tests/support/classes.rs) losing one fact
-# its cleanup reads, one plant each: the record's acquisition stage, the
-# scope queue's drain state, whether an arena is released, the cursors'
-# window arena. Each merges boundaries whose cleanups differ, which only the
-# exhaustive layer, stopping at every member of a class, names
-# (tests/support/lifecycle.rs, `agree`).
-classes-acquisition-unread	tests/data/controls/classes-acquisition-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
+# its cleanup reads, one plant each: the scope queue's drain state, whether
+# an arena is released, the cursors' window arena. Each merges boundaries
+# whose cleanups differ, which only the exhaustive layer, stopping at every
+# member of a class, names (tests/support/lifecycle.rs, `agree`).
 classes-queue-unread	tests/data/controls/classes-queue-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-arena-release-unread	tests/data/controls/classes-arena-release-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody

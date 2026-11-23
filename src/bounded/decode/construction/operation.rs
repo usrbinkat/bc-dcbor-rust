@@ -9,8 +9,8 @@
 //! independent of every other record in the scope. Dropping an operation at
 //! any point only hands its records to the scope queue.
 use super::reclamation::{
-    Acquisition, AcquisitionStage, Cleanup, OwnedInitialized, OwnedRecord, PeekSlot,
-    QueueObservation, Reclaim, Reclaimed, ScopeRef, Slot, record_cost,
+    Acquisition, Cleanup, OwnedInitialized, OwnedRecord, PeekSlot, QueueObservation, Reclaim,
+    Reclaimed, ScopeRef, Slot, record_cost,
 };
 use super::stable::Pending;
 use crate::bounded::boundary::{Bound, Predicate};
@@ -227,16 +227,16 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
     ) -> PermitsObserved;
 }
 
-/// Allocation-free observation of an operation: its record's acquisition
-/// stage, which a step changes before any record exists
-/// ([`ScopeRef::allocate_step`]) and its cleanup reads
-/// ([`Acquisition::stage`]); whether its record is allocated and how much
-/// of its prefix is written; whether it is cancelling or finished; how many
-/// records its scope holds and its scope queue's drain state, which the
-/// queue's steps read ([`ScopeRef::queue_position`]); and its task's detail.
+/// Allocation-free observation of an operation: whether its record is
+/// allocated and how much of its prefix is written; whether it is cancelling
+/// or finished; how many records its scope holds and its scope queue's drain
+/// state, which the queue's steps read ([`ScopeRef::queue_position`]); and
+/// its task's detail. Where its record's acquisition stands is not observed:
+/// cleanup cancels the acquisition at every stage without admitting
+/// anything ([`Acquisition::cancel_into`]), so no stage changes what its
+/// cleanup admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position<D> {
-    pub acquisition: AcquisitionStage,
     pub queue: QueueObservation,
     pub allocated: bool,
     pub initialized: usize,
@@ -297,7 +297,6 @@ impl<'s, K: Task<'s, A>, A: TerminalAllocator> Operation<'s, K, A> {
             }
         };
         Position {
-            acquisition: self.acquisition.stage(),
             queue,
             allocated,
             initialized,

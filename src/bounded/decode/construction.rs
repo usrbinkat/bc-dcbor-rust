@@ -34,9 +34,8 @@ pub(crate) use operation::{Observed, OperationTerms, Task};
 pub use operation::{Operation, Position};
 pub use parse::{DocumentDecoder, OwnedDocument, ParseDetail, ParsePhase, parse_bound};
 pub use reclamation::{
-    Acquisition, AcquisitionStage, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix,
-    QueueObservation, QueuePosition, Reclaim, Reclaimed, Reduction, ScopePosition, Uniform,
-    Written, scope_bound,
+    Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, QueueObservation,
+    QueuePosition, Reclaim, Reclaimed, Reduction, ScopePosition, Uniform, Written, scope_bound,
 };
 
 /// One construction step's whole input: the document, the node it builds
