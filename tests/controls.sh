@@ -8,7 +8,9 @@
 # diff. A native control's test is built and run by the gate tool (`control
 # run`); a Miri control's runs here under the Miri gate's one command and
 # its model's flags (tests/gate-common.sh, `miri_command`, `miri_flags`),
-# and the gate tool judges it (`control judge`). Every decision is the gate
+# and the gate tool judges it (`control judge`). Either runs its test at its
+# row's layer (the `rigor` column, as DCBOR_RIGOR), never this shell's.
+# Every decision is the gate
 # tool's (tests/gate, `controls`): the table and its completeness, each run's
 # judgement, and the evidence.
 #
@@ -192,10 +194,13 @@ if ((${#miri_used[@]} > 0)); then
 fi
 
 # One run of the Miri control whose row is in the variables `name`, `runner`
-# (its model), `package`, `features`, `target` and `test`, side `$1`, in the
-# copy `$2`, logged in `$3`: the Miri gate's one command (`miri_command`)
-# under the model's flags (`miri_flags`), the row's package, features and
-# target, its one test selected exactly; the run classified by the gate
+# (its model), `package`, `features`, `rigor`, `target` and `test`, side
+# `$1`, in the copy `$2`, logged in `$3`: the Miri gate's one command
+# (`miri_command`) under the model's flags (`miri_flags`, which forward
+# DCBOR_RIGOR to the interpreted test), the row's package, features and
+# target, its one test selected exactly at the row's layer and at the
+# Miri gate's minimal witness sizes (tests/miri-owned.sh), both set here
+# whatever this shell's environment holds; the run classified by the gate
 # tool's one classifier of a Miri run (`classify miri`), then judged by it
 # (`control judge`) as a native run is.
 miri_control() {
@@ -213,7 +218,7 @@ miri_control() {
     esac
     local miri_cmd
     miri_command || return 2
-    env MIRIFLAGS="$flags" "${miri_cmd[@]}" "${selection[@]}" -- \
+    env MIRIFLAGS="$flags" DCBOR_RIGOR="$rigor" DCBOR_WITNESS=minimal "${miri_cmd[@]}" "${selection[@]}" -- \
         --exact "$test" --nocapture --test-threads=1 > "$directory/$side.log" 2>&1
     status=$?
     outcome="$(gate classify miri test "$status" "$directory/$side.log")" || return 2
@@ -247,7 +252,7 @@ built="$PWD/target/control-builds"
 
 status=0
 for line in "${controls[@]}"; do
-    IFS=$'\t' read -r name diff runner _ package features target test _ <<< "$line"
+    IFS=$'\t' read -r name diff runner _ package features rigor target test _ <<< "$line"
     # A Miri control's directory and copy name its model too, as the gate
     # tool's do (`controls::directory`): one diff may be a control under
     # each model.

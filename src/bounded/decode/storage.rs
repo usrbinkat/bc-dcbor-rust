@@ -134,6 +134,12 @@ pub struct StoragePosition {
     /// The old allocation's permit remains live until its last element has
     /// moved or been drained, independently of the grown allocation's permit.
     pub has_relocating_permit: bool,
+    /// The arena holds no element, allocation, reservation or growth under
+    /// way ([`Storage::is_released`]): what a holder that steps an arena's
+    /// cleanup only while it is unreleased reads. A settled empty arena
+    /// whose staging block's acquisition is under way is `Settled` but not
+    /// released: its cleanup's entry settles that acquisition's credit.
+    pub released: bool,
 }
 
 impl Default for StoragePosition {
@@ -405,6 +411,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     }
 
     pub fn position(&self) -> StoragePosition {
+        let released = self.is_released();
         match &self.state {
             State::Settled { arena, growth } => StoragePosition {
                 stage: match growth {
@@ -431,6 +438,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     _ => false,
                 },
                 has_relocating_permit: false,
+                released,
             },
             State::Relocating { from, into } => {
                 let into = into.peek();
@@ -445,6 +453,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     staged_physical_capacity: 0,
                     has_staged_permit: false,
                     has_relocating_permit: from._permit.is_some(),
+                    released,
                 }
             }
             State::Relocated { into } => {
@@ -460,6 +469,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     staged_physical_capacity: 0,
                     has_staged_permit: false,
                     has_relocating_permit: false,
+                    released,
                 }
             }
         }
@@ -1908,6 +1918,7 @@ mod tests {
                 staged_physical_capacity: 0,
                 has_staged_permit: false,
                 has_relocating_permit: false,
+                released: true,
             }
         );
     }

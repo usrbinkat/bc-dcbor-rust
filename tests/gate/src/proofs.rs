@@ -3167,6 +3167,7 @@ fn check_resolution(
         if !loops.insert(id) {
             return Err(format!("harness {name}: loop {id} resolved twice"));
         }
+        resolved_in_its_file(name, id, found)?;
         pairs.push(format!("{id}:{bound}"));
     }
     let expected = pairs.join(",");
@@ -3179,6 +3180,46 @@ fn check_resolution(
         }
     }
     Ok(())
+}
+
+/// Whether harness `name`'s resolved loop `id` (`found`, one entry of its
+/// resolution's `resolved`) lies in the file its selector names: the
+/// recorded `file` is the loop's own location's, and it is the selector's
+/// `file` exactly, or, for a selector naming its `package` (a dependency the
+/// solver locates at its absolute path in the host's Cargo home), an absolute
+/// path ending in `/` and the selector's file, the package's root, which only
+/// the run's `cargo metadata` knows, before it.
+fn resolved_in_its_file(name: &str, id: &str, found: &serde_json::Value) -> Result<(), String> {
+    let selector = &found["selector"];
+    let declared = selector["file"]
+        .as_str()
+        .ok_or_else(|| format!("harness {name}: loop {id}'s selector names no file"))?;
+    let file = found["file"]
+        .as_str()
+        .ok_or_else(|| format!("harness {name}: loop {id} records no file"))?;
+    if found["location"]["file"].as_str() != Some(file) {
+        return Err(format!(
+            "harness {name}: loop {id} is located in {}, its resolution records {file}",
+            found["location"]["file"]
+        ));
+    }
+    let placed = if selector.get("package").is_some() {
+        file.starts_with('/') && file.ends_with(&format!("/{declared}"))
+    } else {
+        file == declared
+    };
+    if placed {
+        Ok(())
+    } else {
+        Err(format!(
+            "harness {name}: loop {id} resolved in {file}, its selector names {declared}{}",
+            if selector.get("package").is_some() {
+                format!(" of {}", selector["package"])
+            } else {
+                String::new()
+            }
+        ))
+    }
 }
 
 /// Kani's record of the function scope (`function-scope.json` under
@@ -4437,7 +4478,12 @@ pub(crate) mod tests {
                         "function_scope": [],
                         "artifact": {"path": copy, "sha256": artifact},
                         "warnings": [],
-                        "resolved": [{"selector": entry["loops"][0], "loop": "f.0", "location": {}}],
+                        "resolved": [{
+                            "selector": entry["loops"][0],
+                            "file": entry["loops"][0]["file"],
+                            "loop": "f.0",
+                            "location": {"file": entry["loops"][0]["file"]},
+                        }],
                     })
                     .to_string()
                     .as_bytes(),
@@ -5832,7 +5878,13 @@ pub(crate) mod tests {
                 .map(|(id, bound)| {
                     let mut selector = policy["loops"][0].clone();
                     selector["bound"] = serde_json::json!(bound);
-                    serde_json::json!({"selector": selector, "loop": id, "location": {}})
+                    let file = selector["file"].clone();
+                    serde_json::json!({
+                        "selector": selector,
+                        "file": file,
+                        "loop": id,
+                        "location": {"file": file},
+                    })
                 })
                 .collect();
             let record = serde_json::json!({
@@ -5874,7 +5926,12 @@ pub(crate) mod tests {
                 "function_scope": [scoped],
                 "artifact": {"path": self.artifact("a.y"), "sha256": ARTIFACTS[1].2},
                 "warnings": [],
-                "resolved": [{"selector": scoped, "loop": "g.0", "location": {}}],
+                "resolved": [{
+                    "selector": scoped,
+                    "file": scoped["file"],
+                    "loop": "g.0",
+                    "location": {"file": scoped["file"]},
+                }],
             });
             self.write("a.y", "resolution.json", record.to_string().as_bytes());
             self.command("a.y", Some("g.0:257"), &self.artifact("a.y"));
@@ -6527,8 +6584,18 @@ pub(crate) mod tests {
             "function_scope": [],
             "artifact": {"path": evidence.artifact("a.x"), "sha256": ARTIFACTS[0].2},
             "resolved": [
-                {"selector": policy["loops"][0], "loop": "f.0"},
-                {"selector": second, "loop": "f.0"},
+                {
+                    "selector": policy["loops"][0],
+                    "file": policy["loops"][0]["file"],
+                    "loop": "f.0",
+                    "location": {"file": policy["loops"][0]["file"]},
+                },
+                {
+                    "selector": second,
+                    "file": second["file"],
+                    "loop": "f.0",
+                    "location": {"file": second["file"]},
+                },
             ],
         });
         evidence.write("a.x", "resolution.json", record.to_string().as_bytes());
@@ -7103,14 +7170,80 @@ pub(crate) mod tests {
         assert_eq!(read.deadlines["a::x"].milliseconds, 1000);
     }
 
+    /// A resolved loop lies in its selector's file: a workspace selector's
+    /// file exactly, a packaged selector's under an absolute package root,
+    /// and in either the loop's own location. Each other placement is
+    /// refused, named.
+    #[test]
+    fn a_resolved_loop_lies_in_its_selectors_file() {
+        let workspace = serde_json::json!({"function": "f", "file": "src/a.rs"});
+        let packaged = serde_json::json!({
+            "function": "d",
+            "package": {"name": "dep", "version": "1.0.0"},
+            "file": "src/normalize.rs",
+        });
+        let found = |selector: &serde_json::Value, file: &str, located: &str| {
+            serde_json::json!({
+                "selector": selector,
+                "file": file,
+                "loop": "x.0",
+                "location": {"file": located},
+            })
+        };
+        let root = "/home/a/.cargo/registry/src/i/dep-1.0.0";
+        let inside = format!("{root}/src/normalize.rs");
+        for accepted in [
+            found(&workspace, "src/a.rs", "src/a.rs"),
+            found(&packaged, &inside, &inside),
+        ] {
+            assert_eq!(
+                resolved_in_its_file("h", "x.0", &accepted),
+                Ok(()),
+                "{accepted}"
+            );
+        }
+        let mut unfiled = found(&workspace, "src/a.rs", "src/a.rs");
+        unfiled.as_object_mut().unwrap().remove("file");
+        for (case, planted, fault) in [
+            ("file-unrecorded", unfiled, "records no file"),
+            (
+                "file-unlocated",
+                found(&workspace, "src/a.rs", "src/b.rs"),
+                "is located in \"src/b.rs\", its resolution records src/a.rs",
+            ),
+            (
+                "file-other",
+                found(&workspace, "src/b.rs", "src/b.rs"),
+                "resolved in src/b.rs, its selector names src/a.rs",
+            ),
+            (
+                "package-unrooted",
+                found(&packaged, "src/normalize.rs", "src/normalize.rs"),
+                "resolved in src/normalize.rs, its selector names src/normalize.rs of",
+            ),
+            (
+                "package-other-file",
+                found(
+                    &packaged,
+                    &format!("{root}/src/other.rs"),
+                    &format!("{root}/src/other.rs"),
+                ),
+                "its selector names src/normalize.rs of {\"name\":\"dep\",\"version\":\"1.0.0\"}",
+            ),
+        ] {
+            let error = refused(case, resolved_in_its_file("h", "x.0", &planted));
+            assert!(error.contains(fault), "{case}: {error}");
+        }
+    }
+
     /// The fixture registry's rows: a native control of each channel a
     /// calibration requires, a Miri control of the nightly channel and a
     /// Kani control, the last two outside a calibration's prerequisite.
     const REGISTRY: &[&str] = &[
-        "n\ttests/data/controls/n.patch\tnative\tnightly\tdcbor\tall\tlib\ta::b\t-\tfailed\tboom",
-        "s\ttests/data/controls/s.patch\tnative\tstable\tdcbor\tall\tlib\ta::c\t-\tfailed\tboom",
-        "m\ttests/data/controls/m.patch\ttree\tnightly\tdcbor\tcustom-std-collections\tlib\ta::d\t-\tundefined_behavior\tUndefined Behavior",
-        "k\ttests/data/controls/k.patch\tkani\tkani\tdcbor\t-\tlib\ta::x\t-\tfailed\ta planted failure",
+        "n\ttests/data/controls/n.patch\tnative\tnightly\tdcbor\tall\tfast\tlib\ta::b\t-\tfailed\tboom",
+        "s\ttests/data/controls/s.patch\tnative\tstable\tdcbor\tall\tfast\tlib\ta::c\t-\tfailed\tboom",
+        "m\ttests/data/controls/m.patch\ttree\tnightly\tdcbor\tcustom-std-collections\tfast\tlib\ta::d\t-\tundefined_behavior\tUndefined Behavior",
+        "k\ttests/data/controls/k.patch\tkani\tkani\tdcbor\t-\t-\tlib\ta::x\t-\tfailed\ta planted failure",
     ];
 
     /// The native control runs a calibration of commit `c` follows, laid out

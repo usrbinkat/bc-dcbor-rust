@@ -553,7 +553,11 @@ diff and to read back equal once it is reversed (`gate control evidence`). A Mir
 runs under the Miri gate's own command and its model's flags (`tests/gate-common.sh`,
 `miri_command`, `miri_flags`), the flags part of the run's identity, and is judged by the gate tool
 as a native run is (`gate control judge`): a defect only undefined behavior shows, such as a drop
-reading a field its prefix never initialized, is refused there.
+reading a field its prefix never initialized, is refused there. A native or Miri row names the
+verification layer its test runs at (`rigor`, `fast` or `exhaustive`), which its run sets as
+`DCBOR_RIGOR` whatever the launcher's environment holds, so the row's verdict is the row's alone: a
+defect only the exhaustive layer refuses, such as a cleanup class that merges states its cleanup
+tells apart, is registered at that layer.
 
 `relaxed-publication.patch` makes the decode scope queue's link store, the publication of every
 record queued behind another, `Relaxed` (`tests/concurrency-models.sh`). loom must refuse it with a

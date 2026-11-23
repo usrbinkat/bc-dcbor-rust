@@ -32,7 +32,8 @@ pub use super::stable::Admitted;
 pub(crate) use owned::admits_its_production_representation;
 pub(crate) use owned::{AbortOnUnwind, EMPTIED, ScopeRef, slot_place};
 pub use owned::{
-    Acquisition, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition, scope_bound,
+    Acquisition, AcquisitionStage, DecodeOwner, OwnedInitialized, OwnedRecord, ScopePosition,
+    scope_bound,
 };
 #[cfg(test)]
 #[cfg(feature = "std")]
@@ -1212,6 +1213,27 @@ enum Front {
     Ready,
 }
 
+/// The scope queue's drain state, what its next steps read
+/// ([`Reclaimer::step`]): the remaining declared calls of the record whose
+/// cleanup is active, if one is; the records queued behind it; and whether
+/// the next removal's unit is admitted and retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QueuePosition {
+    pub active: Option<u32>,
+    pub queued: usize,
+    pub removal_admitted: bool,
+}
+
+/// An observation of a scope queue ([`Reclaimer::queue_position`]): none
+/// when the operation holds no scope reference, contended when another
+/// caller was stepping the queue, else its drain state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueueObservation {
+    Unscoped,
+    Contended,
+    Observed(QueuePosition),
+}
+
 /// The queue and accounting of one decode scope. Handles reach it through the
 /// scope; queued blocks are owned by the intrusive queue, not by a dropped
 /// handle. The public authority is [`DecodeOwner`](owned::DecodeOwner).
@@ -1576,6 +1598,42 @@ impl<A: Allocator> Reclaimer<A> {
     ) -> BoundedResult<Reclaimed, A> {
         self.closed.store(true, Ordering::Release);
         self.step(a, worklist)
+    }
+
+    /// What the queue's next steps read ([`Self::step`]): the active
+    /// record's remaining declared calls, the records queued behind it, and
+    /// whether the next removal's unit is admitted. Walked under the
+    /// stepping flag, as [`Self::observe_custody`] walks it;
+    /// [`QueueObservation::Contended`] when another caller is stepping.
+    /// Admits, allocates and releases nothing.
+    pub(crate) fn queue_position(&self) -> QueueObservation {
+        if self.stepping.swap(true, Ordering::Acquire) {
+            return QueueObservation::Contended;
+        }
+        struct Stepping<'a>(&'a AtomicBool);
+        impl Drop for Stepping<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _stepping = Stepping(&self.stepping);
+        // SAFETY: the active slot owns its block exclusively and the stepping
+        // flag held here excludes its cleanup; its budget is only read.
+        let active = NonNull::new(self.active.load(Ordering::Relaxed))
+            .map(|active| unsafe { (*active.as_ptr()).budget.get() });
+        let mut queued = 0;
+        let mut next = self.head.load(Ordering::Acquire);
+        while let Some(record) = NonNull::new(next) {
+            queued += 1;
+            // SAFETY: only the stepping caller removes and frees queued
+            // blocks, and this caller holds the stepping flag.
+            next = unsafe { (*record.as_ptr()).next.load(Ordering::Acquire) };
+        }
+        QueueObservation::Observed(QueuePosition {
+            active,
+            queued,
+            removal_admitted: self.removal_admitted.load(Ordering::Relaxed),
+        })
     }
 
     /// Report every record the queue owns, once each: the active record and

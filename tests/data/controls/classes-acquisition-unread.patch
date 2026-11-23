@@ -1,0 +1,11 @@
+--- tests/support/classes.rs
++++ tests/support/classes.rs
+@@ -156,7 +156,7 @@
+     format!(
+         "{:?}",
+         Operation {
+-            acquisition: position.acquisition,
++            acquisition: AcquisitionStage::Idle,
+             queue: position.queue,
+             allocated: position.allocated,
+             initialized,

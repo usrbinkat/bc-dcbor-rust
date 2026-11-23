@@ -748,7 +748,7 @@ proofs-identity)
 	;;
 control)
 	case "$2" in
-	list) printf 'x\ttests/data/controls/x.patch\tkani\tkani\tdcbor\t-\tlib\ta::h\t-\tfailed\tp\n' ;;
+	list) printf 'x\ttests/data/controls/x.patch\tkani\tkani\tdcbor\t-\t-\tlib\ta::h\t-\tfailed\tp\n' ;;
 	run) if [[ "$3" == baseline ]]; then exit "$BASELINE_EXIT"; fi ;;
 	evidence) ;;
 	*) exit 2 ;;

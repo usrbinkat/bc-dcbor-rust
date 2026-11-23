@@ -23,7 +23,8 @@ use dcbor::bounded::Limits;
 use dcbor::bounded::decode::construction::in_place::{BufferObservation, Session};
 use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reduction};
 use dcbor::bounded::decode::construction::{
-    ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase, Position, TypedPosition,
+    AcquisitionStage, ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase,
+    Position, QueueObservation, TypedPosition,
 };
 use dcbor::bounded::decode::cursor::Phase as ParserPhase;
 use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
@@ -119,14 +120,21 @@ enum Initialized {
     Partial,
 }
 
-/// The operation's own part of a class: whether its record is allocated, how
-/// much of its prefix is written ([`Initialized`]), whether it is cancelling
-/// or finished, and how many records its scope holds. The operation's
-/// cleanup reads each: a record's cleanup releases its written prefix, and
-/// the scope's drain releases every record it holds.
+/// The operation's own part of a class: its record's acquisition stage,
+/// whether its record is allocated, how much of its prefix is written
+/// ([`Initialized`]), whether it is cancelling or finished, and how many
+/// records its scope holds. The operation's cleanup reads each: an
+/// acquisition's cleanup ends what its stage holds (the scope reference and
+/// pending credit of its head stage, a block granted and not yet owned), a
+/// record's cleanup releases its written prefix, and the scope's drain
+/// releases every record it holds, from where its queue stands (the active
+/// record's remaining calls, the records queued behind it, a removal unit
+/// already admitted).
 #[derive(Debug)]
 #[expect(dead_code, reason = "read through the rendering that is the class")]
 struct Operation<D> {
+    acquisition: AcquisitionStage,
+    queue: QueueObservation,
     allocated: bool,
     initialized: Initialized,
     cancelling: bool,
@@ -148,6 +156,8 @@ fn operation_with<D, E: Debug>(
     format!(
         "{:?}",
         Operation {
+            acquisition: position.acquisition,
+            queue: position.queue,
             allocated: position.allocated,
             initialized,
             cancelling: position.cancelling,
@@ -198,14 +208,18 @@ enum ParserStage {
 /// are discarded in one unit whatever their number, so only whether it holds
 /// any; with a staged block, the block is released first and the same holds
 /// after. While relocating or relocated, each element is drained in its own
-/// unit, so their number. What a growth's acquisition holds is settled at
-/// cleanup entry and changes no unit here. Capacities
-/// change no unit: each allocation's release is one, paid for by its
-/// acquisition.
+/// unit, so their number. Whether it is released (`StoragePosition`'s
+/// `released`): a holder steps an arena's cleanup only while it is not
+/// (`Preparation::reclaim_step`, `Storage::is_released`), and an empty
+/// settled arena whose growth's acquisition is under way is not, its stage
+/// alike, so it takes the unit whose entry settles that acquisition's
+/// credit. Capacities change no unit: each allocation's release is one,
+/// paid for by its acquisition.
 #[derive(Debug)]
 #[expect(dead_code, reason = "read through the rendering that is the class")]
 struct Arena {
     stage: StorageStage,
+    released: bool,
     current_permit: bool,
     staged_permit: bool,
     relocating_permit: bool,
@@ -217,8 +231,20 @@ fn arena(position: &StoragePosition) -> Arena {
         position.stage,
         StorageStage::Relocating | StorageStage::Relocated
     );
+    arena_draining(position, drained_one_by_one)
+}
+
+/// What the cleanup of an arena whose element type drops reads
+/// (`Storage::reclaim_step`): as [`arena`], but its elements are drained one
+/// per unit at every stage, so their number.
+fn dropping_arena(position: &StoragePosition) -> Arena {
+    arena_draining(position, true)
+}
+
+fn arena_draining(position: &StoragePosition, drained_one_by_one: bool) -> Arena {
     Arena {
         stage: position.stage,
+        released: position.released,
         current_permit: position.has_current_permit,
         staged_permit: position.has_staged_permit,
         relocating_permit: position.has_relocating_permit,
@@ -454,8 +480,10 @@ enum PlanStage {
 /// its initialization for the current text went (the cleanup reads the
 /// phase that initialization may have rewritten); a copied normalized text,
 /// released in one unit; then each arena, all of plain data ([`arena`]):
-/// frames, open maps, plan bytes, gaps, entry cursors, and the dynamic map
-/// engine's descriptors, merge scratch and permutation bitmap. Its
+/// frames, open maps, plan bytes, gaps, entry cursors; then the cursors'
+/// bucket windows, whose obligations drop, drained one element per unit
+/// ([`dropping_arena`]); then the dynamic map engine's descriptors, merge
+/// scratch and permutation bitmap. Its
 /// instruction, depth, inspection, bignum and every other counter are never
 /// read by cleanup, and are dropped.
 #[derive(Debug)]
@@ -469,6 +497,7 @@ struct Preparing {
     bytes: Arena,
     holes: Arena,
     cursors: Arena,
+    windows: Arena,
     entries: Arena,
     merge: Arena,
     bitmap: Arena,
@@ -485,6 +514,7 @@ fn preparing(position: &PreparationPosition) -> Preparing {
         bytes: arena(&position.bytes),
         holes: arena(&position.holes),
         cursors: arena(&position.cursor_storage),
+        windows: dropping_arena(&position.window_storage),
         entries: arena(&position.dynamic.entry_storage),
         merge: arena(&position.dynamic.merge_storage),
         bitmap: arena(&position.dynamic.bitmap_storage),

@@ -76,23 +76,66 @@ impl Interleaving {
     }
 }
 
+/// The production observation of the first preparation where a cut retires
+/// it.
+type Retired = dcbor::bounded::decode::construction::Position<dcbor::bounded::encoding::PlanDetail>;
+
+/// Where a recorded cleanup call was admitted: the retirement itself, the
+/// scope's queue step after turn `n`, or the scope's final drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupPhase {
+    Retirement,
+    QueueStep(usize),
+    Drain,
+}
+
+/// A retirement's cleanup: every call admitted during retirement, by the
+/// scope's queue steps after the cut, then by its final drain, the
+/// survivor's own turns and its plan's emission excluded, each phase's calls
+/// kept under its phase; and the first preparation's position where the cut
+/// retired it (`None` for an uncut run, whose cleanup is the plans' drain
+/// alone). Two cleanups are equal when their calls are, in order, phase
+/// boundaries and positions aside: that is the claim a class makes. A
+/// disagreement renders both whole, the position and every phase named, so
+/// the failure that finds a merged class states what each member held and
+/// where its calls differ.
+#[derive(Debug)]
+struct Cleanup {
+    retired: Option<Retired>,
+    phases: Vec<(CleanupPhase, Vec<Call>)>,
+}
+
+impl Cleanup {
+    fn calls(&self) -> impl Iterator<Item = &Call> {
+        self.phases.iter().flat_map(|(_, calls)| calls)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls().next().is_none()
+    }
+}
+
+impl PartialEq for Cleanup {
+    fn eq(&self, other: &Self) -> bool {
+        self.calls().eq(other.calls())
+    }
+}
+
 /// What one interleaved run observed: the first preparation's boundaries
 /// while it is live, each the cleanup class of its state there
 /// (`classes::prepare`), the `k`th observed where a cut of `k` retires it;
-/// and the retirement's cleanup: every call admitted during retirement,
-/// by the scope's queue steps after the cut, then by its final drain, the survivor's own
-/// turns and its plan's emission excluded. An uncut run's cleanup is the
-/// drain of the plans alone.
+/// and the retirement's cleanup ([`Cleanup`]).
 struct Interleaved {
     boundaries: Vec<Option<support::classes::Class>>,
-    cleanup: Vec<Call>,
+    cleanup: Cleanup,
 }
 
-/// Disjoint recording intervals owned by retirement and queue cleanup.
-/// Survivor execution lies between intervals and is excluded.
+/// Disjoint recording intervals owned by retirement and queue cleanup, each
+/// with its phase; survivor execution lies between them and is excluded.
 struct RetirementTrace {
     boundaries: Vec<Option<support::classes::Class>>,
-    intervals: Vec<std::ops::Range<usize>>,
+    retired: Option<Retired>,
+    intervals: Vec<(CleanupPhase, std::ops::Range<usize>)>,
     drain_start: usize,
 }
 
@@ -104,7 +147,10 @@ struct RetirementTrace {
 /// depositing it back, or its plan, so every turn is checkpointed with both
 /// in custody ([`Interleaved`]).
 fn interleave(cut: Option<usize>, interleaving: Interleaving) -> Interleaved {
-    let cleanup = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let cleanup = std::rc::Rc::new(std::cell::RefCell::new(Cleanup {
+        retired: None,
+        phases: Vec::new(),
+    }));
     let boundaries = support::recorded_run(|run| {
         let policy = run.policy(u64::MAX);
         let mut trace = run.scoped(policy, &Unwitnessed, |owner| {
@@ -141,29 +187,42 @@ fn interleave(cut: Option<usize>, interleaving: Interleaving) -> Interleaved {
                 )
             })
         })?;
-        trace.intervals.push(trace.drain_start..run.boundary());
+        trace
+            .intervals
+            .push((CleanupPhase::Drain, trace.drain_start..run.boundary()));
         let cleanup = cleanup.clone();
         run.inspect_evidence(move |observed, _| {
             let mut previous_end = 0;
-            let mut calls = cleanup.borrow_mut();
-            for interval in trace.intervals {
+            let mut cleanup = cleanup.borrow_mut();
+            cleanup.retired = trace.retired;
+            for (phase, interval) in trace.intervals {
                 assert!(
                     previous_end <= interval.start && interval.start <= interval.end,
                     "cleanup intervals overlap or run backwards: {interval:?}"
                 );
                 previous_end = interval.end;
-                calls.extend(observed[interval].iter().filter_map(|observation| {
-                    match observation.event {
+                let calls: Vec<Call> = observed[interval]
+                    .iter()
+                    .filter_map(|observation| match observation.event {
                         Event::Call(_, Answer::Refused { .. }) => None,
                         Event::Call(call, _) => Some(call),
                         _ => None,
-                    }
-                }));
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    cleanup.phases.push((phase, calls));
+                }
             }
         });
         Ok(trace.boundaries)
     });
-    let cleanup = std::mem::take(&mut *cleanup.borrow_mut());
+    let cleanup = std::mem::replace(
+        &mut *cleanup.borrow_mut(),
+        Cleanup {
+            retired: None,
+            phases: Vec::new(),
+        },
+    );
     Interleaved {
         boundaries,
         cleanup,
@@ -223,7 +282,7 @@ fn interleaved<H: Custodial<Reservation>>(
     let mut published = [false, false];
     let mut first_turns = 0;
     let mut intervals = Vec::new();
-    let mut retired = false;
+    let mut retired = None;
     for turn in 0..turns {
         if live[0] && boundaries.len() == first_turns {
             holding.drawn(preparations, 0, Retirement::Stopped, |preparation| {
@@ -233,15 +292,17 @@ fn interleaved<H: Custodial<Reservation>>(
         }
         if cut == Some(first_turns) && live[0] {
             let before = holding.boundary();
-            holding.drawn(preparations, 0, Retirement::Stopped, |preparation| {
+            let position = holding.drawn(preparations, 0, Retirement::Stopped, |preparation| {
+                let position = preparation.value().position();
                 assert_eq!(
                     boundaries.last(),
-                    Some(&support::classes::prepare(&preparation.value().position())),
+                    Some(&support::classes::prepare(&position)),
                     "the recorded boundary must describe the state immediately before retirement"
                 );
+                position
             });
-            intervals.push(before..holding.boundary());
-            retired = true;
+            intervals.push((CleanupPhase::Retirement, before..holding.boundary()));
+            retired = Some(position);
             live[0] = false;
         }
         let slot = if interleaving.first(turn, live[0], live[1]) {
@@ -287,8 +348,8 @@ fn interleaved<H: Custodial<Reservation>>(
                     "interleaved cleanup failed: {error:?}"
                 ))),
             })?;
-            if retired {
-                intervals.push(before..view.boundary());
+            if retired.is_some() {
+                intervals.push((CleanupPhase::QueueStep(turn), before..view.boundary()));
             }
             view.checkpoint();
             Ok::<_, Finding>(())
@@ -302,7 +363,7 @@ fn interleaved<H: Custodial<Reservation>>(
             "the shared-owner preparations exceeded their {turns} turns"
         )));
     }
-    if retired != cut.is_some() {
+    if retired.is_some() != cut.is_some() {
         return Err(Finding::Driver(format!(
             "requested retirement {cut:?} was not reached"
         )));
@@ -334,6 +395,7 @@ fn interleaved<H: Custodial<Reservation>>(
     // is its final drain.
     Ok(RetirementTrace {
         boundaries,
+        retired,
         intervals,
         drain_start: holding.boundary(),
     })
@@ -369,8 +431,9 @@ fn cuts(
 /// with the second: the second publishes its exact bytes and the scope
 /// recovers everything. Each boundary is classed by `classes::prepare` of
 /// the first preparation's state where the cut retires it, which reads the
-/// operation's own fields and the scope's outstanding record count, never
-/// the survivor's state or the queue's custody; an interleaving's classes
+/// operation's own fields, its record's acquisition stage, the scope's
+/// outstanding record count and its queue's drain state, never the
+/// survivor's state; an interleaving's classes
 /// are its own, each classed from its own uncut run. The fast layer retires
 /// at the first boundary of each class and at every unclassified one, the
 /// exhaustive layer at every boundary ([`cuts`]); the exhaustive layer then

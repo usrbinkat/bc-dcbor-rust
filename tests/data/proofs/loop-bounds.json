@@ -7,6 +7,33 @@
       "loop": 1,
       "bound": 257,
       "reason": "The prefix sum over the counting pass's offsets (text.rs, Normalizer::release, `for offset in &mut offsets`) iterates once per combining class, CLASSES = 256 (text.rs:68), whatever the text: its backward goto is taken at most 256 times, and bound 257 lets the 256th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 257th. The bound is a property of the code, not of any harness's domain."
+    },
+    {
+      "function": "unicode_normalization::normalize::decompose::<fn(char) -> std::option::Option<&'static [char]> {unicode_normalization::lookups::canonical_fully_decomposed}, {closure@src/bounded/text.rs:282:33: 282:39}>",
+      "package": { "name": "unicode-normalization", "version": "0.1.26" },
+      "file": "src/normalize.rs",
+      "loops_in_function": 1,
+      "loop": 0,
+      "bound": 5,
+      "reason": "decompose's emission of a canonical full decomposition (unicode-normalization 0.1.26 normalize.rs:97, `for &d in decomposed`) iterates once per character of the slice canonical_fully_decomposed returns (lookups.rs:45, CANONICAL_DECOMPOSED_CHARS[start..][..len] for its CANONICAL_DECOMPOSED_KV entry). The longest len in that table, Unicode 18.0.0 (tables.rs:4887-6969), is 4 (U+1F80..U+1FAF among others); every length above 4 is a compatibility decomposition (COMPATIBILITY_DECOMPOSED_KV, tables.rs:13121), which this monomorph does not read. Its backward goto is taken at most 4 times, and bound 5 lets the 4th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 5th. The monomorph of strict validation's normalization (text.rs:282); the bound is a property of the table, not of any harness's domain."
+    },
+    {
+      "function": "unicode_normalization::normalize::decompose::<fn(char) -> std::option::Option<&'static [char]> {unicode_normalization::lookups::canonical_fully_decomposed}, {closure@src/bounded/text_cursor.rs:277:37: 277:43}>",
+      "package": { "name": "unicode-normalization", "version": "0.1.26" },
+      "file": "src/normalize.rs",
+      "loops_in_function": 1,
+      "loop": 0,
+      "bound": 5,
+      "reason": "decompose's emission of a canonical full decomposition (unicode-normalization 0.1.26 normalize.rs:97, `for &d in decomposed`) iterates once per character of the slice canonical_fully_decomposed returns (lookups.rs:45, CANONICAL_DECOMPOSED_CHARS[start..][..len] for its CANONICAL_DECOMPOSED_KV entry). The longest len in that table, Unicode 18.0.0 (tables.rs:4887-6969), is 4 (U+1F80..U+1FAF among others); every length above 4 is a compatibility decomposition (COMPATIBILITY_DECOMPOSED_KV, tables.rs:13121), which this monomorph does not read. Its backward goto is taken at most 4 times, and bound 5 lets the 4th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 5th. The monomorph of the text shape's measurement (text_cursor.rs:277); the bound is a property of the table, not of any harness's domain."
+    },
+    {
+      "function": "unicode_normalization::normalize::decompose::<fn(char) -> std::option::Option<&'static [char]> {unicode_normalization::lookups::canonical_fully_decomposed}, {closure@src/bounded/text_cursor.rs:952:41: 952:47}>",
+      "package": { "name": "unicode-normalization", "version": "0.1.26" },
+      "file": "src/normalize.rs",
+      "loops_in_function": 1,
+      "loop": 0,
+      "bound": 5,
+      "reason": "decompose's emission of a canonical full decomposition (unicode-normalization 0.1.26 normalize.rs:97, `for &d in decomposed`) iterates once per character of the slice canonical_fully_decomposed returns (lookups.rs:45, CANONICAL_DECOMPOSED_CHARS[start..][..len] for its CANONICAL_DECOMPOSED_KV entry). The longest len in that table, Unicode 18.0.0 (tables.rs:4887-6969), is 4 (U+1F80..U+1FAF among others); every length above 4 is a compatibility decomposition (COMPATIBILITY_DECOMPOSED_KV, tables.rs:13121), which this monomorph does not read. Its backward goto is taken at most 4 times, and bound 5 lets the 4th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 5th. The monomorph of the text continuation's source step (text_cursor.rs:952); the bound is a property of the table, not of any harness's domain."
     }
   ],
   "harnesses": [

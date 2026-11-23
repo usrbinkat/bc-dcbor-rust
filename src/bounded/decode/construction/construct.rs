@@ -865,6 +865,8 @@ impl<O> TypedPosition<O> {
         match self {
             Self::Parse(position) => TypedPosition::Parse(position),
             Self::Construct(position) => TypedPosition::Construct(Position {
+                acquisition: position.acquisition,
+                queue: position.queue,
                 allocated: position.allocated,
                 initialized: position.initialized,
                 initialization_steps: position.initialization_steps,

@@ -1,0 +1,11 @@
+--- tests/support/classes.rs
++++ tests/support/classes.rs
+@@ -514,7 +514,7 @@
+         bytes: arena(&position.bytes),
+         holes: arena(&position.holes),
+         cursors: arena(&position.cursor_storage),
+-        windows: dropping_arena(&position.window_storage),
++        windows: dropping_arena(&StoragePosition::default()),
+         entries: arena(&position.dynamic.entry_storage),
+         merge: arena(&position.dynamic.merge_storage),
+         bitmap: arena(&position.dynamic.bitmap_storage),

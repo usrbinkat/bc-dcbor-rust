@@ -1008,10 +1008,10 @@ index 0f0137025..f4349089a 100644
  
 diff --git a/kani-driver/src/loop_bounds.rs b/kani-driver/src/loop_bounds.rs
 new file mode 100644
-index 000000000..ba7613a50
+index 000000000..363ffa6aa
 --- /dev/null
 +++ b/kani-driver/src/loop_bounds.rs
-@@ -0,0 +1,1239 @@
+@@ -0,0 +1,1551 @@
 +// Copyright Kani Contributors
 +// SPDX-License-Identifier: Apache-2.0 OR MIT
 +
@@ -1046,6 +1046,17 @@ index 000000000..ba7613a50
 +//!
 +//! CBMC itself only warns about an `--unwindset` identifier it does not know and drops the bound
 +//! (`goto-programs/unwindset.cpp`), which is why resolution is checked here rather than left to it.
++//!
++//! Files: CBMC's `sourceLocation.file` is the path rustc read the source from, never a remapped
++//! one (`rustc_public_bridge` `get_filename`, `FileNameDisplayPreference::Local`), and Cargo hands
++//! rustc a path relative to the workspace root only for a path package under that root
++//! (`cargo::util::workspace::path_args`); every other package, from a registry or a git source,
++//! is read at its absolute path in the host's Cargo home. A selector of a loop in such a
++//! dependency names its package (`package`, the name and version) and its file relative to that
++//! package's root; the run binds each named package to the root of the one package of that name
++//! and version the run's `cargo metadata` resolves ([`LoopBounds::bind_packages`]) and requires
++//! CBMC's file to be that root joined with the selector's file, exactly. A selector without a
++//! package names CBMC's file as it is, which for the workspace's own packages is relative.
 +//!
 +//! Evidence: the caller names a directory it owns (`--loop-bounds-evidence`); every harness
 +//! verified in the run gets a subdirectory of its own, named by its pretty name with `::` written
@@ -1134,7 +1145,12 @@ index 000000000..ba7613a50
 +pub struct Selector {
 +    /// The function holding the loop, as CBMC's loop inventory names it (`sourceLocation.function`).
 +    pub function: String,
-+    /// The source file of every loop of that function (`sourceLocation.file`).
++    /// The package whose source holds the function, for a dependency CBMC locates at an absolute
++    /// path in the host's Cargo home; none for a file CBMC records as it is.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub package: Option<PackageRef>,
++    /// The source file of every loop of that function: relative to [`Self::package`]'s root
++    /// when it names one, else as CBMC records it (`sourceLocation.file`).
 +    pub file: String,
 +    /// How many loops the function holds in the instrumented binary.
 +    pub loops_in_function: u32,
@@ -1146,6 +1162,23 @@ index 000000000..ba7613a50
 +    /// Why the bound covers every execution of the harness's domain; the unwinding assertion is
 +    /// what checks it.
 +    pub reason: String,
++}
++
++/// A package by the name and version of its manifest, as `cargo metadata` reports them. The
++/// version is compared as text with the resolved package's (`semver::Version`'s rendering), so
++/// it is written exactly as Cargo renders it: `0.1.26` names `0.1.26` and nothing else, a
++/// pre-release or build suffix included only where the package's own version has it.
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct PackageRef {
++    pub name: String,
++    pub version: String,
++}
++
++impl std::fmt::Display for PackageRef {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(formatter, "{} {}", self.name, self.version)
++    }
 +}
 +
 +impl Policy {
@@ -1246,12 +1279,31 @@ index 000000000..ba7613a50
 +    }
 +}
 +
++/// What a selector declares of its function: its package, its file and its loop count, which
++/// every selector of one function in one scope declares alike.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Shape<'s> {
++    package: Option<&'s PackageRef>,
++    file: &'s str,
++    loops: u32,
++}
++
++impl std::fmt::Display for Shape<'_> {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(formatter, "{} loop(s) in {}", self.loops, self.file)?;
++        match self.package {
++            Some(package) => write!(formatter, " of {package}"),
++            None => Ok(()),
++        }
++    }
++}
++
 +/// The selectors of one `scope`, validated: every bound with a reason, every selected loop number
 +/// below its function's declared loop count, no loop selected twice, and one loop count and one
-+/// file per function.
++/// file, in one package or none, per function.
 +fn check_selectors(scope: &str, selectors: &[Selector]) -> Result<()> {
 +    let mut selected = BTreeSet::new();
-+    let mut functions: BTreeMap<&str, (&str, u32)> = BTreeMap::new();
++    let mut functions: BTreeMap<&str, Shape<'_>> = BTreeMap::new();
 +    for selector in selectors {
 +        if selector.reason.trim().is_empty() {
 +            bail!(
@@ -1275,31 +1327,94 @@ index 000000000..ba7613a50
 +                selector.function
 +            );
 +        }
-+        let shape = (selector.file.as_str(), selector.loops_in_function);
++        let shape = Shape {
++            package: selector.package.as_ref(),
++            file: &selector.file,
++            loops: selector.loops_in_function,
++        };
 +        if let Some(previous) = functions.insert(selector.function.as_str(), shape)
 +            && previous != shape
 +        {
-+            bail!(
-+                "{scope}: `{}` is declared both as {} loop(s) in {} and as {} loop(s) in {}",
-+                selector.function,
-+                previous.1,
-+                previous.0,
-+                shape.1,
-+                shape.0
-+            );
++            bail!("{scope}: `{}` is declared both as {previous} and as {shape}", selector.function);
 +        }
 +    }
 +    Ok(())
 +}
 +
-+/// A run's loop bounds: the validated policy, the evidence directory the caller owns, and, per
-+/// function-scoped selector (by index in [`Policy::loops`]), the harnesses of the run that
-+/// resolved it.
++/// A run's loop bounds: the validated policy, the evidence directory the caller owns, the root of
++/// every package a selector names, bound once from the run's `cargo metadata`
++/// ([`Self::bind_packages`]), and, per function-scoped selector (by index in [`Policy::loops`]),
++/// the harnesses of the run that resolved it.
 +#[derive(Debug)]
 +pub struct LoopBounds {
 +    pub policy: Policy,
 +    evidence: PathBuf,
++    roots: std::sync::OnceLock<BTreeMap<PackageRef, PathBuf>>,
 +    applied: std::sync::Mutex<BTreeMap<usize, BTreeSet<String>>>,
++}
++
++/// One package a run's `cargo metadata` resolved, as binding reads it: its name, version, opaque
++/// id and manifest path.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct ResolvedPackage {
++    pub name: String,
++    pub version: String,
++    pub id: String,
++    pub manifest: PathBuf,
++}
++
++impl From<&cargo_metadata::Package> for ResolvedPackage {
++    fn from(package: &cargo_metadata::Package) -> Self {
++        Self {
++            name: package.name.to_string(),
++            version: package.version.to_string(),
++            id: package.id.repr.clone(),
++            manifest: package.manifest_path.as_std_path().to_path_buf(),
++        }
++    }
++}
++
++/// The root of every package `named`, each the directory of the manifest of the one package of
++/// `packages` with its name and version. A name and version no package has, or more than one has
++/// (one version from two sources), is refused with the packages of that name the run resolved.
++pub(crate) fn package_roots<'p>(
++    named: impl IntoIterator<Item = &'p PackageRef>,
++    packages: &[ResolvedPackage],
++) -> Result<BTreeMap<PackageRef, PathBuf>> {
++    let mut roots = BTreeMap::new();
++    for package in named {
++        if roots.contains_key(package) {
++            continue;
++        }
++        let same_name: Vec<&ResolvedPackage> =
++            packages.iter().filter(|candidate| candidate.name == package.name).collect();
++        let matching: Vec<&&ResolvedPackage> =
++            same_name.iter().filter(|candidate| candidate.version == package.version).collect();
++        let found = || {
++            same_name.iter().fold(String::new(), |mut text, candidate| {
++                let _ = write!(text, "\n  {} at {}", candidate.id, candidate.manifest.display());
++                text
++            })
++        };
++        let manifest = match matching.as_slice() {
++            [one] => &one.manifest,
++            [] => bail!(
++                "the loop-bounds file names package {package}, which this run does not resolve; \
++                 its packages of that name:{}",
++                found()
++            ),
++            _ => bail!(
++                "the loop-bounds file names package {package}, which this run resolves from more \
++                 than one source:{}",
++                found()
++            ),
++        };
++        let root = manifest.parent().with_context(|| {
++            format!("the manifest {} of package {package} has no directory", manifest.display())
++        })?;
++        roots.insert(package.clone(), root.to_path_buf());
++    }
++    Ok(roots)
 +}
 +
 +impl LoopBounds {
@@ -1309,7 +1424,62 @@ index 000000000..ba7613a50
 +        if !evidence.is_dir() {
 +            bail!("the loop-bounds evidence directory {} does not exist", evidence.display());
 +        }
-+        Ok(Self { policy, evidence: evidence.to_path_buf(), applied: Default::default() })
++        Ok(Self {
++            policy,
++            evidence: evidence.to_path_buf(),
++            roots: std::sync::OnceLock::new(),
++            applied: Default::default(),
++        })
++    }
++
++    /// Bind every package a selector names to its root ([`package_roots`]) from `metadata`, the
++    /// run's `cargo metadata`, once, before any harness is checked. A run without one (a
++    /// standalone file, the standard library) can bind no package, so a policy naming one is
++    /// refused for it. Its one caller is `verify_project`, which every entry point (cargo,
++    /// standalone, `verify-std`, autoharness) reaches and which alone builds the harness runner
++    /// whose `check_harness` calls `run_cbmc`, so no harness resolves its bounds unbound.
++    pub fn bind_packages(&self, metadata: Option<&cargo_metadata::Metadata>) -> Result<()> {
++        let named: BTreeSet<&PackageRef> = self
++            .policy
++            .loops
++            .iter()
++            .chain(self.policy.harnesses.iter().flat_map(|entry| &entry.loops))
++            .filter_map(|selector| selector.package.as_ref())
++            .collect();
++        let roots = match metadata {
++            Some(metadata) => {
++                let packages: Vec<ResolvedPackage> =
++                    metadata.packages.iter().map(ResolvedPackage::from).collect();
++                package_roots(named, &packages)?
++            }
++            None if named.is_empty() => BTreeMap::new(),
++            None => bail!(
++                "the loop-bounds file names packages {:?}, which a run without Cargo metadata \
++                 cannot locate",
++                named.iter().map(ToString::to_string).collect::<Vec<_>>()
++            ),
++        };
++        self.roots
++            .set(roots)
++            .map_err(|_| anyhow::anyhow!("the loop bounds' packages are bound once"))
++    }
++
++    /// The file CBMC must record for every loop of `selector`'s function: its package's root
++    /// joined with its file, or its file as written when it names no package.
++    fn expected_file(&self, selector: &Selector) -> Result<String> {
++        let Some(package) = &selector.package else {
++            return Ok(selector.file.clone());
++        };
++        let roots = self
++            .roots
++            .get()
++            .context("the loop bounds' packages were not bound before a harness was checked")?;
++        let root =
++            roots.get(package).with_context(|| format!("package {package} was not bound"))?;
++        let file = root.join(&selector.file);
++        file.to_str()
++            .map(str::to_string)
++            .with_context(|| format!("the path {} is not UTF-8", file.display()))
 +    }
 +
 +    /// Record, once every harness of the run has been checked, each function-scoped selector
@@ -1371,11 +1541,12 @@ index 000000000..ba7613a50
 +                })
 +                .map(|(index, _)| index)
 +                .collect();
-+            let selectors: Vec<&Selector> = entry
++            let selectors: Vec<(&Selector, String)> = entry
 +                .into_iter()
 +                .flat_map(|entry| &entry.loops)
 +                .chain(scoped.iter().map(|&index| &self.policy.loops[index]))
-+                .collect();
++                .map(|selector| Ok((selector, self.expected_file(selector)?)))
++                .collect::<Result<_>>()?;
 +            let resolved = resolve(&harness.pretty_name, &selectors, &loops)?;
 +            Ok((warnings, scoped, resolved))
 +        });
@@ -1410,6 +1581,7 @@ index 000000000..ba7613a50
 +            "warnings": warnings,
 +            "resolved": resolved.iter().map(|entry| serde_json::json!({
 +                "selector": entry.selector,
++                "file": entry.file,
 +                "loop": entry.listed.name,
 +                "location": entry.listed.location,
 +            })).collect::<Vec<_>>(),
@@ -1694,10 +1866,12 @@ index 000000000..ba7613a50
 +        .with_context(|| format!("loop identifier `{name}` names no loop number"))
 +}
 +
-+/// One selector resolved against a binary's loops.
++/// One selector resolved against a binary's loops, with the file its loops were required to lie
++/// in ([`LoopBounds::expected_file`]).
 +#[derive(Clone, Debug, PartialEq, Eq)]
 +pub struct Resolved {
 +    pub selector: Selector,
++    pub file: String,
 +    pub listed: Loop,
 +}
 +
@@ -1720,15 +1894,21 @@ index 000000000..ba7613a50
 +    }
 +}
 +
-+/// Resolve each of `selectors`, the bounds that apply to `harness`, against `loops`, the inventory
-+/// of the binary CBMC is about to check: the function's loops must number exactly as declared,
-+/// all lie in the declared file, and come from one function symbol; the selected number must be
-+/// one of them; and no two selectors may resolve to one loop. These checks do not establish which
-+/// source loop a number denotes (see the module documentation).
-+pub fn resolve(harness: &str, selectors: &[&Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
++/// Resolve each of `selectors`, the bounds that apply to `harness`, each with the file CBMC must
++/// record for its loops ([`LoopBounds::expected_file`]), against `loops`, the inventory of the
++/// binary CBMC is about to check: the function's loops must number exactly as declared, all lie
++/// in that file, and come from one function symbol; the selected number must be one of them; and
++/// no two selectors may resolve to one loop. These checks do not establish which source loop a
++/// number denotes (see the module documentation).
++pub fn resolve(
++    harness: &str,
++    selectors: &[(&Selector, String)],
++    loops: &[Loop],
++) -> Result<Vec<Resolved>> {
 +    let mut resolved = Vec::with_capacity(selectors.len());
 +    let mut used = BTreeSet::new();
-+    for &selector in selectors {
++    for (selector, file) in selectors {
++        let selector = *selector;
 +        let candidates: Vec<&Loop> = loops
 +            .iter()
 +            .filter(|listed| {
@@ -1759,9 +1939,8 @@ index 000000000..ba7613a50
 +                describe(&candidates)
 +            );
 +        }
-+        if let Some(elsewhere) = candidates
-+            .iter()
-+            .find(|listed| listed.location.file.as_deref() != Some(selector.file.as_str()))
++        if let Some(elsewhere) =
++            candidates.iter().find(|listed| listed.location.file.as_deref() != Some(file.as_str()))
 +        {
 +            bail!(
 +                "harness `{}`: loop `{}` of `{}` is in {}, the policy declares {}",
@@ -1769,7 +1948,7 @@ index 000000000..ba7613a50
 +                elsewhere.name,
 +                selector.function,
 +                elsewhere.location.file.as_deref().unwrap_or("?"),
-+                selector.file
++                file
 +            );
 +        }
 +        let mut symbols = BTreeSet::new();
@@ -1803,7 +1982,7 @@ index 000000000..ba7613a50
 +        if !used.insert(listed.name.clone()) {
 +            bail!("harness `{harness}`: two bounds resolve to loop `{}`", listed.name);
 +        }
-+        resolved.push(Resolved { selector: selector.clone(), listed });
++        resolved.push(Resolved { selector: selector.clone(), file: file.clone(), listed });
 +    }
 +    Ok(resolved)
 +}
@@ -1882,6 +2061,7 @@ index 000000000..ba7613a50
 +    fn selector(function: &str, loops_in_function: u32, number: u32, bound: u32) -> Selector {
 +        Selector {
 +            function: function.to_string(),
++            package: None,
 +            file: "demo.rs".to_string(),
 +            loops_in_function,
 +            number,
@@ -1890,9 +2070,123 @@ index 000000000..ba7613a50
 +        }
 +    }
 +
-+    /// `selectors` resolved for the harness `h` against `loops`.
++    /// `selectors`, none naming a package, resolved for the harness `h` against `loops`, each
++    /// required in its file as written.
 +    fn resolved(selectors: &[Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
-+        resolve("h", &selectors.iter().collect::<Vec<_>>(), loops)
++        let pairs: Vec<(&Selector, String)> =
++            selectors.iter().map(|selector| (selector, selector.file.clone())).collect();
++        resolve("h", &pairs, loops)
++    }
++
++    fn package(name: &str, version: &str, id: &str, manifest: &str) -> ResolvedPackage {
++        ResolvedPackage {
++            name: name.to_string(),
++            version: version.to_string(),
++            id: id.to_string(),
++            manifest: PathBuf::from(manifest),
++        }
++    }
++
++    fn reference(name: &str, version: &str) -> PackageRef {
++        PackageRef { name: name.to_string(), version: version.to_string() }
++    }
++
++    /// A named package binds to its one manifest's directory; a name and version the run does
++    /// not resolve, or resolves from two sources, is refused naming every package of that name.
++    #[test]
++    fn a_package_binds_to_its_one_root() {
++        let registry = "/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
++        let packages = [
++            package(
++                "unicode-normalization",
++                "0.1.26",
++                "registry+https://github.com/rust-lang/crates.io-index#unicode-normalization@0.1.26",
++                &format!("{registry}/unicode-normalization-0.1.26/Cargo.toml"),
++            ),
++            package("demo", "0.1.0", "path+file:///w#demo@0.1.0", "/w/Cargo.toml"),
++        ];
++        let wanted = reference("unicode-normalization", "0.1.26");
++        let roots = package_roots([&wanted, &wanted], &packages).unwrap();
++        assert_eq!(
++            roots,
++            BTreeMap::from([(
++                wanted.clone(),
++                PathBuf::from(format!("{registry}/unicode-normalization-0.1.26"))
++            )])
++        );
++        let other = reference("unicode-normalization", "0.1.25");
++        let error = format!("{:#}", package_roots([&other], &packages).unwrap_err());
++        assert!(
++            error.contains(
++                "names package unicode-normalization 0.1.25, which this run does not resolve"
++            ),
++            "{error}"
++        );
++        assert!(error.contains("unicode-normalization@0.1.26 at"), "{error}");
++        let twice = [
++            packages[0].clone(),
++            package(
++                "unicode-normalization",
++                "0.1.26",
++                "git+https://github.com/x/unicode-normalization#unicode-normalization@0.1.26",
++                "/home/a/.cargo/git/checkouts/u/Cargo.toml",
++            ),
++        ];
++        let error = format!("{:#}", package_roots([&wanted], &twice).unwrap_err());
++        assert!(error.contains("from more than one source"), "{error}");
++        assert!(error.contains("git+https://github.com/x/unicode-normalization"), "{error}");
++    }
++
++    /// A selector naming a package requires its loops in that package's root joined with its
++    /// file, exactly; one naming none requires its file as written. A package left unbound, or a
++    /// run with no Cargo metadata, refuses it.
++    #[test]
++    fn a_package_selector_requires_its_files_under_its_root() {
++        let root = tempfile::tempdir().unwrap();
++        let policy = root.path().join("policy.json");
++        std::fs::write(
++            &policy,
++            r#"{"loops": [
++                {"function": "pair", "package": {"name": "demo-dep", "version": "1.0.0"},
++                 "file": "src/demo.rs", "loops_in_function": 2, "loop": 1, "bound": 4,
++                 "reason": "the code's"}
++            ], "harnesses": [], "deadlines": []}"#,
++        )
++        .unwrap();
++        let bounds = LoopBounds::load(&policy, root.path()).unwrap();
++        let selector = &bounds.policy.loops[0];
++        let unbound = format!("{:#}", bounds.expected_file(selector).unwrap_err());
++        assert!(unbound.contains("were not bound before a harness was checked"), "{unbound}");
++        let dependency = "/home/a/.cargo/registry/src/i/demo-dep-1.0.0";
++        let packages = [package(
++            "demo-dep",
++            "1.0.0",
++            "registry+x#demo-dep@1.0.0",
++            &format!("{dependency}/Cargo.toml"),
++        )];
++        bounds
++            .roots
++            .set(package_roots([&reference("demo-dep", "1.0.0")], &packages).unwrap())
++            .unwrap();
++        let file = bounds.expected_file(selector).unwrap();
++        assert_eq!(file, format!("{dependency}/src/demo.rs"));
++        let inventory = INVENTORY.replace(r#""file": "demo.rs""#, &format!(r#""file": "{file}""#));
++        let (loops, _) = parse_inventory(&inventory).unwrap();
++        let found = resolve("h", &[(selector, file.clone())], &loops).unwrap();
++        assert_eq!(found[0].listed.name, "_RNvCs1_4demo4pair.1");
++        assert_eq!(found[0].file, file);
++        // The same selector against the inventory of another host, its Cargo home elsewhere.
++        let (elsewhere, _) = parse_inventory(&inventory.replace("/home/a/", "/home/b/")).unwrap();
++        let error = resolve("h", &[(selector, file)], &elsewhere).unwrap_err().to_string();
++        assert!(error.contains("is in /home/b/.cargo"), "{error}");
++        // No Cargo metadata: a standalone run cannot locate the package.
++        let standalone = LoopBounds::load(&policy, root.path()).unwrap();
++        let error = format!("{:#}", standalone.bind_packages(None).unwrap_err());
++        let unlocated = r#"names packages ["demo-dep 1.0.0"], which a run without Cargo metadata cannot locate"#;
++        assert!(error.contains(unlocated), "{error}");
++        let unpackaged = root.path().join("unpackaged.json");
++        std::fs::write(&unpackaged, r#"{"loops": [], "harnesses": [], "deadlines": []}"#).unwrap();
++        LoopBounds::load(&unpackaged, root.path()).unwrap().bind_packages(None).unwrap();
 +    }
 +
 +    #[test]
@@ -2031,6 +2325,24 @@ index 000000000..ba7613a50
 +                    &bound("f", "a.rs", 1, 0).replace(r#""reason": "r""#, r#""reason": " ""#),
 +                )),
 +                "gives no reason",
++            ),
++            (
++                harnesses(&entry(&format!(
++                    "{}, {}",
++                    bound("f", "a.rs", 2, 0),
++                    bound("f", "a.rs", 2, 1).replace(
++                        r#""file""#,
++                        r#""package": {"name": "p", "version": "1.0.0"}, "file""#
++                    )
++                ))),
++                "as 2 loop(s) in a.rs and as 2 loop(s) in a.rs of p 1.0.0",
++            ),
++            (
++                harnesses(&entry(&bound("f", "a.rs", 1, 0).replace(
++                    r#""file""#,
++                    r#""package": {"name": "p", "version": "1", "source": "x"}, "file""#,
++                ))),
++                "unknown field `source`",
 +            ),
 +            (
 +                format!(
@@ -2252,7 +2564,7 @@ index 000000000..ba7613a50
 +    }
 +}
 diff --git a/kani-driver/src/main.rs b/kani-driver/src/main.rs
-index e6ed618e1..c220d6ded 100644
+index e6ed618e1..fe3418aa9 100644
 --- a/kani-driver/src/main.rs
 +++ b/kani-driver/src/main.rs
 @@ -40,6 +40,7 @@
@@ -2263,17 +2575,18 @@ index e6ed618e1..c220d6ded 100644
  mod metadata;
  mod progress_indicator;
  mod project;
-@@ -174,6 +175,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
+@@ -174,6 +175,10 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
      // overhead for every other run, including a `cbmc --version` probe in `process_cbmc_results`.
      let mut handler =
          session.args.export_json.as_ref().map(|path| JsonHandler::new(Some(path.clone())));
 +    if let Some(bounds) = &session.loop_bounds {
 +        bounds.policy.check_harnesses(&project.get_all_harnesses())?;
++        bounds.bind_packages(project.cargo_metadata.as_ref())?;
 +    }
      let harnesses = session.determine_targets(project.get_all_harnesses())?;
      debug!(n = harnesses.len(), ?harnesses, "verify_project");
  
-@@ -199,6 +203,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
+@@ -199,6 +204,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
      // Verification
      let runner = harness_runner::HarnessRunner { sess: &session, project: &project };
      let results = runner.check_all_harnesses(&harnesses, handler.as_mut())?;

@@ -107,6 +107,11 @@ pub struct Control {
     pub package: Option<String>,
     /// `all`, a comma-separated feature list, or none for the defaults.
     pub features: Option<String>,
+    /// The verification layer a native or Miri control's test runs at
+    /// ([`dcbor_record::Rigor`]), which its run sets as
+    /// [`dcbor_record::RIGOR`] whatever the launcher's environment holds;
+    /// none for a Kani or model control, whose run never reads it.
+    pub rigor: Option<dcbor_record::Rigor>,
     /// `lib`, or an integration test binary's name.
     pub target: Option<String>,
     /// The exact libtest name run alone.
@@ -118,7 +123,7 @@ pub struct Control {
     pub pattern: String,
 }
 
-const COLUMNS: usize = 11;
+const COLUMNS: usize = 12;
 
 impl Control {
     /// The row as the table writes it, `-` for an absent column: what
@@ -132,6 +137,8 @@ impl Control {
             column(&self.toolchain),
             column(&self.package),
             column(&self.features),
+            self.rigor
+                .map_or_else(|| "-".to_string(), |rigor| rigor.name().to_string()),
             column(&self.target),
             column(&self.test),
             column(&self.fixture),
@@ -150,10 +157,33 @@ fn optional(value: &str, line: usize, what: &str) -> Result<Option<String>, Stri
     }
 }
 
-/// The table's rows, each validated: eleven columns; a diff of the controls
+/// The rigor column: `-`, or a layer by its name ([`dcbor_record::Rigor`]);
+/// any other value is refused naming the layers.
+fn rigor(value: &str, line: usize) -> Result<Option<dcbor_record::Rigor>, String> {
+    if value == "-" {
+        return Ok(None);
+    }
+    dcbor_record::Rigor::ALL
+        .into_iter()
+        .find(|rigor| rigor.name() == value)
+        .map(Some)
+        .ok_or_else(|| {
+            let names: Vec<&str> = dcbor_record::Rigor::ALL
+                .into_iter()
+                .map(dcbor_record::Rigor::name)
+                .collect();
+            format!(
+                "{TABLE}:{line}: no rigor {value:?}; the layers are {}, or `-`",
+                names.join(", ")
+            )
+        })
+}
+
+/// The table's rows, each validated: twelve columns; a diff of the controls
 /// directory; a known runner and expected outcome; a native row naming its
-/// toolchain, package, target and test, a model row none of them; a pattern;
-/// no (name, runner) twice; one diff per name.
+/// toolchain, package, rigor, target and test, a Miri row the same, a Kani
+/// row no rigor, a model row none of them; a pattern; no (name, runner)
+/// twice; one diff per name.
 pub fn parse(text: &str) -> Result<Vec<Control>, String> {
     let mut controls: Vec<Control> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
@@ -169,6 +199,7 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
             toolchain,
             package,
             features,
+            layer,
             target,
             test,
             fixture,
@@ -210,6 +241,7 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
             toolchain: optional(toolchain, line, "toolchain")?,
             package: optional(package, line, "package")?,
             features: optional(features, line, "features")?,
+            rigor: rigor(layer, line)?,
             target: optional(target, line, "target")?,
             test: optional(test, line, "test")?,
             fixture: optional(fixture, line, "fixture")?,
@@ -222,9 +254,11 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
             ));
         }
         let shape = match runner {
+            // A test's layer decides what it selects, so its row states it.
             Runner::Native => {
                 matches!(control.toolchain.as_deref(), Some("nightly" | "stable"))
                     && control.package.is_some()
+                    && control.rigor.is_some()
                     && control.target.is_some()
                     && control.test.is_some()
             }
@@ -233,6 +267,7 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
             Runner::Miri(_) => {
                 control.toolchain.as_deref() == Some("nightly")
                     && control.package.is_some()
+                    && control.rigor.is_some()
                     && control.target.is_some()
                     && control.test.is_some()
                     && control.fixture.is_none()
@@ -243,6 +278,7 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
                 control.toolchain.as_deref() == Some(KANI_TOOLCHAIN)
                     && control.package.is_some()
                     && control.features.is_none()
+                    && control.rigor.is_none()
                     && control.target.as_deref() == Some(dcbor_model_bounds::LIBRARY)
                     && control.test.is_some()
                     && control.fixture.is_none()
@@ -251,6 +287,7 @@ pub fn parse(text: &str) -> Result<Vec<Control>, String> {
                 control.toolchain.is_none()
                     && control.package.is_none()
                     && control.features.is_none()
+                    && control.rigor.is_none()
                     && control.target.is_none()
                     && control.test.is_none()
                     && control.fixture.is_none()
@@ -1151,6 +1188,7 @@ pub fn observe(
         .ok_or_else(|| missing("package"))?;
     let target = control.target.as_deref().ok_or_else(|| missing("target"))?;
     let test = control.test.as_deref().ok_or_else(|| missing("test"))?;
+    let rigor = control.rigor.ok_or_else(|| missing("rigor"))?;
     let built = crate::process::build_target(
         root,
         package,
@@ -1166,7 +1204,8 @@ pub fn observe(
     // The test runs with the target directory it was built into, as under
     // `cargo test`: a test that builds (trybuild, through `cargo metadata`)
     // writes there, outside the copy, whose digest is its source alone
-    // (`proofs::SourceState`).
+    // (`proofs::SourceState`). It runs at its row's layer, set here whatever
+    // the launcher's environment holds: the layer decides what it selects.
     let target_dir = target_dir.to_str().ok_or_else(|| {
         format!(
             "{}: a target directory that is not UTF-8",
@@ -1176,10 +1215,21 @@ pub fn observe(
     let (termination, text) = crate::process::run_test(
         &executable,
         test,
-        &[("CARGO_TARGET_DIR", target_dir.to_string())],
+        &test_environment(target_dir, rigor),
         &logs.join(format!("{side}.log")),
     )?;
     Ok((outcome::native(Kind::Test, termination, &text), text))
+}
+
+/// What a native control's test runs with beside the controlled
+/// environment: the target directory it was built into, and its row's
+/// layer as [`dcbor_record::RIGOR`], which replaces whatever the launcher's
+/// environment holds.
+fn test_environment(target_dir: &str, rigor: dcbor_record::Rigor) -> Vec<(&'static str, String)> {
+    vec![
+        ("CARGO_TARGET_DIR", target_dir.to_string()),
+        (dcbor_record::RIGOR, rigor.name().to_string()),
+    ]
 }
 
 /// The directory of `control`'s run under `logs`: its name, and for a Miri
@@ -1339,21 +1389,22 @@ mod kani_tests {
 
     const HARNESS: &str = "bounded::proofs::checked_add_is_exact";
 
-    fn row(toolchain: &str, features: &str, target: &str) -> String {
+    fn row(toolchain: &str, features: &str, rigor: &str, target: &str) -> String {
         format!(
-            "x\ttests/data/controls/x.patch\tkani\t{toolchain}\tdcbor\t{features}\t{target}\t\
-             {HARNESS}\t-\tfailed\ta planted failure"
+            "x\ttests/data/controls/x.patch\tkani\t{toolchain}\tdcbor\t{features}\t{rigor}\t\
+             {target}\t{HARNESS}\t-\tfailed\ta planted failure"
         )
     }
 
     /// A Kani row names the proof shell, the library and a harness, and no
-    /// features: the build fixes them. Any other shape is refused.
+    /// features or rigor: the build fixes the one, a harness reads no layer.
+    /// Any other shape is refused.
     #[test]
     fn a_kani_row_has_the_proof_builds_shape() {
-        let parsed = parse(&row("kani", "-", "lib")).expect("a Kani row parses");
+        let parsed = parse(&row("kani", "-", "-", "lib")).expect("a Kani row parses");
         assert_eq!(parsed[0].runner, Runner::Kani);
-        assert_eq!(parsed[0].render(), row("kani", "-", "lib"));
-        let inconclusive = row("kani", "-", "lib").replace("\tfailed\t", "\tno_verdict\t");
+        assert_eq!(parsed[0].render(), row("kani", "-", "-", "lib"));
+        let inconclusive = row("kani", "-", "-", "lib").replace("\tfailed\t", "\tno_verdict\t");
         assert!(
             parse(&inconclusive)
                 .unwrap_err()
@@ -1361,9 +1412,10 @@ mod kani_tests {
             "an inconclusive run cannot be a control's expected refusal"
         );
         for wrong in [
-            row("nightly", "-", "lib"),
-            row("kani", "all", "lib"),
-            row("kani", "-", "encode"),
+            row("nightly", "-", "-", "lib"),
+            row("kani", "all", "-", "lib"),
+            row("kani", "-", "exhaustive", "lib"),
+            row("kani", "-", "-", "encode"),
         ] {
             assert!(
                 parse(&wrong)
@@ -1377,7 +1429,7 @@ mod kani_tests {
     /// was checked and the summary counts one; the pattern must be in it.
     #[test]
     fn a_kani_refusal_is_judged_by_its_one_harness() {
-        let control = &parse(&row("kani", "-", "lib")).unwrap()[0];
+        let control = &parse(&row("kani", "-", "-", "lib")).unwrap()[0];
         let report = format!(
             "Checking harness {HARNESS}...\n ** 1 of 3 failed\nFailed Checks: a planted failure\nVERIFICATION:- FAILED\n\
              Manual Harness Summary:\nVerification failed for - {HARNESS}\n\
@@ -1455,7 +1507,7 @@ mod kani_tests {
     /// baseline that recorded no verdict, is no evidence.
     #[test]
     fn a_kani_control_is_evidence_only_over_a_verified_baseline() {
-        let control = parse(&row("kani", "-", "lib")).unwrap();
+        let control = parse(&row("kani", "-", "-", "lib")).unwrap();
         let logs = std::env::temp_dir().join(format!("dcbor-kani-baseline-{}", std::process::id()));
         let at = directory(&logs, &control[0]);
         std::fs::create_dir_all(&at).expect("a fixture directory");
@@ -1553,7 +1605,7 @@ mod kani_tests {
             std::fs::create_dir_all(&directory).unwrap();
             let tree = crate::proofs::tests::CalibrationTree::new(&format!("authorization-{test}"));
             let references = tree.three();
-            let row = row("kani", "-", "lib").replace(HARNESS, CONTROLLED);
+            let row = row("kani", "-", "-", "lib").replace(HARNESS, CONTROLLED);
             let mut fixture = Self {
                 control: parse(&row).unwrap().remove(0),
                 expectations: tree

@@ -1,0 +1,11 @@
+--- tests/support/classes.rs
++++ tests/support/classes.rs
+@@ -157,7 +157,7 @@
+         "{:?}",
+         Operation {
+             acquisition: position.acquisition,
+-            queue: position.queue,
++            queue: QueueObservation::Unscoped,
+             allocated: position.allocated,
+             initialized,
+             cancelling: position.cancelling,

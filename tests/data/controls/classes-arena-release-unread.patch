@@ -1,0 +1,11 @@
+--- tests/support/classes.rs
++++ tests/support/classes.rs
+@@ -244,7 +244,7 @@
+ fn arena_draining(position: &StoragePosition, drained_one_by_one: bool) -> Arena {
+     Arena {
+         stage: position.stage,
+-        released: position.released,
++        released: false,
+         current_permit: position.has_current_permit,
+         staged_permit: position.has_staged_permit,
+         relocating_permit: position.has_relocating_permit,

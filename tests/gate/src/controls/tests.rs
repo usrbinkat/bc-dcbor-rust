@@ -1,13 +1,13 @@
 use super::*;
 
 const NATIVE: &str =
-    "c\ttests/data/controls/c.patch\tnative\tnightly\tdcbor\tall\tlib\ta::b\t-\tfailed\tboom";
-const FIXTURE: &str = "t\ttests/data/controls/t.patch\tnative\tstable\tdcbor-derive\t-\tui\tsuite\ttests/ui/fail/x.rs\tfailed\tExpected test case to fail to compile, but it succeeded.";
+    "c\ttests/data/controls/c.patch\tnative\tnightly\tdcbor\tall\tfast\tlib\ta::b\t-\tfailed\tboom";
+const EXHAUSTIVE: &str = "e\ttests/data/controls/e.patch\tnative\tnightly\tdcbor\tstd\texhaustive\tclasses\ta::b\t-\tfailed\tboom";
+const FIXTURE: &str = "t\ttests/data/controls/t.patch\tnative\tstable\tdcbor-derive\t-\tfast\tui\tsuite\ttests/ui/fail/x.rs\tfailed\tExpected test case to fail to compile, but it succeeded.";
 const MODEL: &str =
-    "m\ttests/data/controls/m.patch\tloom\t-\t-\t-\t-\t-\t-\tfailed\tCausality violation";
-const BUILT: &str =
-    "w\ttests/data/controls/w.patch\tshuttle\t-\t-\t-\t-\t-\t-\tbuild_refused\tmore than a quantum";
-const MIRI: &str = "u\ttests/data/controls/u.patch\ttree\tnightly\tdcbor\tcustom-std-collections\tlib\ta::b\t-\tundefined_behavior\tUndefined Behavior";
+    "m\ttests/data/controls/m.patch\tloom\t-\t-\t-\t-\t-\t-\t-\tfailed\tCausality violation";
+const BUILT: &str = "w\ttests/data/controls/w.patch\tshuttle\t-\t-\t-\t-\t-\t-\t-\tbuild_refused\tmore than a quantum";
+const MIRI: &str = "u\ttests/data/controls/u.patch\ttree\tnightly\tdcbor\tcustom-std-collections\tfast\tlib\ta::b\t-\tundefined_behavior\tUndefined Behavior";
 
 fn table(rows: &[&str]) -> String {
     let mut text = "# a comment\n\n".to_string();
@@ -24,17 +24,22 @@ fn one(row: &str) -> Control {
 
 #[test]
 fn every_row_is_read_with_its_runner_and_outcome() {
-    let controls = parse(&table(&[NATIVE, FIXTURE, MODEL, BUILT, MIRI])).expect("a valid table");
-    assert_eq!(controls.len(), 5);
+    let rows = [NATIVE, FIXTURE, MODEL, BUILT, MIRI, EXHAUSTIVE];
+    let controls = parse(&table(&rows)).expect("a valid table");
+    assert_eq!(controls.len(), 6);
     assert_eq!(controls[0].runner, Runner::Native);
     assert_eq!(controls[0].expected, Outcome::Failed);
+    assert_eq!(controls[0].rigor, Some(dcbor_record::Rigor::Fast));
     assert_eq!(controls[1].fixture.as_deref(), Some("tests/ui/fail/x.rs"));
     assert_eq!(controls[2].runner, Runner::Model(Checker::Loom));
+    assert_eq!(controls[2].rigor, None);
     assert_eq!(controls[3].runner, Runner::Model(Checker::Shuttle));
     assert_eq!(controls[3].expected, Outcome::BuildRefused);
     assert_eq!(controls[4].runner, Runner::Miri("tree"));
     assert_eq!(controls[4].expected, Outcome::UndefinedBehavior);
-    for (control, row) in controls.iter().zip([NATIVE, FIXTURE, MODEL, BUILT, MIRI]) {
+    assert_eq!(controls[4].rigor, Some(dcbor_record::Rigor::Fast));
+    assert_eq!(controls[5].rigor, Some(dcbor_record::Rigor::Exhaustive));
+    for (control, row) in controls.iter().zip(rows) {
         assert_eq!(control.render(), row, "a row renders as written");
     }
     let mut runners = vec![
@@ -84,6 +89,15 @@ fn a_malformed_row_is_refused() {
         (NATIVE.replace("\tnightly\t", "\tbeta\t"), "only those"),
         (MODEL.replace("\tloom\t-", "\tloom\tnightly"), "only those"),
         (NATIVE.replace("\tdcbor\t", "\t\t"), "empty"),
+        // A test's layer decides what it selects: a native or Miri row
+        // states it, a model row has none, and only a layer is one.
+        (NATIVE.replace("\tfast\t", "\t-\t"), "only those"),
+        (MIRI.replace("\tfast\t", "\t-\t"), "only those"),
+        (
+            MODEL.replace("\tloom\t-\t-\t-\t-", "\tloom\t-\t-\t-\tfast"),
+            "only those",
+        ),
+        (NATIVE.replace("\tfast\t", "\tslow\t"), "no rigor \"slow\""),
         // Miri is a nightly component and runs no trybuild fixture.
         (MIRI.replace("\tnightly\t", "\tstable\t"), "only those"),
         (
@@ -171,6 +185,23 @@ fn every_hunk_an_exact_application_cannot_place_is_refused() {
             faults.len() == 1 && faults[0].starts_with(expected),
             "{diff:?}: {faults:#?}"
         );
+    }
+}
+
+/// A native control's test runs at its row's layer: each row's rigor is the
+/// one value of the variable the test reads, beside its target directory.
+#[test]
+fn a_native_test_runs_at_its_rows_layer() {
+    for (row, layer) in [(NATIVE, "fast"), (EXHAUSTIVE, "exhaustive")] {
+        let control = one(row);
+        let environment = test_environment("/t", control.rigor.expect("a native row's rigor"));
+        let rigor: Vec<&String> = environment
+            .iter()
+            .filter(|(variable, _)| *variable == dcbor_record::RIGOR)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(rigor, [layer], "{row}");
+        assert!(environment.contains(&("CARGO_TARGET_DIR", "/t".to_string())));
     }
 }
 
