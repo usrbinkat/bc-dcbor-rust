@@ -1,6 +1,6 @@
 --- src/bounded/decode/string_cursor.rs
 +++ src/bounded/decode/string_cursor.rs
-@@ -219,13 +219,15 @@
+@@ -260,13 +260,15 @@
                  Step::Finished => return Err(BoundedError::PlanMismatch.into()),
              },
              Phase::Inspect => {

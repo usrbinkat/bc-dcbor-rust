@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction.rs
 +++ src/bounded/decode/construction.rs
-@@ -169,6 +169,15 @@
+@@ -176,6 +176,15 @@
          self.slot
      }
 
@@ -16,7 +16,7 @@
      /// The value's slot and the pending acquisition for the rest of the
      /// step: the context's last use ([`Self::into_slot`]), for a binding
      /// that acquires after it projects.
-@@ -209,6 +218,27 @@
+@@ -216,6 +225,27 @@
      }
  }
 

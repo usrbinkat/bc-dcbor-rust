@@ -1,6 +1,6 @@
 --- tests/gate/src/controls.rs
 +++ tests/gate/src/controls.rs
-@@ -1000,7 +1000,7 @@
+@@ -1059,7 +1059,7 @@
                  let differing: Vec<&String> = expected
                      .keys()
                      .chain(held.keys())

@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -547,7 +547,9 @@
+@@ -595,7 +595,9 @@
              admitted: less(self.admitted, earlier.admitted)?,
              consumed: less(self.consumed, earlier.consumed)?,
              forfeited: less(self.forfeited, earlier.forfeited)?,
@@ -10,4 +10,4 @@
 +            violated: self.violated && !earlier.violated,
          })
      }
-
+ 

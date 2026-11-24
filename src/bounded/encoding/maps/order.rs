@@ -24,7 +24,7 @@ pub(in crate::bounded::encoding) struct Entry {
     pub output: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OrderPhase {
     #[default]
     Run,
@@ -36,7 +36,7 @@ pub enum OrderPhase {
     Complete,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OrderPosition {
     pub phase: OrderPhase,
     pub width: usize,

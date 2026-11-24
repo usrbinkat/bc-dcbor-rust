@@ -101,6 +101,7 @@ pub struct BufferCustody {
 
 /// The cleanup classes of a byte buffer ([`Reduction`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum BufferClass {
     /// No metadata: one unit completes cleanup.
     Unallocated,
@@ -116,17 +117,26 @@ pub enum BufferClass {
     Freed { payload: bool },
 }
 
-// Cleanup (`reclaim_buffer`) reads the metadata's presence, the phase only
-// to separate `Empty`, the written phases and `BufferFreed`, and the payload
-// permit's presence; the bytes copied and a pending acquisition, whose
-// credit the operation settles at its cleanup entry, never change a cleanup
-// unit. Each class above maps to one cleanup unit and one successor class,
-// so the relation is a simulation of cleanup.
+/// A buffer's class is its observation's ([`BufferObservation::class`]),
+/// whatever its permit.
 impl<P> Reduction for BufferState<P> {
     type Class = BufferClass;
 
     fn class(observation: &BufferObservation) -> BufferClass {
-        match *observation {
+        observation.class()
+    }
+}
+
+impl BufferObservation {
+    /// This observation's cleanup class ([`BufferClass`]). Cleanup
+    /// (`reclaim_buffer`) reads the metadata's presence, the phase only to
+    /// separate `Empty`, the written phases and `BufferFreed`, and the
+    /// payload permit's presence; the bytes copied and a pending
+    /// acquisition, whose credit the operation settles at its cleanup entry,
+    /// never change a cleanup unit. Each class maps to one cleanup unit and
+    /// one successor class, so the relation is a simulation of cleanup.
+    pub fn class(&self) -> BufferClass {
+        match *self {
             BufferObservation::Unallocated => BufferClass::Unallocated,
             BufferObservation::Held(BufferCustody { phase, payload, .. }) => match phase {
                 Phase::Empty => BufferClass::Empty,

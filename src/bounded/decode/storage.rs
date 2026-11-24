@@ -134,17 +134,121 @@ pub struct StoragePosition {
     /// The old allocation's permit remains live until its last element has
     /// moved or been drained, independently of the grown allocation's permit.
     pub has_relocating_permit: bool,
-    /// The arena holds no element, allocation, reservation or growth under
-    /// way ([`Storage::is_released`]): what a holder that steps an arena's
-    /// cleanup only while it is unreleased reads. A settled empty arena
-    /// whose staging block's acquisition is under way is `Settled` but not
-    /// released: its cleanup's entry settles that acquisition's credit.
+}
+
+/// An arena's position as a holder that steps its cleanup only while it is
+/// unreleased reads it ([`Storage::held_position`]): its own position, and
+/// whether it holds no element, allocation, reservation or growth under way
+/// ([`Storage::is_released`]). A settled empty arena whose staging block's
+/// acquisition is under way is `Settled` but not released: its cleanup's
+/// entry settles that acquisition's credit. That acquisition is pending
+/// custody, which a refused step leaves admitted, so whether it is under way
+/// is no part of the arena's own position ([`StoragePosition`]), the
+/// progress a binding's observation carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HeldPosition {
+    pub arena: StoragePosition,
     pub released: bool,
+}
+
+impl Default for HeldPosition {
+    fn default() -> Self {
+        Storage::<u8, (), ()>::new().held_position()
+    }
 }
 
 impl Default for StoragePosition {
     fn default() -> Self {
         Storage::<u8, (), ()>::new().position()
+    }
+}
+
+/// How an arena's cleanup disposes of its settled elements: one admitted
+/// unit each ([`Storage::reclaim_step`], elements that drop), or all of them
+/// in one unit ([`Storage::reclaim_copy_step`], plain data).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ElementCleanup {
+    Dropped,
+    Discarded,
+}
+
+/// What an arena's own cleanup admits from a position: two positions of one
+/// class admit the same units in the same order, stepped to their end.
+///
+/// Read from the cleanup ([`Storage::reclaim_step`],
+/// [`Storage::reclaim_copy_step`]): a growth's block and allocation are
+/// released, and the pending custody settled, admitting nothing, so its
+/// stage and permits change no admission; a relocation, interrupted or
+/// complete, drains each element in a unit of its own, then resets in one
+/// admitted write; a settled arena drains each dropping element, or
+/// discards its plain data in one unit, then admits its completing
+/// transition. Whether it is released ([`Storage::is_released`]) changes
+/// nothing here: a released arena admits that transition as an empty one
+/// holding its allocation does. A holder that steps an arena only while it
+/// is not released reads that fact itself, in its own class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct StorageClass {
+    /// Relocating or relocated: the reset write follows the drains.
+    pub relocating: bool,
+    /// The units the elements take.
+    pub elements: Elements,
+}
+
+/// The units an arena's elements take in its cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Elements {
+    /// Each drained in a unit of its own: their number.
+    Each(usize),
+    /// Discarded at once, in one unit if any is held.
+    Any(bool),
+}
+
+/// What a holder that steps an arena's cleanup only while the arena is not
+/// released ([`Storage::is_released`]) admits for it: its own class, and
+/// whether its completing transition is admitted. The arena is released as
+/// soon as its last allocation is: a relocation's reset leaves the empty
+/// arena, and a settled arena holding an allocation releases it in a unit
+/// that admits nothing, so the holder stops before the transition. Only an
+/// empty arena holding no allocation, its staging growth's acquisition
+/// under way and no block granted, is still unreleased then, and admits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct HeldClass {
+    pub arena: StorageClass,
+    pub completes: bool,
+}
+
+impl HeldPosition {
+    /// This position's class under its holder ([`HeldClass`]); `None` once
+    /// released, as such a holder admits nothing more for it.
+    pub fn class(&self, cleanup: ElementCleanup) -> Option<HeldClass> {
+        let arena = &self.arena;
+        (!self.released).then(|| HeldClass {
+            arena: arena.class(cleanup),
+            // Unreleased, settled with no block (an idle growth or one
+            // staging) and holding no allocation: its growth is staging.
+            completes: arena.stage == StorageStage::Settled && !arena.has_current_permit,
+        })
+    }
+}
+
+impl StoragePosition {
+    /// This position's class ([`StorageClass`]) under `cleanup`.
+    pub fn class(&self, cleanup: ElementCleanup) -> StorageClass {
+        let relocating = matches!(
+            self.stage,
+            StorageStage::Relocating | StorageStage::Relocated
+        );
+        let held = self.initialized + self.relocating_remaining;
+        StorageClass {
+            relocating,
+            elements: match cleanup {
+                ElementCleanup::Discarded if !relocating => Elements::Any(held > 0),
+                ElementCleanup::Dropped | ElementCleanup::Discarded => Elements::Each(held),
+            },
+        }
     }
 }
 
@@ -411,7 +515,6 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     }
 
     pub fn position(&self) -> StoragePosition {
-        let released = self.is_released();
         match &self.state {
             State::Settled { arena, growth } => StoragePosition {
                 stage: match growth {
@@ -438,7 +541,6 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     _ => false,
                 },
                 has_relocating_permit: false,
-                released,
             },
             State::Relocating { from, into } => {
                 let into = into.peek();
@@ -453,7 +555,6 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     staged_physical_capacity: 0,
                     has_staged_permit: false,
                     has_relocating_permit: from._permit.is_some(),
-                    released,
                 }
             }
             State::Relocated { into } => {
@@ -469,9 +570,17 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     staged_physical_capacity: 0,
                     has_staged_permit: false,
                     has_relocating_permit: false,
-                    released,
                 }
             }
+        }
+    }
+
+    /// This arena's position under a holder that steps its cleanup only
+    /// while it is unreleased ([`HeldPosition`]).
+    pub fn held_position(&self) -> HeldPosition {
+        HeldPosition {
+            arena: self.position(),
+            released: self.is_released(),
         }
     }
 
@@ -1918,9 +2027,9 @@ mod tests {
                 staged_physical_capacity: 0,
                 has_staged_permit: false,
                 has_relocating_permit: false,
-                released: true,
             }
         );
+        assert!(storage.held_position().released);
     }
 
     /// The element counts [`every_growth_admits_exactly_its_bound`] checks:

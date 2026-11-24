@@ -21,18 +21,22 @@ mod standalone;
 pub use standalone::Standalone;
 
 pub use construct::{
-    ConstructDetail, ConstructPhase, Construction, TypedDecoder, TypedPosition, TypedValue,
-    construction_bound, typed_decode_bound,
+    ConstructClass, ConstructDetail, ConstructPhase, ConstructStage, Construction, TypedClass,
+    TypedDecoder, TypedPosition, TypedValue, construction_bound, typed_decode_bound,
 };
 pub use input::{
-    Borrowed, DecodeInput, InputAcquisition, InputBorrow, InputDetail, borrow_bound, copy_bound,
+    Borrowed, DecodeInput, InputAcquisition, InputBorrow, InputClass, InputDetail, borrow_bound,
+    copy_bound,
 };
 /// The released-prefix witness every prefix record's tests share.
 #[cfg(all(test, feature = "std"))]
 pub(crate) use operation::cuts;
 pub(crate) use operation::{Observed, OperationTerms, Task};
-pub use operation::{Operation, Position};
-pub use parse::{DocumentDecoder, OwnedDocument, ParseDetail, ParsePhase, parse_bound};
+pub use operation::{Operation, OperationClass, Position, PrefixClass};
+pub use parse::{
+    DocumentDecoder, OwnedDocument, ParseClass, ParseDetail, ParsePhase, ParseRecordStage,
+    ParserStage, parse_bound,
+};
 pub use reclamation::{
     Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, QueueObservation,
     QueuePosition, Reclaim, Reclaimed, Reduction, ScopePosition, Uniform, Written, scope_bound,

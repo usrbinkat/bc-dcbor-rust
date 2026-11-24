@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -809,7 +809,7 @@
+@@ -1225,7 +1225,7 @@
                  executable,
                  contents,
              } => tree_record(&mut stream, path, b'f', &[u8::from(*executable)], contents),

@@ -1,6 +1,6 @@
 --- src/bounded/decode/comparison.rs
 +++ src/bounded/decode/comparison.rs
-@@ -193,7 +193,8 @@
+@@ -212,7 +212,8 @@
              return Ok(Some(ordering));
          }
      }

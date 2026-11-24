@@ -1,6 +1,6 @@
 --- tests/controls.sh
 +++ tests/controls.sh
-@@ -274,8 +274,6 @@
+@@ -279,8 +279,6 @@
          else
              event "FAIL $run: the unmutated harness did not verify; the control is not run ($directory/baseline.judged)"
              status=1

@@ -305,8 +305,8 @@ fn every_inspection_admission_allocation_and_stop_boundary() {
 fn a_class_merging_states_of_different_custody_is_rejected() {
     let wire = [0x82, 0x01, 0x82, 0x02, 0x03];
     let merged = Classes {
-        input: |_| Some("merged".to_owned()),
-        parse: |_| Some("merged".to_owned()),
+        input: |_| Some(Class::Planted("merged")),
+        parse: |_| Some(Class::Planted("merged")),
         decode: |_| None,
         prepare: |_| None,
         emit: |_| None,

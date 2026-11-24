@@ -1,6 +1,6 @@
 --- src/bounded/encoding/buckets.rs
 +++ src/bounded/encoding/buckets.rs
-@@ -402,6 +402,11 @@
+@@ -444,6 +444,11 @@
                  };
                  boundary!(budget, Predicate::Buckets => Valuation::Occupied);
                  self.position.yielded += 1;

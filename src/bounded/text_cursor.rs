@@ -1,7 +1,7 @@
 //! Retained NFC preparation and canonical text emission over immutable input.
 use super::decode::storage::Storage;
 use super::*;
-use unicode_normalization::char::{canonical_combining_class, compose, decompose_canonical};
+use unicode_normalization::char::{canonical_combining_class, compose};
 mod initialization;
 mod ordering;
 pub use ordering::{OrderingPhase, OrderingPosition};
@@ -56,6 +56,99 @@ pub struct Position {
     /// Physical output capacity and whether its reservation remains held.
     pub output_capacity: usize,
     pub output_permit: bool,
+}
+
+/// Where a continuation's cleanup stands ([`TextContinuation::reclaim_step`]):
+/// every producing phase enters it by the same admitted unit; the reclaiming
+/// phases are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TextCleanupStage {
+    Active,
+    ReclaimOrdering,
+    ReclaimChars,
+    Finished,
+}
+
+/// What a continuation's cleanup admits from a position
+/// ([`TextContinuation::reclaim_step`]): its stage, then each arena it has
+/// still to release, both of plain characters ([`StorageClass`] under
+/// [`ElementCleanup::Discarded`]): the ordering scratch until its cleanup
+/// ends, the characters until theirs does, the output released with them
+/// in that unit, its request having paid for it. Its read, composition,
+/// measurement and emission counters, its pending decomposition, its
+/// ordering's counters and run, and its output's held release (settled at
+/// cleanup's entry, admitting nothing) change no admission.
+///
+/// [`StorageClass`]: decode::storage::StorageClass
+/// [`ElementCleanup::Discarded`]: decode::storage::ElementCleanup::Discarded
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct TextClass {
+    pub stage: TextCleanupStage,
+    pub scratch: Option<decode::storage::StorageClass>,
+    pub chars: Option<decode::storage::StorageClass>,
+}
+
+/// What a continuation holds: its position, read without allocating or
+/// advancing it ([`TextContinuation::position`]).
+impl<S, P, O: Origin> decode::construction::Custody for TextContinuation<S, P, O> {
+    type Observation = Position;
+
+    fn observe(&mut self) -> Position {
+        self.position()
+    }
+}
+
+/// A continuation's class is its position's ([`Position::class`]).
+impl<S, P, O: Origin> decode::construction::Reduction for TextContinuation<S, P, O> {
+    type Class = TextClass;
+
+    fn class(position: &Position) -> TextClass {
+        position.class()
+    }
+}
+
+impl Position {
+    /// This position's cleanup class ([`TextClass`]). Each cleanup unit
+    /// reads its phase's stage, then the arena it releases: every producing
+    /// phase enters `ReclaimOrdering` by the same admitted unit, whatever
+    /// its counters; the ordering scratch is released by its own cleanup,
+    /// then the characters by theirs, the output with them in a unit its
+    /// request paid for; nothing else of the position is read. A finished
+    /// continuation's class is `Finished` with no arena: what a holder that
+    /// steps it only while unfinished admits for it is the holder's to say.
+    /// Two positions of one class take each unit alike and land again in one
+    /// class.
+    pub fn class(&self) -> TextClass {
+        let position = self;
+        let stage = match position.phase {
+            Phase::ReclaimOrdering => TextCleanupStage::ReclaimOrdering,
+            Phase::ReclaimChars => TextCleanupStage::ReclaimChars,
+            Phase::Finished => TextCleanupStage::Finished,
+            Phase::Read
+            | Phase::Append
+            | Phase::Order
+            | Phase::ReleaseOrdering
+            | Phase::Compose
+            | Phase::Measure
+            | Phase::ReleaseOutput
+            | Phase::Allocate
+            | Phase::Header
+            | Phase::Emit
+            | Phase::ReleaseChars
+            | Phase::Publish => TextCleanupStage::Active,
+        };
+        let plain = decode::storage::ElementCleanup::Discarded;
+        TextClass {
+            stage,
+            scratch: matches!(
+                stage,
+                TextCleanupStage::Active | TextCleanupStage::ReclaimOrdering
+            )
+            .then(|| position.ordering_state.scratch.class(plain)),
+            chars: (stage != TextCleanupStage::Finished).then(|| position.characters.class(plain)),
+        }
+    }
 }
 
 /// Each step performs one scalar decomposition, one ordering unit (a part
@@ -274,7 +367,7 @@ impl TextShape {
         let mut run = 0u64;
         for ch in text.chars() {
             shape.scalars += 1;
-            decompose_canonical(ch, |part| {
+            decomposition::parts(ch, &mut |part| {
                 shape.parts += 1;
                 shape.part_bytes += part.len_utf8() as u64;
                 if canonical_combining_class(part) != 0 {
@@ -949,7 +1042,7 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
                     return Ok(Step::Progress);
                 };
                 let mut count = 0usize;
-                decompose_canonical(ch, |part| {
+                decomposition::parts(ch, &mut |part| {
                     if let Some(slot) = self.pending.get_mut(count) {
                         *slot = part;
                     }
@@ -1196,6 +1289,7 @@ mod tests {
     use core::ops::ControlFlow;
     use pipeline::{TextPreparation, preparation_bound};
     use unicode_normalization::UnicodeNormalization;
+    use unicode_normalization::char::decompose_canonical;
 
     /// What preparing `text` reported, requested and held at its peak, and
     /// what its published plan holds.

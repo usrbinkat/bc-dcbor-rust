@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -562,7 +562,7 @@
+                 .map(|text| text.class()),
+             frames: position.frames.class(Discarded),
+             maps: position.maps.class(Discarded),
+-            bytes: position.bytes.class(Discarded),
++            bytes: position.bytes.class(Discarded).filter(|_| false),
+             holes: position.holes.class(Discarded),
+             cursors: position.cursor_storage.class(Discarded),
+             windows: position.window_storage.class(Dropped),

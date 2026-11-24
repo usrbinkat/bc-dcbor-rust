@@ -560,6 +560,7 @@ impl<S: Custody> Custody for Session<S> {
 /// unit is still to come, cleanup is under way, or it is complete. The bound
 /// node is not read by cleanup, so it is not part of the class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum StageClass {
     /// `Unbound`: one unit, straight to `Released`.
     Unbound,

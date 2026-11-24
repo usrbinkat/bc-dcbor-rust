@@ -1,6 +1,6 @@
 --- tests/gate/src/controls.rs
 +++ tests/gate/src/controls.rs
-@@ -648,7 +648,7 @@
+@@ -1301,7 +1301,7 @@
          let read = |file: &str| {
              std::fs::read_to_string(directory.join(file)).map(|text| text.trim().to_string())
          };

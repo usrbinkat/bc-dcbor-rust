@@ -1,6 +1,6 @@
 --- src/bounded/decode/cursor/publication.rs
 +++ src/bounded/decode/cursor/publication.rs
-@@ -177,7 +177,8 @@
+@@ -178,7 +178,8 @@
              transferred,
              released,
          } = *parts;

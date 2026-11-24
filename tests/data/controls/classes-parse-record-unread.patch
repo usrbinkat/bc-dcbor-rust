@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/parse.rs
++++ src/bounded/decode/construction/parse.rs
+@@ -448,7 +448,7 @@
+         use crate::bounded::decode::storage::ElementCleanup::Discarded;
+         use cursor::Phase;
+         ParseClass {
+-            record: self.phase.map(|phase| match phase {
++            record: self.phase.filter(|_| false).map(|phase| match phase {
+                 ParsePhase::Parse
+                 | ParsePhase::Transfer
+                 | ParsePhase::ReleaseParser

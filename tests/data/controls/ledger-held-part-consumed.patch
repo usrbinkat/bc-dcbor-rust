@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -220,7 +220,8 @@
+@@ -251,7 +251,8 @@
              Credit::Admit { work, held } => {
                  let consumed = match held {
                      None => Some(work),

@@ -135,6 +135,7 @@ pub enum OptionalObservation<S> {
 /// The cleanup classes of a native option ([`Reduction`]), `C` its
 /// payload's class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum OptionalClass<C> {
     /// No metadata: one unit completes cleanup.
     Unallocated,

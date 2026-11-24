@@ -1,6 +1,6 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -366,7 +366,7 @@
+@@ -417,7 +417,7 @@
                  ));
              }
              (RunPurpose::Calibration { .. }, Selection::Only(harnesses))

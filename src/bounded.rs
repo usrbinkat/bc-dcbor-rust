@@ -716,6 +716,7 @@ mod bigint;
 pub mod boundary;
 use boundary::{Bound, Predicate};
 pub mod decode;
+mod decomposition;
 pub mod encoding;
 /// Kani harnesses of the arenas' growth recurrence (register item 4):
 /// compiled only by `cargo kani`.

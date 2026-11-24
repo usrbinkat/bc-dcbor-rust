@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1333,7 +1333,9 @@
+@@ -1597,7 +1597,9 @@
                      self.text_source = None;
                      // Published: its output moved out, its arenas drained;
                      // what remains is its owners, destroyed with it.

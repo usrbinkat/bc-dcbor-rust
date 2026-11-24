@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2438,7 +2438,7 @@
+@@ -2776,7 +2776,7 @@
          match self {
              Self::Live => match std::fs::symlink_metadata(path) {
                  Ok(_) => Ok(true),

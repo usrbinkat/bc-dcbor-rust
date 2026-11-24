@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -5040,7 +5040,7 @@
+@@ -5282,7 +5282,7 @@
          if self.lost.is_none() {
              self.lost = lost(m, at);
          }

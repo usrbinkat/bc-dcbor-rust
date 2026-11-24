@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -212,9 +212,6 @@
+@@ -216,9 +216,6 @@
          if !(self.bound && expected.bound) {
              return Err(BoundedError::PlanMismatch);
          }

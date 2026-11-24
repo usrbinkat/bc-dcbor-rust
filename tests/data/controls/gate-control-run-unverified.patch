@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -477,7 +477,7 @@
+@@ -488,7 +488,7 @@
                      result.control, result.runner
                  ));
              }
@@ -9,7 +9,7 @@
                  return fault(format!(
                      "did not pass {} under {}: {:?}",
                      result.control, result.runner, result.faults
-@@ -552,7 +552,7 @@
+@@ -563,7 +563,7 @@
              record.channel, record.runners
          ));
      }

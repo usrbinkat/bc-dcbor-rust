@@ -1,6 +1,6 @@
 --- src/bounded/text_cursor.rs
 +++ src/bounded/text_cursor.rs
-@@ -1107,10 +1107,14 @@
+@@ -1200,10 +1200,14 @@
                  let by = allocator.performer();
                  // Granted: the release is spent at the permit, which carries
                  // it and whose drop performs it on every path below.

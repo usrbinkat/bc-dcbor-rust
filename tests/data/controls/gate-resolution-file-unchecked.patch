@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -3205,9 +3205,9 @@
+@@ -3206,9 +3206,9 @@
      }
      let placed = if selector.get("package").is_some() {
          file.starts_with('/') && file.ends_with(&format!("/{declared}"))

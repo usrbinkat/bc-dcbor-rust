@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -1259,15 +1259,24 @@
+@@ -1377,15 +1377,24 @@
              if self.ready {
                  scope(&block).owner.closed.store(true, Ordering::Release);
                  scope(&block).owner.abandoned.store(true, Ordering::Release);

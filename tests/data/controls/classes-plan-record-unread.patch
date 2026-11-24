@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -4046,7 +4046,7 @@
+     /// This detail's class ([`PlanClass`]).
+     pub fn class(&self) -> PlanClass {
+         PlanClass {
+-            record: self.phase.map(|phase| match phase {
++            record: self.phase.filter(|_| false).map(|phase| match phase {
+                 PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
+                 PlanPhase::ReclaimPreparation => PlanStage::ReclaimPreparation,
+                 PlanPhase::ReclaimSource => PlanStage::ReclaimSource,

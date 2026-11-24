@@ -59,13 +59,13 @@ fn scalar_pipeline_distinguishes_turn_exhaustion_from_injected_refusals() {
 #[test]
 #[should_panic(expected = "the class merges states of different custody")]
 fn an_emission_class_merged_with_a_decode_boundary_is_rejected() {
-    const PLANTED: &str = "planted";
+    const PLANTED: classes::Class = classes::Class::Planted("planted");
     let merged = Classes::<Typed<u64>> {
         decode: |position| match position {
-            TypedPosition::Parse(parse) if !parse.allocated => Some(PLANTED.to_owned()),
+            TypedPosition::Parse(parse) if !parse.allocated => Some(PLANTED),
             other => classes::typed::<u64>(other),
         },
-        emit: |_| Some(PLANTED.to_owned()),
+        emit: |_| Some(PLANTED),
         ..classes::reduced::<u64>()
     };
     matrix(

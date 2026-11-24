@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -249,7 +249,7 @@
+@@ -240,7 +240,7 @@
      if holder.is_none() {
          return Err(BoundedError::PlanMismatch);
      }

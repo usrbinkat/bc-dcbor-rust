@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/parse.rs
++++ src/bounded/decode/construction/parse.rs
+@@ -454,7 +454,7 @@
+                 | ParsePhase::ReleaseParser
+                 | ParsePhase::Publish
+                 | ParsePhase::Published => ParseRecordStage::Active,
+-                ParsePhase::ReclaimArena => ParseRecordStage::ReclaimArena,
++                ParsePhase::ReclaimArena => ParseRecordStage::Active,
+                 ParsePhase::ReclaimParser => ParseRecordStage::ReclaimParser,
+                 ParsePhase::ReclaimInput => ParseRecordStage::ReclaimInput,
+                 ParsePhase::Done => ParseRecordStage::Done,

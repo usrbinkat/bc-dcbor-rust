@@ -1,0 +1,11 @@
+--- tests/gate/src/proofs/diagnostics.rs
++++ tests/gate/src/proofs/diagnostics.rs
+@@ -371,7 +371,7 @@
+ pub fn verdict(ran: &Ran, property: &str) -> Result<Verdict, String> {
+     Ok(match ran.ended {
+         Ended::Deadline { .. } => Verdict::Deadline,
+-        Ended::Exited { code: 0 | 5 | 10 } => match status(&json_stream(&ran.stdout())?, property)?
++        Ended::Exited { .. } => match status(&json_stream(&ran.stdout())?, property)?
+         {
+             Some(status) => Verdict::Reported { status },
+             None => Verdict::Unreported { ended: ran.ended },

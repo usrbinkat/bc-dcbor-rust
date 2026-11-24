@@ -5,7 +5,7 @@ use super::*;
 
 /// Retained emission progress: the plan offset, header gaps passed, and
 /// bytes emitted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EmitPosition {
     pub source: usize,
     pub hole: usize,
@@ -471,10 +471,54 @@ pub struct OwnedWriter<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> {
 /// Emission progress together with the plan record's retained custody.
 /// Completing emission does not release the plan or its source; explicit
 /// reclamation and retirement therefore remain observable after completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnedEmitPosition {
     pub emission: EmitPosition,
     pub plan: PlanDetail,
+}
+
+/// What an emission's cleanup admits: its plan record's ([`PlanClass`]),
+/// marked as an emission's, so a plan record at an emission boundary is
+/// never one class with one at a preparation boundary, whose operation's
+/// cleanup differs. The emission's own progress is not read: every stop at
+/// an emission boundary retires the writer, which hands its record to the
+/// scope's drain, and the drain reads only the record; an emission step
+/// writes only the writer's own progress ([`OwnedWriter::step`]), which the
+/// writer's own cleanup carries only to rebuild itself
+/// ([`OwnedWriter::reclaim_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct EmitClass(pub PlanClass);
+
+/// What a writer holds: its position ([`OwnedWriter::position`]).
+impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> decode::construction::Custody
+    for OwnedWriter<'_, I, T, A>
+{
+    type Observation = OwnedEmitPosition;
+
+    fn observe(&mut self) -> OwnedEmitPosition {
+        self.position()
+    }
+}
+
+impl OwnedEmitPosition {
+    /// An emission's class ([`EmitClass`]), whatever value it encodes. Two
+    /// positions of one class take each unit alike and land again in one
+    /// class.
+    pub fn class(&self) -> EmitClass {
+        EmitClass(self.plan.class())
+    }
+}
+
+/// An emission's class is its position's ([`OwnedEmitPosition::class`]).
+impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> decode::construction::Reduction
+    for OwnedWriter<'_, I, T, A>
+{
+    type Class = EmitClass;
+
+    fn class(position: &OwnedEmitPosition) -> EmitClass {
+        position.class()
+    }
 }
 
 impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> OwnedWriter<'s, I, T, A> {

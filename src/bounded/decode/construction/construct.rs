@@ -845,6 +845,157 @@ where
     }
 }
 
+/// Where a construction record's cleanup stands (`Constructed`'s
+/// `reclaim_step`): every phase before reclamation enters it by the same
+/// admitted unit; the reclaiming phases are distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ConstructStage {
+    Active,
+    ReclaimValue,
+    ReclaimDocument,
+    ReclaimInput,
+    Done,
+}
+
+/// What a construction's cleanup admits from its detail
+/// ([`ConstructDetail`]), `C` its value's class: the record's stage (every
+/// phase before reclamation alike), its document and input slots, and its
+/// value through the value's own cleanup, whose class the value's session
+/// declares ([`super::Reduction`] of [`Session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct ConstructClass<C> {
+    pub record: Option<ConstructStage>,
+    pub document: bool,
+    pub input: bool,
+    pub value: Option<C>,
+}
+
+impl<O> Position<ConstructDetail<O>> {
+    /// A construction's class, its value's by `S`, the value's session's
+    /// reduction, whatever its input. Before the record's prefix is complete
+    /// its cleanup (`Constructed`'s `reclaim_step`, `remaining`) reads only
+    /// whether the document slot is written and holds the document, then
+    /// releases the record in one unit; the rest of the prefix (the empty
+    /// input slot, the value's initial state, the phase, the pending
+    /// credit's idle units) owns nothing. So every partial prefix of an
+    /// allocated record is one class, by its document alone; past it, the
+    /// record's stage, its slots and its value's class. Two positions of one
+    /// class take each unit alike and land again in one class.
+    pub fn class<S: super::Reduction<Observation = O>>(
+        &self,
+    ) -> super::operation::OperationClass<ConstructClass<S::Class>> {
+        use super::operation::PrefixClass;
+        let position = self;
+        let detail = &position.detail;
+        let prefix = position.partial();
+        let task = if prefix == PrefixClass::Partial {
+            ConstructClass {
+                record: None,
+                document: detail.document,
+                input: false,
+                value: None,
+            }
+        } else {
+            ConstructClass {
+                record: detail.phase.map(|phase| match phase {
+                    ConstructPhase::Build
+                    | ConstructPhase::Detach
+                    | ConstructPhase::Publish
+                    | ConstructPhase::Published => ConstructStage::Active,
+                    ConstructPhase::ReclaimValue => ConstructStage::ReclaimValue,
+                    ConstructPhase::ReclaimDocument => ConstructStage::ReclaimDocument,
+                    ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
+                    ConstructPhase::Done => ConstructStage::Done,
+                }),
+                document: detail.document,
+                input: detail.input,
+                value: detail.build.as_ref().map(S::class),
+            }
+        };
+        position.operation_class(prefix, task)
+    }
+}
+
+/// A construction's class is its position's, its value's by the value's
+/// session's reduction ([`Position::class`]).
+impl<'s, I, T, A> super::Reduction for Construction<'s, I, T, A>
+where
+    I: DecodeInput<A> + 's,
+    T: Transferable<A> + 's,
+    A: TerminalAllocator + 's,
+    A::Permit: Send,
+    Session<T::State>: super::Reduction,
+{
+    type Class = super::operation::OperationClass<
+        ConstructClass<<Session<T::State> as super::Reduction>::Class>,
+    >;
+
+    fn class(
+        position: &Position<ConstructDetail<<Session<T::State> as Custody>::Observation>>,
+    ) -> Self::Class {
+        position.class::<Session<T::State>>()
+    }
+}
+
+/// What a typed decode's cleanup admits: its parse's while it parses
+/// ([`DocumentDecoder`]'s reduction), its construction's once the parsed
+/// document moved into it ([`Construction`]'s), nothing once finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum TypedClass<C> {
+    Parse(super::operation::OperationClass<super::parse::ParseClass>),
+    Construct(C),
+    Finished,
+}
+
+/// What a typed decode holds: its position ([`TypedDecoder::position`]).
+impl<'s, I, T, A> Custody for TypedDecoder<'s, I, T, A>
+where
+    I: DecodeInput<A> + 's,
+    T: Transferable<A> + 's,
+    A: TerminalAllocator + 's,
+    A::Permit: Send,
+{
+    type Observation = TypedPosition<<Session<T::State> as Custody>::Observation>;
+
+    fn observe(&mut self) -> Self::Observation {
+        self.position()
+    }
+}
+
+/// A typed decode's class is its position's ([`TypedPosition::class`]).
+impl<'s, I, T, A> super::Reduction for TypedDecoder<'s, I, T, A>
+where
+    I: DecodeInput<A> + 's,
+    T: Transferable<A> + 's,
+    A: TerminalAllocator + 's,
+    A::Permit: Send,
+    Session<T::State>: super::Reduction,
+{
+    type Class = TypedClass<<Construction<'s, I, T, A> as super::Reduction>::Class>;
+
+    fn class(position: &Self::Observation) -> Self::Class {
+        position.class::<Session<T::State>>()
+    }
+}
+
+impl<O> TypedPosition<O> {
+    /// A typed decode's class, its value's by `S`, the value's session's
+    /// reduction: the stage's own operation's, the decode's cleanup being
+    /// that operation's, and a finished decode holding nothing.
+    pub fn class<S: super::Reduction<Observation = O>>(
+        &self,
+    ) -> TypedClass<super::operation::OperationClass<ConstructClass<S::Class>>> {
+        match self {
+            TypedPosition::Parse(parse) => TypedClass::Parse(parse.class()),
+            TypedPosition::Construct(construct) => TypedClass::Construct(construct.class::<S>()),
+            TypedPosition::Finished => TypedClass::Finished,
+        }
+    }
+}
+
 /// Where a typed decode is, `O` its value's custody observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[expect(

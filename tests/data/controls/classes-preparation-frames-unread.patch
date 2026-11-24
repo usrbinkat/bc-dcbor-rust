@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -560,7 +560,7 @@
+                 .normalization
+                 .filter(|text| text.phase != text_cursor::Phase::Finished)
+                 .map(|text| text.class()),
+-            frames: position.frames.class(Discarded),
++            frames: position.frames.class(Discarded).filter(|_| false),
+             maps: position.maps.class(Discarded),
+             bytes: position.bytes.class(Discarded),
+             holes: position.holes.class(Discarded),

@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2273,7 +2273,7 @@
+@@ -2759,7 +2759,7 @@
                  )
              })?;
              let digest = crate::process::sha256_bytes(&bytes)?;

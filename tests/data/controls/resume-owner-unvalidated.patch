@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -580,8 +580,6 @@
+@@ -590,8 +590,6 @@
                  // between recorded and unrecorded) is refused here, before
                  // any admission: the pending and resource accounting
                  // unchanged, recording validity sticky-invalid.

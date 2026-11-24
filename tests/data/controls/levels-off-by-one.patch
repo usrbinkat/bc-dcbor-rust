@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -2381,7 +2381,8 @@
+@@ -2775,7 +2775,8 @@
  /// levels a merge of `n` entries passes (`ceil(log2 n)`), and the probes a
  /// binary lookup among them makes.
  fn levels<R>(n: u64) -> Result<u64, BoundedError<R>> {

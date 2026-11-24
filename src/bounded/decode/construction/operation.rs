@@ -247,6 +247,83 @@ pub struct Position<D> {
     pub detail: D,
 }
 
+/// How much of a record's prefix its cleanup reads: its exact units, or,
+/// for a record whose cleanup before its prefix is complete reads only a
+/// slot its task's detail already carries, that the prefix is partial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum PrefixClass {
+    Units(usize),
+    Partial,
+}
+
+/// The operation's part of a class ([`super::Reduction`]), its task's
+/// class `C` beside it: whether its record is allocated, how much of its
+/// prefix cleanup reads ([`PrefixClass`]), whether it is cancelling or
+/// finished, how many records its scope holds and where its queue stands.
+/// Each is read: a record's cleanup releases its written prefix, and the
+/// scope's drain releases every record it holds from where its queue stands
+/// (the active record's remaining calls, the records queued behind it, a
+/// removal unit already admitted). Where the record's acquisition stands is
+/// not: every cleanup step cancels it first, admitting nothing
+/// ([`Acquisition::cancel_into`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct OperationClass<C> {
+    pub queue: QueueObservation,
+    pub allocated: bool,
+    pub prefix: PrefixClass,
+    pub cancelling: bool,
+    pub finished: bool,
+    pub outstanding: usize,
+    pub task: C,
+}
+
+impl<D> Position<D> {
+    /// The prefix by its exact units.
+    pub(crate) fn units(&self) -> PrefixClass {
+        PrefixClass::Units(self.initialized)
+    }
+
+    /// The prefix as partial while the record is allocated and its prefix
+    /// begun but incomplete, its exact units otherwise: the prefix of a
+    /// record whose cleanup then reads only a slot its detail carries.
+    pub(crate) fn partial(&self) -> PrefixClass {
+        if self.allocated && 0 < self.initialized && self.initialized < self.initialization_steps {
+            PrefixClass::Partial
+        } else {
+            self.units()
+        }
+    }
+
+    /// The operation's part of a class ([`OperationClass`]), its prefix
+    /// read as `prefix` and its task's class `task`: what each operation's
+    /// own `class` builds on.
+    pub(crate) fn operation_class<C>(&self, prefix: PrefixClass, task: C) -> OperationClass<C> {
+        OperationClass {
+            queue: self.queue,
+            allocated: self.allocated,
+            prefix,
+            cancelling: self.cancelling,
+            finished: self.finished,
+            outstanding: self.outstanding,
+            task,
+        }
+    }
+}
+
+/// What an operation holds: its position ([`Operation::position`]).
+impl<'s, K: Task<'s, A>, A: TerminalAllocator> super::Custody for Operation<'s, K, A>
+where
+    K::Detail: Eq + Ord,
+{
+    type Observation = Position<K::Detail>;
+
+    fn observe(&mut self) -> Position<K::Detail> {
+        self.position()
+    }
+}
+
 /// The controller. Construction allocates nothing.
 pub struct Operation<'s, K: Task<'s, A>, A: TerminalAllocator> {
     task: K,

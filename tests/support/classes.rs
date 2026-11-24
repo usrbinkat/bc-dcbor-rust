@@ -4,38 +4,136 @@
 //! one thing: the cleanup that follows from the state the boundary reached.
 //! A class groups boundaries whose cleanup is claimed alike: the same
 //! admitted units in the same order, everything released, nothing
-//! allocated. Each class below is a projection of the operation's position
-//! that keeps everything its cleanup reads and drops counters its cleanup
-//! never reads; the argument is stated beside each. The exhaustive layer
-//! stops at every member of every class and requires their cleanups to be
-//! equal, so a class that merges states of different custody fails there,
-//! named.
+//! allocated. Each boundary's class is its operation's declared cleanup
+//! reduction ([`Reduction`]), stated beside that operation's cleanup in the
+//! crate; this module only selects, for each boundary, the operation whose
+//! reduction classes it. The exhaustive layer stops at every member of every
+//! class and requires their cleanups to be equal, so a reduction that merges
+//! states of different custody fails there, named.
 //!
 //! Classes compare boundaries of one pipeline run over one input: the
 //! document a construction holds and the input a record holds are the same
 //! at every boundary of that run, so a class need not carry their custody.
 //!
-//! A boundary returns no class when no argument covers it: every stop there
+//! A boundary returns no class when no reduction covers it: every stop there
 //! runs in both layers.
-use core::fmt::Debug;
-use dcbor::ByteString;
-use dcbor::bounded::Limits;
-use dcbor::bounded::decode::construction::in_place::{BufferObservation, Session};
-use dcbor::bounded::decode::construction::reclamation::{Custody, Reclaim, Reduction};
-use dcbor::bounded::decode::construction::{
-    ConstructDetail, ConstructPhase, InputDetail, ParseDetail, ParsePhase, Position,
-    QueueObservation, TypedPosition,
-};
-use dcbor::bounded::decode::cursor::Phase as ParserPhase;
-use dcbor::bounded::decode::storage::{StoragePosition, StorageStage};
-use dcbor::bounded::encoding::{
-    OwnedEmitPosition, PlanDetail, PlanPhase, Position as PreparationPosition,
-};
-use dcbor::bounded::text_cursor::{Phase as TextPhase, Position as TextPosition};
+use core::any::Any;
+use core::cmp::Ordering;
+use core::fmt::{self, Debug};
 
-/// A boundary's cleanup class, rendered: classes of different operations
-/// and value types compare as their renderings, which name every field.
-pub type Class = String;
+use dcbor::bounded::Limits;
+use dcbor::bounded::decode::construction::in_place::{BufferClass, BufferObservation, Session};
+use dcbor::bounded::decode::construction::{
+    Custody, InputClass, InputDetail, OperationClass, ParseClass, ParseDetail, Position, Reclaim,
+    Reduction, TypedPosition,
+};
+use dcbor::bounded::encoding::{EmitClass, OwnedEmitPosition, PlanClass, PlanDetail};
+
+/// A boundary's cleanup class: its operation's class value, compared as
+/// that value, never as a rendering. Classes of different operations are
+/// distinct and ordered by operation. A typed decode's class type depends
+/// on the value it decodes, so it is held as a [`Decoded`].
+///
+/// `Debug` renders the operation's class alone, as the class inventory
+/// (`rigor::classes`) records it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    Input(OperationClass<InputClass<BufferClass>>),
+    Parse(OperationClass<ParseClass>),
+    Decode(Decoded),
+    Prepare(OperationClass<PlanClass>),
+    Emit(EmitClass),
+    /// A planted classifier's class, by its name: what a control that
+    /// merges boundaries of different operations claims for all of them.
+    Planted(&'static str),
+}
+
+impl Debug for Class {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(class) => class.fmt(f),
+            Self::Parse(class) => class.fmt(f),
+            Self::Decode(class) => class.fmt(f),
+            Self::Prepare(class) => class.fmt(f),
+            Self::Emit(class) => class.fmt(f),
+            Self::Planted(name) => name.fmt(f),
+        }
+    }
+}
+
+/// A typed decode's class, of whatever class type its value's reduction
+/// declares (`Reduction::Class`: `Copy + Eq + Ord + Debug`). Two classes of
+/// one type compare by that type's own `Eq` and `Ord`; classes of two types
+/// are unequal, ordered by their types' identities, which are fixed for one
+/// test binary.
+pub struct Decoded(Box<dyn DecodedClass>);
+
+/// What [`Decoded`] needs of a class value: its type's comparison, reached
+/// through `Any`.
+trait DecodedClass: Any + Debug {
+    fn as_any(&self) -> &dyn Any;
+    fn boxed(&self) -> Box<dyn DecodedClass>;
+    /// `self` against `other`, which is of `self`'s type.
+    fn compare(&self, other: &dyn Any) -> Ordering;
+}
+
+impl<C: Copy + Ord + Debug + 'static> DecodedClass for C {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn boxed(&self) -> Box<dyn DecodedClass> {
+        Box::new(*self)
+    }
+
+    fn compare(&self, other: &dyn Any) -> Ordering {
+        let other = other
+            .downcast_ref::<C>()
+            .expect("compared only with a class of its own type");
+        self.cmp(other)
+    }
+}
+
+impl Decoded {
+    pub fn new<C: Copy + Ord + Debug + 'static>(class: C) -> Self {
+        Self(Box::new(class))
+    }
+}
+
+impl Clone for Decoded {
+    fn clone(&self) -> Self {
+        Self(self.0.boxed())
+    }
+}
+
+impl Debug for Decoded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Ord for Decoded {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (mine, theirs) = (self.0.as_any(), other.0.as_any());
+        Any::type_id(mine)
+            .cmp(&Any::type_id(theirs))
+            .then_with(|| self.0.compare(theirs))
+    }
+}
+
+impl PartialOrd for Decoded {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Decoded {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Decoded {}
 
 /// The position of a typed decode of `T`: its construction's detail carries
 /// the value's root session observation, its stage and the binding's own.
@@ -84,7 +182,7 @@ impl<P> Classes<P> {
 pub fn reduced<T>() -> Classes<Typed<T>>
 where
     T: Reclaim<Limits>,
-    T::State: Reduction,
+    Session<T::State>: Reduction<Class: 'static>,
 {
     Classes {
         input,
@@ -110,497 +208,65 @@ pub fn parsed<T: Reclaim<Limits>>() -> Classes<Typed<T>> {
     }
 }
 
-/// How much of a record's prefix its cleanup reads: the exact units
-/// written, or, for a record whose cleanup before its prefix is complete
-/// reads only what its detail already carries, that the prefix is partial.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-enum Initialized {
-    Units(usize),
-    Partial,
-}
-
-/// The operation's own part of a class: whether its record is allocated, how
-/// much of its prefix is written ([`Initialized`]), whether it is cancelling
-/// or finished, and how many records its scope holds and where its queue
-/// stands. The operation's cleanup reads each: a record's cleanup releases
-/// its written prefix, and the scope's drain releases every record it holds,
-/// from where its queue stands (the active record's remaining calls, the
-/// records queued behind it, a removal unit already admitted). Where the
-/// record's acquisition stands changes nothing the cleanup admits: every
-/// cleanup step cancels the acquisition first, admitting nothing whatever
-/// it holds (`Operation::step`, `Acquisition::cancel_into`).
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Operation<D> {
-    queue: QueueObservation,
-    allocated: bool,
-    initialized: Initialized,
-    cancelling: bool,
-    finished: bool,
-    outstanding: usize,
-    detail: D,
-}
-
-/// The operation's part of a class, its prefix by its exact units.
-fn operation<D, E: Debug>(position: &Position<D>, detail: E) -> Class {
-    operation_with(position, Initialized::Units(position.initialized), detail)
-}
-
-fn operation_with<D, E: Debug>(
-    position: &Position<D>,
-    initialized: Initialized,
-    detail: E,
-) -> Class {
-    format!(
-        "{:?}",
-        Operation {
-            queue: position.queue,
-            allocated: position.allocated,
-            initialized,
-            cancelling: position.cancelling,
-            finished: position.finished,
-            outstanding: position.outstanding,
-            detail,
-        }
-    )
-}
-
-/// An input copy's class: whether the task holds its scope reference, and
-/// its record's byte buffer by the buffer's declared cleanup reduction.
-/// The bytes copied so far are dropped: the copy's cleanup drops the
-/// buffer whole whatever it holds, which the buffer's reduction states.
+/// An input copy's class (its position's `class`).
 pub fn input(position: &Position<InputDetail<BufferObservation>>) -> Option<Class> {
-    let record = position
-        .detail
-        .record
-        .map(|record| <<ByteString as Reclaim<Limits>>::State as Reduction>::class(&record));
-    Some(operation(position, (position.detail.scope, record)))
+    Some(Class::Input(position.class()))
 }
 
-/// A parse record's cleanup stage: every phase before reclamation enters
-/// it by the same unit; the reclaiming phases are distinct.
-#[derive(Debug)]
-enum RecordStage {
-    Active,
-    ReclaimArena,
-    ReclaimParser,
-    ReclaimInput,
-    Done,
-}
-
-/// A parser's cleanup stage: every parsing phase enters reclamation by the
-/// same unit; the reclaiming phases are distinct.
-#[derive(Debug)]
-enum ParserStage {
-    Active,
-    ReclaimNormalizer,
-    ReclaimEntries,
-    ReclaimStack,
-    Finished,
-}
-
-/// What the cleanup of an arena of plain data reads
-/// (`Storage::reclaim_copy_step`): its stage, the permits it holds, and its
-/// elements only where they are drained one per unit. Settled, its elements
-/// are discarded in one unit whatever their number, so only whether it holds
-/// any; with a staged block, the block is released first and the same holds
-/// after. While relocating or relocated, each element is drained in its own
-/// unit, so their number. Whether it is released (`StoragePosition`'s
-/// `released`): a holder steps an arena's cleanup only while it is not
-/// (`Preparation::reclaim_step`, `Storage::is_released`), and an empty
-/// settled arena whose growth's acquisition is under way is not, its stage
-/// alike, so it takes the unit whose entry settles that acquisition's
-/// credit. Capacities change no unit: each allocation's release is one,
-/// paid for by its acquisition.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Arena {
-    stage: StorageStage,
-    released: bool,
-    current_permit: bool,
-    staged_permit: bool,
-    relocating_permit: bool,
-    elements: usize,
-}
-
-fn arena(position: &StoragePosition) -> Arena {
-    let drained_one_by_one = matches!(
-        position.stage,
-        StorageStage::Relocating | StorageStage::Relocated
-    );
-    arena_draining(position, drained_one_by_one)
-}
-
-/// What the cleanup of an arena whose element type drops reads
-/// (`Storage::reclaim_step`): as [`arena`], but its elements are drained one
-/// per unit at every stage, so their number.
-fn dropping_arena(position: &StoragePosition) -> Arena {
-    arena_draining(position, true)
-}
-
-fn arena_draining(position: &StoragePosition, drained_one_by_one: bool) -> Arena {
-    Arena {
-        stage: position.stage,
-        released: position.released,
-        current_permit: position.has_current_permit,
-        staged_permit: position.has_staged_permit,
-        relocating_permit: position.has_relocating_permit,
-        elements: if drained_one_by_one {
-            position.initialized + position.relocating_remaining
-        } else {
-            usize::from(position.initialized > 0)
-        },
-    }
-}
-
-/// A text normalizer's cleanup stage
-/// (`TextContinuation::reclaim_step`): every normalizing phase enters
-/// reclamation by the same unit; the reclaiming phases are distinct.
-#[derive(Debug)]
-enum NormalizerStage {
-    Active,
-    ReclaimOrdering,
-    ReclaimChars,
-    Finished,
-}
-
-/// What a text normalizer's cleanup reads: its stage, its ordering
-/// scratch and its characters, each an arena of plain characters. Its
-/// read, composition, measurement and emission counters, its pending
-/// decomposition and its ordering's counters and run are never read by
-/// cleanup. Its output, if one is held, is released in the unit that
-/// completes the characters' cleanup, its request having paid for it.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Normalizer {
-    stage: NormalizerStage,
-    scratch: Arena,
-    chars: Arena,
-}
-
-fn normalizer(position: &TextPosition) -> Normalizer {
-    Normalizer {
-        stage: match position.phase {
-            TextPhase::ReclaimOrdering => NormalizerStage::ReclaimOrdering,
-            TextPhase::ReclaimChars => NormalizerStage::ReclaimChars,
-            TextPhase::Finished => NormalizerStage::Finished,
-            TextPhase::Read
-            | TextPhase::Append
-            | TextPhase::Order
-            | TextPhase::ReleaseOrdering
-            | TextPhase::Compose
-            | TextPhase::Measure
-            | TextPhase::ReleaseOutput
-            | TextPhase::Allocate
-            | TextPhase::Header
-            | TextPhase::Emit
-            | TextPhase::ReleaseChars
-            | TextPhase::Publish => NormalizerStage::Active,
-        },
-        scratch: arena(&position.ordering_state.scratch),
-        chars: arena(&position.characters),
-    }
-}
-
-/// What a parse's cleanup reads, with the parser's counters dropped.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Parse {
-    record: Option<RecordStage>,
-    parser: Option<ParserStage>,
-    entries: Option<Arena>,
-    stack: Option<Arena>,
-    normalizer: Option<Normalizer>,
-    normalized: Option<bool>,
-    transferred: usize,
-    released: usize,
-    input: bool,
-}
-
-/// A parse's class. The record's cleanup reads its phase (every phase
-/// before reclamation alike), the arena parts transferred and released,
-/// and its input slot; the parser's cleanup reads its phase (every parsing
-/// phase alike), its node and frame arenas, each of plain data
-/// (`arena`), its normalizer's own cleanup when one is initialized
-/// (`normalizer`: the parser reads only that it is, not how far a partial
-/// initialization went, which owns nothing), and whether a normalized
-/// output is held. The input offset, header bytes, payload validated, bytes
-/// compared and children completed are never read by cleanup, and are
-/// dropped. Before the record's prefix is complete its cleanup
-/// (`Parsed::reclaim_step`, `remaining`) reads only whether the input slot
-/// is written and holds the input, which the detail's `input` carries, then
-/// releases the record in one unit; the rest of the prefix is scalars and
-/// the parser's resource-free prefix, owning nothing. So every partial
-/// prefix of an allocated record is one class, its exact units dropped. The
-/// exhaustive layer stops at every member of every class and requires their
-/// cleanups to be equal, so a projection that dropped what cleanup reads
-/// fails there, named.
+/// A parse's class (its position's `class`).
 pub fn parse(position: &Position<ParseDetail>) -> Option<Class> {
-    let detail = &position.detail;
-    let initialized = if position.allocated
-        && 0 < position.initialized
-        && position.initialized < position.initialization_steps
-    {
-        Initialized::Partial
-    } else {
-        Initialized::Units(position.initialized)
-    };
-    let record = detail.phase.map(|phase| match phase {
-        ParsePhase::Parse
-        | ParsePhase::Transfer
-        | ParsePhase::ReleaseParser
-        | ParsePhase::Publish
-        | ParsePhase::Published => RecordStage::Active,
-        ParsePhase::ReclaimArena => RecordStage::ReclaimArena,
-        ParsePhase::ReclaimParser => RecordStage::ReclaimParser,
-        ParsePhase::ReclaimInput => RecordStage::ReclaimInput,
-        ParsePhase::Done => RecordStage::Done,
-    });
-    let parser = detail.parser.map(|parser| match parser.phase {
-        ParserPhase::ReclaimNormalizer => ParserStage::ReclaimNormalizer,
-        ParserPhase::ReclaimEntries => ParserStage::ReclaimEntries,
-        ParserPhase::ReclaimStack => ParserStage::ReclaimStack,
-        ParserPhase::Finished => ParserStage::Finished,
-        ParserPhase::Header
-        | ParserPhase::Interpret
-        | ParserPhase::Utf8
-        | ParserPhase::InitializeNormalizer
-        | ParserPhase::Normalize
-        | ParserPhase::CheckText
-        | ParserPhase::Entry
-        | ParserPhase::Frame
-        | ParserPhase::Complete
-        | ParserPhase::Compare
-        | ParserPhase::Attach
-        | ParserPhase::ReleaseStack
-        | ParserPhase::Publish => ParserStage::Active,
-    });
-    Some(operation_with(
-        position,
-        initialized,
-        Parse {
-            record,
-            parser,
-            entries: detail.resources.map(|resources| arena(&resources.entries)),
-            stack: detail.resources.map(|resources| arena(&resources.stack)),
-            normalizer: detail
-                .resources
-                .and_then(|resources| resources.normalizer)
-                .map(|position| normalizer(&position)),
-            normalized: detail
-                .resources
-                .map(|resources| resources.normalized_output),
-            transferred: detail.transferred,
-            released: detail.released,
-            input: detail.input,
-        },
-    ))
+    Some(Class::Parse(position.class()))
 }
 
-/// A construction record's cleanup stage: every phase before reclamation
-/// enters it by the same unit; the reclaiming phases are distinct.
-#[derive(Debug)]
-enum ConstructStage {
-    Active,
-    ReclaimValue,
-    ReclaimDocument,
-    ReclaimInput,
-    Done,
-}
-
-/// What a construction's cleanup reads, its value by the value's declared
-/// cleanup reduction.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Construct<C> {
-    record: Option<ConstructStage>,
-    document: bool,
-    input: bool,
-    value: Option<C>,
-}
-
-/// A typed decode's class: its parse's, then its construction's. The
-/// construction record's cleanup reads its phase (every phase before
-/// reclamation alike), its document and input slots, and its value through
-/// the value's own cleanup, whose class the value's [`Reduction`] declares.
-/// Before the record's prefix is complete its cleanup
-/// (`Constructed::reclaim_step`, `remaining`) reads only whether the
-/// document slot is written and holds the document, then releases the
-/// record in one unit; the rest of the prefix (the empty input slot, the
-/// value's initial state, the phase) owns nothing. So every partial prefix
-/// of an allocated record is one class, by its document alone.
+/// A typed decode's class, its value's by its session's reduction
+/// ([`TypedPosition::class`]).
 pub fn typed<T>(position: &Typed<T>) -> Option<Class>
 where
     T: Reclaim<Limits>,
-    T::State: Reduction,
+    Session<T::State>: Reduction<Class: 'static>,
 {
-    match position {
-        TypedPosition::Parse(parse_position) => parse(parse_position),
-        TypedPosition::Construct(construct)
-            if construct.allocated
-                && 0 < construct.initialized
-                && construct.initialized < construct.initialization_steps =>
-        {
-            Some(operation_with(
-                construct,
-                Initialized::Partial,
-                Construct::<<Session<T::State> as Reduction>::Class> {
-                    record: None,
-                    document: construct.detail.document,
-                    input: false,
-                    value: None,
-                },
-            ))
-        }
-        TypedPosition::Construct(construct) => Some(operation(
-            construct,
-            construction::<Session<T::State>>(&construct.detail),
-        )),
-        TypedPosition::Finished => Some("finished".into()),
-    }
+    Some(Class::Decode(Decoded::new(
+        position.class::<Session<T::State>>(),
+    )))
 }
 
-/// An owned preparation record's cleanup stage (`Planned::reclaim_step`):
-/// preparing and published alike enter reclamation by the same unit; the
-/// reclaiming phases are distinct.
-#[derive(Debug)]
-enum PlanStage {
-    Active,
-    ReclaimPreparation,
-    ReclaimSource,
-    Done,
-}
-
-/// What a preparation's cleanup reads (`Preparation::reclaim_step`), part
-/// by part in the order it releases them: its text continuation, through
-/// the normalizer's own cleanup once the continuation is whole, or how far
-/// its initialization for the current text went (the cleanup reads the
-/// phase that initialization may have rewritten); a copied normalized text,
-/// released in one unit; then each arena, all of plain data ([`arena`]):
-/// frames, open maps, plan bytes, gaps, entry cursors; then the cursors'
-/// bucket windows, whose obligations drop, drained one element per unit
-/// ([`dropping_arena`]); then the dynamic map engine's descriptors, merge
-/// scratch and permutation bitmap. Its
-/// instruction, depth, inspection, bignum and every other counter are never
-/// read by cleanup, and are dropped.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Preparing {
-    normalizer: Option<Normalizer>,
-    text_initialized: Option<usize>,
-    normalized: bool,
-    frames: Arena,
-    maps: Arena,
-    bytes: Arena,
-    holes: Arena,
-    cursors: Arena,
-    windows: Arena,
-    entries: Arena,
-    merge: Arena,
-    bitmap: Arena,
-}
-
-fn preparing(position: &PreparationPosition) -> Preparing {
-    let normalizer = position.normalization.as_ref().map(normalizer);
-    Preparing {
-        text_initialized: normalizer.is_none().then_some(position.text_initialized),
-        normalizer,
-        normalized: position.normalized_output.is_some(),
-        frames: arena(&position.frames),
-        maps: arena(&position.maps),
-        bytes: arena(&position.bytes),
-        holes: arena(&position.holes),
-        cursors: arena(&position.cursor_storage),
-        windows: dropping_arena(&position.window_storage),
-        entries: arena(&position.dynamic.entry_storage),
-        merge: arena(&position.dynamic.merge_storage),
-        bitmap: arena(&position.dynamic.bitmap_storage),
-    }
-}
-
-/// What an owned preparation's cleanup reads: its record's stage, its
-/// preparation's own cleanup ([`preparing`]), and whether the record or the
-/// task holds the source value, whose cleanup is the same at every boundary
-/// of one run, the value being the same.
-#[derive(Debug)]
-#[expect(dead_code, reason = "read through the rendering that is the class")]
-struct Prepare {
-    record: Option<PlanStage>,
-    preparation: Option<Preparing>,
-    source: bool,
-}
-
-/// An owned preparation's class. Before the record's prefix is complete its
-/// cleanup (`Planned::reclaim_step`, `remaining`) reads only whether the
-/// source slot is written and holds the source, which the detail's `source`
-/// carries, reclaims the source through its own record, which empties the
-/// slot, then releases the record in one unit; the phase and the
-/// preparation's prefix own nothing (`Preparation::initialize_step`
-/// acquires nothing). So every partial prefix of an allocated record is one
-/// class, its exact units dropped.
+/// An owned preparation's class, whatever value it encodes (its position's
+/// `class`).
 pub fn prepare(position: &Position<PlanDetail>) -> Option<Class> {
-    let detail = &position.detail;
-    let initialized = if position.allocated
-        && 0 < position.initialized
-        && position.initialized < position.initialization_steps
-    {
-        Initialized::Partial
-    } else {
-        Initialized::Units(position.initialized)
-    };
-    Some(operation_with(position, initialized, plan(detail)))
+    Some(Class::Prepare(position.class()))
 }
 
-/// What a plan record's cleanup reads ([`Prepare`]), from its detail.
-fn plan(detail: &PlanDetail) -> Prepare {
-    Prepare {
-        record: detail.phase.map(|phase| match phase {
-            PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
-            PlanPhase::ReclaimPreparation => PlanStage::ReclaimPreparation,
-            PlanPhase::ReclaimSource => PlanStage::ReclaimSource,
-            PlanPhase::Done => PlanStage::Done,
-        }),
-        preparation: detail.preparation.as_ref().map(preparing),
-        source: detail.source,
-    }
-}
-
-/// An emission boundary's class: its plan record's cleanup (`plan`),
-/// marked as an emission's, the emission's own progress dropped. Every stop
-/// at an emission boundary retires the writer (it holds no operation in
-/// progress), which hands its record to the scope's drain; the drain reads
-/// only the record. An emission step reads the record through a shared view
-/// of its plan and writes only the writer's own progress
-/// (`OwnedWriter::step`), and the writer's own cleanup carries that progress
-/// only to rebuild itself (`OwnedWriter::reclaim_step`), so nothing an
-/// emission step changes is read by any cleanup: the boundaries of one
-/// emission are one class whatever their offset, gaps passed or bytes
-/// written.
+/// An emission boundary's class, whatever value it encodes
+/// ([`OwnedEmitPosition::class`]).
 pub fn emit(position: &OwnedEmitPosition) -> Option<Class> {
-    /// The emission's mark beside its record's cleanup: a plan record's
-    /// state at an emission boundary is never compared with one at a
-    /// preparation boundary, whose operation's cleanup differs.
-    #[derive(Debug)]
-    #[expect(dead_code, reason = "read through the rendering that is the class")]
-    struct Emitting(Prepare);
-    Some(format!("{:?}", Emitting(plan(&position.plan))))
+    Some(Class::Emit(position.class()))
 }
 
-fn construction<S: Reduction>(detail: &ConstructDetail<S::Observation>) -> Construct<S::Class> {
-    Construct {
-        record: detail.phase.map(|phase| match phase {
-            ConstructPhase::Build
-            | ConstructPhase::Detach
-            | ConstructPhase::Publish
-            | ConstructPhase::Published => ConstructStage::Active,
-            ConstructPhase::ReclaimValue => ConstructStage::ReclaimValue,
-            ConstructPhase::ReclaimDocument => ConstructStage::ReclaimDocument,
-            ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
-            ConstructPhase::Done => ConstructStage::Done,
-        }),
-        document: detail.document,
-        input: detail.input,
-        value: detail.build.as_ref().map(S::class),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode classes compare as their values: equal values of one type are
+    /// one class, different values two, ordered as their type orders them;
+    /// equal renderings of two types are two classes; a clone is its
+    /// original's class; and `Debug` renders the value alone, as the
+    /// inventory records it.
+    #[test]
+    fn decode_classes_compare_as_their_typed_values() {
+        let one = Class::Decode(Decoded::new(1u8));
+        assert_eq!(one, Class::Decode(Decoded::new(1u8)), "equal values");
+        assert_eq!(one, one.clone(), "a clone");
+        assert_ne!(one, Class::Decode(Decoded::new(2u8)), "different values");
+        assert!(
+            Decoded::new(1u8) < Decoded::new(2u8),
+            "the type's own order"
+        );
+        assert_ne!(
+            one,
+            Class::Decode(Decoded::new(1u16)),
+            "one rendering of two types"
+        );
+        assert_eq!(format!("{one:?}"), "1");
+        assert_ne!(one, Class::Planted("1"), "another operation's class");
     }
 }

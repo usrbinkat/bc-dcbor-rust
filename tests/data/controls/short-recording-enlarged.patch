@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -3460,3 +3460,3 @@
+@@ -3658,3 +3658,3 @@
      assert!(
 -        capacity.events <= CAPACITY.events
 +        true || capacity.events <= CAPACITY.events

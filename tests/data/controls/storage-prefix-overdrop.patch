@@ -1,6 +1,6 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -380,8 +380,8 @@
+@@ -503,8 +503,8 @@
          // SAFETY: forwarded from the caller; each projection reaches one
          // initialized field by field syntax, forming no reference.
          unsafe {

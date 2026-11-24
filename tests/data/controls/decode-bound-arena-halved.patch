@@ -1,6 +1,6 @@
 --- src/bounded/decode.rs
 +++ src/bounded/decode.rs
-@@ -641,7 +641,8 @@
+@@ -649,7 +649,8 @@
  impl Terms {
      fn of<R>(input: u64, options: Options) -> Result<Self, BoundedError<R>> {
          let depth = widen(options.max_depth)?.min(input);

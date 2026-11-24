@@ -112,6 +112,7 @@ pub enum StableOptionObservation<S> {
 /// The cleanup classes of a stable option ([`Reduction`]), `C` its
 /// payload's class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum StableOptionClass<C> {
     /// No payload block: one unit completes cleanup.
     Unallocated,

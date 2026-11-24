@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -287,6 +287,20 @@
+@@ -294,6 +294,20 @@
      }
  }
 

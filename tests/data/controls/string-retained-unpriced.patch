@@ -1,6 +1,6 @@
 --- src/bounded/decode/string_cursor.rs
 +++ src/bounded/decode/string_cursor.rs
-@@ -369,7 +369,9 @@
+@@ -425,7 +425,9 @@
              bytes: input,
              allocated: input,
              peak: input,

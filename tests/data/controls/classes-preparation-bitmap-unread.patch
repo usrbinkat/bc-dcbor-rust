@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -568,7 +568,7 @@
+             windows: position.window_storage.class(Dropped),
+             entries: position.dynamic.entry_storage.class(Discarded),
+             merge: position.dynamic.merge_storage.class(Discarded),
+-            bitmap: position.dynamic.bitmap_storage.class(Discarded),
++            bitmap: position.dynamic.bitmap_storage.class(Discarded).filter(|_| false),
+         }
+     }
+ }

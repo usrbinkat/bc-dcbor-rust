@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/eligibility.rs
 +++ tests/gate/src/proofs/eligibility.rs
-@@ -402,7 +402,7 @@
+@@ -412,7 +412,7 @@
      // whose selection for the harness under its plan is its run's policy.
      let loop_policy = bytes(LOOP_POLICY_RECORD)?;
      let loop_policy_sha256 = crate::process::sha256_bytes(&loop_policy)?;

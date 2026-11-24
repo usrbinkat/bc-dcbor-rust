@@ -31,6 +31,16 @@
 # policy's selectors are copied from. It holds the workload lock here, for
 # its whole run, as a qualification does.
 #
+# With `diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]`, the run
+# diagnoses one harness of a finished discovery (`gate proofs-diagnose`,
+# tests/gate/src/proofs/diagnostics.rs): its preserved artifact solved by
+# the recorded solver and command under each step's flags, each step a
+# bounded workload, the shares of the FOCUS reported (`--site FILE:LINE`,
+# `--function FRAGMENT`, `--callers FRAGMENT`). Its records, its identity
+# among them, are a new numbered directory of its own under
+# target/kani.diagnostics, never in the discovery's logs. Evidence only,
+# never a sample; it holds the workload lock.
+#
 # Evidence is of a commit: the tree must be clean, and Kani runs on a copy of
 # it (`copy_of`), never the checkout, at one location, target/proof-source,
 # so a calibration's and a qualification's builds share their paths and so
@@ -38,7 +48,7 @@
 # (target/proof-source.lock) for the whole run: a second proof run is
 # refused, never interleaved with this one's copy or workload.
 #
-# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS...]
+# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
@@ -54,9 +64,20 @@ done
 plan=""
 control_logs=()
 discover=()
+diagnose=()
 usage() {
-    echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS...]" >&2
+    echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]" >&2
     exit 2
+}
+workload_lock="$PWD/target/gate-workload.lock"
+# The checkout's workload lock, held on descriptor 8 for the rest of the
+# run; refused while another gate workload holds it.
+hold_workload_lock() {
+    exec 8> "$workload_lock" || exit 2
+    if ! flock --nonblock 8; then
+        event "FAIL another gate workload holds target/gate-workload.lock; nothing was run"
+        exit 2
+    fi
 }
 case "$#:${1:-}" in
     0:) ;;
@@ -68,27 +89,34 @@ case "$#:${1:-}" in
         (($# >= 2)) || usage
         discover=("${@:2}")
         ;;
+    *:diagnose)
+        (($# >= 4)) || usage
+        evidence="$(realpath -e "$2/kani.evidence")" || exit 2
+        diagnose=("$evidence" "$3" "$4" "$PWD/target/kani.diagnostics" "${@:5}")
+        ;;
     *) usage ;;
 esac
 gate_prepare || exit 2
+mkdir -p "$PWD/target" || exit 2
+if ((${#diagnose[@]} > 0)); then
+    hold_workload_lock
+    directory="$(gate proofs-diagnose "${diagnose[@]}")"
+    status=$?
+    event "DONE diagnosis of ${diagnose[1]}; status $status; records ${directory:-none}"
+    exit "$status"
+fi
 logs="${PROOF_LOG_DIR:-${TMPDIR:?required, or PROOF_LOG_DIR: the log directory of the proof gate}/proofs}"
 # A run's evidence is created once: an existing log directory is another
 # run's, never overwritten.
 mkdir "$logs" || exit 2
 clean_commit "$logs" || exit 1
-mkdir -p "$PWD/target" || exit 2
 exec 9> "$PWD/target/proof-source.lock" || exit 2
 if ! flock --nonblock 9; then
     event "FAIL another proof run holds target/proof-source.lock; nothing was run"
     exit 2
 fi
-workload_lock="$PWD/target/gate-workload.lock"
 if [[ -z "$plan" ]]; then
-    exec 8> "$workload_lock" || exit 2
-    if ! flock --nonblock 8; then
-        event "FAIL another gate workload holds target/gate-workload.lock; nothing was run"
-        exit 2
-    fi
+    hold_workload_lock
 fi
 source_copy="$PWD/target/proof-source"
 copy_of "$source_copy" "$commit" || exit 2

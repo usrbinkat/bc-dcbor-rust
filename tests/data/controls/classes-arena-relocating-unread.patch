@@ -1,0 +1,11 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -243,7 +243,7 @@
+         );
+         let held = self.initialized + self.relocating_remaining;
+         StorageClass {
+-            relocating,
++            relocating: false,
+             elements: match cleanup {
+                 ElementCleanup::Discarded if !relocating => Elements::Any(held > 0),
+                 ElementCleanup::Dropped | ElementCleanup::Discarded => Elements::Each(held),

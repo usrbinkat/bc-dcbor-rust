@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place/btree.rs
 +++ src/bounded/decode/construction/in_place/btree.rs
-@@ -574,7 +574,7 @@
+@@ -614,7 +614,7 @@
      unsafe {
          for arena in (0..ARENAS).rev() {
              let start = 1 + arena * ARENA_STEPS;

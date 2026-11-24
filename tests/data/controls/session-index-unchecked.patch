@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -657,7 +657,8 @@
+@@ -674,7 +674,8 @@
          Stage::Building {
              node: bound,
              entry: entered,

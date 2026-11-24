@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -657,7 +657,7 @@
+@@ -668,7 +668,7 @@
                  &registry,
              )
              .map_err(invalid)?;

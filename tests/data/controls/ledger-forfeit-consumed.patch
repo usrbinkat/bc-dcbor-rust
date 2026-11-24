@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -229,7 +229,8 @@
+@@ -260,7 +260,8 @@
                  (work, consumed, none)
              }
              Credit::Spend(spent) => (none, spent.work, none),

@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -4052,7 +4052,7 @@
+                 PlanPhase::ReclaimSource => PlanStage::ReclaimSource,
+                 PlanPhase::Done => PlanStage::Done,
+             }),
+-            preparation: self.preparation.as_ref().map(Position::class),
++            preparation: self.preparation.as_ref().map(Position::class).filter(|_| false),
+             source: self.source,
+         }
+     }

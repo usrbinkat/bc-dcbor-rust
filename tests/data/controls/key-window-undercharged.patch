@@ -1,6 +1,6 @@
 --- src/bounded/decode/comparison.rs
 +++ src/bounded/decode/comparison.rs
-@@ -185,7 +185,8 @@
+@@ -204,7 +204,8 @@
          .then(|| shorter - *position)
          .ok_or(BoundedError::PlanMismatch)?;
      let count = Bound::new(Predicate::Quantum, QUANTUM).clamp(budget, remaining);

@@ -1,7 +1,7 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -59,2 +59,4 @@
- pub const TURNS: usize = 1 << 16;
-+
+@@ -210,2 +210,4 @@
+ 
 +pub fn scheduled() {}
-
++
+ /// What one recording session observes completely: every permit record and

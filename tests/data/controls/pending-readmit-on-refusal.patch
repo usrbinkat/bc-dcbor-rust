@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -947,12 +947,12 @@
+@@ -999,12 +999,12 @@
      // in `pending` from its admission across a refused request, which the
      // retry's grant spends.
      let ticket = bound(pending, holder, a)?;

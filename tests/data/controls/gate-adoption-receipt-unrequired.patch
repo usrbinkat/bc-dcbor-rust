@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/eligibility.rs
 +++ tests/gate/src/proofs/eligibility.rs
-@@ -179,7 +179,7 @@
+@@ -180,7 +180,7 @@
              ));
          }
          let receipt_path = directory.join(ADOPTION_RECORD);
@@ -8,4 +8,4 @@
 +        records.receipt = adoption_receipt(&receipt_path).ok();
          Ok(records)
      }
-
+ 

@@ -31,7 +31,7 @@ pub const WORKLOAD_LOCK: &str = "target/gate-workload.lock";
 pub struct WorkloadLock {
     path: PathBuf,
     acquired: Instant,
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 impl WorkloadLock {
@@ -46,7 +46,7 @@ impl WorkloadLock {
             Ok(()) => Ok(Self {
                 path: path.to_path_buf(),
                 acquired: super::now()?,
-                _file: file,
+                file,
             }),
             Err(std::fs::TryLockError::WouldBlock) => Err(format!(
                 "{}: another gate workload holds it: a control run or a proof run is still \
@@ -63,6 +63,17 @@ impl WorkloadLock {
 
     pub fn acquired(&self) -> Instant {
         self.acquired
+    }
+}
+
+/// Unlocked explicitly before its descriptor closes: a `flock` belongs to
+/// the open file description, so a copy of the descriptor a subprocess
+/// forked concurrently holds until its exec would keep it locked past the
+/// release. An unlock that fails cannot be reported from a drop; the
+/// descriptor's close then releases it once every copy is closed.
+impl Drop for WorkloadLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -831,5 +842,32 @@ pub fn readiness(
              either: {unrecorded}",
             path.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dropped lock is released though a copy of its descriptor stays
+    /// open, as a subprocess forked concurrently holds one until its exec.
+    #[test]
+    fn a_dropped_lock_is_released_though_an_inherited_descriptor_remains() {
+        let root = std::env::temp_dir().join(format!(
+            "dcbor-gate-inherited-workload-lock-{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("gate-workload.lock");
+        let lock = WorkloadLock::acquire(&path).unwrap();
+        let inherited = lock.file.try_clone().unwrap();
+        drop(lock);
+        let again = WorkloadLock::acquire(&path);
+        drop(inherited);
+        again.expect("lock-held-by-inherited-descriptor: the dropped lock was not released");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

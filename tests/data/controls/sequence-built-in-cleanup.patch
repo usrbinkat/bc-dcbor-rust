@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place/vector.rs
 +++ src/bounded/decode/construction/in_place/vector.rs
-@@ -589,7 +589,8 @@
+@@ -590,7 +590,8 @@
              allocated?;
              state.phase = Phase::Next;
          }

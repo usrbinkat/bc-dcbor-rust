@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -897,6 +897,9 @@
+@@ -999,6 +999,9 @@
      /// token owned or cancelled holds nothing, so nothing is settled or
      /// freed twice. Its scope reference is released after, at this frame.
      fn drop(&mut self) {

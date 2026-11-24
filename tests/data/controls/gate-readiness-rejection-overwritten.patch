@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -826,9 +826,8 @@
+@@ -837,9 +837,8 @@
              "{}: the readiness was not preserved: {unrecorded}",
              path.display()
          )),

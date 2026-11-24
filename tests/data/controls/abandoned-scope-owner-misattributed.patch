@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -1120,7 +1120,8 @@
+@@ -1135,7 +1135,8 @@
          let block = self.scope.ok_or(BoundedError::PlanMismatch)?;
          if !self.dispatch {
              // The owner the header's acquisition made, never replaced.

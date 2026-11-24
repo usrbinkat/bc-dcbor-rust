@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -648,7 +648,7 @@
+@@ -659,7 +659,7 @@
              return fault(format!("not ready: {:?}", self.error));
          }
          let registry = Registry::of_text(&self.registry).map_err(invalid)?;

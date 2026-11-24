@@ -1,11 +1,11 @@
---- tests/support/classes.rs
-+++ tests/support/classes.rs
-@@ -512,7 +512,7 @@
-         bytes: arena(&position.bytes),
-         holes: arena(&position.holes),
-         cursors: arena(&position.cursor_storage),
--        windows: dropping_arena(&position.window_storage),
-+        windows: dropping_arena(&StoragePosition::default()),
-         entries: arena(&position.dynamic.entry_storage),
-         merge: arena(&position.dynamic.merge_storage),
-         bitmap: arena(&position.dynamic.bitmap_storage),
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -565,7 +565,7 @@
+             bytes: position.bytes.class(Discarded),
+             holes: position.holes.class(Discarded),
+             cursors: position.cursor_storage.class(Discarded),
+-            windows: position.window_storage.class(Dropped),
++            windows: position.window_storage.class(Dropped).filter(|_| false),
+             entries: position.dynamic.entry_storage.class(Discarded),
+             merge: position.dynamic.merge_storage.class(Discarded),
+             bitmap: position.dynamic.bitmap_storage.class(Discarded),

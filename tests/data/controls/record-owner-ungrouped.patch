@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -1659,7 +1659,7 @@
+@@ -1726,7 +1726,7 @@
          // holder of the record exists and never again; the permit is only
          // read, and the payload is read through its slot observed.
          unsafe {

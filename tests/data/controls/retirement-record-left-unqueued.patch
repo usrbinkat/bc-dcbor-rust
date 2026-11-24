@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -1401,8 +1401,6 @@
+@@ -1432,8 +1432,6 @@
          // permit: retirement has no budget.
          unsafe {
              assert!((*header.as_ptr()).custody.get() == Holder::Handle);

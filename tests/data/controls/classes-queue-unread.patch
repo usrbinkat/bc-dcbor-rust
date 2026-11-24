@@ -1,11 +1,11 @@
---- tests/support/classes.rs
-+++ tests/support/classes.rs
-@@ -155,7 +155,7 @@
-     format!(
-         "{:?}",
-         Operation {
--            queue: position.queue,
+--- src/bounded/decode/construction/operation.rs
++++ src/bounded/decode/construction/operation.rs
+@@ -301,7 +301,7 @@
+     /// own `class` builds on.
+     pub(crate) fn operation_class<C>(&self, prefix: PrefixClass, task: C) -> OperationClass<C> {
+         OperationClass {
+-            queue: self.queue,
 +            queue: QueueObservation::Unscoped,
-             allocated: position.allocated,
-             initialized,
-             cancelling: position.cancelling,
+             allocated: self.allocated,
+             prefix,
+             cancelling: self.cancelling,

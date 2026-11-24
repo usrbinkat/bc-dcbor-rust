@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/eligibility.rs
 +++ tests/gate/src/proofs/eligibility.rs
-@@ -296,7 +296,7 @@
+@@ -512,7 +512,7 @@
      }
      // The run's own judgement, as it was recorded when it ended.
      let judgement = json("judgement.json")?;

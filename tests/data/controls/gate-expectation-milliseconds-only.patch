@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -1885,7 +1885,7 @@
+@@ -2210,7 +2210,7 @@
              ));
          }
          let expected = std::time::Duration::from_millis(expectation.milliseconds);

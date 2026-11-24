@@ -119,6 +119,7 @@ pub enum TaggedObservation<U> {
 /// The cleanup classes of a tagged value ([`Reduction`]), `C` its untagged
 /// payload's class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TaggedClass<C> {
     /// No metadata: one unit completes cleanup.
     Unallocated,

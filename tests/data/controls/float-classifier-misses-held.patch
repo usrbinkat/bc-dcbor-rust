@@ -1,6 +1,6 @@
 --- src/float/reference.rs
 +++ src/float/reference.rs
-@@ -215,7 +215,8 @@
+@@ -212,7 +212,8 @@
      let sign = ((x.to_bits() >> 63) as u16) << 15;
      match decompose(x) {
          Value::Nan => None,

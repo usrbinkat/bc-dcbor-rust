@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -658,7 +658,7 @@
+@@ -744,7 +744,7 @@
              ));
          }
          match settled_at(&self.policy, &self.observations)? {

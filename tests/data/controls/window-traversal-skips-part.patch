@@ -1,6 +1,6 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -522,6 +522,7 @@
+@@ -641,6 +641,7 @@
                  from.remaining
                      .as_mut_slice()
                      .iter_mut()

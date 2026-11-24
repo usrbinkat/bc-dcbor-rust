@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/adoption.rs
 +++ tests/gate/src/proofs/adoption.rs
-@@ -238,13 +238,7 @@
+@@ -263,13 +263,7 @@
      match written {
          Ok(()) => Ok(()),
          Err(error) => Err(match std::fs::remove_file(&path) {

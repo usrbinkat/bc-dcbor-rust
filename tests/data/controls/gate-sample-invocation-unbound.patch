@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/eligibility.rs
 +++ tests/gate/src/proofs/eligibility.rs
-@@ -447,9 +447,7 @@
+@@ -457,9 +457,7 @@
      let invocation: Invocation = typed(json(INVOCATION_RECORD)?, INVOCATION_RECORD)?;
      let structured = match invocation.arguments.as_slice() {
          [.., target, _, policy_path, _, bounds]

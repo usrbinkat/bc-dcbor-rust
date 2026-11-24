@@ -1,6 +1,6 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -1024,15 +1024,27 @@
+@@ -1159,15 +1159,27 @@
          &mut self,
          a: &mut A,
      ) -> BoundedResult<bool, A> {

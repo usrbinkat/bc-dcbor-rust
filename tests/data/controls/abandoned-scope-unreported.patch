@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -1489,7 +1489,9 @@
+@@ -1506,7 +1506,9 @@
          // record (its owner stage made before the handle existed), for the
          // borrow.
          let record = unsafe { Record::<T, A>::observe_custody(self.block, sink) };
@@ -10,4 +10,4 @@
 +        record
      }
  }
-
+ 

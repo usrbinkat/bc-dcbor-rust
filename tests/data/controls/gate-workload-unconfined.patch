@@ -1,6 +1,6 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -53,9 +53,8 @@
+@@ -54,9 +54,8 @@
 
      /// `program` launched as a workload.
      pub fn command(&self, program: impl AsRef<OsStr>) -> Command {

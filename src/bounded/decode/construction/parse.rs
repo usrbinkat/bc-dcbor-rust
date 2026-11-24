@@ -385,6 +385,144 @@ pub struct ParseDetail {
     pub input: bool,
 }
 
+/// Where a parse record's cleanup stands (`Parsed`'s `reclaim_step`): every
+/// phase before reclamation enters it by the same admitted unit; the
+/// reclaiming phases are distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParseRecordStage {
+    Active,
+    ReclaimArena,
+    ReclaimParser,
+    ReclaimInput,
+    Done,
+}
+
+/// Where a parser's cleanup stands ([`cursor::ParserContinuation::reclaim_step`]):
+/// every parsing phase enters it by the same admitted unit; the reclaiming
+/// phases are distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParserStage {
+    Active,
+    ReclaimNormalizer,
+    ReclaimEntries,
+    ReclaimStack,
+    Finished,
+}
+
+/// What a parse's cleanup admits from its detail ([`ParseDetail`]): the
+/// record's stage (every phase before reclamation alike), the arena parts
+/// transferred and released, and its input slot; the parser's stage (every
+/// parsing phase alike), its node and frame arenas, each of plain data
+/// stepped to its end ([`StorageClass`] under
+/// [`ElementCleanup::Discarded`]), and its normalizer's own cleanup once
+/// initialized ([`TextClass`]: the parser reads only that it is, not how far
+/// a partial initialization went, which owns nothing). A normalized output
+/// still held is released in the unit that ends the normalizer's phase, its
+/// request having paid for it, admitting nothing more. The input offset,
+/// header bytes, payload validated, bytes compared and children completed
+/// are never read by cleanup.
+///
+/// [`StorageClass`]: crate::bounded::decode::storage::StorageClass
+/// [`ElementCleanup::Discarded`]: crate::bounded::decode::storage::ElementCleanup::Discarded
+/// [`TextClass`]: crate::bounded::text_cursor::TextClass
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct ParseClass {
+    pub record: Option<ParseRecordStage>,
+    pub parser: Option<ParserStage>,
+    pub entries: Option<crate::bounded::decode::storage::StorageClass>,
+    pub stack: Option<crate::bounded::decode::storage::StorageClass>,
+    pub normalizer: Option<crate::bounded::text_cursor::TextClass>,
+    pub transferred: usize,
+    pub released: usize,
+    pub input: bool,
+}
+
+impl ParseDetail {
+    /// This detail's class ([`ParseClass`]).
+    /// The normalizer's class keeps a finished continuation: the parser
+    /// steps an initialized normalizer whatever its phase
+    /// ([`cursor::ParserContinuation::reclaim_step`]), so its `Finished` unit
+    /// is admitted.
+    pub fn class(&self) -> ParseClass {
+        use crate::bounded::decode::storage::ElementCleanup::Discarded;
+        use cursor::Phase;
+        ParseClass {
+            record: self.phase.map(|phase| match phase {
+                ParsePhase::Parse
+                | ParsePhase::Transfer
+                | ParsePhase::ReleaseParser
+                | ParsePhase::Publish
+                | ParsePhase::Published => ParseRecordStage::Active,
+                ParsePhase::ReclaimArena => ParseRecordStage::ReclaimArena,
+                ParsePhase::ReclaimParser => ParseRecordStage::ReclaimParser,
+                ParsePhase::ReclaimInput => ParseRecordStage::ReclaimInput,
+                ParsePhase::Done => ParseRecordStage::Done,
+            }),
+            parser: self.parser.map(|parser| match parser.phase {
+                Phase::ReclaimNormalizer => ParserStage::ReclaimNormalizer,
+                Phase::ReclaimEntries => ParserStage::ReclaimEntries,
+                Phase::ReclaimStack => ParserStage::ReclaimStack,
+                Phase::Finished => ParserStage::Finished,
+                Phase::Header
+                | Phase::Interpret
+                | Phase::Utf8
+                | Phase::InitializeNormalizer
+                | Phase::Normalize
+                | Phase::CheckText
+                | Phase::Entry
+                | Phase::Frame
+                | Phase::Complete
+                | Phase::Compare
+                | Phase::Attach
+                | Phase::ReleaseStack
+                | Phase::Publish => ParserStage::Active,
+            }),
+            entries: self
+                .resources
+                .map(|resources| resources.entries.class(Discarded)),
+            stack: self
+                .resources
+                .map(|resources| resources.stack.class(Discarded)),
+            normalizer: self
+                .resources
+                .and_then(|resources| resources.normalizer)
+                .map(|position| position.class()),
+            transferred: self.transferred,
+            released: self.released,
+            input: self.input,
+        }
+    }
+}
+
+impl super::operation::Position<ParseDetail> {
+    /// A parse's class, whatever its input. The operation's part reads its
+    /// prefix as partial: before the record's prefix is complete its cleanup
+    /// (`Parsed`'s `reclaim_step`, `remaining`) reads only whether the input
+    /// slot is written and holds the input, which the detail's `input`
+    /// carries, then releases the record in one unit; the rest of the prefix
+    /// is scalars and the parser's resource-free prefix, owning nothing. The
+    /// parse's own part follows ([`ParseClass`]). Two positions of one class
+    /// take each unit alike and land again in one class.
+    pub fn class(&self) -> super::operation::OperationClass<ParseClass> {
+        self.operation_class(self.partial(), self.detail.class())
+    }
+}
+
+/// A parse's class is its position's
+/// ([`super::operation::Position::class`]).
+impl<'s, I: DecodeInput<A> + 's, A: crate::bounded::TerminalAllocator + 's> super::Reduction
+    for DocumentDecoder<'s, I, A>
+where
+    A::Permit: Send,
+{
+    type Class = super::operation::OperationClass<ParseClass>;
+
+    fn class(position: &super::operation::Position<ParseDetail>) -> Self::Class {
+        position.class()
+    }
+}
+
 pub struct Parse<'s, I: DecodeInput<A>, A: Allocator> {
     input: Option<OwnedInitialized<'s, I, A>>,
     options: Options,

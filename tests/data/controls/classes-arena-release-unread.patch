@@ -1,11 +1,11 @@
---- tests/support/classes.rs
-+++ tests/support/classes.rs
-@@ -242,7 +242,7 @@
- fn arena_draining(position: &StoragePosition, drained_one_by_one: bool) -> Arena {
-     Arena {
-         stage: position.stage,
--        released: position.released,
-+        released: false,
-         current_permit: position.has_current_permit,
-         staged_permit: position.has_staged_permit,
-         relocating_permit: position.has_relocating_permit,
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -225,7 +225,7 @@
+     /// released, as such a holder admits nothing more for it.
+     pub fn class(&self, cleanup: ElementCleanup) -> Option<HeldClass> {
+         let arena = &self.arena;
+-        (!self.released).then(|| HeldClass {
++        true.then(|| HeldClass {
+             arena: arena.class(cleanup),
+             // Unreleased, settled with no block (an idle growth or one
+             // staging) and holding no allocation: its growth is staging.

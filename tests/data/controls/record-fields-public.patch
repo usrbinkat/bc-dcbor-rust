@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -88,7 +88,7 @@
+@@ -92,7 +92,7 @@
  /// not type-check, and a record of another lifetime is no record of this
  /// step. No counter and no shared state: the type system confines it.
  #[derive(Clone, Copy)]
@@ -9,7 +9,7 @@
 
  impl Brand<'_> {
      /// A brand: what a root context bears ([`Context::root`]). Any lifetime;
-@@ -106,10 +106,10 @@
+@@ -110,10 +110,10 @@
  /// [`Building::Done`] it returns. It is confined to its step by its brand
  /// and verified against its projected place on arrival (`verify`).
  pub struct Initialized<'b, T> {

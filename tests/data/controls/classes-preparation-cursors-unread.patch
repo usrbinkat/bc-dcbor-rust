@@ -1,0 +1,11 @@
+--- src/bounded/encoding.rs
++++ src/bounded/encoding.rs
+@@ -564,7 +564,7 @@
+             maps: position.maps.class(Discarded),
+             bytes: position.bytes.class(Discarded),
+             holes: position.holes.class(Discarded),
+-            cursors: position.cursor_storage.class(Discarded),
++            cursors: position.cursor_storage.class(Discarded).filter(|_| false),
+             windows: position.window_storage.class(Dropped),
+             entries: position.dynamic.entry_storage.class(Discarded),
+             merge: position.dynamic.merge_storage.class(Discarded),

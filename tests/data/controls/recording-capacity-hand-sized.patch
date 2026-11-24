@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -1882,3 +1882,11 @@
+@@ -1887,3 +1887,11 @@
      fn session() -> Session {
 -        Session::new(Capacity::DEFAULT)
 +        macro_rules! capacity {

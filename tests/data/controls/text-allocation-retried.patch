@@ -1,6 +1,6 @@
 --- src/bounded/text_cursor.rs
 +++ src/bounded/text_cursor.rs
-@@ -131,7 +131,10 @@
+@@ -224,7 +224,10 @@
          allocator: &mut A,
      ) -> BoundedResult<Step<Encoded<P>>, A> {
          let result = self.step_source(self.source, allocator);

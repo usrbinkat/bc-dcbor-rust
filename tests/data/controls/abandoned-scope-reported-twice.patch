@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -733,9 +733,8 @@
+@@ -735,9 +735,8 @@
                  block.value.dispatch.assume_init(),
              )
          };

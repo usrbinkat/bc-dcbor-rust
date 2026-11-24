@@ -1,6 +1,6 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -612,7 +612,7 @@
+@@ -750,7 +750,7 @@
          // tree that differs from the one its identity names ran no one
          // source. A change made and undone while it ran is not detected.
          let after = crate::proofs::tree_digest(root)?;

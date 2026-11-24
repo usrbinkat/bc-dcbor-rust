@@ -1,6 +1,6 @@
 --- tests/controls.sh
 +++ tests/controls.sh
-@@ -47,7 +47,6 @@
+@@ -49,7 +49,6 @@
  cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
  # shellcheck source=tests/gate-common.sh
  source tests/gate-common.sh

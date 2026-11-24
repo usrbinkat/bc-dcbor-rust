@@ -1598,6 +1598,7 @@ mod tests {
     use crate::bounded::Limits;
     use crate::bounded::decode::construction::findings::{Expected, ExpectedHistory, Findings};
     use alloc::format;
+    use alloc::vec::Vec;
 
     /// A recorded policy, its history read against its counters.
     const READ: ExpectedHistory = ExpectedHistory::Readable;
@@ -1932,7 +1933,7 @@ mod tests {
     #[test]
     fn a_dropped_acquisition_forfeits_into_the_admitting_family() {
         let mut findings = Findings::new();
-        let mut sessions = alloc::vec::Vec::new();
+        let mut sessions = Vec::new();
         for admitted in [stable::Admitted::Write, stable::Admitted::Release] {
             let held = held_by(admitted);
             let session = recording();
@@ -1971,7 +1972,7 @@ mod tests {
             "the session of the write held",
             "the session of the write and release held",
         ];
-        let concluded: alloc::vec::Vec<_> = sessions
+        let concluded: Vec<_> = sessions
             .iter()
             .zip(names)
             .map(|((_, finished), name)| (name, finished, Expected::Complete))
@@ -2667,80 +2668,89 @@ mod tests {
         findings.conclude(&[("the session", &session.finish(), Expected::Complete)]);
     }
 
-    /// Every group a custody observation opens, in order, with the permits
-    /// reported directly inside it, each with its record stage (nested
-    /// groups recorded on their own): what the owner-association witnesses
-    /// below compare.
-    #[derive(Default)]
-    struct Groups {
-        open: std::vec::Vec<usize>,
-        groups: std::vec::Vec<Group>,
-    }
-
-    /// One group a custody observation opened: its owner, and each permit
-    /// reported directly inside it with its record stage.
-    type Group = (
-        Option<crate::bounded::Identity>,
-        std::vec::Vec<(
-            crate::bounded::Identity,
-            Option<crate::bounded::RecordStage>,
-        )>,
-    );
-
-    impl Groups {
-        /// The permit identities of group `at`, stages passed over.
-        fn permits(&self, at: usize) -> std::vec::Vec<crate::bounded::Identity> {
-            self.groups[at].1.iter().map(|(id, _)| *id).collect()
-        }
-    }
-
-    impl CustodySink<crate::bounded::Reservation> for Groups {
-        fn begin(&mut self, owner: Option<crate::bounded::Identity>) {
-            self.open.push(self.groups.len());
-            self.groups.push((owner, std::vec::Vec::new()));
-        }
-        /// Bindings are the refinement collector's to compare; these
-        /// witnesses compare permit groups alone.
-        fn bound(&mut self, _: crate::bounded::Identity) {}
-        fn held(&mut self, _: crate::bounded::Hold) {}
-        fn permit(
-            &mut self,
-            permit: &crate::bounded::Reservation,
-            record: Option<crate::bounded::RecordStage>,
-        ) {
-            let at = *self
-                .open
-                .last()
-                .expect("a permit reported outside every group");
-            self.groups[at].1.push((
-                <Limits as crate::bounded::Releasing>::permit_identity(permit),
-                record,
-            ));
-        }
-        fn end(&mut self) {
-            self.open.pop().expect("an end without its begin");
-        }
-        /// Every group the observation reaches, shared custody once: by
-        /// the first holder, while its permit is not yet recorded.
-        fn shared(&mut self, custody: crate::bounded::Identity) -> bool {
-            !self
-                .groups
-                .iter()
-                .any(|(_, permits)| permits.iter().any(|(id, _)| *id == custody))
-        }
-    }
-
     /// A recording session of the default capacity.
     fn recording() -> crate::bounded::Session {
         crate::bounded::Session::new(crate::bounded::Capacity::DEFAULT)
     }
 
-    /// The groups `observe` reports, every group closed.
-    fn groups(observe: impl FnOnce(&mut Groups) -> PermitsObserved) -> Groups {
-        let mut sink = Groups::default();
-        assert_eq!(observe(&mut sink), PermitsObserved::Complete);
-        assert!(sink.open.is_empty(), "a group was left open");
-        sink
+    #[cfg(feature = "std")]
+    use groups::{Groups, groups};
+
+    /// The permit groups the owner-association witnesses compare: they
+    /// record into `std` collections, so they exist only with `std`.
+    #[cfg(feature = "std")]
+    mod groups {
+        use super::*;
+
+        /// Every group a custody observation opens, in order, with the
+        /// permits reported directly inside it, each with its record stage
+        /// (nested groups recorded on their own).
+        #[derive(Default)]
+        pub(super) struct Groups {
+            pub(super) open: Vec<usize>,
+            pub(super) groups: Vec<Group>,
+        }
+
+        /// One group a custody observation opened: its owner, and each
+        /// permit reported directly inside it with its record stage.
+        type Group = (
+            Option<crate::bounded::Identity>,
+            Vec<(
+                crate::bounded::Identity,
+                Option<crate::bounded::RecordStage>,
+            )>,
+        );
+
+        impl Groups {
+            /// The permit identities of group `at`, stages passed over.
+            pub(super) fn permits(&self, at: usize) -> Vec<crate::bounded::Identity> {
+                self.groups[at].1.iter().map(|(id, _)| *id).collect()
+            }
+        }
+
+        /// The groups `observe` reports, every group closed.
+        pub(super) fn groups(observe: impl FnOnce(&mut Groups) -> PermitsObserved) -> Groups {
+            let mut sink = Groups::default();
+            assert_eq!(observe(&mut sink), PermitsObserved::Complete);
+            assert!(sink.open.is_empty(), "a group was left open");
+            sink
+        }
+
+        impl CustodySink<crate::bounded::Reservation> for Groups {
+            fn begin(&mut self, owner: Option<crate::bounded::Identity>) {
+                self.open.push(self.groups.len());
+                self.groups.push((owner, Vec::new()));
+            }
+            /// Bindings are the refinement collector's to compare; these
+            /// witnesses compare permit groups alone.
+            fn bound(&mut self, _: crate::bounded::Identity) {}
+            fn held(&mut self, _: crate::bounded::Hold) {}
+            fn permit(
+                &mut self,
+                permit: &crate::bounded::Reservation,
+                record: Option<crate::bounded::RecordStage>,
+            ) {
+                let at = *self
+                    .open
+                    .last()
+                    .expect("a permit reported outside every group");
+                self.groups[at].1.push((
+                    <Limits as crate::bounded::Releasing>::permit_identity(permit),
+                    record,
+                ));
+            }
+            fn end(&mut self) {
+                self.open.pop().expect("an end without its begin");
+            }
+            /// Every group the observation reaches, shared custody once: by
+            /// the first holder, while its permit is not yet recorded.
+            fn shared(&mut self, custody: crate::bounded::Identity) -> bool {
+                !self
+                    .groups
+                    .iter()
+                    .any(|(_, permits)| permits.iter().any(|(id, _)| *id == custody))
+            }
+        }
     }
 
     /// An abandoned scope's custody is reported by the handles that keep it

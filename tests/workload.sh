@@ -14,8 +14,23 @@
 # driver (kani-driver) as much as its solver (CBMC); OOMPolicy=continue only
 # keeps systemd from ending the rest of the workload's tree after a kill, so
 # whatever survives may still report, which nothing relies on.
+#
+# A caller that bounds its workload's time sets DCBOR_WORKLOAD_DEADLINE to
+# whole seconds (tests/gate `process::bounded`): the scope's RuntimeMaxSec
+# (systemd.scope(5), systemd 244 and later), so the manager stops every
+# process of the scope at the deadline, not only the one the caller started.
+# The variable is the launcher's alone: the workload does not inherit it.
 set -euo pipefail
 : "${DCBOR_GATE_MEMORY:?run a workload from a gate (tests/gate-common.sh, gate_confinement)}"
+deadline=()
+if [[ -n "${DCBOR_WORKLOAD_DEADLINE:-}" ]]; then
+    [[ "$DCBOR_WORKLOAD_DEADLINE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "DCBOR_WORKLOAD_DEADLINE must be a positive number of seconds: $DCBOR_WORKLOAD_DEADLINE" >&2
+        exit 2
+    }
+    deadline=(--property=RuntimeMaxSec="$DCBOR_WORKLOAD_DEADLINE")
+fi
+unset DCBOR_WORKLOAD_DEADLINE
 exec systemd-run --user --scope --quiet --collect \
-	--property=MemoryMax="$DCBOR_GATE_MEMORY" --property=MemorySwapMax=0 --property=OOMPolicy=continue \
-	-- "$@"
+    --property=MemoryMax="$DCBOR_GATE_MEMORY" --property=MemorySwapMax=0 --property=OOMPolicy=continue \
+    "${deadline[@]}" -- "$@"

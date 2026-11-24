@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/adoption.rs
 +++ tests/gate/src/proofs/adoption.rs
-@@ -138,7 +138,7 @@
+@@ -213,7 +213,7 @@
              from.as_ptr(),
              libc::AT_FDCWD,
              to.as_ptr(),

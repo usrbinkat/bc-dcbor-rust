@@ -1,0 +1,11 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -229,7 +229,7 @@
+             arena: arena.class(cleanup),
+             // Unreleased, settled with no block (an idle growth or one
+             // staging) and holding no allocation: its growth is staging.
+-            completes: arena.stage == StorageStage::Settled && !arena.has_current_permit,
++            completes: false,
+         })
+     }
+ }

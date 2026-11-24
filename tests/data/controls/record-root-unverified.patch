@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -670,7 +670,11 @@
+@@ -687,7 +687,11 @@
              // The root's own dispatch level, its declaration taken here.
              binding.descend::<A::Refusal>(T::DISPATCH_DEPTH)?;
              let expected = binding.assembly();

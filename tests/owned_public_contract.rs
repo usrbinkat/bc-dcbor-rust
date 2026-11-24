@@ -46,8 +46,8 @@ fn encode(
                     .plan
                     .preparation
                     .expect("published plan omitted its arenas");
-                assert!(prepared.bytes.has_current_permit);
-                assert_eq!(prepared.bytes.initialized, wire.len());
+                assert!(prepared.bytes.arena.has_current_permit);
+                assert_eq!(prepared.bytes.arena.initialized, wire.len());
                 assert!(!before.emission.finished);
                 let mut bytes = Vec::with_capacity(wire.len());
                 assert!(writer.emit(policy, &mut bytes, wire.len(), |_, _, _| false)?);

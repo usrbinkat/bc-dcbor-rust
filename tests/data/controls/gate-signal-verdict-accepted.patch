@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -837,7 +837,7 @@
+@@ -3064,7 +3064,7 @@
      };
      let (agrees, completed) = match ended {
          Ended::Exited => (verified && !killed && !signaled, true),

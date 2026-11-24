@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/adoption.rs
 +++ tests/gate/src/proofs/adoption.rs
-@@ -102,7 +102,7 @@
+@@ -103,7 +103,7 @@
      lock: std::fs::File,
      outcome: Result<PathBuf, Adoption>,
  ) -> Result<PathBuf, Adoption> {

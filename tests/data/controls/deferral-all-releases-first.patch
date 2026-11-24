@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -206,7 +206,7 @@
+@@ -248,7 +248,7 @@
                  }
              }
              n => {

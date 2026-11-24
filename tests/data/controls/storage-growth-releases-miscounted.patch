@@ -1,6 +1,6 @@
 --- src/bounded.rs
 +++ src/bounded.rs
-@@ -2104,7 +2104,8 @@
+@@ -2370,7 +2370,8 @@
      let relocated = owned_growth(elements, 1)?.copied;
      let growth = Growth {
          copied: grown.copied,

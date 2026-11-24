@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -166,7 +166,7 @@
+@@ -178,7 +178,7 @@
      for Constructed<'_, I, T, A>
  {
      const DISPATCH_DEPTH: usize = {

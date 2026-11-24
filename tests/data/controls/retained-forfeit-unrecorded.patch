@@ -1,6 +1,6 @@
 --- src/bounded.rs
 +++ src/bounded.rs
-@@ -1115,8 +1115,9 @@
+@@ -1269,8 +1269,9 @@
      /// forfeit is a granted permit's (its reservation failed, or its scope
      /// closed under the grant), `by` its performer.
      pub(crate) fn forfeit(mut self, rule: Forfeit, permit: Option<Identity>, by: Performer) {

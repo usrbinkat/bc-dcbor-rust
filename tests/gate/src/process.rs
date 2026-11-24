@@ -87,6 +87,23 @@ fn controlled(program: impl AsRef<OsStr>) -> Result<Command, String> {
     Ok(isolated(workload(program)?))
 }
 
+/// The variable through which a bounded workload's launcher learns its
+/// deadline (tests/workload.sh): the scope's `RuntimeMaxSec`.
+const DEADLINE: &str = "DCBOR_WORKLOAD_DEADLINE";
+
+/// `program` launched by `workload` as an isolated workload whose scope the
+/// manager stops, every process of it, `seconds` after it starts
+/// (tests/workload.sh), colour off (`TERM=dumb`) as every recorded
+/// workload's. The workload ends by a signal at its deadline; its caller
+/// tells a deadline from another signal by the time it waited.
+pub fn bounded(workload: &Workload, program: impl AsRef<OsStr>, seconds: u64) -> Command {
+    let mut command = isolated(workload.command(program));
+    command
+        .env(DEADLINE, seconds.to_string())
+        .env("TERM", "dumb");
+    command
+}
+
 /// Clear inherited execution and publication permissions before a run adds
 /// its explicitly selected inputs.
 fn isolate(command: &mut Command, names: impl IntoIterator<Item = std::ffi::OsString>) {
@@ -95,7 +112,7 @@ fn isolate(command: &mut Command, names: impl IntoIterator<Item = std::ffi::OsSt
         if text.starts_with("LOOM_")
             || text.starts_with("SHUTTLE_")
             || text.starts_with("DCBOR_RECORD_")
-            || [BOUND, STACK, DESCRIBE].contains(&text.as_ref())
+            || [BOUND, STACK, DESCRIBE, DEADLINE].contains(&text.as_ref())
         {
             command.env_remove(&name);
         }

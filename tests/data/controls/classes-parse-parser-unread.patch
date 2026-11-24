@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/parse.rs
++++ src/bounded/decode/construction/parse.rs
+@@ -459,7 +459,7 @@
+                 ParsePhase::ReclaimInput => ParseRecordStage::ReclaimInput,
+                 ParsePhase::Done => ParseRecordStage::Done,
+             }),
+-            parser: self.parser.map(|parser| match parser.phase {
++            parser: self.parser.filter(|_| false).map(|parser| match parser.phase {
+                 Phase::ReclaimNormalizer => ParserStage::ReclaimNormalizer,
+                 Phase::ReclaimEntries => ParserStage::ReclaimEntries,
+                 Phase::ReclaimStack => ParserStage::ReclaimStack,

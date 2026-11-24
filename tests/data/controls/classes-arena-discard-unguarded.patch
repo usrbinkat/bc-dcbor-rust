@@ -1,0 +1,11 @@
+--- src/bounded/decode/storage.rs
++++ src/bounded/decode/storage.rs
+@@ -245,7 +245,7 @@
+         StorageClass {
+             relocating,
+             elements: match cleanup {
+-                ElementCleanup::Discarded if !relocating => Elements::Any(held > 0),
++                ElementCleanup::Discarded => Elements::Any(held > 0),
+                 ElementCleanup::Dropped | ElementCleanup::Discarded => Elements::Each(held),
+             },
+         }

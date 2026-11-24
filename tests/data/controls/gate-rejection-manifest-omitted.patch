@@ -1,6 +1,6 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -778,6 +778,9 @@
+@@ -848,6 +848,9 @@
      // write did: the run's last record, describing exactly what it holds, its
      // identity named only when one was made.
      let judged = record_judgement(evidence, result);

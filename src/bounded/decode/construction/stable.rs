@@ -1392,9 +1392,14 @@ impl<S, P> Stack<S, P> {
 
 #[cfg(test)]
 mod tests {
+    // The findings name their checks in every build, `no_std` included:
+    // `alloc` is this module's parent's.
     use super::*;
     use crate::bounded::Unreadable;
     use crate::bounded::decode::construction::findings::{Expected, ExpectedHistory, Findings};
+    use alloc::format;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// A policy whose history its session holds and reports.
     const READ: ExpectedHistory = ExpectedHistory::Readable;
@@ -1413,7 +1418,7 @@ mod tests {
     fn lifecycle(
         observed: &[Observed],
         acquisition: Identity,
-    ) -> std::vec::Vec<(usize, u64, Performer, Event)> {
+    ) -> Vec<(usize, u64, Performer, Event)> {
         observed
             .iter()
             .enumerate()
@@ -1434,8 +1439,8 @@ mod tests {
 
     /// The acquisitions `pending`'s custody reports bound, by its one
     /// traversal ([`crate::bounded::bound_of`]).
-    fn reported(pending: &Pending<<Limits as Budget>::Origin>) -> std::vec::Vec<Identity> {
-        let mut bound = std::vec::Vec::new();
+    fn reported(pending: &Pending<<Limits as Budget>::Origin>) -> Vec<Identity> {
+        let mut bound = Vec::new();
         let observed = crate::bounded::bound_of(
             |sink: &mut dyn CustodySink<()>| pending.observe_custody(sink),
             &mut |acquisition| bound.push(acquisition),

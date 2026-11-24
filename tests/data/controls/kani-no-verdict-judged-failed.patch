@@ -1,6 +1,6 @@
 --- tests/gate/src/outcome.rs
 +++ tests/gate/src/outcome.rs
-@@ -355,13 +355,8 @@
+@@ -371,13 +371,8 @@
  /// it reports unsound ([`KANI_UNSOUND`]). The one reading of it, for a run
  /// ([`kani`]) and for each harness's block (`crate::proofs::checked`).
  pub fn kani_without_verdict(report: &str) -> bool {

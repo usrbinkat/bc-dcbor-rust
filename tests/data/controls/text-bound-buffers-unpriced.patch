@@ -1,6 +1,6 @@
 --- src/bounded/text.rs
 +++ src/bounded/text.rs
-@@ -570,7 +570,11 @@
+@@ -574,7 +574,11 @@
              ordering: work(&[COUNTING.over(releases, parts)?, HANDED.times(parts)?])?,
              // A value per emitted character, and the normal form's bytes.
              emitting: WriteWork::new(mul(parts, EMITTED.values())?, emitted_bytes),

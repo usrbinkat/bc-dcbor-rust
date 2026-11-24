@@ -41,6 +41,7 @@ pub mod instances;
 
 mod adoption;
 mod calibration;
+pub mod diagnostics;
 mod eligibility;
 mod readiness;
 
@@ -501,7 +502,7 @@ pub fn discovery_of(
     }
     let bytes: Vec<u8> = selection
         .iter()
-        .flat_map(|harness| harness.bytes().chain([b'\n']))
+        .flat_map(|harness| harness.bytes().chain(*b"\n"))
         .collect();
     Ok(Discovery {
         sha256: crate::process::sha256_bytes(&bytes)?,

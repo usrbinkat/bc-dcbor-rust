@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/construct.rs
++++ src/bounded/decode/construction/construct.rs
+@@ -899,7 +899,7 @@
+             }
+         } else {
+             ConstructClass {
+-                record: detail.phase.map(|phase| match phase {
++                record: detail.phase.filter(|_| false).map(|phase| match phase {
+                     ConstructPhase::Build
+                     | ConstructPhase::Detach
+                     | ConstructPhase::Publish

@@ -28,7 +28,7 @@ import_stdlib!();
 
 use unicode_normalization::{
     IsNormalized,
-    char::{canonical_combining_class, compose, decompose_canonical},
+    char::{canonical_combining_class, compose},
     is_nfc_quick,
 };
 
@@ -279,7 +279,7 @@ fn normalize<A: Allocator>(
     for ch in text.chars() {
         CHARACTER.admit(&mut *normalizer.allocator)?;
         let mut failure = None;
-        decompose_canonical(ch, |part| {
+        super::decomposition::parts(ch, &mut |part| {
             if failure.is_none()
                 && let Err(error) = normalizer.decomposed(part)
             {
@@ -619,6 +619,7 @@ mod proofs;
 #[cfg(test)]
 mod tests {
     use unicode_normalization::UnicodeNormalization;
+    use unicode_normalization::char::decompose_canonical;
 
     use super::super::tests::{check, limited};
     use super::*;

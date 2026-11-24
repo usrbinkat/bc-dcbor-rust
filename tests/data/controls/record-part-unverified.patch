@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -832,7 +832,11 @@
+@@ -849,7 +849,11 @@
      let mut ctx = ctx;
      ctx.descend::<A::Refusal>(T::DISPATCH_DEPTH)?;
      let expected = ctx.assembly();

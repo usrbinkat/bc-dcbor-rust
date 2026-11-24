@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/stable.rs
 +++ src/bounded/decode/construction/stable.rs
-@@ -833,7 +833,7 @@
+@@ -885,7 +885,7 @@
      pub(crate) const fn of() -> Self {
          Self {
              written: crate::bounded::write_extent(

@@ -1,0 +1,11 @@
+--- src/bounded/text_cursor.rs
++++ src/bounded/text_cursor.rs
+@@ -140,7 +140,7 @@
+         };
+         let plain = decode::storage::ElementCleanup::Discarded;
+         TextClass {
+-            stage,
++            stage: TextCleanupStage::Active,
+             scratch: matches!(
+                 stage,
+                 TextCleanupStage::Active | TextCleanupStage::ReclaimOrdering

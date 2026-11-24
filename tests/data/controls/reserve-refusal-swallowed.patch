@@ -1,6 +1,6 @@
 --- src/bounded.rs
 +++ src/bounded.rs
-@@ -2098,11 +2098,12 @@
+@@ -2099,11 +2099,12 @@
              };
              let permit = match allocator.allocate(bytes) {
                  Ok(permit) => permit,

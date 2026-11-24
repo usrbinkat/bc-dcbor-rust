@@ -1,6 +1,6 @@
 --- src/bounded/decode/header.rs
 +++ src/bounded/decode/header.rs
-@@ -208,6 +208,8 @@
+@@ -226,6 +226,8 @@
          }
          let complete = self.acquired == self.needed || self.acquired == input.len();
          if complete {

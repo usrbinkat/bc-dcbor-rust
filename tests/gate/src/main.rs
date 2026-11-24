@@ -106,6 +106,16 @@
 //!                   nothing is verified and no results row is written;
 //!                   status 1 unless every harness's discovery holds
 //!                   (`proofs::discover`, `proofs::check_discovery`)
+//!   proofs-diagnose EVIDENCE HARNESS HARNESS_FILE ROOT [FOCUS...]
+//!                   the formula diagnostics of HARNESS (its source file
+//!                   HARNESS_FILE) from a discovery's EVIDENCE, in a new
+//!                   numbered directory under ROOT, which is printed: the
+//!                   property inventory, a verdict per harness and unwinding
+//!                   assertion, the formula's steps and byte operations by
+//!                   function and file:line, and the shares of the FOCUS
+//!                   (`--site FILE:LINE`, `--function FRAGMENT`, `--callers
+//!                   FRAGMENT`); status 1 when a harness assertion failed or
+//!                   a step did not succeed (`proofs::diagnostics::diagnose`)
 //!   miri inventory LOG OUT
 //!                   the inventory the run's LOG reports, written to OUT;
 //!                   status 1 when a line of it is malformed
@@ -206,6 +216,7 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      classify miri|cargo|binary KIND STATUS LOG | proofs-build | proofs-identity LAUNCHER | \
                      proofs ROOT TARGET LOGS LAUNCHER | \
                      proofs-discover ROOT TARGET LOGS LAUNCHER HARNESS... | \
+                     proofs-diagnose EVIDENCE HARNESS HARNESS_FILE ROOT [FOCUS...] | \
                      proofs-calibrate ROOT TARGET LOGS LAUNCHER PLAN WORKLOAD_LOCK CONTROL_LOGS... | \
                      proofs-adopt EVIDENCE ROOT | \
                      miri models | \
@@ -1119,6 +1130,38 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             ) {
                 Ok(records) => {
                     println!("{}", records.display());
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(fault) => Ok(verdict(&[fault])),
+            }
+        }
+        // The formula diagnostics of one harness of a discovery's evidence
+        // (`proofs::diagnostics::diagnose`), in a new numbered directory under
+        // ROOT, its focus the arguments after ROOT: the directory printed;
+        // status 1 when a harness assertion failed or a step the summary
+        // rests on did not succeed.
+        [
+            "proofs-diagnose",
+            evidence,
+            harness,
+            harness_file,
+            root,
+            focus @ ..,
+        ] => {
+            let diagnosed =
+                dcbor_gate::proofs::diagnostics::Focus::parse(focus).and_then(|focus| {
+                    dcbor_gate::proofs::diagnostics::diagnose(
+                        &dcbor_gate::process::Workload::exported()?,
+                        Path::new(evidence),
+                        harness,
+                        harness_file,
+                        focus,
+                        Path::new(root),
+                    )
+                });
+            match diagnosed {
+                Ok((_, directory)) => {
+                    println!("{}", directory.display());
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(fault) => Ok(verdict(&[fault])),

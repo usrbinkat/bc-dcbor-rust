@@ -1,6 +1,6 @@
 --- src/float/reference.rs
 +++ src/float/reference.rs
-@@ -203,7 +203,8 @@
+@@ -200,7 +200,8 @@
      } else {
          // A subnormal, `fraction * 2^-24`: its leading bit at `top`.
          let top = 63 - u64::from(fraction.leading_zeros());

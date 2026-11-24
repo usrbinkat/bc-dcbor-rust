@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/in_place.rs
 +++ src/bounded/decode/construction/in_place.rs
-@@ -132,6 +132,17 @@
+@@ -136,6 +136,17 @@
 
  impl<T> Copy for Assembly<'_, T> {}
 

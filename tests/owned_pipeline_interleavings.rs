@@ -550,7 +550,7 @@ fn a_class_merging_retirements_of_different_cleanup_is_rejected() {
 #[test]
 fn the_fast_layer_retires_once_per_class() {
     use support::rigor::Rigor;
-    let class = |name: &str| Some(name.to_owned());
+    let class = |name: &'static str| Some(support::classes::Class::Planted(name));
     let boundaries = [class("a"), class("a"), None, class("b"), None, class("a")];
     assert_eq!(cuts(Rigor::Fast, &boundaries), [0, 2, 3, 4]);
     assert_eq!(cuts(Rigor::Exhaustive, &boundaries), [0, 1, 2, 3, 4, 5]);

@@ -1,6 +1,6 @@
 --- src/bounded/decode/comparison.rs
 +++ src/bounded/decode/comparison.rs
-@@ -184,7 +184,8 @@
+@@ -203,7 +203,8 @@
      let remaining = (!Bound::new(Predicate::Payload, shorter).exceeded(budget, *position))
          .then(|| shorter - *position)
          .ok_or(BoundedError::PlanMismatch)?;

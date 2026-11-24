@@ -1,0 +1,11 @@
+--- tests/data/proofs/loop-bounds.json
++++ tests/data/proofs/loop-bounds.json
+@@ -14,7 +14,7 @@
+       "file": "src/normalize.rs",
+       "loops_in_function": 1,
+       "loop": 0,
+-      "bound": 5,
++      "bound": 3,
+       "reason": "decompose's emission of a canonical full decomposition (unicode-normalization 0.1.26 normalize.rs:97, `for &d in decomposed`) iterates once per character of the slice canonical_fully_decomposed returns (lookups.rs:45, CANONICAL_DECOMPOSED_CHARS[start..][..len] for its CANONICAL_DECOMPOSED_KV entry). The longest len in that table, Unicode 18.0.0 (tables.rs:4887-6969), is 4 (U+1F80..U+1FAF among others); every length above 4 is a compatibility decomposition (COMPATIBILITY_DECOMPOSED_KV, tables.rs:13121), which this monomorph does not read. Its backward goto is taken at most 4 times, and bound 5 lets the 4th backedge reach the loop's exit evaluation, which the unwinding assertion checks takes no 5th. The one monomorph every bounded decomposition instantiates (src/bounded/decomposition.rs, `parts`, its sink a `&mut dyn FnMut(char)`): strict validation's normalization, a text shape's measurement and the text continuation's source step; the bound is a property of the table, not of any harness's domain."
+     }
+   ],

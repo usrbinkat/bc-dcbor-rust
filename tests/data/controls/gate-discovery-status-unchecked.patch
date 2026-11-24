@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2198,7 +2198,7 @@
+@@ -2533,7 +2533,7 @@
  ) -> Result<BTreeSet<String>, String> {
      let read = |file: &str| records.read(&at.join(file));
      let status = read("discovery.status")?;

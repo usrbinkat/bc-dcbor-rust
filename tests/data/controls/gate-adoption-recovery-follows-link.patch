@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/eligibility.rs
 +++ tests/gate/src/proofs/eligibility.rs
-@@ -195,7 +195,7 @@
+@@ -194,7 +194,7 @@
          let kind = std::fs::symlink_metadata(directory)
              .map_err(|error| format!("{}: {error}", directory.display()))?
              .file_type();

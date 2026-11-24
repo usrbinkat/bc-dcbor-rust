@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/parse.rs
 +++ src/bounded/decode/construction/parse.rs
-@@ -151,7 +151,7 @@
+@@ -174,7 +174,7 @@
      // `Record::reclaim_step`, which are no dispatch level, as the derive's
      // declaration accounts for its generated frames. The census records the
      // margin.
@@ -8,4 +8,4 @@
 +    const DISPATCH_DEPTH: usize = I::DISPATCH_DEPTH.saturating_add(3);
      type State = Prefix;
      const INITIAL: Prefix = Prefix::EMPTY;
-
+ 

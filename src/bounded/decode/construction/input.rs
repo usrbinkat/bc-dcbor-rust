@@ -1,6 +1,6 @@
 //! Input handles: immutable bytes in scope custody, copied or borrowed.
 use super::in_place::Built;
-use super::in_place::text::{BufferObservation, BufferState};
+use super::in_place::text::{BufferClass, BufferObservation, BufferState};
 use super::operation::{Operation, OperationTerms, Task};
 use super::reclamation::{
     Cleanup, Custody, DecodeOwner, OwnedInitialized, PeekSlot, Prefix, Reclaim, Reclaimed,
@@ -247,6 +247,48 @@ where
             scope: self.scope.is_some(),
             record,
         }
+    }
+}
+
+/// What an input copy's cleanup admits from its detail: whether the task
+/// holds its scope reference, ended in one unit, and its record's byte
+/// buffer by the buffer's own reduction. The bytes copied so far are not
+/// read: the copy's cleanup drops the buffer whole whatever it holds, which
+/// the buffer's reduction states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct InputClass<C> {
+    pub scope: bool,
+    pub record: Option<C>,
+}
+
+impl super::operation::Position<InputDetail<BufferObservation>> {
+    /// An input copy's class. The operation's part reads its prefix by its
+    /// exact units (it has none: `INIT_STEPS` is 0), the copy's own part
+    /// follows ([`InputClass`]). Two positions of one class take each unit
+    /// alike and land again in one class.
+    pub fn class(&self) -> super::operation::OperationClass<InputClass<BufferClass>> {
+        self.operation_class(
+            self.units(),
+            InputClass {
+                scope: self.detail.scope,
+                record: self.detail.record.map(|record| record.class()),
+            },
+        )
+    }
+}
+
+/// An input copy's class is its position's
+/// ([`super::operation::Position::class`]).
+impl<'src, 's, A: crate::bounded::TerminalAllocator> super::Reduction
+    for InputAcquisition<'src, 's, A>
+where
+    A::Permit: Send,
+{
+    type Class = super::operation::OperationClass<InputClass<BufferClass>>;
+
+    fn class(position: &super::operation::Position<InputDetail<BufferObservation>>) -> Self::Class {
+        position.class()
     }
 }
 

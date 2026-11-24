@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -214,6 +214,7 @@
+@@ -256,6 +256,7 @@
          }
      }
      release_reference(block, worklist);

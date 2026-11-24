@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation/owned.rs
 +++ src/bounded/decode/construction/reclamation/owned.rs
-@@ -949,7 +949,9 @@
+@@ -1372,7 +1372,9 @@
      /// is abandoned to its references' terminal drain, a partially
      /// initialized one freed.
      fn drop(&mut self) {

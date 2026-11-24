@@ -1,6 +1,6 @@
 --- src/bounded/decode/header.rs
 +++ src/bounded/decode/header.rs
-@@ -128,7 +128,8 @@
+@@ -131,7 +131,8 @@
          let acquired = input.min(MAX_HEAD_LEN as u64);
          Self {
              acquisition: WriteWork::new(acquired, acquired),

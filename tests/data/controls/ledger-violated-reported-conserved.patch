@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -560,7 +560,9 @@
+@@ -608,7 +608,9 @@
              .consumed
              .checked_then(self.forfeited)?
              .checked_then(held)?;
@@ -10,4 +10,4 @@
 +        Some(accounted == self.admitted)
      }
  }
-
+ 

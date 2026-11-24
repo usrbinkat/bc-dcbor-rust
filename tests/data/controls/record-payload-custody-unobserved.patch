@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/reclamation.rs
 +++ src/bounded/decode/construction/reclamation.rs
-@@ -1664,7 +1664,10 @@
+@@ -1731,7 +1731,10 @@
              // the header the holder transitions write.
              let holder = (*block.cast::<Header<A>>().as_ptr()).custody.get();
              sink.permit(block.as_ref().permit(), Some(stage_of(holder)));

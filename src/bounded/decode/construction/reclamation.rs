@@ -361,6 +361,16 @@ pub trait Custody {
 /// check the relation against the states and cleanup transitions they
 /// reach, and reject planted relations that merge states of different
 /// custody.
+///
+/// A class carries exactly what its state's cleanup reads, so a class
+/// gains a field or a variant whenever that cleanup comes to read more: the
+/// crate's class types are `#[non_exhaustive]`, read and compared by their
+/// users, built only by the crate's own `class` functions (an enum's
+/// variants excepted). Their `Ord` is a total order for keying classes in
+/// sorted collections within one build of the crate; it means nothing
+/// beyond equality and carries no stability across versions. A state's
+/// observation, unlike its class, is the exact alphabet its successor
+/// relations are written over, and stays exhaustive.
 pub trait Reduction: Custody {
     type Class: Copy + Eq + Ord + core::fmt::Debug;
 

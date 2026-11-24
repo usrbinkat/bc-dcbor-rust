@@ -1,6 +1,6 @@
 --- src/float/reference.rs
 +++ src/float/reference.rs
-@@ -214,7 +214,8 @@
+@@ -211,7 +211,8 @@
  pub(crate) fn binary16_bits(x: f64) -> Option<u16> {
      let sign = ((x.to_bits() >> 63) as u16) << 15;
      match decompose(x) {

@@ -1,6 +1,6 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -196,7 +196,7 @@
+@@ -306,7 +306,7 @@
          }
          let [first, second] = values;
          self.owned.items.push(first);

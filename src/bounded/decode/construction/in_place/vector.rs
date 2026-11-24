@@ -174,6 +174,7 @@ impl<E: Custody, P> Custody for State<E, P> {
 /// whether its payload's permit is held, the elements committed, and the
 /// newest record's element, whether committed and its class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum SequenceClass<C> {
     /// No metadata: one unit completes cleanup.
     Unallocated,

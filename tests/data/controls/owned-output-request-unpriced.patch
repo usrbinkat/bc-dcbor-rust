@@ -1,6 +1,6 @@
 --- src/bounded/encoding/writer.rs
 +++ src/bounded/encoding/writer.rs
-@@ -409,7 +409,9 @@
+@@ -419,7 +419,9 @@
          let output = encoded_released::<P>()
              .bound()
              .checked_then(ResourceBound {

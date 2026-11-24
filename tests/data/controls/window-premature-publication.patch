@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1796,8 +1796,10 @@
+@@ -1879,8 +1879,10 @@
                  None => return Err(BoundedError::PlanMismatch),
              }
          } else {

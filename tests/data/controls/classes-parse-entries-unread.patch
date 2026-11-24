@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/parse.rs
++++ src/bounded/decode/construction/parse.rs
+@@ -480,7 +480,7 @@
+             }),
+             entries: self
+                 .resources
+-                .map(|resources| resources.entries.class(Discarded)),
++                .map(|resources| resources.entries.class(Discarded)).filter(|_| false),
+             stack: self
+                 .resources
+                 .map(|resources| resources.stack.class(Discarded)),

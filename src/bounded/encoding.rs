@@ -31,7 +31,8 @@ pub use values::Tagged;
 pub(crate) use values::{tree_next, tree_start, tree_step_moves};
 mod writer;
 pub use writer::{
-    EmitPosition, OwnedEmitPosition, OwnedEmitStep, OwnedWriter, emit_bound, owned_emit_bound,
+    EmitClass, EmitPosition, OwnedEmitPosition, OwnedEmitStep, OwnedWriter, emit_bound,
+    owned_emit_bound,
 };
 /// Kani harness of the preparation's whole-operation bound (register item
 /// 4): compiled only by `cargo kani`.
@@ -444,18 +445,20 @@ struct MapFrame<'a> {
     state: MapState<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
-    /// The five traversal and output arenas in their authoritative growth
-    /// states. Counts alone do not distinguish a retained growth admission
-    /// from an allocated staging block or a relocated arena.
-    pub frames: decode::storage::StoragePosition,
-    pub bytes: decode::storage::StoragePosition,
-    pub holes: decode::storage::StoragePosition,
-    pub maps: decode::storage::StoragePosition,
-    pub cursor_storage: decode::storage::StoragePosition,
+    /// The traversal and output arenas in their authoritative growth states,
+    /// each as the preparation's cleanup, which steps an arena only while it
+    /// is unreleased, reads it ([`decode::storage::HeldPosition`]). Counts
+    /// alone do not distinguish a retained growth admission from an
+    /// allocated staging block or a relocated arena.
+    pub frames: decode::storage::HeldPosition,
+    pub bytes: decode::storage::HeldPosition,
+    pub holes: decode::storage::HeldPosition,
+    pub maps: decode::storage::HeldPosition,
+    pub cursor_storage: decode::storage::HeldPosition,
     /// Two custody parts per open cursor: acquisition, then credit.
-    pub window_storage: decode::storage::StoragePosition,
+    pub window_storage: decode::storage::HeldPosition,
     pub finished: bool,
     pub child: bool,
     pub inspect: Option<u64>,
@@ -488,6 +491,86 @@ pub struct Position {
     /// The current bignum's digits read in its pass, and whether its bytes
     /// are being emitted.
     pub bignum: Option<(usize, bool)>,
+}
+
+/// What a preparation's cleanup admits from a position
+/// ([`Preparation::reclaim_step`]), part by part in the order it releases
+/// them: its text continuation's while one is present and unfinished
+/// ([`text_cursor::TextClass`]); then each arena as a holder that steps it
+/// only while it is unreleased ([`decode::storage::HeldClass`]): frames,
+/// open maps, plan bytes, gaps and entry cursors, of plain data, the
+/// cursors' bucket windows, whose obligations drop, and the dynamic map
+/// engine's descriptors, merge scratch and permutation bitmap, of plain
+/// data; then its completion, admitted alike from every position. A copied
+/// normalized text is released in a unit that admits nothing, its request
+/// having paid for it, and the windows' obligations are settled at
+/// cleanup's entry, admitting nothing: neither changes an admission. Its
+/// instruction, depth, inspection, bignum and every other counter are never
+/// read by cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct PreparationClass {
+    pub text: Option<text_cursor::TextClass>,
+    pub frames: Option<decode::storage::HeldClass>,
+    pub maps: Option<decode::storage::HeldClass>,
+    pub bytes: Option<decode::storage::HeldClass>,
+    pub holes: Option<decode::storage::HeldClass>,
+    pub cursors: Option<decode::storage::HeldClass>,
+    pub windows: Option<decode::storage::HeldClass>,
+    pub entries: Option<decode::storage::HeldClass>,
+    pub merge: Option<decode::storage::HeldClass>,
+    pub bitmap: Option<decode::storage::HeldClass>,
+}
+
+/// What a preparation holds: its position, read without allocating or
+/// advancing it ([`Preparation::position`]).
+impl<P, O: Origin> decode::construction::Custody for Preparation<'_, P, O> {
+    type Observation = Position;
+
+    fn observe(&mut self) -> Position {
+        Preparation::position(self)
+    }
+}
+
+/// A preparation's class is its position's ([`Position::class`]).
+impl<P, O: Origin> decode::construction::Reduction for Preparation<'_, P, O> {
+    type Class = PreparationClass;
+
+    fn class(position: &Position) -> PreparationClass {
+        position.class()
+    }
+}
+
+impl Position {
+    /// This position's cleanup class ([`PreparationClass`]). Each cleanup
+    /// unit releases the first part still holding anything, in the order of
+    /// `PreparationClass`, each part by its own class: the text
+    /// continuation's while it is unfinished (a finished one is stepped no
+    /// further, `Preparation::reclaim_step`, so the preparation admits
+    /// nothing for it), each arena's under a holder stepping it only while
+    /// unreleased; then the completion, alike from every position. What it
+    /// settles at entry and the copied text it drops admit nothing. Two
+    /// positions of one class take each unit alike and land again in one
+    /// class.
+    pub fn class(&self) -> PreparationClass {
+        use decode::storage::ElementCleanup::{Discarded, Dropped};
+        let position = self;
+        PreparationClass {
+            text: position
+                .normalization
+                .filter(|text| text.phase != text_cursor::Phase::Finished)
+                .map(|text| text.class()),
+            frames: position.frames.class(Discarded),
+            maps: position.maps.class(Discarded),
+            bytes: position.bytes.class(Discarded),
+            holes: position.holes.class(Discarded),
+            cursors: position.cursor_storage.class(Discarded),
+            windows: position.window_storage.class(Dropped),
+            entries: position.dynamic.entry_storage.class(Discarded),
+            merge: position.dynamic.merge_storage.class(Discarded),
+            bitmap: position.dynamic.bitmap_storage.class(Discarded),
+        }
+    }
 }
 
 /// Owns only flat arenas and borrowed source references. No source value is
@@ -1145,12 +1228,12 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
 
     pub fn position(&self) -> Position {
         Position {
-            frames: self.frames.position(),
-            bytes: self.bytes.position(),
-            holes: self.holes.position(),
-            maps: self.map_frames.position(),
-            cursor_storage: self.cursors.position(),
-            window_storage: self.windows.position(),
+            frames: self.frames.held_position(),
+            bytes: self.bytes.held_position(),
+            holes: self.holes.held_position(),
+            maps: self.map_frames.held_position(),
+            cursor_storage: self.cursors.held_position(),
+            window_storage: self.windows.held_position(),
             finished: self.end != End::Running,
             child: self.child.is_some(),
             inspect: self.inspect,
@@ -3643,7 +3726,7 @@ pub struct Writer<'p, 'o, P> {
 }
 
 /// Where an owned preparation is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlanPhase {
     Prepare,
     Published,
@@ -3928,11 +4011,83 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
 /// Observation of an owned preparation: the record's phase, its
 /// preparation's position, and whether the record, or before the record
 /// holds it the task, holds the source value, which cleanup reclaims last.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PlanDetail {
     pub phase: Option<PlanPhase>,
     pub preparation: Option<Position>,
     pub source: bool,
+}
+
+/// Where an owned preparation record's cleanup stands (`Planned`'s
+/// `reclaim_step`): preparing and published alike enter reclamation by the
+/// same admitted unit; the reclaiming phases are distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlanStage {
+    Active,
+    ReclaimPreparation,
+    ReclaimSource,
+    Done,
+}
+
+/// What a plan record's cleanup admits from its detail ([`PlanDetail`]):
+/// its stage, its preparation's own cleanup while held
+/// ([`PreparationClass`]), and whether the record or the task holds the
+/// source value, whose cleanup is the same at every boundary of one run, the
+/// value being the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct PlanClass {
+    pub record: Option<PlanStage>,
+    pub preparation: Option<PreparationClass>,
+    pub source: bool,
+}
+
+impl PlanDetail {
+    /// This detail's class ([`PlanClass`]).
+    pub fn class(&self) -> PlanClass {
+        PlanClass {
+            record: self.phase.map(|phase| match phase {
+                PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
+                PlanPhase::ReclaimPreparation => PlanStage::ReclaimPreparation,
+                PlanPhase::ReclaimSource => PlanStage::ReclaimSource,
+                PlanPhase::Done => PlanStage::Done,
+            }),
+            preparation: self.preparation.as_ref().map(Position::class),
+            source: self.source,
+        }
+    }
+}
+
+impl decode::construction::Position<PlanDetail> {
+    /// An owned preparation's class, whatever value it encodes: the value's cleanup is the
+    /// same at every boundary of one run, so the class reads none of it.
+    /// Before the record's prefix is complete its cleanup (`Planned`'s
+    /// `reclaim_step`, `remaining`) reads only whether the source slot is
+    /// written and holds the source, which the detail's `source` carries,
+    /// reclaims the source through its own record, which empties the slot,
+    /// then releases the record in one unit; the phase and the
+    /// preparation's prefix own nothing (`Preparation::initialize_step`
+    /// acquires nothing). So the operation's part reads its prefix as
+    /// partial; the record's follows ([`PlanClass`]).
+    pub fn class(&self) -> decode::construction::OperationClass<PlanClass> {
+        self.operation_class(self.partial(), self.detail.class())
+    }
+}
+
+/// The plan record's class is its position's
+/// ([`decode::construction::Position::class`]).
+impl<'s, I, T, A> decode::construction::Reduction for OwnedPreparation<'s, I, T, A>
+where
+    I: DecodeInput<A> + 's,
+    T: Transferable<A> + TransferableSchema + 's,
+    A: crate::bounded::TerminalAllocator + 's,
+    A::Permit: Send,
+{
+    type Class = decode::construction::OperationClass<PlanClass>;
+
+    fn class(position: &decode::construction::Position<PlanDetail>) -> Self::Class {
+        position.class()
+    }
 }
 
 /// The owned preparation task. Public only as the unnameable task of
@@ -4708,8 +4863,8 @@ mod bound_tests {
         }
         let pairs = |position: Position| {
             assert_eq!(
-                held_elements(position.window_storage),
-                2 * held_elements(position.cursor_storage),
+                held_elements(position.window_storage.arena),
+                2 * held_elements(position.cursor_storage.arena),
                 "a cursor without its whole window pair: {position:?}"
             );
         };
@@ -5436,6 +5591,7 @@ mod bound_tests {
                 position.dynamic.bitmap_storage,
             ]
             .into_iter()
+            .map(|held| held.arena)
             .chain(text.into_iter().flatten())
         }
 
@@ -5783,7 +5939,9 @@ mod bound_tests {
                     Box::new(vec![Pairs(
                         (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
                     )]),
-                    Some(Cancel::Draining(|position| relocates(position.bytes, 512))),
+                    Some(Cancel::Draining(|position| {
+                        relocates(position.bytes.arena, 512)
+                    })),
                 ),
                 // Each sealed bucket table the build compiles, a run of its
                 // own; none where none is built.
@@ -6071,7 +6229,7 @@ mod bound_tests {
                     (0..64u64).rev().map(|n| (n, vec![n; 4])).collect(),
                 )]),
                 cancel_after: Some(Cancel::Draining(|position| {
-                    relocates(position.dynamic.entry_storage, 64)
+                    relocates(position.dynamic.entry_storage.arena, 64)
                 })),
             });
             let mut runs = Vec::new();

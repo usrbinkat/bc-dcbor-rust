@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -5005,6 +5005,10 @@
+@@ -5232,6 +5232,10 @@
  /// invalid session and mask it. A family that records nothing loses
  /// nothing.
  fn lost(m: &Limits, turn: usize) -> Option<Lost> {

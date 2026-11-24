@@ -1,6 +1,6 @@
 --- tests/refinement/src/history.rs
 +++ tests/refinement/src/history.rs
-@@ -84,7 +84,6 @@
+@@ -85,7 +85,6 @@
              let group = &mut checkpoint.custody[change.index];
              group.owner = change.owner;
              change.bound.apply(&mut group.bound);

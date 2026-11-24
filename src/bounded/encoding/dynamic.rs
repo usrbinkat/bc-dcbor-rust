@@ -3,7 +3,7 @@ use super::*;
 use crate::bounded::boundary::{boundary, side};
 use maps::order::{Entry, Order};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DynamicPhase {
     #[default]
     Order,
@@ -16,13 +16,14 @@ pub enum DynamicPhase {
     Complete,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DynamicPosition {
     /// Descriptor, merge-scratch and permutation-bitmap custody, including
-    /// retained growth admissions and relocation stages.
-    pub entry_storage: decode::storage::StoragePosition,
-    pub merge_storage: decode::storage::StoragePosition,
-    pub bitmap_storage: decode::storage::StoragePosition,
+    /// retained growth admissions and relocation stages, each as the
+    /// preparation's cleanup reads it ([`decode::storage::HeldPosition`]).
+    pub entry_storage: decode::storage::HeldPosition,
+    pub merge_storage: decode::storage::HeldPosition,
+    pub bitmap_storage: decode::storage::HeldPosition,
     pub merge_middle: usize,
     pub merge_end: usize,
     pub merge_forward: bool,
@@ -194,9 +195,9 @@ impl<P, O: Origin> Dynamic<P, O> {
 
     pub fn position(&self) -> DynamicPosition {
         DynamicPosition {
-            entry_storage: self.entries.position(),
-            merge_storage: self.order.scratch.position(),
-            bitmap_storage: self.permutation.visited.position(),
+            entry_storage: self.entries.held_position(),
+            merge_storage: self.order.scratch.held_position(),
+            bitmap_storage: self.permutation.visited.held_position(),
             merge_middle: self.order.middle,
             merge_end: self.order.end,
             merge_forward: self.order.forward,

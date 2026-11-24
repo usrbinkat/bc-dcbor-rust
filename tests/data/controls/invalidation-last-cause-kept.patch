@@ -1,6 +1,6 @@
 --- src/bounded/policy/record.rs
 +++ src/bounded/policy/record.rs
-@@ -288,9 +288,9 @@
+@@ -331,9 +331,9 @@
  /// Make `store`'s session, stickily, no evidence, for `cause`: the first
  /// cause is kept, every later one leaves it ([`Invalidation`]).
  pub(crate) fn exhaust(store: &Shared, cause: Invalidation) {

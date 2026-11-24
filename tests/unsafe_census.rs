@@ -118,7 +118,8 @@ struct UnsafeImpl {
 }
 
 /// One comparison or bound call the boundary rule governs: the function or
-/// constant it lies in (the outermost named one), its line, what it is
+/// constant it lies in (the outermost named one, a method as
+/// `Owner::method`), its line, what it is
 /// (`<`, `min`, `checked_add`, ...), and whether an operand extracts a
 /// bound's raw limit (`raw_limit`), a bypass of the seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,11 +150,50 @@ fn governed(name: &str) -> bool {
 #[derive(Default)]
 struct BoundarySites {
     function: Option<String>,
+    /// The type of the `impl` block, or the trait, whose items are being
+    /// visited: a method's site is `Owner::method`, so an exemption names
+    /// exactly one function, never every function of that name in its
+    /// module.
+    owner: Option<String>,
     bounds: BTreeSet<String>,
     found: Vec<BoundarySite>,
 }
 
+/// The name of an `impl` block's self type: its path's last segment
+/// (`Storage` for `Storage<T, P, O>`), through references and groups; the
+/// whole type's tokens for any other type.
+fn self_type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|last| last.ident.to_string())
+            .unwrap_or_else(|| ty.to_token_stream().to_string()),
+        syn::Type::Reference(reference) => self_type_name(&reference.elem),
+        syn::Type::Group(group) => self_type_name(&group.elem),
+        syn::Type::Paren(paren) => self_type_name(&paren.elem),
+        other => other.to_token_stream().to_string(),
+    }
+}
+
 impl BoundarySites {
+    /// Visit `visit` with `owner` as the owner of the items it reaches.
+    fn owned(&mut self, owner: String, visit: impl FnOnce(&mut Self)) {
+        let outer = self.owner.replace(owner);
+        visit(self);
+        self.owner = outer;
+    }
+
+    /// `name` as its site names it: `Owner::name` inside an `impl` block or
+    /// a trait, `name` otherwise.
+    fn qualified(&self, name: &syn::Ident) -> String {
+        match &self.owner {
+            Some(owner) => format!("{owner}::{name}"),
+            None => name.to_string(),
+        }
+    }
+
     /// Visit `visit` as the item `name`, unless already within one: a nested
     /// item counts toward its outermost named item.
     fn within(&mut self, name: String, visit: impl FnOnce(&mut Self)) {
@@ -227,14 +267,26 @@ impl<'ast> Visit<'ast> for BoundarySites {
         });
     }
 
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        self.owned(self_type_name(&item.self_ty), |this| {
+            syn::visit::visit_item_impl(this, item)
+        });
+    }
+
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        self.owned(item.ident.to_string(), |this| {
+            syn::visit::visit_item_trait(this, item)
+        });
+    }
+
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        self.within(item.sig.ident.to_string(), |this| {
+        self.within(self.qualified(&item.sig.ident), |this| {
             syn::visit::visit_impl_item_fn(this, item)
         });
     }
 
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-        self.within(item.sig.ident.to_string(), |this| {
+        self.within(self.qualified(&item.sig.ident), |this| {
             syn::visit::visit_trait_item_fn(this, item)
         });
     }
@@ -2633,7 +2685,8 @@ fn the_allocator_check_finds_every_allocator_past_the_global_one_and_nothing_els
 
 /// Every function, of a module whose own code holds `unsafe`, whose
 /// comparisons and bound calls stay outside the seam, by module, function
-/// (`*` for the whole module) and why: none of them derives a pointer, an
+/// (a method as `Owner::method`, its `impl` block's type or its trait, so
+/// one entry names one function; `*` for the whole module) and why: none of them derives a pointer, an
 /// offset, a length or a capacity that unsafe code relies on, or each is
 /// checked at compile time. Everything else in such a module goes through
 /// the seam (`bounded::boundary`). An exemption whose function has no such
@@ -2641,22 +2694,22 @@ fn the_allocator_check_finds_every_allocator_past_the_global_one_and_nothing_els
 const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
         "crate::bounded::decode::construction::construct",
-        "pending_units",
+        "Constructed::pending_units",
         "the pending field's units within the recorded initialization prefix, re-used by terminal destruction without a policy",
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "observe_permits",
+        "Constructed::observe_permits",
         "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
     ),
     (
         "crate::bounded::decode::construction::parse",
-        "observe_permits",
+        "Parsed::observe_permits",
         "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
     ),
     (
         "crate::bounded::decode::cursor::publication",
-        "observe_prefix",
+        "DocumentArena::observe_prefix",
         "read-only custody traversal re-checks recorded transfer and release prefixes, no policy",
     ),
     (
@@ -2671,12 +2724,12 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::storage",
-        "drop_prefix",
+        "Storage::drop_prefix",
         "terminal destruction selects fixed fields from their recorded initialized prefix, no policy",
     ),
     (
         "crate::bounded::decode::construction::reclamation",
-        "descend",
+        "Depth::descend",
         "dispatch recursion count checked against the root's declaration, no pointer or allocation length",
     ),
     (
@@ -2686,7 +2739,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::reclamation",
-        "set",
+        "Prefix::set",
         "niche encoding of an initialization count whose task bounds it before writing; no field or offset selected here",
     ),
     (
@@ -2716,7 +2769,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::policy::record",
-        "boundary",
+        "Session::boundary",
         "clamps the verified prefix to the claimed count before a checked `get` range, no policy",
     ),
     (
@@ -2731,7 +2784,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "covering",
+        "Capped::covering",
         "bound arithmetic: units covering a count, no pointer",
     ),
     (
@@ -2746,42 +2799,47 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "checked_then",
+        "ResourceBound::checked_then",
         "bound composition (sequence): a peak as max(P_a, R_a + P_b), overflow None",
     ),
     (
         "crate::bounded",
-        "checked_followed_by",
+        "WriteWork::checked_then",
+        "work composition (sequence), overflow None",
+    ),
+    (
+        "crate::bounded",
+        "ResourceBound::checked_followed_by",
         "bound composition (sequence after release): overflow None",
     ),
     (
         "crate::bounded",
-        "checked_repeated",
+        "ResourceBound::checked_repeated",
         "bound composition (repeat): overflow None",
     ),
     (
         "crate::bounded",
-        "checked_repeated_retained",
+        "ResourceBound::checked_repeated_retained",
         "bound composition (repeat, retained): (n-1)R + P, overflow None",
     ),
     (
         "crate::bounded",
-        "checked_sequence",
+        "WriteWork::checked_sequence",
         "work composition over a sequence, overflow None",
     ),
     (
         "crate::bounded",
-        "checked_times",
+        "WriteWork::checked_times",
         "work composition over a count, overflow None",
     ),
     (
         "crate::bounded",
-        "checked_add",
+        "ResourceBound::checked_add",
         "bound composition: overflow is None",
     ),
     (
         "crate::bounded",
-        "checked_mul",
+        "ResourceBound::checked_mul",
         "bound composition: overflow is None",
     ),
     (
@@ -2801,27 +2859,32 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "times",
+        "Unit::times",
         "a charge rule's work over a count, refused as Overflow",
     ),
     (
         "crate::bounded",
-        "held",
+        "Capped::times",
+        "a capped charge rule's work over a count, refused as Overflow",
+    ),
+    (
+        "crate::bounded",
+        "Rate::held",
         "a charge rule's held part over a count, refused as Overflow",
     ),
     (
         "crate::bounded",
-        "of",
+        "Rate::of",
         "a charge rule's work over a count, refused as Overflow",
     ),
     (
         "crate::bounded",
-        "over",
+        "Rate::over",
         "a charge rule's work over a count, refused as Overflow",
     ),
     (
         "crate::bounded",
-        "one_growing",
+        "Growth::one_growing",
         "growth bound composition: arenas held at once, one relocating",
     ),
     (
@@ -2831,8 +2894,13 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded",
-        "covers",
+        "ResourceBound::covers",
         "a run within its bound: a check of evidence, no pointer",
+    ),
+    (
+        "crate::bounded",
+        "WriteWork::covers",
+        "a run's work within its bound: a check of evidence, no pointer",
     ),
     (
         "crate::bounded",
@@ -2847,8 +2915,8 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ("crate::bounded", "integer", "an integer's sign"),
     (
         "crate::bounded",
-        "reserve",
-        "Owned::reserve: checked growth refused as Overflow",
+        "Owned::reserve",
+        "checked growth refused as Overflow",
     ),
     (
         "crate::bounded::policy",
@@ -2857,17 +2925,22 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::storage",
-        "reclaim_remaining",
+        "Storage::reclaim_remaining",
         "a count of cleanup calls",
     ),
     (
         "crate::bounded::decode::storage",
-        "settle_remaining",
+        "Storage::settle_remaining",
         "a count of settlement calls",
     ),
     (
         "crate::bounded::decode::storage",
-        "push_pair",
+        "StoragePosition::class",
+        "a cleanup class read from a position without a policy, no pointer derived",
+    ),
+    (
+        "crate::bounded::decode::storage",
+        "Spare::push_pair",
         "the free slots against the two a pair takes, checked before Vec::push within reserved capacity, no pointer",
     ),
     (
@@ -2877,27 +2950,27 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::cursor",
-        "of",
+        "RetainedTerms::of",
         "bound arithmetic of the retained parse",
     ),
     (
         "crate::bounded::decode::cursor",
-        "peak_of",
+        "RetainedTerms::peak_of",
         "bound arithmetic of the retained parse",
     ),
     (
         "crate::bounded::decode::cursor",
-        "reclaim_remaining",
+        "ParserContinuation::reclaim_remaining",
         "a count of cleanup calls",
     ),
     (
         "crate::bounded::decode::cursor",
-        "advance",
+        "ParserContinuation::advance",
         "the numeric profile (an argument above i64::MAX), checked lengths refused as Overflow, and the phase chosen by children remaining",
     ),
     (
         "crate::bounded::decode",
-        "next",
+        "Children::next",
         "checked indexing of a published document's children, no policy",
     ),
     (
@@ -2907,12 +2980,12 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode",
-        "of",
+        "Terms::of",
         "bound arithmetic of the synchronous decode",
     ),
     (
         "crate::bounded::decode",
-        "peak_of",
+        "Terms::peak_of",
         "bound arithmetic of the synchronous decode",
     ),
     (
@@ -2942,7 +3015,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "of",
+        "ConstructTerms::of",
         "bound composition of the owned construction, overflow None",
     ),
     (
@@ -2982,12 +3055,12 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::btree::cleanup",
-        "new",
+        "Owed::new",
         "a count of cleanup calls, overflow None",
     ),
     (
         "crate::bounded::decode::construction::in_place::btree::cleanup",
-        "record",
+        "Owed::record",
         "a count of cleanup calls, overflow None",
     ),
     (
@@ -2997,22 +3070,27 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::operation",
-        "of",
+        "OperationTerms::of",
         "bound composition of an owned operation, overflow refused",
     ),
     (
         "crate::bounded::decode::construction::operation",
-        "peak",
+        "OperationTerms::peak",
         "bound composition of an owned operation, overflow refused",
     ),
     (
+        "crate::bounded::decode::construction::operation",
+        "Position::partial",
+        "a cleanup class read from a position without a policy, no pointer derived",
+    ),
+    (
         "crate::bounded::decode::construction::parse",
-        "of",
+        "ParseTerms::of",
         "bound composition of the owned parse, overflow refused",
     ),
     (
         "crate::bounded::decode::construction::reclamation::owned",
-        "of",
+        "ScopeTerms::of",
         "bound composition of an owned record, overflow refused",
     ),
     (
@@ -3022,38 +3100,38 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::stable",
-        "bind",
+        "Pending::bind",
         "acquisition ticket counter, overflow refused before minting, no pointer",
     ),
     (
         "crate::bounded::decode::cursor::publication",
-        "transfer_work",
+        "DocumentArena::transfer_work",
         "work composition of a publication's field transfers, overflow refused",
     ),
     (
         "crate::bounded::decode::cursor::publication",
-        "release_work",
+        "DocumentArena::release_work",
         "work composition of a publication's releases, overflow refused",
     ),
     (
         "crate::bounded::decode::storage",
-        "transfer_work",
+        "Storage::transfer_work",
         "work composition of a transfer, overflow refused",
     ),
     (
         "crate::bounded::decode::storage",
-        "cleanup_work",
+        "Storage::cleanup_work",
         "work composition of a cleanup, overflow refused",
     ),
     (
         "crate::bounded::encoding",
-        "observe_permits",
+        "Planned::observe_permits",
         "read-only custody traversal re-checks the prefix recorded by initialization, no policy",
     ),
     (
         "crate::bounded::encoding",
-        "text",
-        "Shape::text: a text's walk bound, overflow refused",
+        "Shape::text",
+        "a text's walk bound, overflow refused",
     ),
     (
         "crate::bounded::encoding",
@@ -3072,7 +3150,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding",
-        "initialize_step",
+        "Preparation::initialize_step",
         "checked subtraction of the already recorded prefix base, refused as PlanMismatch",
     ),
     (
@@ -3082,47 +3160,47 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::parse",
-        "custody",
+        "Parsed::custody",
         "a re-check of a prefix the calling step records",
     ),
     (
         "crate::bounded::decode::construction::parse",
-        "remaining",
+        "Parsed::remaining",
         "a count of cleanup calls, observed without a policy",
     ),
     (
         "crate::bounded::decode::construction::parse",
-        "detail",
+        "Parse::detail",
         "observation without a policy",
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "custody",
+        "Constructed::custody",
         "a re-check of a prefix the calling step records",
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "remaining",
+        "Constructed::remaining",
         "a count of cleanup calls, observed without a policy",
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "detail",
+        "Construct::detail",
         "observation without a policy",
     ),
     (
         "crate::bounded::decode::construction::in_place",
-        "checked_per_byte",
+        "ConstructionCost::checked_per_byte",
         "the construction cost algebra, overflow None",
     ),
     (
         "crate::bounded::decode::construction::in_place",
-        "checked_add",
+        "ConstructionCost::checked_add",
         "the construction cost algebra, overflow None",
     ),
     (
         "crate::bounded::decode::construction::in_place",
-        "checked_children",
+        "ConstructionCost::checked_children",
         "the construction cost algebra, overflow None",
     ),
     (
@@ -3212,12 +3290,12 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::btree",
-        "child",
+        "Shape::child",
         "plan arithmetic certified with raised",
     ),
     (
         "crate::bounded::decode::construction::in_place::btree",
-        "rank",
+        "Shape::rank",
         "plan arithmetic certified with raised",
     ),
     (
@@ -3232,7 +3310,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::btree",
-        "observe",
+        "State::observe",
         "observation without a policy",
     ),
     (
@@ -3250,20 +3328,24 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "remaining",
         "a count of cleanup calls",
     ),
-    ("crate::map", "insert_next", "symbolic key order, no offset"),
     (
-        "crate::bounded::encoding",
-        "of",
-        "PreparationTerms::of: bound arithmetic",
+        "crate::map",
+        "Map::insert_next",
+        "symbolic key order, no offset",
     ),
     (
         "crate::bounded::encoding",
-        "walk",
+        "PreparationTerms::of",
+        "bound arithmetic of a preparation",
+    ),
+    (
+        "crate::bounded::encoding",
+        "Shape::walk",
         "the shape walk's counts, admitted and refused as Overflow",
     ),
     (
         "crate::bounded::encoding",
-        "merged",
+        "Shape::merged",
         "the shape walk's counts",
     ),
     (
@@ -3278,7 +3360,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding",
-        "advance",
+        "Preparation::advance",
         "an entry cursor's admitted node moves against those it states (a count, admitted in units), the instruction index, a map payload's start, the omitted gap bytes and the window part count (two per cursor), each checked and refused as Overflow, and the window arena's free parts against the pair it publishes, refused as PlanMismatch",
     ),
     (
@@ -3288,7 +3370,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding::values",
-        "instruction",
+        "CBOR::instruction",
         "the numeric profile: a negative argument above i64::MAX is out of range, no offset",
     ),
     (
@@ -3303,7 +3385,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::optional",
-        "remaining",
+        "Option::remaining",
         "a count of cleanup calls, observed without a policy",
     ),
     (
@@ -3313,7 +3395,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::in_place::stable_option",
-        "remaining",
+        "StableOption::remaining",
         "a count of cleanup calls, observed without a policy",
     ),
     (
@@ -3333,7 +3415,7 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding",
-        "plan_len",
+        "Preparation::plan_len",
         "a plan's length, checked",
     ),
     (
@@ -3343,37 +3425,37 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding",
-        "custody",
+        "Planned::custody",
         "a re-check of a prefix the calling step records",
     ),
     (
         "crate::bounded::encoding",
-        "remaining",
+        "Planned::remaining",
         "a count of cleanup calls, observed without a policy",
     ),
     (
         "crate::bounded::encoding",
-        "detail",
+        "Prepare::detail",
         "observation without a policy",
     ),
     (
         "crate::bounded::encoding::dynamic",
-        "reclaim_remaining",
+        "Dynamic::reclaim_remaining",
         "a count of cleanup calls",
     ),
     (
         "crate::bounded::encoding::dynamic",
-        "compact_child",
+        "Preparation::compact_child",
         "the omitted gap bytes' checked subtraction, refused as PlanMismatch",
     ),
     (
         "crate::bounded::encoding::permutation",
-        "step",
+        "Permutation::step",
         "the payload's length past its base and the output offsets, checked and refused",
     ),
     (
         "crate::bounded::encoding::maps::order",
-        "step",
+        "Order::step",
         "the run width's checked doubling refused as Overflow",
     ),
 ];
@@ -3441,7 +3523,9 @@ fn every_boundary_in_an_unsafe_module_goes_through_the_seam() {
 
 /// The boundary rule's pass and fail scenarios: in a module holding
 /// `unsafe`, an unwrapped comparison fails; a comparison over a raw limit
-/// fails even exempted; a governed call inside a macro's arguments, a
+/// fails even exempted; a method sharing an exempted free function's name
+/// fails, its exemption naming its owner (`S::owned`) passes; a governed
+/// call inside a macro's arguments, a
 /// comparison in a `matches!` guard, a macro whose arguments are not
 /// expressions, and a governed call and a comparison in a `macro_rules!`
 /// body fail, and so does one in a `const fn`, which runs at run time; an
@@ -3480,7 +3564,10 @@ fn the_boundary_check_finds_every_unwrapped_site_and_nothing_else() {
              macro_rules! step { ($a:expr) => { if $a.saturating_sub(1) > 0 { boundary!(a, P, $a, 4) } } }\n\
              pub const LIMIT: usize = if 3 > 2 { 4usize.saturating_add(1) } else { 2 };\n\
              pub fn sized<T>() { const { assert!(core::mem::size_of::<T>() <= 8) } }\n\
-             pub const fn runs(a: usize) -> usize { a.saturating_sub(1) }\n",
+             pub const fn runs(a: usize) -> usize { a.saturating_sub(1) }\n\
+             pub struct S;\n\
+             impl S { pub fn exempted(a: usize) -> usize { a.max(4) } }\n\
+             impl S { pub fn owned(a: usize) -> usize { a.max(2) } }\n",
         ),
         ("safe.rs", "pub fn ignored(a: usize) -> bool { a < 2 }\n"),
     ] {
@@ -3493,6 +3580,11 @@ fn the_boundary_check_finds_every_unwrapped_site_and_nothing_else() {
             &scanned,
             &[
                 ("crate::engine", "exempted", "a limit with no pointer"),
+                (
+                    "crate::engine",
+                    "S::owned",
+                    "a method exempted by its owner"
+                ),
                 (
                     "crate::engine",
                     "bypass",
@@ -3512,6 +3604,7 @@ fn the_boundary_check_finds_every_unwrapped_site_and_nothing_else() {
             "crate::engine: <item>:16: >".to_string(),
             "crate::engine: <item>:16: saturating_sub".to_string(),
             "crate::engine: runs:19: saturating_sub".to_string(),
+            "crate::engine: S::exempted:21: max".to_string(),
             "crate::engine: reasonless: an exemption without a reason".to_string(),
             "crate::engine: gone: a stale exemption, no site".to_string(),
             "crate::other: anything: a stale exemption, no site".to_string(),

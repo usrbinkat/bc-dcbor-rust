@@ -109,3 +109,6 @@ tests/data/proofs/calibration/.adoption.lock
 # cargo-mutants output.
 mutants.out/
 mutants.out.old/
+
+# Internal compiler error reports rustc writes into the working directory.
+rustc-ice-*.txt

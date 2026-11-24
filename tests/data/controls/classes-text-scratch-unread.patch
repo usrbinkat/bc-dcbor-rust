@@ -1,0 +1,11 @@
+--- src/bounded/text_cursor.rs
++++ src/bounded/text_cursor.rs
+@@ -145,7 +145,7 @@
+                 stage,
+                 TextCleanupStage::Active | TextCleanupStage::ReclaimOrdering
+             )
+-            .then(|| position.ordering_state.scratch.class(plain)),
++            .then(|| position.ordering_state.scratch.class(plain)).filter(|_| false),
+             chars: (stage != TextCleanupStage::Finished).then(|| position.characters.class(plain)),
+         }
+     }

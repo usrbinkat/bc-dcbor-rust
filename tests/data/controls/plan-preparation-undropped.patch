@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -3428,7 +3428,9 @@
+@@ -3907,7 +3907,9 @@
                      // SAFETY: the preparation is initialized and held in this
                      // phase; the phase moves past it below, and no later
                      // step, count, observation or detail reads it.

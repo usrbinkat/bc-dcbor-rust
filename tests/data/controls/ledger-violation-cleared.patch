@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -238,7 +238,10 @@
+@@ -269,7 +269,10 @@
          ];
          if fitted.contains(&false) {
              self.violate();

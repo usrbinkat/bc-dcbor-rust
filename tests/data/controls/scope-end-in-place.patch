@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/input.rs
 +++ src/bounded/decode/construction/input.rs
-@@ -108,7 +108,7 @@
+@@ -128,7 +128,7 @@
  ) -> BoundedResult<Reclaimed, A> {
      SETTLE.admit(cleanup)?;
      if let Some(scope) = scope.take() {

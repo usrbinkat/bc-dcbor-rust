@@ -57,7 +57,7 @@ pub(super) const PERMUTED: Unit<PreparationPlace> = Unit::new(
     2 * core::mem::size_of::<usize>() as u64,
 );
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermutationPhase {
     #[default]
     Offsets,
@@ -70,7 +70,7 @@ pub enum PermutationPhase {
     Complete,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PermutationPosition {
     pub phase: PermutationPhase,
     pub entry: usize,

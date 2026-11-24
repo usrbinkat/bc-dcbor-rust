@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2563,7 +2563,7 @@
+@@ -2901,7 +2901,7 @@
          // owes. One refused before launch (its policy's resolution) owes none
          // and may report no verification result; one launched owes all of it,
          // verdict or not, validated before its report is read.

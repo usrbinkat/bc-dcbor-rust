@@ -11613,7 +11613,7 @@ pub mod pipeline {
                 .boundaries
                 .iter()
                 .map(|boundary| match &boundary.class {
-                    Some(class) => format!("{:?}: {class}", boundary.phase),
+                    Some(class) => format!("{:?}: {class:?}", boundary.phase),
                     None => format!("unclassified {:?} turn {}", boundary.phase, boundary.turn),
                 }),
         );

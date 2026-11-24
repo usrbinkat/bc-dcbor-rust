@@ -1,6 +1,6 @@
 --- tests/gate/src/process.rs
 +++ tests/gate/src/process.rs
-@@ -417,7 +417,7 @@
+@@ -434,7 +434,7 @@
                  }
              }
              (RunPurpose::Discovery(discovery), selection) => {
