@@ -565,7 +565,7 @@ window-remint-on-retry	tests/data/controls/window-remint-on-retry.patch	native	n
 window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly	dcbor	all	fast	held_credit	preparation_continues_a_window_across_families	-	failed	does not refine the protocol
 # A cleanup class losing one fact its cleanup reads, one plant each: the
 # scope queue's drain state (operation.rs, `OperationClass`), whether an arena is
-# released under its holder (storage.rs `held_class`) and the cursors' window
+# released under its holder (storage.rs `HeldPosition::class`) and the cursors' window
 # arena (encoding.rs, `Preparation`'s `Reduction`). Each merges boundaries
 # whose cleanups differ, which only the exhaustive layer, stopping at every
 # member of a class, names (tests/support/lifecycle.rs, `agree`).
