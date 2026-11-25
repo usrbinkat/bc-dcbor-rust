@@ -743,6 +743,29 @@ fn diagnosis_directory(root: &Path, harness: &str) -> Result<PathBuf, String> {
     Err(format!("{}: no free diagnosis number", root.display()))
 }
 
+/// The run identity of the discovery whose evidence is `evidence`
+/// (`run.json`, validated), refused unless its purpose is discovery. It is
+/// the diagnosis's source identity: the source state that discovery
+/// compiled (`tree_sha256`, the digest of its clean commit's copy), never a
+/// digest of the directory a diagnosis runs in, which is the checkout and
+/// holds its build output.
+fn discovery_identity(evidence: &Path) -> Result<super::RunIdentity, String> {
+    let path = evidence.join("run.json");
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let identity =
+        super::typed::<super::RunIdentityRecord>(super::strict_json(&bytes)?, "run.json")?
+            .validate()?;
+    if identity.purpose() != super::PURPOSE_DISCOVERY {
+        return Err(format!(
+            "{}: run {} has the purpose {}, not a discovery: only a discovery's evidence is diagnosed",
+            path.display(),
+            identity.id(),
+            identity.purpose()
+        ));
+    }
+    Ok(identity)
+}
+
 /// Diagnose `harness` (its source file `harness_file`, relative to the
 /// package, as CBMC records it) from the discovery evidence `evidence`,
 /// under `focus`, in a new directory under `root` ([`diagnosis_directory`]),
@@ -761,15 +784,20 @@ pub fn diagnose(
     focus: Focus,
     root: &Path,
 ) -> Result<(Summary, PathBuf), String> {
+    let discovery = discovery_identity(evidence)?;
     let recorded = recorded(evidence, harness)?;
     let out = diagnosis_directory(root, harness)?;
     let identity = serde_json::json!({
         "harness": harness,
         "evidence": evidence,
+        "discovery": {
+            "id": discovery.id(),
+            "revision": discovery.revision(),
+            "tree_sha256": discovery.record().tree_sha256,
+            "loop_policy_sha256": discovery.record().loop_policy_sha256,
+        },
         "artifact": {"path": recorded.artifact, "sha256": recorded.sha256},
         "solver": recorded.solver,
-        "tree_sha256": super::tree_digest(&std::env::current_dir()
-            .map_err(|error| format!("the working directory: {error}"))?)?,
     });
     crate::process::record(
         &out.join("identity.json"),
@@ -1120,7 +1148,76 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        write_identity(&evidence, super::super::PURPOSE_DISCOVERY);
         evidence
+    }
+
+    /// The source state the fixture's discovery records.
+    const TREE: &str = "94c31505a3d7504ce18ed571b0a586c32a8d6ec372e8e5851e88e659fdf24a60";
+    /// The fixture's discovery run identifier.
+    const RUN: &str = "409e62f1-83d8-4144-b9d7-ae6c629ccc91";
+
+    /// `evidence`'s run identity (`run.json`), of `purpose`.
+    fn write_identity(evidence: &Path, purpose: &str) {
+        let identity = super::super::RunIdentityRecord {
+            version: super::super::RUNTIME_VERSION,
+            id: RUN.to_string(),
+            purpose: purpose.to_string(),
+            revision: "c303ce7502584427108246cd599a2f656e9ffe8b406e325f2c7359264e03bb08"
+                .to_string(),
+            tree_sha256: TREE.to_string(),
+            build: "kani --package dcbor --lib".to_string(),
+            loop_policy_sha256: "61408177d0a9de25f6bff09f7dc50e206240678227213a593bd4a5d966cd35d8"
+                .to_string(),
+            started: super::super::Instant {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        };
+        std::fs::write(
+            evidence.join("run.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A diagnosis's identity is the discovery's: its run and the source
+    /// state it compiled, read from its validated `run.json`, never a digest
+    /// of the directory the diagnosis runs in (the checkout, its build output
+    /// included); evidence of any other purpose is refused before anything
+    /// runs.
+    #[test]
+    fn a_diagnosis_is_bound_to_its_discovery_run() {
+        let directory = tempdir("bound");
+        let evidence = discovery_evidence(&directory, &solver(&directory, 0));
+        let root = directory.join("kani.diagnostics");
+        let (_, out) = diagnose(
+            &unconfined(),
+            &evidence,
+            "a::h",
+            "src/h.rs",
+            Focus::default(),
+            &root,
+        )
+        .unwrap();
+        let identity: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("identity.json")).unwrap()).unwrap();
+        assert_eq!(identity["discovery"]["id"], RUN);
+        assert_eq!(identity["discovery"]["tree_sha256"], TREE);
+        write_identity(&evidence, super::super::PURPOSE_CALIBRATION);
+        let refused = diagnose(
+            &unconfined(),
+            &evidence,
+            "a::h",
+            "src/h.rs",
+            Focus::default(),
+            &root,
+        )
+        .err()
+        .unwrap();
+        assert!(refused.contains("not a discovery"), "{refused}");
+        assert!(!root.join("a.h.2").exists());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A stand-in solver answering each step's flags as CBMC 6.11.0 would,
