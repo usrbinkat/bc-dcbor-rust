@@ -10457,13 +10457,17 @@ pub mod pipeline {
     /// A run records into the default capacity ([`CAPACITY`]); a fixture
     /// that outgrows it runs through its measured budget
     /// ([`crate::budgets::Budgets::encode_checked`]), never a capacity a
-    /// schedule states.
+    /// schedule states. `cleanup_refusal` refuses every admission once from
+    /// a cancelled stop's cleanup on, its drain included ([`Refusal::Each`]
+    /// applied after the cancellation): the run before the stop, its
+    /// boundaries and turns, is the unrefused run's.
     #[derive(Clone, Copy, Debug)]
     pub struct Schedule {
         pub refusal: Refusal,
         pub physical: Option<usize>,
         pub stop: Option<(Phase, usize, Stop)>,
         pub observed: bool,
+        pub cleanup_refusal: bool,
     }
 
     impl Schedule {
@@ -10473,6 +10477,7 @@ pub mod pipeline {
             physical: None,
             stop: None,
             observed: true,
+            cleanup_refusal: false,
         };
     }
 
@@ -10624,6 +10629,11 @@ pub mod pipeline {
         cleaned: std::cell::RefCell<Vec<(Class, usize, usize)>>,
         /// Positions are read ([`Schedule::observed`]).
         observed: bool,
+        /// A cancelled stop's cleanup refuses every admission once
+        /// ([`Schedule::cleanup_refusal`]).
+        cleanup_refusal: bool,
+        /// The stop cancelled an operation in progress ([`Report::cancelled`]).
+        cancelled: std::cell::Cell<bool>,
     }
 
     /// Classification and cancellation of an operation already held by the run.
@@ -10749,6 +10759,18 @@ pub mod pipeline {
             // position observes. So each position's calls end where the
             // operation's cleanup ends, the count after its last turn.
             let classed = cancelled && self.observed;
+            // Cleanup driven with every admission refused once: a refused
+            // first cleanup unit leaves the operation cancelling with its
+            // record's state unchanged (a plan record still `Active`, its
+            // preparation held), a position no unrefused cleanup records.
+            // The cancellation admitted nothing, so the run before it is the
+            // unrefused run's.
+            if cancelled {
+                self.cancelled.set(true);
+                if self.cleanup_refusal {
+                    operation.with_policy(self.policy, |_, m| refuse(m, Refusal::Each));
+                }
+            }
             let first = self.cleaned.borrow().len();
             let end = std::cell::Cell::new(None);
             if let Err(stop) = operation.cleanup(
@@ -11139,6 +11161,9 @@ pub mod pipeline {
         /// rest of its operation's cleanup, the drain excluded. Empty for
         /// every other run.
         pub cleaned: Vec<(Class, Vec<Call>)>,
+        /// The selected stop cancelled an operation in progress, whose own
+        /// cleanup then ran; a cancellation at a boundary with none retires.
+        pub cancelled: bool,
         /// The selected end was reached with the input's exact bytes.
         pub complete: bool,
         /// The input was rejected while parsing or decoding.
@@ -11253,6 +11278,8 @@ pub mod pipeline {
                     stopped_at: std::cell::Cell::new(None),
                     cleaned: std::cell::RefCell::new(Vec::new()),
                     observed: schedule.observed,
+                    cleanup_refusal: schedule.cleanup_refusal,
+                    cancelled: std::cell::Cell::new(false),
                 };
                 let mut output = Vec::with_capacity(wire.len());
                 let (reached, drain_attempt, accounting, metrics) = run.holding(
@@ -11334,6 +11361,7 @@ pub mod pipeline {
                     bounds: context.bounds.into_inner(),
                     cleanup,
                     cleaned,
+                    cancelled: context.cancelled.get(),
                     complete,
                     invalid: matches!(reached, Reached::Invalid),
                     stopped: matches!(reached, Reached::Stopped),
@@ -11639,7 +11667,13 @@ pub mod pipeline {
     ///   boundary of none; the exhaustive layer stops at every boundary and
     ///   requires every member of a class to clean up with exactly the
     ///   admitted calls its first member made, each position a
-    ///   cancellation's cleanup passes through a member of its own class;
+    ///   cancellation's cleanup passes through a member of its own class.
+    ///   Each cancellation runs a second time with every admission from its
+    ///   cleanup on refused once ([`Schedule::cleanup_refusal`]): a refused
+    ///   first cleanup unit leaves the operation cancelling in its record's
+    ///   live stage, which no unrefused cleanup reaches, and those positions
+    ///   join their classes beside the unrefused run's; the refused run
+    ///   refuses exactly its cleanup's admitted calls and admits the same;
     /// - observation without effect (`unaffected`): a schedule run again
     ///   reading no position reaches the same report. The fast layer checks
     ///   the unobstructed run and the one-pass refusal, which together reach
@@ -11778,7 +11812,17 @@ pub mod pipeline {
             .zip(in_fast)
             .filter(|&(_, in_fast)| in_fast || rigor == Rigor::Exhaustive)
             .collect();
-        const STOPS: [Stop; 3] = [Stop::Retire, Stop::Unwind, Stop::Cancel];
+        // Each kind of stop, and a cancellation whose cleanup has every
+        // admission refused once: a refused first cleanup unit leaves the
+        // operation cancelling in its record's live stage, the one position
+        // from which the transition into cleanup is still owed, so its class
+        // must part from the stage that follows.
+        const STOPS: [(Stop, bool); 4] = [
+            (Stop::Retire, false),
+            (Stop::Unwind, false),
+            (Stop::Cancel, false),
+            (Stop::Cancel, true),
+        ];
         progress.stage(
             "stops",
             selected.len() * STOPS.len(),
@@ -11788,14 +11832,23 @@ pub mod pipeline {
         // cleanup it made: members of one class must clean up alike.
         let mut members = Vec::new();
         for (boundary, in_fast) in selected {
-            for stop in STOPS {
+            // The unrefused cancellation's cleanup, which the refused one's
+            // admitted calls must equal.
+            let mut cancelled: Option<Vec<Call>> = None;
+            for (stop, cleanup_refusal) in STOPS {
+                let refused = if cleanup_refusal {
+                    ", every cleanup admission refused once"
+                } else {
+                    ""
+                };
                 let at = format!(
-                    "{stop:?} at {:?} {}, class {:?}",
+                    "{stop:?} at {:?} {}, class {:?}{refused}",
                     boundary.phase, boundary.turn, boundary.class
                 );
                 progress.case(&at);
                 let schedule = Schedule {
                     stop: Some((boundary.phase, boundary.turn, stop)),
+                    cleanup_refusal,
                     ..Schedule::BASELINE
                 };
                 let stopped = run(&schedule);
@@ -11812,6 +11865,31 @@ pub mod pipeline {
                 assert!(!stopped.complete, "{at}: published");
                 if exhaustive {
                     unaffected(&run, &schedule, &stopped, &at);
+                }
+                if stop == Stop::Cancel {
+                    if cleanup_refusal {
+                        // Every admission from the stop on, the cleanup's
+                        // and the drain's, refused once and admitted at its
+                        // retry: a refusal admits nothing and changes no
+                        // call.
+                        let expected = if stopped.cancelled {
+                            stopped.cleanup.len()
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            stopped.refused, expected,
+                            "{at}: not every cleanup admission was refused exactly once"
+                        );
+                        assert_eq!(
+                            Some(&stopped.cleanup),
+                            cancelled.as_ref(),
+                            "{at}: refused cleanup admitted other calls than the unrefused one"
+                        );
+                    } else {
+                        assert_eq!(stopped.refused, 0, "{at}: refused unscheduled");
+                        cancelled = Some(stopped.cleanup.clone());
+                    }
                 }
                 // A cancellation's cleanup positions are members too: from
                 // two positions of one class the rest of cleanup must admit

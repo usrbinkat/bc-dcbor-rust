@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/operation.rs
 +++ src/bounded/decode/construction/operation.rs
-@@ -289,7 +289,7 @@
+@@ -293,7 +293,7 @@
      /// begun but incomplete, its exact units otherwise: the prefix of a
      /// record whose cleanup then reads only a slot its detail carries.
      pub(crate) fn partial(&self) -> PrefixClass {

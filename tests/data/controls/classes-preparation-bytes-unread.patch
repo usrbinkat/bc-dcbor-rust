@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -562,7 +562,7 @@
+@@ -563,7 +563,7 @@
                  .map(|text| text.class()),
              frames: position.frames.class(Discarded),
              maps: position.maps.class(Discarded),

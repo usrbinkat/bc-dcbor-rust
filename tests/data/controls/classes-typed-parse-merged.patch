@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -1029,7 +1029,7 @@
+@@ -1085,7 +1085,7 @@
          S: super::Reduction<Observation = O>,
      {
          match self {

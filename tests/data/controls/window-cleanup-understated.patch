@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1495,7 +1495,7 @@
+@@ -1496,7 +1496,7 @@
              self.bytes.unreleased_copy_remaining()?,
              self.holes.unreleased_copy_remaining()?,
              self.cursors.unreleased_copy_remaining()?,

@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -564,7 +564,7 @@
+@@ -565,7 +565,7 @@
              maps: position.maps.class(Discarded),
              bytes: position.bytes.class(Discarded),
              holes: position.holes.class(Discarded),

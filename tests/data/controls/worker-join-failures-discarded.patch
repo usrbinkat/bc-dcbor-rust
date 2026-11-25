@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -2046,1 +2046,2 @@
+@@ -2049,1 +2049,2 @@
 -    failures
 +    failures.clear();
 +    failures

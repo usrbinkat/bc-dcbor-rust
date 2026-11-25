@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -821,13 +821,13 @@
+@@ -822,13 +822,13 @@
      rule: Forfeit,
  ) {
      windows.for_each_mut(|part| {

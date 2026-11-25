@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/input.rs
 +++ src/bounded/decode/construction/input.rs
-@@ -271,7 +271,7 @@
+@@ -280,7 +280,7 @@
          self.operation_class(
              self.units(),
              InputClass {

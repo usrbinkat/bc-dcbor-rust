@@ -262,21 +262,22 @@ pub enum PrefixClass {
 
 /// The operation's part of a class ([`super::Reduction`]), its task's
 /// class `C` beside it: whether its record is allocated, how much of its
-/// prefix cleanup reads ([`PrefixClass`]), whether it is cancelling or
-/// finished, how many records its scope holds and where its queue stands.
-/// Each is read: a record's cleanup releases its written prefix, and the
-/// scope's drain releases every record it holds from where its queue stands
-/// (the active record's remaining calls, the records queued behind it, a
-/// removal unit already admitted). Where the record's acquisition stands is
-/// not: every cleanup step cancels it first, admitting nothing
-/// ([`Acquisition::cancel_into`]).
+/// prefix cleanup reads ([`PrefixClass`]), whether it is finished, how many
+/// records its scope holds and where its queue stands. Each is read: a
+/// record's cleanup releases its written prefix, and the scope's drain
+/// releases every record it holds from where its queue stands (the active
+/// record's remaining calls, the records queued behind it, a removal unit
+/// already admitted). Whether the operation is cancelling is not: a stop
+/// cancels it before its cleanup, which runs alike from either
+/// ([`Operation::cancel`], [`Operation::step`]), and its drop reads nothing
+/// of it. Nor is where the record's acquisition stands: every cleanup step
+/// cancels it first, admitting nothing ([`Acquisition::cancel_into`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub struct OperationClass<C> {
     pub queue: QueueObservation,
     pub allocated: bool,
     pub prefix: PrefixClass,
-    pub cancelling: bool,
     pub finished: bool,
     pub outstanding: usize,
     pub task: C,
@@ -307,7 +308,6 @@ impl<D> Position<D> {
             queue: self.queue,
             allocated: self.allocated,
             prefix,
-            cancelling: self.cancelling,
             finished: self.finished,
             outstanding: self.outstanding,
             task,

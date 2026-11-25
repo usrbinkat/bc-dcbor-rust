@@ -1,6 +1,6 @@
 --- tests/support/lifecycle.rs
 +++ tests/support/lifecycle.rs
-@@ -3710,6 +3710,10 @@
+@@ -3713,6 +3713,10 @@
                  .unwrap_or_else(|payload| Err(Finding::Defect(panic_report(payload.as_ref()))))
          },
      );

@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/input.rs
 +++ src/bounded/decode/construction/input.rs
-@@ -272,7 +272,7 @@
+@@ -281,7 +281,7 @@
              self.units(),
              InputClass {
                  scope: self.detail.scope,

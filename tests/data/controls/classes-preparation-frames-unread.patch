@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -560,7 +560,7 @@
+@@ -561,7 +561,7 @@
                  .normalization
                  .filter(|text| text.phase != text_cursor::Phase::Finished)
                  .map(|text| text.class()),

@@ -583,10 +583,11 @@ classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	n
 # arenas run on the nested tree pipeline (two maps, two entry cursors, a
 # child whose Rust key order is not canonical). Every operation stop's
 # cancellation classes each cleanup position too, so a reclaiming stage's
-# plant is met there.
+# plant is met there. Whether an operation is cancelling is no field of
+# its class: a stop cancels it before its cleanup, which runs alike either
+# way, so no plant of it could merge boundaries whose cleanups differ.
 classes-operation-allocated-unread	tests/data/controls/classes-operation-allocated-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-prefix-unread	tests/data/controls/classes-operation-prefix-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
-classes-operation-cancelling-unread	tests/data/controls/classes-operation-cancelling-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-finished-unread	tests/data/controls/classes-operation-finished-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-outstanding-unread	tests/data/controls/classes-operation-outstanding-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-input-scope-unread	tests/data/controls/classes-input-scope-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
@@ -606,7 +607,11 @@ classes-construct-value-unread	tests/data/controls/classes-construct-value-unrea
 # cleanup: an interleaving retires a preparation at its live boundaries,
 # where the record is active and the source published, and leaves its
 # cleanup to the scope's drain, whose positions no class observes. Both run
-# where a cancelled preparation's cleanup positions are classed.
+# where a cancelled preparation's cleanup positions are classed. The record's
+# live stage, cancelling, is observable only when the first cleanup unit is
+# refused (an unrefused one always moves it to reclaiming the preparation),
+# so the matrix also drives every cancelled cleanup with each of its
+# admissions refused once.
 classes-plan-record-unread	tests/data/controls/classes-plan-record-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-plan-source-unread	tests/data/controls/classes-plan-source-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-plan-preparation-unread	tests/data/controls/classes-plan-preparation-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody

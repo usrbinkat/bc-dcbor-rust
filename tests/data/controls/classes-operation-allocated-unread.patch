@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/operation.rs
 +++ src/bounded/decode/construction/operation.rs
-@@ -302,7 +302,7 @@
+@@ -306,7 +306,7 @@
      pub(crate) fn operation_class<C>(&self, prefix: PrefixClass, task: C) -> OperationClass<C> {
          OperationClass {
              queue: self.queue,
 -            allocated: self.allocated,
 +            allocated: false,
              prefix,
-             cancelling: self.cancelling,
              finished: self.finished,
+             outstanding: self.outstanding,

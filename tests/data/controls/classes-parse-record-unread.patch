@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/parse.rs
 +++ src/bounded/decode/construction/parse.rs
-@@ -448,7 +448,7 @@
+@@ -534,7 +534,7 @@
          use crate::bounded::decode::storage::ElementCleanup::Discarded;
          use cursor::Phase;
          ParseClass {

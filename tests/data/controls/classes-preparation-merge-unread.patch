@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -567,7 +567,7 @@
+@@ -568,7 +568,7 @@
              cursors: position.cursor_storage.class(Discarded),
              windows: position.window_storage.class(Dropped),
              entries: position.dynamic.entry_storage.class(Discarded),

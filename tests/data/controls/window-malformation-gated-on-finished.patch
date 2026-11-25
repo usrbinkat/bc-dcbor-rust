@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1385,7 +1385,8 @@
+@@ -1386,7 +1386,8 @@
          &mut self,
          a: &mut A,
      ) -> BoundedResult<Reclaimed, A> {

@@ -1,6 +1,6 @@
 --- src/bounded/decode/construction/parse.rs
 +++ src/bounded/decode/construction/parse.rs
-@@ -174,7 +174,7 @@
+@@ -237,7 +237,7 @@
      // `Record::reclaim_step`, which are no dispatch level, as the derive's
      // declaration accounts for its generated frames. The census records the
      // margin.

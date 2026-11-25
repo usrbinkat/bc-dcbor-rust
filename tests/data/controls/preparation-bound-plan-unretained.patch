@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -2866,7 +2866,8 @@
+@@ -2867,7 +2867,8 @@
      let plan = terms.term(PreparationPlace::PlanBytes).retained;
      let encoding = ResourceBound {
          peak: plan,

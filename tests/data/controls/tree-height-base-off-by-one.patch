@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -325,7 +325,8 @@
+@@ -326,7 +326,8 @@
  pub const fn tree_height(len: usize) -> u64 {
      let mut height = 1u64;
      // The fewest entries a tree of `height + 1` levels holds.
