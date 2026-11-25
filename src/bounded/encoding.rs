@@ -1386,20 +1386,10 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
         &mut self,
         a: &mut A,
     ) -> BoundedResult<Reclaimed, A> {
-        let malformed = windows_malformed(&self.windows, self.cursors.len());
-        // Cleanup entry ends the preparation's work: a cancelled one is
-        // failed, its cleanup this; a published one stays published.
-        if self.end == End::Running {
-            self.end = End::Failed;
-        }
-        // Cleanup entry: every open cursor's window closed, its obligation
-        // forfeited into the family that admitted it, then its acquisition
-        // ended, before any unit, whatever that unit's outcome; a later call
-        // settles and ends nothing again.
-        forfeit_windows(&mut self.windows, a.performer(), Forfeit::Cancelled);
-        if malformed {
-            invalidate_windows(&self.owner);
-        }
+        // Idempotent: a holder that entered cleanup in an admitted unit of
+        // its own ([`Self::enter_cleanup`], `Planned`'s transition) changes
+        // nothing here.
+        self.enter_cleanup(a.performer());
         let cleanup = PreparationPlace::Cleanup;
         if let Some(text) = self.text_mut()
             && text.position().phase != text_cursor::Phase::Finished
@@ -1438,6 +1428,28 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
             return Ok(Reclaimed::Done);
         }
         Ok(Reclaimed::Progress)
+    }
+
+    /// The preparation's cleanup entry, `by` its performer, admitting
+    /// nothing: its work ended (a running one is failed, its cleanup owed; a
+    /// published one stays published), every open cursor's window closed,
+    /// its obligation forfeited into the family that admitted it and then
+    /// its acquisition ended, and malformed window custody invalidated.
+    /// Idempotent: a later call settles, ends and changes nothing. A holder
+    /// that steps the preparation's cleanup under the refusal contract (a
+    /// refused step changes nothing) enters it here inside an admitted unit
+    /// of its own, before any refusable cleanup unit runs (`Planned`'s
+    /// transition into reclaiming its preparation); [`Self::reclaim_step`]
+    /// enters it for every other caller.
+    fn enter_cleanup(&mut self, by: Performer) {
+        let malformed = windows_malformed(&self.windows, self.cursors.len());
+        if self.end == End::Running {
+            self.end = End::Failed;
+        }
+        forfeit_windows(&mut self.windows, by, Forfeit::Cancelled);
+        if malformed {
+            invalidate_windows(&self.owner);
+        }
     }
 
     /// The credit this preparation's custody holds ([`Obligation`]): the
@@ -3878,7 +3890,10 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Planned<'s, I, T, A> {
 // resource-free prefix, which needs no cleanup; the preparation's own arenas
 // record what it acquired. admission: each cleanup unit, the record's and the
 // preparation's (`Preparation::reclaim_step`), is admitted before it runs, a
-// refusal changing nothing. cleanup: it releases the preparation's arenas,
+// refusal changing nothing; the preparation's cleanup entry, which admits
+// nothing (`Preparation::enter_cleanup`), runs inside the record's admitted
+// transition unit, never ahead of a refusable unit of the preparation's own.
+// cleanup: it releases the preparation's arenas,
 // drops the drained preparation in place, which releases its arenas' and its
 // own owner capabilities, then releases the source value, in place; no
 // arbitrary destructor runs, nothing is allocated and nothing unwinds. done:
@@ -3956,6 +3971,12 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
             PlanPhase::Done => return Ok(Reclaimed::Done),
             PlanPhase::Prepare | PlanPhase::Published => {
                 PLAN_TRANSITION.admit(cleanup)?;
+                // The preparation's cleanup entry is this admitted unit's,
+                // not its first cleanup unit's: that unit may be refused,
+                // and a refused step changes nothing.
+                // SAFETY: the prefix is complete, and the preparation is held
+                // in these phases (`holds_preparation`).
+                unsafe { preparation.assume_init_mut() }.enter_cleanup(cleanup.performer());
                 *phase = PlanPhase::ReclaimPreparation;
             }
         }

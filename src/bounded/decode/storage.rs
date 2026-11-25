@@ -1165,8 +1165,8 @@ impl<T, P, O: Origin> Storage<T, P, O> {
             // admissions are settled: the arena's own cleanup follows.
             State::Settled {
                 arena,
-                growth: Growth::Idle | Growth::Staging,
-            } => Self::reclaim_settled(arena, a),
+                growth: growth @ (Growth::Idle | Growth::Staging),
+            } => Self::reclaim_settled(arena, growth, a),
             State::Settled { arena, growth } => {
                 Self::release_growth(growth);
                 (
@@ -1234,24 +1234,32 @@ impl<T, P, O: Origin> Storage<T, P, O> {
         self.holder = None;
     }
 
-    /// One unit of cleanup of a settled arena with no growth staged.
+    /// One unit of cleanup of a settled arena with no block staged, its
+    /// growth idle or staging (`held`). A staging growth holds nothing once
+    /// cleanup entry settled its pending custody, and becomes idle in the
+    /// unit that ends it: an admitted one, or the allocation's release that
+    /// admits nothing. A refused unit keeps it staging: the growth is what
+    /// [`Storage::is_released`] reads, and a refused step changes nothing.
     fn reclaim_settled<A: Releasing<Permit = P, Origin = O>>(
         mut arena: Owned<T, P>,
+        held: Growth<T, P>,
         a: &mut A,
     ) -> (State<T, P>, BoundedResult<bool, A>) {
-        let growth = Growth::Idle;
-        if !arena.items.is_empty() {
-            let result = Self::ELEMENT.admit(a).map(|()| {
+        let admitted = if !arena.items.is_empty() {
+            Self::ELEMENT.admit(a).map(|()| {
                 arena.items.pop();
                 false
-            });
-            return (State::Settled { arena, growth }, result);
-        }
-        if arena.release() {
-            return (State::Settled { arena, growth }, Ok(false));
-        }
-        let result = Self::STEP.admit(a).map(|()| true);
-        (State::Settled { arena, growth }, result)
+            })
+        } else if arena.release() {
+            Ok(false)
+        } else {
+            Self::STEP.admit(a).map(|()| true)
+        };
+        let growth = match admitted {
+            Ok(_) => Growth::Idle,
+            Err(_) => held,
+        };
+        (State::Settled { arena, growth }, admitted)
     }
 
     /// Release a staged growth's block, and its grown allocation if it was
