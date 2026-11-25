@@ -1,12 +1,12 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -1386,7 +1386,8 @@
-         &mut self,
-         a: &mut A,
-     ) -> BoundedResult<Reclaimed, A> {
+@@ -1442,7 +1442,8 @@
+     /// transition into reclaiming its preparation); [`Self::reclaim_step`]
+     /// enters it for every other caller.
+     fn enter_cleanup(&mut self, by: Performer) {
 -        let malformed = windows_malformed(&self.windows, self.cursors.len());
 +        let malformed =
 +            self.end == End::Running && !windows_valid(&self.windows, self.cursors.len());
-         // Cleanup entry ends the preparation's work: a cancelled one is
-         // failed, its cleanup this; a published one stays published.
          if self.end == End::Running {
+             self.end = End::Failed;
+         }

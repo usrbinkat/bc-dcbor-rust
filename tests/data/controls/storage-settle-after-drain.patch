@@ -1,6 +1,6 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -1159,15 +1159,27 @@
+@@ -1159,15 +1159,25 @@
          &mut self,
          a: &mut A,
      ) -> BoundedResult<bool, A> {
@@ -10,18 +10,17 @@
 -            // admissions are settled: the arena's own cleanup follows.
              State::Settled {
                  arena,
--                growth: Growth::Idle | Growth::Staging,
+-                growth: growth @ (Growth::Idle | Growth::Staging),
+-            } => Self::reclaim_settled(arena, growth, a),
 +                growth: Growth::Idle,
-             } => Self::reclaim_settled(arena, a),
++            } => Self::reclaim_settled(arena, Growth::Idle, a),
 +            State::Settled {
 +                arena,
 +                growth: Growth::Staging,
 +            } => {
-+                let (mut next, result) = Self::reclaim_settled(arena, a);
++                let (next, result) = Self::reclaim_settled(arena, Growth::Staging, a);
 +                if result.is_ok() {
 +                    self.enter_cleanup(a.performer());
-+                } else if let State::Settled { growth, .. } = &mut next {
-+                    *growth = Growth::Staging;
 +                }
 +                (next, result)
 +            }

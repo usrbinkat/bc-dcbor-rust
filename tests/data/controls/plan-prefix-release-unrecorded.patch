@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -3917,7 +3917,9 @@
+@@ -3932,7 +3932,9 @@
                  return Ok(Reclaimed::Progress);
              }
              PLAN_TRANSITION.admit(cleanup)?;

@@ -1,6 +1,6 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -4101,7 +4101,7 @@
+@@ -4122,7 +4122,7 @@
          S: decode::construction::Reduction<Observation = O>,
      {
          PlanClass {
