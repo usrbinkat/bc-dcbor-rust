@@ -41,7 +41,11 @@ fn encode(
                     assert_eq!(m.calls().len(), calls, "observation changed the trace");
                     (before, held)
                 });
-                assert!(before.plan.source);
+                assert_eq!(
+                    before.plan.source.and_then(|source| source.phase),
+                    Some(dcbor::bounded::decode::construction::ConstructPhase::Published),
+                    "a published plan's source is its published value's record"
+                );
                 let prepared = before
                     .plan
                     .preparation

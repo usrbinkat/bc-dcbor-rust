@@ -12,7 +12,9 @@ use super::Context;
 use super::in_place::{self, Built, InPlace, Session, Transferable};
 use super::input::DecodeInput;
 use super::operation::{Observed, Operation, OperationTerms, Position, Task};
-use super::parse::{DocumentDecoder, OwnedDocument, ParseDetail};
+use super::parse::{
+    DocumentDecoder, InputClassOf, InputObservation, OwnedDocument, ParseClass, ParseDetail,
+};
 use super::reclamation::{
     Cleanup, Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
     ScopeRef, Slot, reclaim_within, slot_place,
@@ -153,6 +155,63 @@ impl<'s, I: DecodeInput<A>, T: Reclaim<A>, A: Allocator> Constructed<'s, I, T, A
         // records the document field initialized; the projection reaches that
         // field alone.
         Some(unsafe { place.custody(prefix, |record| addr_of_mut!((*record).custody.document)) })
+    }
+
+    /// The record's observation ([`ConstructDetail`]), the one every holder
+    /// of it reads: its construction task, and an owned preparation holding
+    /// the published value ([`TypedValue::detail`]). `unwritten` is the
+    /// document's observation while the record's document field is not
+    /// written (a task that still holds the document, or none). Each custody
+    /// field is read only once the prefix records it written: the document
+    /// and the input through their own exclusive custody
+    /// ([`OwnedDocument::detail`], [`OwnedInitialized::state`]), whose
+    /// cleanups are this record's, and the value's construction state under
+    /// the prefix's exclusive borrow; the value, which a reader of the
+    /// published record may hold borrowed, is never read. Nothing is
+    /// changed, admitted or allocated.
+    fn detail<M: Mode>(
+        slot: &mut Slot<'_, Self, Prefix, M>,
+        unwritten: Option<ParseDetail<InputObservation<I, A>>>,
+    ) -> ConstructDetail<InputObservation<I, A>, <Session<T::State> as Custody>::Observation> {
+        let (place, prefix) = slot.parts();
+        let initialized = prefix.initialized();
+        // SAFETY: the slot pairs the record's place with its progress; each
+        // custody field is read only once the prefix records it written,
+        // through a view of that field alone, the prefix borrowed for each
+        // read; no custody field is borrowed by a reader of the published
+        // value, and the value itself is never read.
+        unsafe {
+            ConstructDetail {
+                document: if initialized > 0 {
+                    place
+                        .custody(&mut *prefix, |record| {
+                            addr_of_mut!((*record).custody.document)
+                        })
+                        .as_mut()
+                        .map(OwnedDocument::detail)
+                } else {
+                    unwritten
+                },
+                input: if initialized > 1 {
+                    place
+                        .custody(&mut *prefix, |record| addr_of_mut!((*record).custody.input))
+                        .as_mut()
+                        .map(OwnedInitialized::state)
+                } else {
+                    None
+                },
+                build: (initialized > 2).then(|| {
+                    place
+                        .custody(&mut *prefix, |record| addr_of_mut!((*record).custody.build))
+                        .observe()
+                }),
+                phase: (initialized > 3).then(|| {
+                    *place
+                        .project(|record| addr_of_mut!((*record).custody.phase))
+                        .get(&*prefix)
+                }),
+            }
+        }
     }
 }
 
@@ -390,18 +449,21 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     }
 }
 
-/// Observation of a construction, `O` its value's custody observation: the
-/// record's phase; whether the record, or before the record holds it the
-/// task, holds the document; whether the record holds the detached input;
-/// and the value's construction state, observed whole, once the record's
-/// prefix is written. Whether an acquisition of the value's construction is
-/// bound is the record's custody's to report ([`CustodySink::bound`], from
+/// Observation of a construction, `N` its input's state observation and `O`
+/// its value's custody observation: the record's phase; the document's
+/// record observed ([`OwnedDocument::detail`]) while the record, or before
+/// the record holds it the task, holds it; the detached input's state while
+/// the record holds it; and the value's construction state, observed whole,
+/// once the record's prefix is written. The document's and the input's
+/// cleanups are the record's, so their states, not only their presence, are
+/// observed. Whether an acquisition of the value's construction is bound is
+/// the record's custody's to report ([`CustodySink::bound`], from
 /// [`Pending::observe_custody`]), not its progress's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConstructDetail<O> {
+pub struct ConstructDetail<N, O> {
     pub phase: Option<ConstructPhase>,
-    pub document: bool,
-    pub input: bool,
+    pub document: Option<ParseDetail<N>>,
+    pub input: Option<N>,
     pub build: Option<O>,
 }
 
@@ -431,7 +493,8 @@ where
     type State = Constructed<'s, I, T, A>;
     type Output = TypedValue<'s, I, T, A>;
     type Error = DecodeError<A::Refusal>;
-    type Detail = ConstructDetail<<Session<T::State> as Custody>::Observation>;
+    type Detail =
+        ConstructDetail<InputObservation<I, A>, <Session<T::State> as Custody>::Observation>;
     const INIT_STEPS: usize = Constructed::<'s, I, T, A>::INIT_STEPS;
 
     fn scope(&self) -> Option<&ScopeRef<'s, A>> {
@@ -596,48 +659,19 @@ where
         }
     }
 
-    fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
-        let Some(mut slot) = record else {
-            return ConstructDetail {
+    /// The record's observation ([`Constructed::detail`]), the document the
+    /// task still holds observed while the record's document field is
+    /// unwritten.
+    fn detail(&mut self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
+        let held = self.document.as_mut().map(OwnedDocument::detail);
+        match record {
+            Some(mut slot) => Constructed::detail(&mut slot, held),
+            None => ConstructDetail {
                 phase: None,
-                document: self.document.is_some(),
-                input: false,
+                document: held,
+                input: None,
                 build: None,
-            };
-        };
-        let (place, prefix) = slot.parts();
-        let initialized = prefix.initialized();
-        // SAFETY: the slot pairs the record's place with its progress; each
-        // custody field is read only once the prefix records it written,
-        // through a view of that field alone, the prefix borrowed for each
-        // read; the value's construction state is observed under the prefix's
-        // exclusive borrow; the value is never read.
-        unsafe {
-            ConstructDetail {
-                document: if initialized > 0 {
-                    place
-                        .project(|record| addr_of_mut!((*record).custody.document))
-                        .get(&*prefix)
-                        .is_some()
-                } else {
-                    self.document.is_some()
-                },
-                input: initialized > 1
-                    && place
-                        .project(|record| addr_of_mut!((*record).custody.input))
-                        .get(&*prefix)
-                        .is_some(),
-                build: (initialized > 2).then(|| {
-                    place
-                        .custody(&mut *prefix, |record| addr_of_mut!((*record).custody.build))
-                        .observe()
-                }),
-                phase: (initialized > 3).then(|| {
-                    *place
-                        .project(|record| addr_of_mut!((*record).custody.phase))
-                        .get(&*prefix)
-                }),
-            }
+            },
         }
     }
 }
@@ -699,6 +733,16 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> TypedValue<'s, I, T, A>
             |record| Self { record },
             OwnedInitialized::reclaim_under,
         )
+    }
+
+    /// The value's record observed ([`Constructed::detail`]): what a holder
+    /// stepping its cleanup (an owned preparation's record or task) reads of
+    /// it. `&mut self` excludes every reader of the value meanwhile; nothing
+    /// is changed, admitted or allocated.
+    pub fn detail(
+        &mut self,
+    ) -> ConstructDetail<InputObservation<I, A>, <Session<T::State> as Custody>::Observation> {
+        Constructed::detail(&mut self.record.destination(), None)
     }
 
     /// The calls [`Self::reclaim_step`] still takes from `slot`
@@ -859,33 +903,84 @@ pub enum ConstructStage {
 }
 
 /// What a construction's cleanup admits from its detail
-/// ([`ConstructDetail`]), `C` its value's class: the record's stage (every
-/// phase before reclamation alike), its document and input slots, and its
-/// value through the value's own cleanup, whose class the value's session
-/// declares ([`super::Reduction`] of [`Session`]).
+/// ([`ConstructDetail`]), `D` its input's class and `C` its value's: the
+/// record's stage (every phase before reclamation alike), its held document
+/// by the parse's own class ([`ParseClass`]) and its held input by the
+/// input's ([`DecodeInput`]), each of whose cleanup the record steps, and
+/// its value through the value's own cleanup, whose class the value's
+/// session declares ([`super::Reduction`] of [`Session`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
-pub struct ConstructClass<C> {
+pub struct ConstructClass<D, C> {
     pub record: Option<ConstructStage>,
-    pub document: bool,
-    pub input: bool,
+    pub document: Option<ParseClass<D>>,
+    pub input: Option<D>,
     pub value: Option<C>,
 }
 
-impl<O> Position<ConstructDetail<O>> {
-    /// A construction's class, its value's by `S`, the value's session's
-    /// reduction, whatever its input. Before the record's prefix is complete
-    /// its cleanup (`Constructed`'s `reclaim_step`, `remaining`) reads only
-    /// whether the document slot is written and holds the document, then
-    /// releases the record in one unit; the rest of the prefix (the empty
-    /// input slot, the value's initial state, the phase, the pending
-    /// credit's idle units) owns nothing. So every partial prefix of an
-    /// allocated record is one class, by its document alone; past it, the
-    /// record's stage, its slots and its value's class. Two positions of one
-    /// class take each unit alike and land again in one class.
-    pub fn class<S: super::Reduction<Observation = O>>(
+impl<N, O> ConstructDetail<N, O> {
+    /// The class of a record whose prefix is complete ([`ConstructClass`]),
+    /// its input's by `D`, the input state's reduction, and its value's by
+    /// `S`, the value's session's: the record's stage (every phase before
+    /// reclamation alike), its held document by the parse's own class, its
+    /// held input by the input's, and its value through the value's own
+    /// cleanup. What a published value's holder reads of it
+    /// ([`TypedValue::detail`]), and the complete-prefix part of an
+    /// operation's class ([`Position::class`]).
+    pub fn class<D, S>(&self) -> ConstructClass<D::Class, S::Class>
+    where
+        D: super::Reduction<Observation = N>,
+        S: super::Reduction<Observation = O>,
+    {
+        ConstructClass {
+            record: self.phase.map(|phase| match phase {
+                ConstructPhase::Build
+                | ConstructPhase::Detach
+                | ConstructPhase::Publish
+                | ConstructPhase::Published => ConstructStage::Active,
+                ConstructPhase::ReclaimValue => ConstructStage::ReclaimValue,
+                ConstructPhase::ReclaimDocument => ConstructStage::ReclaimDocument,
+                ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
+                ConstructPhase::Done => ConstructStage::Done,
+            }),
+            document: self.document.as_ref().map(ParseDetail::class::<D>),
+            input: self.input.as_ref().map(D::class),
+            value: self.build.as_ref().map(S::class),
+        }
+    }
+
+    /// This detail with its input's and its value's custody observations
+    /// elided to whether each is held: what a record of positions of any
+    /// typed decode, kept in fixed storage, holds.
+    pub fn outline(self) -> ConstructDetail<(), ()> {
+        ConstructDetail {
+            phase: self.phase,
+            document: self.document.map(ParseDetail::outline),
+            input: self.input.map(|_| ()),
+            build: self.build.map(|_| ()),
+        }
+    }
+}
+
+impl<N, O> Position<ConstructDetail<N, O>> {
+    /// A construction's class, its input's by `D`, the input state's
+    /// reduction, and its value's by `S`, the value's session's. Before the
+    /// record's prefix is complete its cleanup (`Constructed`'s
+    /// `reclaim_step`, `remaining`) reads only the document slot, stepping
+    /// the held document's own cleanup, then releases the record in one unit;
+    /// the rest of the prefix (the empty input slot, the value's initial
+    /// state, the phase, the pending credit's idle units) owns nothing. So
+    /// every partial prefix of an allocated record is classed by its
+    /// document alone; past it, the record's stage, its document, its input
+    /// and its value's class. Two positions of one class take each unit
+    /// alike and land again in one class.
+    pub fn class<D, S>(
         &self,
-    ) -> super::operation::OperationClass<ConstructClass<S::Class>> {
+    ) -> super::operation::OperationClass<ConstructClass<D::Class, S::Class>>
+    where
+        D: super::Reduction<Observation = N>,
+        S: super::Reduction<Observation = O>,
+    {
         use super::operation::PrefixClass;
         let position = self;
         let detail = &position.detail;
@@ -893,33 +988,20 @@ impl<O> Position<ConstructDetail<O>> {
         let task = if prefix == PrefixClass::Partial {
             ConstructClass {
                 record: None,
-                document: detail.document,
-                input: false,
+                document: detail.document.as_ref().map(ParseDetail::class::<D>),
+                input: None,
                 value: None,
             }
         } else {
-            ConstructClass {
-                record: detail.phase.map(|phase| match phase {
-                    ConstructPhase::Build
-                    | ConstructPhase::Detach
-                    | ConstructPhase::Publish
-                    | ConstructPhase::Published => ConstructStage::Active,
-                    ConstructPhase::ReclaimValue => ConstructStage::ReclaimValue,
-                    ConstructPhase::ReclaimDocument => ConstructStage::ReclaimDocument,
-                    ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
-                    ConstructPhase::Done => ConstructStage::Done,
-                }),
-                document: detail.document,
-                input: detail.input,
-                value: detail.build.as_ref().map(S::class),
-            }
+            detail.class::<D, S>()
         };
         position.operation_class(prefix, task)
     }
 }
 
-/// A construction's class is its position's, its value's by the value's
-/// session's reduction ([`Position::class`]).
+/// A construction's class is its position's, its input's by the input
+/// state's reduction and its value's by the value's session's
+/// ([`Position::class`]).
 impl<'s, I, T, A> super::Reduction for Construction<'s, I, T, A>
 where
     I: DecodeInput<A> + 's,
@@ -929,23 +1011,26 @@ where
     Session<T::State>: super::Reduction,
 {
     type Class = super::operation::OperationClass<
-        ConstructClass<<Session<T::State> as super::Reduction>::Class>,
+        ConstructClass<InputClassOf<I, A>, <Session<T::State> as super::Reduction>::Class>,
     >;
 
     fn class(
-        position: &Position<ConstructDetail<<Session<T::State> as Custody>::Observation>>,
+        position: &Position<
+            ConstructDetail<InputObservation<I, A>, <Session<T::State> as Custody>::Observation>,
+        >,
     ) -> Self::Class {
-        position.class::<Session<T::State>>()
+        position.class::<I::State, Session<T::State>>()
     }
 }
 
-/// What a typed decode's cleanup admits: its parse's while it parses
-/// ([`DocumentDecoder`]'s reduction), its construction's once the parsed
-/// document moved into it ([`Construction`]'s), nothing once finished.
+/// What a typed decode's cleanup admits, `D` its input's class: its
+/// parse's while it parses ([`DocumentDecoder`]'s reduction), its
+/// construction's once the parsed document moved into it
+/// ([`Construction`]'s), nothing once finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
-pub enum TypedClass<C> {
-    Parse(super::operation::OperationClass<super::parse::ParseClass>),
+pub enum TypedClass<D, C> {
+    Parse(super::operation::OperationClass<ParseClass<D>>),
     Construct(C),
     Finished,
 }
@@ -958,7 +1043,8 @@ where
     A: TerminalAllocator + 's,
     A::Permit: Send,
 {
-    type Observation = TypedPosition<<Session<T::State> as Custody>::Observation>;
+    type Observation =
+        TypedPosition<InputObservation<I, A>, <Session<T::State> as Custody>::Observation>;
 
     fn observe(&mut self) -> Self::Observation {
         self.position()
@@ -974,47 +1060,63 @@ where
     A::Permit: Send,
     Session<T::State>: super::Reduction,
 {
-    type Class = TypedClass<<Construction<'s, I, T, A> as super::Reduction>::Class>;
+    type Class =
+        TypedClass<InputClassOf<I, A>, <Construction<'s, I, T, A> as super::Reduction>::Class>;
 
     fn class(position: &Self::Observation) -> Self::Class {
-        position.class::<Session<T::State>>()
+        position.class::<I::State, Session<T::State>>()
     }
 }
 
-impl<O> TypedPosition<O> {
-    /// A typed decode's class, its value's by `S`, the value's session's
-    /// reduction: the stage's own operation's, the decode's cleanup being
-    /// that operation's, and a finished decode holding nothing.
-    pub fn class<S: super::Reduction<Observation = O>>(
+impl<N, O> TypedPosition<N, O> {
+    /// A typed decode's class, its input's by `D`, the input state's
+    /// reduction, and its value's by `S`, the value's session's: the stage's
+    /// own operation's, the decode's cleanup being that operation's, and a
+    /// finished decode holding nothing.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the class is the stage operations' own class types, composed"
+    )]
+    pub fn class<D, S>(
         &self,
-    ) -> TypedClass<super::operation::OperationClass<ConstructClass<S::Class>>> {
+    ) -> TypedClass<D::Class, super::operation::OperationClass<ConstructClass<D::Class, S::Class>>>
+    where
+        D: super::Reduction<Observation = N>,
+        S: super::Reduction<Observation = O>,
+    {
         match self {
-            TypedPosition::Parse(parse) => TypedClass::Parse(parse.class()),
-            TypedPosition::Construct(construct) => TypedClass::Construct(construct.class::<S>()),
+            TypedPosition::Parse(parse) => TypedClass::Parse(parse.class::<D>()),
+            TypedPosition::Construct(construct) => TypedClass::Construct(construct.class::<D, S>()),
             TypedPosition::Finished => TypedClass::Finished,
         }
     }
 }
 
-/// Where a typed decode is, `O` its value's custody observation.
+/// Where a typed decode is, `N` its input's state observation and `O` its
+/// value's custody observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "custody snapshots preserve the complete continuation inline; observation must not allocate"
-)]
-pub enum TypedPosition<O> {
-    Parse(Position<ParseDetail>),
-    Construct(Position<ConstructDetail<O>>),
+pub enum TypedPosition<N, O> {
+    Parse(Position<ParseDetail<N>>),
+    Construct(Position<ConstructDetail<N, O>>),
     Finished,
 }
 
-impl<O> TypedPosition<O> {
-    /// This position with the value's custody observation elided, whatever
-    /// the value's type: what a record of positions of any typed decode,
-    /// kept in fixed storage, holds.
-    pub fn outline(self) -> TypedPosition<()> {
+impl<N, O> TypedPosition<N, O> {
+    /// This position with the input's and the value's custody observations
+    /// elided to whether each is held, whatever their types: what a record
+    /// of positions of any typed decode, kept in fixed storage, holds.
+    pub fn outline(self) -> TypedPosition<(), ()> {
         match self {
-            Self::Parse(position) => TypedPosition::Parse(position),
+            Self::Parse(position) => TypedPosition::Parse(Position {
+                queue: position.queue,
+                allocated: position.allocated,
+                initialized: position.initialized,
+                initialization_steps: position.initialization_steps,
+                cancelling: position.cancelling,
+                finished: position.finished,
+                outstanding: position.outstanding,
+                detail: position.detail.outline(),
+            }),
             Self::Construct(position) => TypedPosition::Construct(Position {
                 queue: position.queue,
                 allocated: position.allocated,
@@ -1023,12 +1125,7 @@ impl<O> TypedPosition<O> {
                 cancelling: position.cancelling,
                 finished: position.finished,
                 outstanding: position.outstanding,
-                detail: ConstructDetail {
-                    phase: position.detail.phase,
-                    document: position.detail.document,
-                    input: position.detail.input,
-                    build: position.detail.build.map(|_| ()),
-                },
+                detail: position.detail.outline(),
             }),
             Self::Finished => TypedPosition::Finished,
         }
@@ -1114,7 +1211,9 @@ where
         }
     }
 
-    pub fn position(&mut self) -> TypedPosition<<Session<T::State> as Custody>::Observation> {
+    pub fn position(
+        &mut self,
+    ) -> TypedPosition<InputObservation<I, A>, <Session<T::State> as Custody>::Observation> {
         match &mut self.stage {
             Stage::Parse(operation) => TypedPosition::Parse(operation.position()),
             Stage::Construct(operation) => TypedPosition::Construct(operation.position()),
@@ -1163,7 +1262,8 @@ where
 {
     type Output = TypedValue<'s, I, T, A>;
     type Error = DecodeError<A::Refusal>;
-    type Position = TypedPosition<<Session<T::State> as Custody>::Observation>;
+    type Position =
+        TypedPosition<InputObservation<I, A>, <Session<T::State> as Custody>::Observation>;
 
     fn step(&mut self, a: &mut A) -> Result<Step<TypedValue<'s, I, T, A>>, Self::Error> {
         TypedDecoder::step(self, a)
@@ -1205,14 +1305,17 @@ mod released {
                     },
                 )
             },
-            |detail: &ConstructDetail<_>, released, what| {
+            |detail: &ConstructDetail<_, _>, released, what| {
                 if released {
                     assert_eq!(detail.phase, None, "{what}: a released record's phase read");
                     assert_eq!(detail.build, None, "{what}: a released record's value read");
                 } else {
                     assert_eq!(detail.phase, Some(ConstructPhase::Done), "{what}");
-                    assert!(!detail.document, "{what}: the released document observed");
-                    assert!(!detail.input, "{what}: the released input observed");
+                    assert_eq!(
+                        detail.document, None,
+                        "{what}: the released document observed"
+                    );
+                    assert_eq!(detail.input, None, "{what}: the released input observed");
                 }
             },
         );

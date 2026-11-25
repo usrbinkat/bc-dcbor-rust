@@ -1,8 +1,8 @@
 --- src/bounded/encoding.rs
 +++ src/bounded/encoding.rs
-@@ -4046,7 +4046,7 @@
-     /// This detail's class ([`PlanClass`]).
-     pub fn class(&self) -> PlanClass {
+@@ -4101,7 +4101,7 @@
+         S: decode::construction::Reduction<Observation = O>,
+     {
          PlanClass {
 -            record: self.phase.map(|phase| match phase {
 +            record: self.phase.filter(|_| false).map(|phase| match phase {

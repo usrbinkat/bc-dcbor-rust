@@ -9,7 +9,7 @@ use core::ptr::addr_of_mut;
 use super::input::DecodeInput;
 use super::operation::{Observed, Operation, OperationTerms, Task};
 use super::reclamation::{
-    Cleanup, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
+    Cleanup, Custody, EMPTIED, Mode, OwnedInitialized, PeekSlot, Place, Prefix, Reclaim, Reclaimed,
     ScopeRef, Slot, reclaim_within, slot_place,
 };
 use super::stable::Pending;
@@ -146,7 +146,70 @@ impl<'s, I: DecodeInput<A>, A: Allocator> Parsed<'s, I, A> {
         // field alone.
         Some(unsafe { place.custody(prefix, |record| addr_of_mut!((*record).custody.input)) })
     }
+
+    /// The record's observation ([`ParseDetail`]), the one every holder of
+    /// it reads: its parse task, and a construction holding the published
+    /// document ([`OwnedDocument::detail`]). `unwritten` is the input's
+    /// observation while the record's input field is not written (a task
+    /// that still holds the input, or none). Before the prefix is complete
+    /// only the input is known: the record takes it with its first prefix
+    /// unit. The held input's state is read through its exclusive custody
+    /// ([`OwnedInitialized::state`]): its cleanup is this record's. Only
+    /// the recorded prefix is read, the parser only while it is held
+    /// (`holds_parser`), the arena never; nothing is changed, admitted or
+    /// allocated.
+    fn detail<M: Mode>(
+        slot: &mut Slot<'_, Self, Prefix, M>,
+        unwritten: Option<InputObservation<I, A>>,
+    ) -> ParseDetail<InputObservation<I, A>> {
+        let incomplete = |input| ParseDetail {
+            input,
+            phase: None,
+            parser: None,
+            resources: None,
+            transferred: 0,
+            released: 0,
+        };
+        let initialized = slot.parts().1.initialized();
+        if initialized < Self::INIT_STEPS {
+            return incomplete(match Self::input(slot) {
+                Some(input) => input.as_mut().map(OwnedInitialized::state),
+                None => unwritten,
+            });
+        }
+        let Ok(ParseCustody {
+            input,
+            parser,
+            parts,
+            phase,
+        }) = Self::custody::<_, ()>(slot)
+        else {
+            return incomplete(unwritten);
+        };
+        // The parser, read only while it is held (`holds_parser`): dropped
+        // once drained, it reports no position and no resources.
+        let parser = holds_parser(*phase).then(|| {
+            // SAFETY: a complete prefix includes the parser's, held in this
+            // phase.
+            unsafe { parser.assume_init_ref() }
+        });
+        ParseDetail {
+            input: input.as_mut().map(OwnedInitialized::state),
+            phase: Some(*phase),
+            parser: parser.map(|parser| parser.position()),
+            resources: parser.map(|parser| parser.resources()),
+            transferred: parts.transferred,
+            released: parts.released,
+        }
+    }
 }
+
+/// The observation of an input `I`'s state: what a parse or a construction
+/// holding it reads of its cleanup ([`DecodeInput`]).
+pub type InputObservation<I, A> = <<I as Reclaim<A>>::State as Custody>::Observation;
+
+/// The class of an input `I`'s state ([`DecodeInput`]'s reduction).
+pub type InputClassOf<I, A> = <<I as Reclaim<A>>::State as super::Reduction>::Class;
 
 // SAFETY: initial: no prefix unit initialized and nothing transferred or
 // released. state: the initialization prefix (the input handle, scalar
@@ -372,17 +435,20 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
     }
 }
 
-/// Observation of a parse: the record's phase, its parser's position and
-/// resources, the arena parts transferred and released, and whether the
-/// record or, before the record holds it, the task holds the input handle.
+/// Observation of a parse, `N` its input's state observation: the record's
+/// phase, its parser's position and resources, the arena parts transferred
+/// and released, and the input handle's state while the record or, before
+/// the record holds it, the task holds it (`None` once neither does). The
+/// input's cleanup is the holder's, so its state, not only its presence, is
+/// observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ParseDetail {
+pub struct ParseDetail<N> {
     pub phase: Option<ParsePhase>,
     pub parser: Option<cursor::Position>,
     pub resources: Option<Resources>,
     pub transferred: usize,
     pub released: usize,
-    pub input: bool,
+    pub input: Option<N>,
 }
 
 /// Where a parse record's cleanup stands (`Parsed`'s `reclaim_step`): every
@@ -409,9 +475,10 @@ pub enum ParserStage {
     Finished,
 }
 
-/// What a parse's cleanup admits from its detail ([`ParseDetail`]): the
-/// record's stage (every phase before reclamation alike), the arena parts
-/// transferred and released, and its input slot; the parser's stage (every
+/// What a parse's cleanup admits from its detail ([`ParseDetail`]), `C` its
+/// input's class: the record's stage (every phase before reclamation
+/// alike), the arena parts transferred and released, and its held input by
+/// the input's own reduction ([`DecodeInput`]); the parser's stage (every
 /// parsing phase alike), its node and frame arenas, each of plain data
 /// stepped to its end ([`StorageClass`] under
 /// [`ElementCleanup::Discarded`]), and its normalizer's own cleanup once
@@ -427,7 +494,7 @@ pub enum ParserStage {
 /// [`TextClass`]: crate::bounded::text_cursor::TextClass
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
-pub struct ParseClass {
+pub struct ParseClass<C> {
     pub record: Option<ParseRecordStage>,
     pub parser: Option<ParserStage>,
     pub entries: Option<crate::bounded::decode::storage::StorageClass>,
@@ -435,16 +502,31 @@ pub struct ParseClass {
     pub normalizer: Option<crate::bounded::text_cursor::TextClass>,
     pub transferred: usize,
     pub released: usize,
-    pub input: bool,
+    pub input: Option<C>,
 }
 
-impl ParseDetail {
-    /// This detail's class ([`ParseClass`]).
+impl<N> ParseDetail<N> {
+    /// This detail with its input's state elided to whether it is held:
+    /// what a record of positions of any input, kept in fixed storage,
+    /// holds.
+    pub fn outline(self) -> ParseDetail<()> {
+        ParseDetail {
+            phase: self.phase,
+            parser: self.parser,
+            resources: self.resources,
+            transferred: self.transferred,
+            released: self.released,
+            input: self.input.map(|_| ()),
+        }
+    }
+
+    /// This detail's class ([`ParseClass`]), its input's by `S`, the
+    /// input state's reduction.
     /// The normalizer's class keeps a finished continuation: the parser
     /// steps an initialized normalizer whatever its phase
     /// ([`cursor::ParserContinuation::reclaim_step`]), so its `Finished` unit
     /// is admitted.
-    pub fn class(&self) -> ParseClass {
+    pub fn class<S: super::Reduction<Observation = N>>(&self) -> ParseClass<S::Class> {
         use crate::bounded::decode::storage::ElementCleanup::Discarded;
         use cursor::Phase;
         ParseClass {
@@ -490,36 +572,41 @@ impl ParseDetail {
                 .map(|position| position.class()),
             transferred: self.transferred,
             released: self.released,
-            input: self.input,
+            input: self.input.as_ref().map(S::class),
         }
     }
 }
 
-impl super::operation::Position<ParseDetail> {
-    /// A parse's class, whatever its input. The operation's part reads its
-    /// prefix as partial: before the record's prefix is complete its cleanup
-    /// (`Parsed`'s `reclaim_step`, `remaining`) reads only whether the input
-    /// slot is written and holds the input, which the detail's `input`
-    /// carries, then releases the record in one unit; the rest of the prefix
-    /// is scalars and the parser's resource-free prefix, owning nothing. The
-    /// parse's own part follows ([`ParseClass`]). Two positions of one class
-    /// take each unit alike and land again in one class.
-    pub fn class(&self) -> super::operation::OperationClass<ParseClass> {
-        self.operation_class(self.partial(), self.detail.class())
+impl<N> super::operation::Position<ParseDetail<N>> {
+    /// A parse's class, its input's by `S`, the input state's reduction.
+    /// The operation's part reads its prefix as partial: before the record's
+    /// prefix is complete its cleanup (`Parsed`'s `reclaim_step`,
+    /// `remaining`) reads only the input slot, stepping the held input's
+    /// own cleanup, which the detail's `input` carries, then releases the
+    /// record in one unit; the rest of the prefix is scalars and the
+    /// parser's resource-free prefix, owning nothing. The parse's own part
+    /// follows ([`ParseClass`]). Two positions of one class take each unit
+    /// alike and land again in one class.
+    pub fn class<S: super::Reduction<Observation = N>>(
+        &self,
+    ) -> super::operation::OperationClass<ParseClass<S::Class>> {
+        self.operation_class(self.partial(), self.detail.class::<S>())
     }
 }
 
-/// A parse's class is its position's
-/// ([`super::operation::Position::class`]).
+/// A parse's class is its position's, its input's by the input state's
+/// reduction ([`super::operation::Position::class`]).
 impl<'s, I: DecodeInput<A> + 's, A: crate::bounded::TerminalAllocator + 's> super::Reduction
     for DocumentDecoder<'s, I, A>
 where
     A::Permit: Send,
 {
-    type Class = super::operation::OperationClass<ParseClass>;
+    type Class = super::operation::OperationClass<ParseClass<InputClassOf<I, A>>>;
 
-    fn class(position: &super::operation::Position<ParseDetail>) -> Self::Class {
-        position.class()
+    fn class(
+        position: &super::operation::Position<ParseDetail<InputObservation<I, A>>>,
+    ) -> Self::Class {
+        position.class::<I::State>()
     }
 }
 
@@ -546,7 +633,7 @@ where
     type State = Parsed<'s, I, A>;
     type Output = OwnedDocument<'s, I, A>;
     type Error = DecodeError<A::Refusal>;
-    type Detail = ParseDetail;
+    type Detail = ParseDetail<InputObservation<I, A>>;
     const INIT_STEPS: usize = Parsed::<'s, I, A>::INIT_STEPS;
 
     fn scope(&self) -> Option<&ScopeRef<'s, A>> {
@@ -701,59 +788,20 @@ where
     /// keep theirs within the record ([`ParserContinuation`]).
     fn settle(&mut self, _: crate::bounded::Performer) {}
 
-    fn detail(&self, record: Observed<'_, 's, Self, A>) -> ParseDetail {
-        // Before the record is complete only whether the input is held is
-        // known: the record takes it with its first prefix unit; before that,
-        // and when no record exists, the task holds it.
-        let incomplete = |input| ParseDetail {
-            input,
-            phase: None,
-            parser: None,
-            resources: None,
-            transferred: 0,
-            released: 0,
-        };
-        let Some(mut slot) = record else {
-            return incomplete(self.input.is_some());
-        };
-        let (place, prefix) = slot.parts();
-        let initialized = prefix.initialized();
-        if initialized < Self::INIT_STEPS {
-            return incomplete(if initialized > 0 {
-                // SAFETY: a nonempty prefix includes the input field, read
-                // through a view of that field alone.
-                unsafe {
-                    place
-                        .project(|record| addr_of_mut!((*record).custody.input))
-                        .get(&*prefix)
-                        .is_some()
-                }
-            } else {
-                self.input.is_some()
-            });
-        }
-        // SAFETY: a complete prefix initializes the whole custody, the
-        // parser's prefix included, read through one shared view of it; the
-        // arena, which a document view borrows, is not read.
-        let custody = unsafe {
-            place
-                .project(|record| addr_of_mut!((*record).custody))
-                .get(&*prefix)
-        };
-        // The parser, read only while it is held (`holds_parser`): dropped
-        // once drained, it reports no position and no resources.
-        let parser = holds_parser(custody.phase).then(|| {
-            // SAFETY: a complete prefix includes the parser's, held in this
-            // phase.
-            unsafe { custody.parser.assume_init_ref() }
-        });
-        ParseDetail {
-            input: custody.input.is_some(),
-            phase: Some(custody.phase),
-            parser: parser.map(|parser| parser.position()),
-            resources: parser.map(|parser| parser.resources()),
-            transferred: custody.parts.transferred,
-            released: custody.parts.released,
+    /// The record's observation ([`Parsed::detail`]), the input the task
+    /// still holds observed while the record's input field is unwritten.
+    fn detail(&mut self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
+        let held = self.input.as_mut().map(OwnedInitialized::state);
+        match record {
+            Some(mut slot) => Parsed::detail(&mut slot, held),
+            None => ParseDetail {
+                input: held,
+                phase: None,
+                parser: None,
+                resources: None,
+                transferred: 0,
+                released: 0,
+            },
         }
     }
 
@@ -864,6 +912,14 @@ impl<'s, I: DecodeInput<A>, A: Allocator> OwnedDocument<'s, I, A> {
 
     pub(crate) fn scope(&self) -> &ScopeRef<'s, A> {
         self.record.scope()
+    }
+
+    /// The document's record observed ([`Parsed::detail`]): what a holder
+    /// stepping its cleanup (a construction's record or task) reads of it.
+    /// `&mut self` excludes every view of the document meanwhile; nothing is
+    /// changed, admitted or allocated.
+    pub fn detail(&mut self) -> ParseDetail<InputObservation<I, A>> {
+        Parsed::detail(&mut self.record.destination(), None)
     }
 }
 
@@ -1014,7 +1070,7 @@ mod released {
                     },
                 )
             },
-            |detail: &ParseDetail, released, what| {
+            |detail: &ParseDetail<_>, released, what| {
                 assert_eq!(detail.parser, None, "{what}: a parser observed after Done");
                 assert_eq!(
                     detail.resources, None,
@@ -1024,7 +1080,7 @@ mod released {
                     assert_eq!(detail.phase, None, "{what}: a released record's phase read");
                 } else {
                     assert_eq!(detail.phase, Some(ParsePhase::Done), "{what}");
-                    assert!(!detail.input, "{what}: the released input observed");
+                    assert_eq!(detail.input, None, "{what}: the released input observed");
                 }
             },
         );

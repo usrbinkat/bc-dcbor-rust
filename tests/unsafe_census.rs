@@ -3170,8 +3170,8 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::parse",
-        "Parse::detail",
-        "observation without a policy",
+        "Parsed::detail",
+        "observation without a policy: the one parse observation its task and a holding construction read",
     ),
     (
         "crate::bounded::decode::construction::construct",
@@ -3185,8 +3185,8 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::decode::construction::construct",
-        "Construct::detail",
-        "observation without a policy",
+        "Constructed::detail",
+        "observation without a policy: the one construction observation its task and a holding preparation read",
     ),
     (
         "crate::bounded::decode::construction::in_place",
@@ -3435,8 +3435,8 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "crate::bounded::encoding",
-        "Prepare::detail",
-        "observation without a policy",
+        "Planned::detail",
+        "observation without a policy: the one plan observation its task and an owned writer read",
     ),
     (
         "crate::bounded::encoding::dynamic",

@@ -1,0 +1,11 @@
+--- src/bounded/decode/construction/in_place/text.rs
++++ src/bounded/decode/construction/in_place/text.rs
+@@ -140,7 +140,7 @@
+             BufferObservation::Unallocated => BufferClass::Unallocated,
+             BufferObservation::Held(BufferCustody { phase, payload, .. }) => match phase {
+                 Phase::Empty => BufferClass::Empty,
+-                Phase::BufferFreed => BufferClass::Freed { payload },
++                Phase::BufferFreed => BufferClass::Written { payload },
+                 Phase::Initialized
+                 | Phase::ReleasePayload
+                 | Phase::AllocatePayload

@@ -623,8 +623,8 @@ pub struct Admission {
     /// Live and peak storage after the call.
     pub storage: (u64, u64),
     /// The caller-supplied lifecycle position current at the call, its
-    /// value's custody elided ([`TypedPosition::outline`]).
-    pub position: Option<TypedPosition<()>>,
+    /// input's and value's custody elided ([`TypedPosition::outline`]).
+    pub position: Option<TypedPosition<(), ()>>,
 }
 
 /// The most recent admissions in fixed storage, and the first refusal kept
@@ -636,7 +636,7 @@ pub struct AdmissionTrace {
     recent: [Option<Admission>; AdmissionTrace::CAPACITY],
     count: usize,
     first_refusal: Option<Admission>,
-    context: Option<TypedPosition<()>>,
+    context: Option<TypedPosition<(), ()>>,
 }
 
 impl AdmissionTrace {
@@ -649,7 +649,7 @@ impl AdmissionTrace {
         }
     }
 
-    pub fn context<O>(&mut self, position: TypedPosition<O>) {
+    pub fn context<N, O>(&mut self, position: TypedPosition<N, O>) {
         self.context = Some(position.outline());
     }
 

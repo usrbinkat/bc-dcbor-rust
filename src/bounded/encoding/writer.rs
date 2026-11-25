@@ -468,16 +468,19 @@ pub struct OwnedWriter<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> {
     at: EmitPosition,
 }
 
-/// Emission progress together with the plan record's retained custody.
-/// Completing emission does not release the plan or its source; explicit
-/// reclamation and retirement therefore remain observable after completion.
+/// Emission progress together with the plan record's retained custody, `N`
+/// its source's input observation and `O` its source value's
+/// ([`PlanDetail`]). Completing emission does not release the plan or its
+/// source; explicit reclamation and retirement therefore remain observable
+/// after completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OwnedEmitPosition {
+pub struct OwnedEmitPosition<N, O> {
     pub emission: EmitPosition,
-    pub plan: PlanDetail,
+    pub plan: PlanDetail<N, O>,
 }
 
-/// What an emission's cleanup admits: its plan record's ([`PlanClass`]),
+/// What an emission's cleanup admits, `D` its source's input class and `C`
+/// its source value's: its plan record's ([`PlanClass`]),
 /// marked as an emission's, so a plan record at an emission boundary is
 /// never one class with one at a preparation boundary, whose operation's
 /// cleanup differs. The emission's own progress is not read: every stop at
@@ -488,36 +491,48 @@ pub struct OwnedEmitPosition {
 /// ([`OwnedWriter::reclaim_step`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
-pub struct EmitClass(pub PlanClass);
+pub struct EmitClass<D, C>(pub PlanClass<D, C>);
 
 /// What a writer holds: its position ([`OwnedWriter::position`]).
 impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> decode::construction::Custody
     for OwnedWriter<'_, I, T, A>
 {
-    type Observation = OwnedEmitPosition;
+    type Observation = OwnedEmitPosition<InputObservation<I, A>, ValueObservation<T, A>>;
 
-    fn observe(&mut self) -> OwnedEmitPosition {
+    fn observe(&mut self) -> Self::Observation {
         self.position()
     }
 }
 
-impl OwnedEmitPosition {
-    /// An emission's class ([`EmitClass`]), whatever value it encodes. Two
-    /// positions of one class take each unit alike and land again in one
-    /// class.
-    pub fn class(&self) -> EmitClass {
-        EmitClass(self.plan.class())
+impl<N, O> OwnedEmitPosition<N, O> {
+    /// An emission's class ([`EmitClass`]), its source's input by `D`, the
+    /// input state's reduction, and its source value by `S`, the value's
+    /// session's. Two positions of one class take each unit alike and land
+    /// again in one class.
+    pub fn class<D, S>(&self) -> EmitClass<D::Class, S::Class>
+    where
+        D: decode::construction::Reduction<Observation = N>,
+        S: decode::construction::Reduction<Observation = O>,
+    {
+        EmitClass(self.plan.class::<D, S>())
     }
 }
 
-/// An emission's class is its position's ([`OwnedEmitPosition::class`]).
+/// An emission's class is its position's ([`OwnedEmitPosition::class`]),
+/// its source's input by the input state's reduction and its source value
+/// by the value's session's.
 impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> decode::construction::Reduction
     for OwnedWriter<'_, I, T, A>
+where
+    decode::construction::in_place::Session<T::State>: decode::construction::Reduction,
 {
-    type Class = EmitClass;
+    type Class = EmitClass<
+        InputClassOf<I, A>,
+        <decode::construction::in_place::Session<T::State> as decode::construction::Reduction>::Class,
+    >;
 
-    fn class(position: &OwnedEmitPosition) -> EmitClass {
-        position.class()
+    fn class(position: &Self::Observation) -> Self::Class {
+        position.class::<I::State, decode::construction::in_place::Session<T::State>>()
     }
 }
 
@@ -529,15 +544,17 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> OwnedWriter<'s, I, T, A
         }
     }
 
-    pub fn position(&self) -> OwnedEmitPosition {
-        let record = self.record.value();
+    /// The emission's progress and its plan record observed
+    /// ([`Planned::detail`]): the record's source is read through its
+    /// exclusive custody, its cleanup being the record's. `&mut self`
+    /// excludes every borrowed chunk meanwhile; nothing is changed, admitted
+    /// or allocated.
+    pub fn position(
+        &mut self,
+    ) -> OwnedEmitPosition<InputObservation<I, A>, ValueObservation<T, A>> {
         OwnedEmitPosition {
             emission: self.at,
-            plan: PlanDetail {
-                phase: Some(record.phase),
-                preparation: record.preparation().map(Preparation::position),
-                source: record.source.is_some(),
-            },
+            plan: Planned::detail(&mut self.record.destination(), None),
         }
     }
 

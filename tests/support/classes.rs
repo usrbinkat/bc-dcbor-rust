@@ -11,38 +11,79 @@
 //! class and requires their cleanups to be equal, so a reduction that merges
 //! states of different custody fails there, named.
 //!
-//! Classes compare boundaries of one pipeline run over one input: the
-//! document a construction holds and the input a record holds are the same
-//! at every boundary of that run, so a class need not carry their custody.
+//! A held document's, a held input's and a held source value's cleanups are
+//! their holder's, and a stop's cleanup and every position it passes
+//! through are classed: so each class carries the held document's, input's
+//! and source's own classes, by the input's reduction ([`DecodeInput`]) and
+//! the value's, never their presence alone. A value whose construction
+//! state declares no reduction is classed by its exact observation
+//! ([`Exact`]).
 //!
 //! A boundary returns no class when no reduction covers it: every stop there
 //! runs in both layers.
 use core::any::Any;
 use core::cmp::Ordering;
+use core::convert::Infallible;
 use core::fmt::{self, Debug};
+use core::marker::PhantomData;
 
+use dcbor::ByteString;
 use dcbor::bounded::Limits;
 use dcbor::bounded::decode::construction::in_place::{BufferClass, BufferObservation, Session};
 use dcbor::bounded::decode::construction::{
-    Custody, InputClass, InputDetail, OperationClass, ParseClass, ParseDetail, Position, Reclaim,
-    Reduction, TypedPosition,
+    Custody, DecodeInput, InputClass, InputClassOf, InputDetail, InputObservation, OperationClass,
+    ParseClass, ParseDetail, Position, Reclaim, Reduction, TypedPosition,
 };
-use dcbor::bounded::encoding::{EmitClass, OwnedEmitPosition, PlanClass, PlanDetail};
+use dcbor::bounded::encoding::{OwnedEmitPosition, PlanDetail, ValueObservation};
+
+/// The state of the pipelines' acquired input, a copied byte string
+/// ([`Classes::input`], [`Classes::parse`]).
+type Copied = <ByteString as Reclaim<Limits>>::State;
+
+/// The identity reduction of a custody observation `O`: every observation
+/// its own class, the finest relation, a simulation of any cleanup whose
+/// state the observation is, as `Written`'s and `Prefix`'s own reductions
+/// are. What a value whose construction state declares no reduction is
+/// classed by where it is held (a preparation's or an emission's source).
+/// Uninhabited: it names a reduction and is never a state, so nothing is
+/// ever observed through it.
+pub enum Exact<O> {
+    Never(Infallible, PhantomData<O>),
+}
+
+impl<O: Copy + Eq + Ord + Debug> Custody for Exact<O> {
+    type Observation = O;
+
+    fn observe(&mut self) -> O {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+}
+
+impl<O: Copy + Eq + Ord + Debug> Reduction for Exact<O> {
+    type Class = O;
+
+    fn class(observation: &O) -> O {
+        *observation
+    }
+}
 
 /// A boundary's cleanup class: its operation's class value, compared as
 /// that value, never as a rendering. Classes of different operations are
-/// distinct and ordered by operation. A typed decode's class type depends
-/// on the value it decodes, so it is held as a [`Decoded`].
+/// distinct and ordered by operation. A typed decode's, an owned
+/// preparation's and an emission's class types depend on the value they
+/// hold, so each is held as a [`Decoded`].
 ///
 /// `Debug` renders the operation's class alone, as the class inventory
 /// (`rigor::classes`) records it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
     Input(OperationClass<InputClass<BufferClass>>),
-    Parse(OperationClass<ParseClass>),
+    Parse(OperationClass<ParseClass<BufferClass>>),
     Decode(Decoded),
-    Prepare(OperationClass<PlanClass>),
-    Emit(EmitClass),
+    Prepare(Decoded),
+    Emit(Decoded),
     /// A planted classifier's class, by its name: what a control that
     /// merges boundaries of different operations claims for all of them.
     Planted(&'static str),
@@ -61,8 +102,9 @@ impl Debug for Class {
     }
 }
 
-/// A typed decode's class, of whatever class type its value's reduction
-/// declares (`Reduction::Class`: `Copy + Eq + Ord + Debug`). Two classes of
+/// A class of whatever class type its operation's reduction declares over
+/// the value it holds (`Reduction::Class`: `Copy + Eq + Ord + Debug`): a
+/// typed decode's, an owned preparation's, an emission's. Two classes of
 /// one type compare by that type's own `Eq` and `Ord`; classes of two types
 /// are unequal, ordered by their types' identities, which are fixed for one
 /// test binary.
@@ -135,35 +177,43 @@ impl PartialEq for Decoded {
 
 impl Eq for Decoded {}
 
-/// The position of a typed decode of `T`: its construction's detail carries
-/// the value's root session observation, its stage and the binding's own.
-pub type Typed<T> = TypedPosition<<Session<<T as Reclaim<Limits>>::State> as Custody>::Observation>;
+/// The position of a typed decode of `T` from an input `I`: its parse's
+/// and construction's details carry the input's state observation, and the
+/// construction's the value's root session observation, its stage and the
+/// binding's own.
+pub type Typed<I, T> = TypedPosition<InputObservation<I, Limits>, ValueObservation<T, Limits>>;
 
-/// The classifiers of one pipeline run: an input acquisition's, a parse's,
-/// a typed decode's of the value the run decodes, the owned preparation's of
-/// that value's encoding, and its emission's.
-pub struct Classes<P> {
+/// The classifiers of one pipeline run, `N` the input observation and `O`
+/// the value observation of the value it decodes: an input acquisition's
+/// and a parse's of the copied input, a typed decode's of the value, the
+/// owned preparation's of that value's encoding, and its emission's, the
+/// last three each holding the value, observed by `N` and `O`.
+pub struct Classes<N, O> {
     pub input: fn(&Position<InputDetail<BufferObservation>>) -> Option<Class>,
-    pub parse: fn(&Position<ParseDetail>) -> Option<Class>,
-    pub decode: fn(&P) -> Option<Class>,
-    pub prepare: fn(&Position<PlanDetail>) -> Option<Class>,
-    pub emit: fn(&OwnedEmitPosition) -> Option<Class>,
+    pub parse: fn(&Position<ParseDetail<BufferObservation>>) -> Option<Class>,
+    pub decode: fn(&TypedPosition<N, O>) -> Option<Class>,
+    pub prepare: fn(&Position<PlanDetail<N, O>>) -> Option<Class>,
+    pub emit: fn(&OwnedEmitPosition<N, O>) -> Option<Class>,
 }
 
-impl Classes<()> {
-    /// Acquisition and inspection: their operations' classes.
+/// The classifiers of a pipeline decoding `T` from an input `I`.
+pub type Pipeline<I, T> = Classes<InputObservation<I, Limits>, ValueObservation<T, Limits>>;
+
+impl Classes<(), ()> {
+    /// Acquisition and inspection: their operations' classes. They decode
+    /// no value, so nothing holding one is classed.
     pub fn certified() -> Self {
         Self {
             input,
             parse,
             decode: |_| None,
-            prepare,
-            emit,
+            prepare: |_| None,
+            emit: |_| None,
         }
     }
 }
 
-impl<P> Classes<P> {
+impl<N, O> Classes<N, O> {
     /// Every boundary its own class: what a planted classifier is compared
     /// against, and what a run claims when it reduces nothing.
     pub fn none() -> Self {
@@ -177,34 +227,48 @@ impl<P> Classes<P> {
     }
 }
 
-/// A typed decode of `T` whose construction states declare a cleanup
-/// reduction: its parse and construction stages both classed.
-pub fn reduced<T>() -> Classes<Typed<T>>
+/// A typed decode of `T` from an input `I` whose construction states
+/// declare a cleanup reduction: its parse and construction stages both
+/// classed.
+pub fn reduced<I, T>() -> Pipeline<I, T>
 where
+    I: DecodeInput<Limits>,
+    InputClassOf<I, Limits>: 'static,
     T: Reclaim<Limits>,
     Session<T::State>: Reduction<Class: 'static>,
 {
     Classes {
         input,
         parse,
-        decode: typed::<T>,
-        prepare,
-        emit,
+        decode: typed::<I, T>,
+        prepare: prepare::<I, Session<T::State>>,
+        emit: emit::<I, Session<T::State>>,
     }
 }
 
-/// A typed decode of `T` whose construction states declare no reduction:
-/// its parse stage classed, every construction boundary its own class.
-pub fn parsed<T: Reclaim<Limits>>() -> Classes<Typed<T>> {
+/// A typed decode of `T` from an input `I` whose construction states
+/// declare no reduction: its parse stage classed, by the input's reduction,
+/// every construction boundary its own class; its preparation and emission
+/// classed, the source value they hold by its exact observation
+/// ([`Exact`]).
+pub fn parsed<I, T>() -> Pipeline<I, T>
+where
+    I: DecodeInput<Limits>,
+    InputClassOf<I, Limits>: 'static,
+    T: Reclaim<Limits>,
+    <T::State as Custody>::Observation: 'static,
+{
     Classes {
         input,
         parse,
         decode: |position| match position {
-            TypedPosition::Parse(parse_position) => parse(parse_position),
+            TypedPosition::Parse(parse) => Some(Class::Decode(Decoded::new(
+                parse.class::<<I as Reclaim<Limits>>::State>(),
+            ))),
             TypedPosition::Construct(_) | TypedPosition::Finished => None,
         },
-        prepare,
-        emit,
+        prepare: prepare::<I, Exact<ValueObservation<T, Limits>>>,
+        emit: emit::<I, Exact<ValueObservation<T, Limits>>>,
     }
 }
 
@@ -213,33 +277,54 @@ pub fn input(position: &Position<InputDetail<BufferObservation>>) -> Option<Clas
     Some(Class::Input(position.class()))
 }
 
-/// A parse's class (its position's `class`).
-pub fn parse(position: &Position<ParseDetail>) -> Option<Class> {
-    Some(Class::Parse(position.class()))
+/// A parse's class of the copied input, its input's by the byte string's
+/// reduction (its position's `class`).
+pub fn parse(position: &Position<ParseDetail<BufferObservation>>) -> Option<Class> {
+    Some(Class::Parse(position.class::<Copied>()))
 }
 
-/// A typed decode's class, its value's by its session's reduction
-/// ([`TypedPosition::class`]).
-pub fn typed<T>(position: &Typed<T>) -> Option<Class>
+/// A typed decode's class, its input's by the input state's reduction and
+/// its value's by its session's ([`TypedPosition::class`]).
+pub fn typed<I, T>(position: &Typed<I, T>) -> Option<Class>
 where
+    I: DecodeInput<Limits>,
+    InputClassOf<I, Limits>: 'static,
     T: Reclaim<Limits>,
     Session<T::State>: Reduction<Class: 'static>,
 {
     Some(Class::Decode(Decoded::new(
-        position.class::<Session<T::State>>(),
+        position.class::<<I as Reclaim<Limits>>::State, Session<T::State>>(),
     )))
 }
 
-/// An owned preparation's class, whatever value it encodes (its position's
-/// `class`).
-pub fn prepare(position: &Position<PlanDetail>) -> Option<Class> {
-    Some(Class::Prepare(position.class()))
+/// An owned preparation's class, its source's input by the input state's
+/// reduction and its source value by `S` (its position's `class`).
+pub fn prepare<I, S>(
+    position: &Position<PlanDetail<InputObservation<I, Limits>, S::Observation>>,
+) -> Option<Class>
+where
+    I: DecodeInput<Limits>,
+    InputClassOf<I, Limits>: 'static,
+    S: Reduction<Class: 'static>,
+{
+    Some(Class::Prepare(Decoded::new(
+        position.class::<<I as Reclaim<Limits>>::State, S>(),
+    )))
 }
 
-/// An emission boundary's class, whatever value it encodes
-/// ([`OwnedEmitPosition::class`]).
-pub fn emit(position: &OwnedEmitPosition) -> Option<Class> {
-    Some(Class::Emit(position.class()))
+/// An emission boundary's class, its source's input by the input state's
+/// reduction and its source value by `S` ([`OwnedEmitPosition::class`]).
+pub fn emit<I, S>(
+    position: &OwnedEmitPosition<InputObservation<I, Limits>, S::Observation>,
+) -> Option<Class>
+where
+    I: DecodeInput<Limits>,
+    InputClassOf<I, Limits>: 'static,
+    S: Reduction<Class: 'static>,
+{
+    Some(Class::Emit(Decoded::new(
+        position.class::<<I as Reclaim<Limits>>::State, S>(),
+    )))
 }
 
 #[cfg(test)]

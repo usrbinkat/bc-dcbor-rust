@@ -1,20 +1,20 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -893,7 +893,7 @@
+@@ -943,7 +943,7 @@
+                 ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
+                 ConstructPhase::Done => ConstructStage::Done,
+             }),
+-            document: self.document.as_ref().map(ParseDetail::class::<D>),
++            document: None,
+             input: self.input.as_ref().map(D::class),
+             value: self.build.as_ref().map(S::class),
+         }
+@@ -988,7 +988,7 @@
          let task = if prefix == PrefixClass::Partial {
              ConstructClass {
                  record: None,
--                document: detail.document,
-+                document: false,
-                 input: false,
+-                document: detail.document.as_ref().map(ParseDetail::class::<D>),
++                document: None,
+                 input: None,
                  value: None,
-             }
-@@ -909,7 +909,7 @@
-                     ConstructPhase::ReclaimInput => ConstructStage::ReclaimInput,
-                     ConstructPhase::Done => ConstructStage::Done,
-                 }),
--                document: detail.document,
-+                document: false,
-                 input: detail.input,
-                 value: detail.build.as_ref().map(S::class),
              }

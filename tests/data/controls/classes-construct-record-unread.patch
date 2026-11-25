@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -899,7 +899,7 @@
-             }
-         } else {
-             ConstructClass {
--                record: detail.phase.map(|phase| match phase {
-+                record: detail.phase.filter(|_| false).map(|phase| match phase {
-                     ConstructPhase::Build
-                     | ConstructPhase::Detach
-                     | ConstructPhase::Publish
+@@ -933,7 +933,7 @@
+         S: super::Reduction<Observation = O>,
+     {
+         ConstructClass {
+-            record: self.phase.map(|phase| match phase {
++            record: self.phase.filter(|_| false).map(|phase| match phase {
+                 ConstructPhase::Build
+                 | ConstructPhase::Detach
+                 | ConstructPhase::Publish

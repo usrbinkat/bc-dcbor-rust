@@ -571,13 +571,19 @@ window-wrong-origin	tests/data/controls/window-wrong-origin.patch	native	nightly
 # member of a class, names (tests/support/lifecycle.rs, `agree`).
 classes-queue-unread	tests/data/controls/classes-queue-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-arena-release-unread	tests/data/controls/classes-arena-release-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
+classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 # Every other field of every cleanup class, one plant each, the field read
 # as a constant where its operation's reduction is declared
 # (operation.rs `OperationClass`, input.rs, parse.rs, construct.rs,
 # encoding.rs `PlanClass` and `Preparation`'s reduction, text_cursor.rs,
 # storage.rs `StorageClass` and `HeldClass`): each merges boundaries whose
-# cleanups differ, named by the exhaustive layer's agreement.
+# cleanups differ, named by the exhaustive layer's agreement. A plant runs
+# where its fact varies: the interleavings prepare two texts, which hold no
+# map, so the open-map, gap, cursor, window, descriptor, merge and bitmap
+# arenas run on the nested tree pipeline (two maps, two entry cursors, a
+# child whose Rust key order is not canonical). Every operation stop's
+# cancellation classes each cleanup position too, so a reclaiming stage's
+# plant is met there.
 classes-operation-allocated-unread	tests/data/controls/classes-operation-allocated-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-prefix-unread	tests/data/controls/classes-operation-prefix-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-cancelling-unread	tests/data/controls/classes-operation-cancelling-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
@@ -602,13 +608,13 @@ classes-plan-preparation-unread	tests/data/controls/classes-plan-preparation-unr
 classes-plan-source-unread	tests/data/controls/classes-plan-source-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-preparation-text-unread	tests/data/controls/classes-preparation-text-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-preparation-frames-unread	tests/data/controls/classes-preparation-frames-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-maps-unread	tests/data/controls/classes-preparation-maps-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
+classes-preparation-maps-unread	tests/data/controls/classes-preparation-maps-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 classes-preparation-bytes-unread	tests/data/controls/classes-preparation-bytes-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-holes-unread	tests/data/controls/classes-preparation-holes-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-cursors-unread	tests/data/controls/classes-preparation-cursors-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-entries-unread	tests/data/controls/classes-preparation-entries-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-merge-unread	tests/data/controls/classes-preparation-merge-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
-classes-preparation-bitmap-unread	tests/data/controls/classes-preparation-bitmap-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
+classes-preparation-holes-unread	tests/data/controls/classes-preparation-holes-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
+classes-preparation-cursors-unread	tests/data/controls/classes-preparation-cursors-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
+classes-preparation-entries-unread	tests/data/controls/classes-preparation-entries-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
+classes-preparation-merge-unread	tests/data/controls/classes-preparation-merge-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
+classes-preparation-bitmap-unread	tests/data/controls/classes-preparation-bitmap-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 classes-text-stage-unread	tests/data/controls/classes-text-stage-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-text-scratch-unread	tests/data/controls/classes-text-scratch-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-text-chars-unread	tests/data/controls/classes-text-chars-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
@@ -626,10 +632,17 @@ classes-text-chars-unread-parse	tests/data/controls/classes-text-chars-unread.pa
 # parse boundaries merged with its finish, and a complete prefix read as
 # partial.
 classes-parse-stage-merged	tests/data/controls/classes-parse-stage-merged.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
-classes-windows-cleanup-discarded	tests/data/controls/classes-windows-cleanup-discarded.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
+classes-windows-cleanup-discarded	tests/data/controls/classes-windows-cleanup-discarded.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 classes-arena-discard-unguarded	tests/data/controls/classes-arena-discard-unguarded.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-typed-parse-merged	tests/data/controls/classes-typed-parse-merged.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-partial-complete	tests/data/controls/classes-operation-partial-complete.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
+# A held input's state folded away while its presence is kept: the copied
+# buffer's freed state classed as written (in_place/text.rs
+# `BufferObservation::class`). A parse holding the input steps the input's
+# cleanup, so the parse whose input is freed and the one whose input still
+# owes its drop share a class and clean up differently; the inspection's
+# null document reaches both, before and after its first cleanup turn.
+classes-buffer-freed-merged	tests/data/controls/classes-buffer-freed-merged.patch	native	nightly	dcbor	all	exhaustive	owned_inspection	every_inspection_admission_allocation_and_stop_boundary	-	failed	the class merges states of different custody
 # A retired record linked into the scope queue with its custody still
 # `Handle` (reclamation.rs, `Reclaimer::enqueue`): the queue's removal
 # requires every record it takes to be `Queued` (`Reclaimer::step`), so the

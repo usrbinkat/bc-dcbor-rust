@@ -1746,7 +1746,7 @@ where
         turns: usize,
         published: Retirement,
     ) -> Result<(), Halt<T>> {
-        self.cleanup(policy, turns, published, true, |_| {})
+        self.cleanup(policy, turns, published, true, |_, _| {})
     }
 
     /// [`Self::finish`], `observe` reading the operation after each recorded
@@ -1757,22 +1757,25 @@ where
         policy: PolicyId,
         turns: usize,
         published: Retirement,
-        observe: impl FnMut(&mut T),
+        mut observe: impl FnMut(&mut T),
     ) -> Result<(), Halt<T>> {
-        self.cleanup(policy, turns, published, true, observe)
+        self.cleanup(policy, turns, published, true, |_, operation| {
+            observe(operation)
+        })
     }
 
     /// The one held cleanup schedule ([`wound_by`]): each step's contract
     /// checked through the operation's position when `observed`, the
-    /// holding stack checkpointed and `observe` run after every turn; once
-    /// finished, the operation holds nothing ([`Retirement::Exhausted`]).
+    /// holding stack checkpointed and `observe` run after every turn, given
+    /// the policy shared and the operation; once finished, the operation
+    /// holds nothing ([`Retirement::Exhausted`]).
     fn cleanup(
         &mut self,
         policy: PolicyId,
         turns: usize,
         published: Retirement,
         observed: bool,
-        mut observe: impl FnMut(&mut T),
+        mut observe: impl FnMut(&Limits, &mut T),
     ) -> Result<(), Halt<T>> {
         let (completed, result) = {
             let RecordedRun {
@@ -1793,7 +1796,7 @@ where
                 self.value.get(),
                 bound,
                 observed,
-                |operation, outcome| {
+                |m, operation, outcome| {
                     stack_checkpoint(
                         session,
                         checkpoints,
@@ -1802,7 +1805,7 @@ where
                         operation,
                         outcome,
                     );
-                    observe(operation);
+                    observe(m, operation);
                 },
                 Execution {
                     step: |m: &mut Limits, operation: &mut T, observed, at| {
@@ -6107,11 +6110,12 @@ where
 
 /// The one cleanup driver: a cancelled or failed `operation` through its
 /// own cleanup to `Finished`, in at most `turns` fresh checked turns, each
-/// observed or not ([`turn`]). `after_turn` is given the operation
-/// exclusively after each turn whose recording is still evidence, outside
-/// it, for fixture witnesses such as a checkpoint ([`Holding::finish`]):
-/// it observes custody and never
-/// steps or moves out of the operation. Cleanup's own completion rules:
+/// observed or not ([`turn`]). `after_turn` is given the policy, shared, and
+/// the operation exclusively after each turn whose recording is still
+/// evidence, outside it, for fixture witnesses such as a checkpoint
+/// ([`Holding::finish`]) or a cleanup position's class with the admitted
+/// calls made so far (`pipeline::Context::phase`): it observes custody and
+/// never steps or moves out of the operation. Cleanup's own completion rules:
 /// `Finished` ends it, checked to admit nothing after ([`ended`]); a
 /// publication is a stop, its output returned to the caller
 /// ([`Stopped::Published`]); a refusal no fresh turn satisfies and a
@@ -6123,7 +6127,7 @@ fn wound_by<O: Resumable<Limits>, S, E>(
     operation: &mut O,
     turns: usize,
     observed: bool,
-    mut after_turn: impl FnMut(&mut O, &mut StepOf<O>),
+    mut after_turn: impl FnMut(&Limits, &mut O, &mut StepOf<O>),
     mut execution: Execution<S, E>,
 ) -> (bool, Result<(), Driven<O>>)
 where
@@ -6148,7 +6152,8 @@ where
             let progressing = matches!(&turned.outcome, Ok(Step::Progress))
                 || matches!(&turned.outcome, Err(error) if error.refused() && retryable(m, error, injected));
             let turned = if first.is_none() {
-                turned.observed(m, at, |outcome| after_turn(operation, outcome))
+                let shared: &Limits = m;
+                turned.observed(shared, at, |outcome| after_turn(shared, operation, outcome))
             } else {
                 turned
             };
@@ -6167,9 +6172,10 @@ where
                 completed = true;
                 let probe = (execution.end)(m, operation, observed, at + 1);
                 let probe = if first.is_none() {
-                    probe.observed(m, at + 1, |outcome| {
+                    let shared: &Limits = m;
+                    probe.observed(shared, at + 1, |outcome| {
                         if let Some(outcome) = outcome {
-                            after_turn(operation, outcome);
+                            after_turn(shared, operation, outcome);
                         }
                     })
                 } else {
@@ -7056,21 +7062,22 @@ impl<P, O: Custodial<P>> Custodial<P> for Traced<O> {
     }
 }
 
-impl<P, O> Resumable<Limits> for Traced<O>
+impl<N, P, O> Resumable<Limits> for Traced<O>
 where
+    N: Clone + PartialEq + Debug,
     P: Clone + PartialEq + Debug,
-    O: Resumable<Limits, Position = TypedPosition<P>>,
+    O: Resumable<Limits, Position = TypedPosition<N, P>>,
 {
     type Output = O::Output;
     type Error = O::Error;
-    type Position = TypedPosition<P>;
+    type Position = TypedPosition<N, P>;
 
     fn step(&mut self, m: &mut Limits) -> Result<Step<O::Output>, O::Error> {
         m.trace_mut().context(self.0.position());
         self.0.step(m)
     }
 
-    fn position(&mut self) -> TypedPosition<P> {
+    fn position(&mut self) -> TypedPosition<N, P> {
         self.0.position()
     }
 }
@@ -7247,6 +7254,18 @@ impl Custody for InputPhase {
 
     fn observe(&mut self) -> Self {
         *self
+    }
+}
+
+/// The phase fixes the cleanup that follows, one field released per unit
+/// in its order ([`Instrumented`]'s `reclaim_step`): identity, as
+/// `Prefix`'s, the input's reduction its holders' classes carry
+/// ([`DecodeInput`]).
+impl dcbor::bounded::decode::construction::Reduction for InputPhase {
+    type Class = Self;
+
+    fn class(observation: &Self) -> Self {
+        *observation
     }
 }
 
@@ -9750,7 +9769,7 @@ mod tests {
                 &mut operation,
                 turns,
                 false,
-                |_, _| panic!("planted operation cleanup observer failure"),
+                |_, _, _| panic!("planted operation cleanup observer failure"),
                 Execution {
                     step: |m: &mut Limits, operation: &mut Cleanup, _, at| {
                         let outcome = operation.step(m);
@@ -9812,7 +9831,7 @@ mod tests {
             &mut Finished(&inside),
             1,
             true,
-            |_, _| {
+            |_, _, _| {
                 assert!(!inside.get(), "checkpoint ran inside the physical window");
                 observations += 1;
             },
@@ -10376,7 +10395,7 @@ mod tests {
 /// [`heap::Heap`] as its global allocator.
 pub mod pipeline {
     use super::*;
-    use crate::classes::{Class, Classes, Typed};
+    use crate::classes::{Class, Classes, Pipeline};
     use crate::rigor::{Progress, Rigor};
     use dcbor::bounded::encoding::OwnedPreparation;
     use std::panic::AssertUnwindSafe;
@@ -10597,6 +10616,12 @@ pub mod pipeline {
         /// The admitted calls made before the selected stop: the stop's
         /// cleanup is every call after them.
         stopped_at: std::cell::Cell<Option<usize>>,
+        /// After each turn of a cancelled stop's cleanup, the class of the
+        /// position it reached, when one is certified, the admitted calls
+        /// made by then, and those made once the operation's cleanup ended:
+        /// every cleanup position is a member of its class too, over the
+        /// rest of its operation's cleanup ([`Report::cleaned`]).
+        cleaned: std::cell::RefCell<Vec<(Class, usize, usize)>>,
         /// Positions are read ([`Schedule::observed`]).
         observed: bool,
     }
@@ -10714,17 +10739,42 @@ pub mod pipeline {
                 Err(stop) => return Err(Reached::Found(stop.into())),
             };
             let calls = self.heap.requests();
+            // A cancelled stop's cleanup is the stop's own: each position it
+            // passes through is classed, as a boundary is, with the calls
+            // admitted so far. A failure's or a rejection's cleanup is no
+            // stop and claims nothing. A position's class claims the rest of
+            // its operation's cleanup alone: once the operation releases its
+            // scope reference (`QueueObservation::Unscoped`) the records it
+            // retired into the scope's queue are the drain's, which no later
+            // position observes. So each position's calls end where the
+            // operation's cleanup ends, the count after its last turn.
+            let classed = cancelled && self.observed;
+            let first = self.cleaned.borrow().len();
+            let end = std::cell::Cell::new(None);
             if let Err(stop) = operation.cleanup(
                 self.policy,
                 turns,
                 Retirement::Published,
                 self.observed,
-                |_| {},
+                |m, operation| {
+                    if classed {
+                        let admitted = m.admitted_calls().len();
+                        end.set(Some(admitted));
+                        if let Some(class) = classify(&operation.position()) {
+                            self.cleaned.borrow_mut().push((class, admitted, admitted));
+                        }
+                    }
+                },
             ) {
                 if let Reached::Found(finding) = reached {
                     operation.run.defects.push(finding);
                 }
                 return Err(Reached::Found(stop.into()));
+            }
+            if let Some(end) = end.get() {
+                for (_, _, until) in &mut self.cleaned.borrow_mut()[first..] {
+                    *until = end;
+                }
             }
             assert_eq!(self.heap.requests(), calls, "{phase:?} cleanup allocated");
             Err(reached)
@@ -10796,7 +10846,7 @@ pub mod pipeline {
         context: &Context<P>,
         owner: &mut Holding<'_, '_, DecodeOwner<'_, Limits>, P>,
         wire: &[u8],
-        classes: &Classes<()>,
+        classes: &Classes<(), ()>,
     ) -> Reached {
         acquired(context, owner, wire, classes.input, |_| Reached::Complete)
             .unwrap_or_else(|reached| reached)
@@ -10808,7 +10858,7 @@ pub mod pipeline {
         context: &Context<P>,
         owner: &mut Holding<'_, '_, DecodeOwner<'_, Limits>, P>,
         wire: &[u8],
-        classes: &Classes<()>,
+        classes: &Classes<(), ()>,
     ) -> Reached {
         let bound = dcbor::bounded::decode::construction::parse_bound::<ByteString, Limits, ()>(
             wire.len() as u64,
@@ -10867,7 +10917,7 @@ pub mod pipeline {
         owner: &mut Holding<'_, '_, DecodeOwner<'_, Limits>, P>,
         wire: &[u8],
         output: &mut Vec<u8>,
-        classes: &Classes<Typed<T>>,
+        classes: &Pipeline<ByteString, T>,
         inspect: impl FnOnce(&T),
     ) -> Reached
     where
@@ -10974,7 +11024,7 @@ pub mod pipeline {
         owner: &mut Holding<'_, '_, DecodeOwner<'static, Limits>, P>,
         wire: &[u8],
         options: Options,
-        classes: &Classes<Typed<T>>,
+        classes: &Pipeline<Instrumented, T>,
         released: &Arc<AtomicUsize>,
         inspect: impl FnOnce(&T),
     ) -> Reached {
@@ -11084,6 +11134,11 @@ pub mod pipeline {
         /// The admitted calls after the selected stop: its cleanup, through
         /// the drain. Empty when no stop was reached.
         pub cleanup: Vec<Call>,
+        /// Each position a cancelled stop's cleanup reached, in order, of a
+        /// certified class: its class and the admitted calls after it, the
+        /// rest of its operation's cleanup, the drain excluded. Empty for
+        /// every other run.
+        pub cleaned: Vec<(Class, Vec<Call>)>,
         /// The selected end was reached with the input's exact bytes.
         pub complete: bool,
         /// The input was rejected while parsing or decoding.
@@ -11196,6 +11251,7 @@ pub mod pipeline {
                     physical: schedule.physical,
                     armed: std::cell::Cell::new(false),
                     stopped_at: std::cell::Cell::new(None),
+                    cleaned: std::cell::RefCell::new(Vec::new()),
                     observed: schedule.observed,
                 };
                 let mut output = Vec::with_capacity(wire.len());
@@ -11260,6 +11316,12 @@ pub mod pipeline {
                     .stopped_at
                     .get()
                     .map_or_else(Vec::new, |at| accounting.admitted()[at..].to_vec());
+                let cleaned = context
+                    .cleaned
+                    .take()
+                    .into_iter()
+                    .map(|(class, at, end)| (class, accounting.admitted()[at..end].to_vec()))
+                    .collect();
                 let (attempts, refusals, refused, valuations) = metrics;
                 Ok(Report {
                     accounting,
@@ -11271,6 +11333,7 @@ pub mod pipeline {
                     boundaries: context.boundaries.into_inner(),
                     bounds: context.bounds.into_inner(),
                     cleanup,
+                    cleaned,
                     complete,
                     invalid: matches!(reached, Reached::Invalid),
                     stopped: matches!(reached, Reached::Stopped),
@@ -11294,7 +11357,7 @@ pub mod pipeline {
         /// Copy `wire`, which may be any bytes, into a scope, observed
         /// (`observe`), its boundaries classed by `classes`; complete once
         /// the published copy equals it.
-        pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+        pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<(), ()>) -> Report {
             observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
                 acquisition(context, owner, wire, classes)
             })
@@ -11303,7 +11366,7 @@ pub mod pipeline {
         /// Copy `wire` and parse it to a document inspected in place,
         /// observed (`observe`), its boundaries classed by `classes`;
         /// complete once the document's root is the input.
-        pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+        pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<(), ()>) -> Report {
             observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
                 inspection(context, owner, wire, classes)
             })
@@ -11313,7 +11376,11 @@ pub mod pipeline {
         /// and emit it, observed (`observe`), its boundaries classed by
         /// `classes`; complete once the emitted bytes are the input, as
         /// every canonical input's are.
-        pub fn encode<T>(wire: &[u8], schedule: &Schedule, classes: &Classes<Typed<T>>) -> Report
+        pub fn encode<T>(
+            wire: &[u8],
+            schedule: &Schedule,
+            classes: &Pipeline<ByteString, T>,
+        ) -> Report
         where
             T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
         {
@@ -11325,7 +11392,7 @@ pub mod pipeline {
         pub fn encode_checked<T>(
             wire: &[u8],
             schedule: &Schedule,
-            classes: &Classes<Typed<T>>,
+            classes: &Pipeline<ByteString, T>,
             inspect: impl FnOnce(&T),
         ) -> Report
         where
@@ -11339,7 +11406,7 @@ pub mod pipeline {
         pub(crate) fn encode_checked_in<T>(
             wire: &[u8],
             schedule: &Schedule,
-            classes: &Classes<Typed<T>>,
+            classes: &Pipeline<ByteString, T>,
             capacity: Capacity,
             inspect: impl FnOnce(&T),
         ) -> Report
@@ -11363,7 +11430,7 @@ pub mod pipeline {
             wire: &[u8],
             options: Options,
             schedule: &Schedule,
-            classes: &Classes<Typed<T>>,
+            classes: &Pipeline<Instrumented, T>,
             inspect: impl FnOnce(&T),
         ) -> Report {
             let released = Arc::new(AtomicUsize::new(0));
@@ -11412,17 +11479,17 @@ pub mod pipeline {
     }
 
     /// [`Under::acquire`] under the heap guard.
-    pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+    pub fn acquire(wire: &[u8], schedule: &Schedule, classes: &Classes<(), ()>) -> Report {
         Under::<heap::Observation>::acquire(wire, schedule, classes)
     }
 
     /// [`Under::inspect`] under the heap guard.
-    pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<()>) -> Report {
+    pub fn inspect(wire: &[u8], schedule: &Schedule, classes: &Classes<(), ()>) -> Report {
         Under::<heap::Observation>::inspect(wire, schedule, classes)
     }
 
     /// [`Under::encode`] under the heap guard.
-    pub fn encode<T>(wire: &[u8], schedule: &Schedule, classes: &Classes<Typed<T>>) -> Report
+    pub fn encode<T>(wire: &[u8], schedule: &Schedule, classes: &Pipeline<ByteString, T>) -> Report
     where
         T: Transferable<Limits> + dcbor::bounded::encoding::TransferableSchema + 'static,
     {
@@ -11434,7 +11501,7 @@ pub mod pipeline {
         wire: &[u8],
         options: Options,
         schedule: &Schedule,
-        classes: &Classes<Typed<T>>,
+        classes: &Pipeline<Instrumented, T>,
         inspect: impl FnOnce(&T),
     ) -> Report {
         Under::<heap::Observation>::decode::<T>(wire, options, schedule, classes, inspect)
@@ -11571,7 +11638,8 @@ pub mod pipeline {
     ///   stops at the first boundary of each certified class and at every
     ///   boundary of none; the exhaustive layer stops at every boundary and
     ///   requires every member of a class to clean up with exactly the
-    ///   admitted calls its first member made;
+    ///   admitted calls its first member made, each position a
+    ///   cancellation's cleanup passes through a member of its own class;
     /// - observation without effect (`unaffected`): a schedule run again
     ///   reading no position reaches the same report. The fast layer checks
     ///   the unobstructed run and the one-pass refusal, which together reach
@@ -11744,6 +11812,17 @@ pub mod pipeline {
                 assert!(!stopped.complete, "{at}: published");
                 if exhaustive {
                     unaffected(&run, &schedule, &stopped, &at);
+                }
+                // A cancellation's cleanup positions are members too: from
+                // two positions of one class the rest of cleanup must admit
+                // the same calls, which is what a class claims of every
+                // state, a reclaiming one included.
+                for (turn, (class, rest)) in stopped.cleaned.into_iter().enumerate() {
+                    members.push((
+                        format!("{at}, after cleanup turn {turn}"),
+                        (class, "cleanup".to_owned()),
+                        rest,
+                    ));
                 }
                 if let Some(class) = &boundary.class {
                     members.push((at, (class.clone(), format!("{stop:?}")), stopped.cleanup));

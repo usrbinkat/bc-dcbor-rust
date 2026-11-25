@@ -39,6 +39,13 @@ const RETIRE: Unit<InputPlace> = Unit::new(InputPlace::Borrow, 1, 0);
 /// input's record moves between threads with the handles holding it, so the
 /// input and its construction state are both `Send`.
 ///
+/// A record holding an input steps the input's own cleanup, so what that
+/// cleanup reads is part of the holder's: the input's state is its whole
+/// custody ([`Reclaim::State`], observed through [`Custody`]) and declares
+/// its reduction ([`super::Reduction`]), which a holder's class carries as
+/// its input's. A state whose observation leaves out something its cleanup
+/// reads cannot implement that reduction soundly.
+///
 /// # Safety
 /// An implementation keeps one obligation beside its [`Reclaim`]'s, which
 /// releases its evidence and reservations incrementally, and the
@@ -49,7 +56,9 @@ const RETIRE: Unit<InputPlace> = Unit::new(InputPlace::Borrow, 1, 0);
 /// - *bytes*: `bytes` returns the same byte sequence throughout this
 ///   resource's live lifetime, across calls through other shared aliases
 ///   too; no interior mutation changes those bytes.
-pub unsafe trait DecodeInput<A: Allocator>: Reclaim<A, State: Send> + Send {
+pub unsafe trait DecodeInput<A: Allocator>:
+    Reclaim<A, State: Send + super::Reduction> + Send
+{
     fn bytes(&self) -> &[u8];
 }
 
@@ -234,7 +243,7 @@ where
     }
 
     fn detail(
-        &self,
+        &mut self,
         record: Option<PeekSlot<'_, ByteString, BufferState<A::Permit>>>,
     ) -> InputDetail<BufferObservation> {
         let record = record.map(|mut slot| slot.custody().observe());
@@ -379,7 +388,10 @@ unsafe impl<'s, A: Allocator> Task<'s, A> for BorrowInput<'s, A> {
         PermitsObserved::Complete
     }
 
-    fn detail(&self, record: Option<PeekSlot<'_, Borrowed<'s>, Prefix>>) -> InputDetail<Prefix> {
+    fn detail(
+        &mut self,
+        record: Option<PeekSlot<'_, Borrowed<'s>, Prefix>>,
+    ) -> InputDetail<Prefix> {
         let record = record.map(|mut slot| slot.custody().observe());
         InputDetail {
             length: self.source.len(),

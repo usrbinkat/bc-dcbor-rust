@@ -12,7 +12,8 @@ use decode::construction::reclamation::{
     self, Cleanup, PeekSlot, Prefix, Reclaim, Reclaimed, ScopeRef,
 };
 use decode::construction::{
-    DecodeInput, Observed, Operation, OperationTerms, OwnedInitialized, Task, TypedValue,
+    ConstructClass, ConstructDetail, Custody, DecodeInput, InputClassOf, InputObservation,
+    Observed, Operation, OperationTerms, OwnedInitialized, Task, TypedValue,
 };
 use decode::initialization::field;
 use decode::storage::Storage;
@@ -3812,8 +3813,8 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Planned<'s, I, T, A> {
     /// The preparation, while the record holds it ([`holds_preparation`]);
     /// `None` once its drained preparation was dropped in place. A record is
     /// reached whole only once its prefix is complete: through
-    /// [`Self::custody`], a shared view taken after the same check
-    /// ([`Prepare`]'s `detail`), or a published record's handle.
+    /// [`Self::custody`] ([`Self::detail`] among its readers), or a published
+    /// record's handle.
     fn preparation(&self) -> Option<&Preparation<'s, A::Permit, A::Origin>> {
         // SAFETY: a record reached whole has its complete prefix, the
         // preparation's included, and the preparation is held in this phase.
@@ -3826,6 +3827,41 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Planned<'s, I, T, A> {
         // SAFETY: as [`Self::preparation`]; the record is borrowed
         // exclusively.
         holds_preparation(self.phase).then(|| unsafe { self.preparation.assume_init_mut() })
+    }
+
+    /// The record's observation ([`PlanDetail`]), the one every holder of it
+    /// reads: its preparation task, and an owned writer emitting the
+    /// published plan ([`OwnedWriter::position`]). `unwritten` is the
+    /// source's observation while the record's source field is not written
+    /// (a task that still holds the source, or none). Before the prefix is
+    /// complete only the source is known: the record takes it with its first
+    /// prefix unit. The held source is read through its exclusive custody
+    /// ([`TypedValue::detail`]): its cleanup is this record's. Only the
+    /// recorded prefix is read, the preparation only while it is held
+    /// ([`holds_preparation`]); nothing is changed, admitted or allocated.
+    fn detail<M: reclamation::Mode>(
+        slot: &mut reclamation::Slot<'_, Self, Prefix, M>,
+        unwritten: Option<SourceObservation<I, T, A>>,
+    ) -> PlanDetail<InputObservation<I, A>, ValueObservation<T, A>> {
+        let incomplete = |source| PlanDetail {
+            phase: None,
+            preparation: None,
+            source,
+        };
+        if slot.parts().1.initialized() < Self::INIT_STEPS {
+            return incomplete(match Self::source(slot) {
+                Some(source) => source.as_mut().map(TypedValue::detail),
+                None => unwritten,
+            });
+        }
+        let Ok(planned) = Self::custody::<_, ()>(slot) else {
+            return incomplete(unwritten);
+        };
+        PlanDetail {
+            phase: Some(planned.phase),
+            preparation: planned.preparation().map(Preparation::position),
+            source: planned.source.as_mut().map(TypedValue::detail),
+        }
     }
 
     /// The plan of a published record.
@@ -4008,14 +4044,27 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     }
 }
 
-/// Observation of an owned preparation: the record's phase, its
-/// preparation's position, and whether the record, or before the record
-/// holds it the task, holds the source value, which cleanup reclaims last.
+/// The observation of a value `T`'s construction state: its root session's
+/// ([`decode::construction::in_place::Session`]).
+pub type ValueObservation<T, A> =
+    <decode::construction::in_place::Session<<T as Reclaim<A>>::State> as Custody>::Observation;
+
+/// The observation of a published value's record, decoded as `T` from an
+/// input `I` ([`TypedValue::detail`]).
+pub type SourceObservation<I, T, A> =
+    ConstructDetail<InputObservation<I, A>, ValueObservation<T, A>>;
+
+/// Observation of an owned preparation, `N` its source's input observation
+/// and `O` its source value's session observation: the record's phase, its
+/// preparation's position, and the source value's record observed
+/// ([`TypedValue::detail`]) while the record, or before the record holds it
+/// the task, holds it (`None` once neither does). The source's cleanup is
+/// the holder's, so its state, not only its presence, is observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PlanDetail {
+pub struct PlanDetail<N, O> {
     pub phase: Option<PlanPhase>,
     pub preparation: Option<Position>,
-    pub source: bool,
+    pub source: Option<ConstructDetail<N, O>>,
 }
 
 /// Where an owned preparation record's cleanup stands (`Planned`'s
@@ -4029,22 +4078,28 @@ pub enum PlanStage {
     Done,
 }
 
-/// What a plan record's cleanup admits from its detail ([`PlanDetail`]):
-/// its stage, its preparation's own cleanup while held
-/// ([`PreparationClass`]), and whether the record or the task holds the
-/// source value, whose cleanup is the same at every boundary of one run, the
-/// value being the same.
+/// What a plan record's cleanup admits from its detail ([`PlanDetail`]),
+/// `D` its source's input class and `C` its source value's: its stage, its
+/// preparation's own cleanup while held ([`PreparationClass`]), and its held
+/// source by the source record's own class ([`ConstructClass`]), whose
+/// cleanup the record steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
-pub struct PlanClass {
+pub struct PlanClass<D, C> {
     pub record: Option<PlanStage>,
     pub preparation: Option<PreparationClass>,
-    pub source: bool,
+    pub source: Option<ConstructClass<D, C>>,
 }
 
-impl PlanDetail {
-    /// This detail's class ([`PlanClass`]).
-    pub fn class(&self) -> PlanClass {
+impl<N, O> PlanDetail<N, O> {
+    /// This detail's class ([`PlanClass`]), its source's input by `D`, the
+    /// input state's reduction, and its source value by `S`, the value's
+    /// session's.
+    pub fn class<D, S>(&self) -> PlanClass<D::Class, S::Class>
+    where
+        D: decode::construction::Reduction<Observation = N>,
+        S: decode::construction::Reduction<Observation = O>,
+    {
         PlanClass {
             record: self.phase.map(|phase| match phase {
                 PlanPhase::Prepare | PlanPhase::Published => PlanStage::Active,
@@ -4053,28 +4108,32 @@ impl PlanDetail {
                 PlanPhase::Done => PlanStage::Done,
             }),
             preparation: self.preparation.as_ref().map(Position::class),
-            source: self.source,
+            source: self.source.as_ref().map(ConstructDetail::class::<D, S>),
         }
     }
 }
 
-impl decode::construction::Position<PlanDetail> {
-    /// An owned preparation's class, whatever value it encodes: the value's cleanup is the
-    /// same at every boundary of one run, so the class reads none of it.
-    /// Before the record's prefix is complete its cleanup (`Planned`'s
-    /// `reclaim_step`, `remaining`) reads only whether the source slot is
-    /// written and holds the source, which the detail's `source` carries,
-    /// reclaims the source through its own record, which empties the slot,
-    /// then releases the record in one unit; the phase and the
-    /// preparation's prefix own nothing (`Preparation::initialize_step`
-    /// acquires nothing). So the operation's part reads its prefix as
-    /// partial; the record's follows ([`PlanClass`]).
-    pub fn class(&self) -> decode::construction::OperationClass<PlanClass> {
-        self.operation_class(self.partial(), self.detail.class())
+impl<N, O> decode::construction::Position<PlanDetail<N, O>> {
+    /// An owned preparation's class, its source's input by `D` and its
+    /// source value by `S`. Before the record's prefix is complete its
+    /// cleanup (`Planned`'s `reclaim_step`, `remaining`) reads only the
+    /// source slot, stepping the held source's own cleanup, which the
+    /// detail's `source` carries, then releases the record in one unit; the
+    /// phase and the preparation's prefix own nothing
+    /// (`Preparation::initialize_step` acquires nothing). So the operation's
+    /// part reads its prefix as partial; the record's follows
+    /// ([`PlanClass`]).
+    pub fn class<D, S>(&self) -> decode::construction::OperationClass<PlanClass<D::Class, S::Class>>
+    where
+        D: decode::construction::Reduction<Observation = N>,
+        S: decode::construction::Reduction<Observation = O>,
+    {
+        self.operation_class(self.partial(), self.detail.class::<D, S>())
     }
 }
 
-/// The plan record's class is its position's
+/// The plan record's class is its position's, its source's input by the
+/// input state's reduction and its source value by the value's session's
 /// ([`decode::construction::Position::class`]).
 impl<'s, I, T, A> decode::construction::Reduction for OwnedPreparation<'s, I, T, A>
 where
@@ -4082,11 +4141,21 @@ where
     T: Transferable<A> + TransferableSchema + 's,
     A: crate::bounded::TerminalAllocator + 's,
     A::Permit: Send,
+    decode::construction::in_place::Session<T::State>: decode::construction::Reduction,
 {
-    type Class = decode::construction::OperationClass<PlanClass>;
+    type Class = decode::construction::OperationClass<
+        PlanClass<
+            InputClassOf<I, A>,
+            <decode::construction::in_place::Session<T::State> as decode::construction::Reduction>::Class,
+        >,
+    >;
 
-    fn class(position: &decode::construction::Position<PlanDetail>) -> Self::Class {
-        position.class()
+    fn class(
+        position: &decode::construction::Position<
+            PlanDetail<InputObservation<I, A>, ValueObservation<T, A>>,
+        >,
+    ) -> Self::Class {
+        position.class::<I::State, decode::construction::in_place::Session<T::State>>()
     }
 }
 
@@ -4119,7 +4188,7 @@ where
     type State = Planned<'s, I, T, A>;
     type Output = OwnedPrepared<'s, I, T, A>;
     type Error = BoundedError<A::Refusal>;
-    type Detail = PlanDetail;
+    type Detail = PlanDetail<InputObservation<I, A>, ValueObservation<T, A>>;
     const INIT_STEPS: usize = Planned::<'s, I, T, A>::INIT_STEPS;
 
     fn scope(&self) -> Option<&ScopeRef<'s, A>> {
@@ -4230,42 +4299,17 @@ where
     /// acquisition. Nothing to settle.
     fn settle(&mut self, _: Performer) {}
 
-    fn detail(&self, record: Observed<'_, 's, Self, A>) -> PlanDetail {
-        // Before the record is complete only whether the source is held is
-        // known: the record takes it with its first prefix unit; before that,
-        // and when no record exists, the task holds it.
-        let incomplete = |source| PlanDetail {
-            phase: None,
-            preparation: None,
-            source,
-        };
-        let Some(mut slot) = record else {
-            return incomplete(self.source.is_some());
-        };
-        let (place, prefix) = slot.parts();
-        let initialized = prefix.initialized();
-        if initialized < Self::INIT_STEPS {
-            return incomplete(if initialized > 0 {
-                // SAFETY: a nonempty prefix includes the source field, read
-                // through a view of that field alone.
-                unsafe {
-                    place
-                        .project(|record| addr_of_mut!((*record).source))
-                        .get(&*prefix)
-                        .is_some()
-                }
-            } else {
-                self.source.is_some()
-            });
-        }
-        // SAFETY: a complete prefix initializes the source, the phase and the
-        // preparation's resource-free prefix, read through one shared view of
-        // the record; the preparation is read only while it is held.
-        let planned = unsafe { place.get(&*prefix) };
-        PlanDetail {
-            phase: Some(planned.phase),
-            preparation: planned.preparation().map(Preparation::position),
-            source: planned.source.is_some(),
+    /// The record's observation ([`Planned::detail`]), the source the task
+    /// still holds observed while the record's source field is unwritten.
+    fn detail(&mut self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
+        let held = self.source.as_mut().map(TypedValue::detail);
+        match record {
+            Some(mut slot) => Planned::detail(&mut slot, held),
+            None => PlanDetail {
+                phase: None,
+                preparation: None,
+                source: held,
+            },
         }
     }
 
@@ -6868,7 +6912,7 @@ mod plan_record {
                     },
                 )
             },
-            |detail: &PlanDetail, released, what| {
+            |detail: &PlanDetail<_, _>, released, what| {
                 assert_eq!(
                     detail.preparation, None,
                     "{what}: a preparation observed after Done"
@@ -6877,7 +6921,7 @@ mod plan_record {
                     assert_eq!(detail.phase, None, "{what}: a released record's phase read");
                 } else {
                     assert_eq!(detail.phase, Some(PlanPhase::Done), "{what}");
-                    assert!(!detail.source, "{what}: the released source observed");
+                    assert_eq!(detail.source, None, "{what}: the released source observed");
                 }
             },
         );

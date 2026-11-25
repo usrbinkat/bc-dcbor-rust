@@ -266,7 +266,7 @@ fn every_probe_lifecycle_fault_keeps_custody_without_destructors() {
             &[0xf6],
             Options::normalizing(8),
             schedule,
-            &parsed::<Probe>(),
+            &parsed::<support::Instrumented, Probe>(),
             |probe| {
                 assert_eq!(probe.inline, [0x5a; 256]);
                 assert_eq!(

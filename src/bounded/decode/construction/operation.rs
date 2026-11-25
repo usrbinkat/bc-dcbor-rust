@@ -205,8 +205,11 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
 
     /// The task's observation of `record`, its slot observed once
     /// allocated: only the parts the progress records as initialized are
-    /// read, and nothing is changed, admitted or allocated.
-    fn detail(&self, record: Observed<'_, 's, Self, A>) -> Self::Detail;
+    /// read, and nothing is changed, admitted or allocated. Takes `&mut
+    /// self` because a held input handle's state is observed through its
+    /// exclusive custody ([`OwnedInitialized::state`]), as
+    /// [`Self::observe_custody`] observes its permits.
+    fn detail(&mut self, record: Observed<'_, 's, Self, A>) -> Self::Detail;
 
     /// The task's custody outside its record, each independently owning
     /// component as a group of its own owner ([`CustodySink`]): an input

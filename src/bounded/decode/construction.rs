@@ -34,8 +34,8 @@ pub(crate) use operation::cuts;
 pub(crate) use operation::{Observed, OperationTerms, Task};
 pub use operation::{Operation, OperationClass, Position, PrefixClass};
 pub use parse::{
-    DocumentDecoder, OwnedDocument, ParseClass, ParseDetail, ParsePhase, ParseRecordStage,
-    ParserStage, parse_bound,
+    DocumentDecoder, InputClassOf, InputObservation, OwnedDocument, ParseClass, ParseDetail,
+    ParsePhase, ParseRecordStage, ParserStage, parse_bound,
 };
 pub use reclamation::{
     Acquisition, Custody, DecodeOwner, OwnedInitialized, OwnedRecord, Prefix, QueueObservation,

@@ -201,9 +201,10 @@ impl<T> Reclaiming<T> {
         }
     }
 
-    /// Read the surviving handle without removing it from held custody.
-    pub fn value(&self) -> Option<&T> {
-        self.slot.as_ref()
+    /// The surviving handle, exclusively, without removing it from held
+    /// custody: observing a handle's custody takes `&mut` (`Custody`).
+    pub fn value(&mut self) -> Option<&mut T> {
+        self.slot.as_mut()
     }
 
     /// Exercise the production empty-slot contract after completed cleanup.
@@ -224,12 +225,14 @@ impl<T: Custodial<Permit>> Custodial<Permit> for Reclaiming<T> {
 }
 
 impl<T: Custodial<Permit>, W: pipeline::Physical> Holding<'_, '_, Reclaiming<T>, W> {
-    /// Finish operation-local cleanup, checkpointing the complete holding stack.
+    /// Finish operation-local cleanup, checkpointing the complete holding
+    /// stack, `observe` given the surviving handle exclusively after each
+    /// turn, as every cleanup observer is ([`reclaim_by`]).
     pub fn reclaim(
         &mut self,
         policy: PolicyId,
         turns: usize,
-        mut observe: impl FnMut(&T),
+        mut observe: impl FnMut(&mut T),
     ) -> Result<(), Finding> {
         let run = &mut *self.run;
         let m = &mut run.policies[policy.0];

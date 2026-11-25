@@ -1557,6 +1557,14 @@ impl<'s, T: Reclaim<A>, A: Allocator> OwnedInitialized<'s, T, A> {
         self.record.destination()
     }
 
+    /// The published record's state, observed ([`Custody`]): what a holder
+    /// stepping this record's cleanup reads of it. `&mut self` excludes every
+    /// reader of the value meanwhile; nothing is changed, admitted or
+    /// allocated.
+    pub fn state(&mut self) -> <T::State as Custody>::Observation {
+        self.destination().custody().observe()
+    }
+
     /// Operation-local cleanup of a published value ([`OwnedRecord::reclaim_step`]),
     /// the cleanup capability minted here over `a`.
     pub fn reclaim_step(slot: &mut Option<Self>, a: &mut A) -> BoundedResult<Reclaimed, A> {

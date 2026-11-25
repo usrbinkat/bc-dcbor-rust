@@ -356,8 +356,9 @@ enum Held {
     TypedOutput,
 }
 
-fn held(
+fn held<N>(
     position: &dcbor::bounded::decode::construction::TypedPosition<
+        N,
         dcbor::bounded::decode::construction::in_place::SessionObservation<
             dcbor::bounded::decode::construction::in_place::BufferObservation,
         >,

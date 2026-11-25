@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -910,7 +910,7 @@
-                     ConstructPhase::Done => ConstructStage::Done,
-                 }),
-                 document: detail.document,
--                input: detail.input,
-+                input: false,
-                 value: detail.build.as_ref().map(S::class),
-             }
-         };
+@@ -944,7 +944,7 @@
+                 ConstructPhase::Done => ConstructStage::Done,
+             }),
+             document: self.document.as_ref().map(ParseDetail::class::<D>),
+-            input: self.input.as_ref().map(D::class),
++            input: None,
+             value: self.build.as_ref().map(S::class),
+         }
+     }

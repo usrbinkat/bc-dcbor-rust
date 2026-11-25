@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -911,7 +911,7 @@
-                 }),
-                 document: detail.document,
-                 input: detail.input,
--                value: detail.build.as_ref().map(S::class),
-+                value: detail.build.as_ref().map(S::class).filter(|_| false),
-             }
-         };
-         position.operation_class(prefix, task)
+@@ -945,7 +945,7 @@
+             }),
+             document: self.document.as_ref().map(ParseDetail::class::<D>),
+             input: self.input.as_ref().map(D::class),
+-            value: self.build.as_ref().map(S::class),
++            value: self.build.as_ref().map(S::class).filter(|_| false),
+         }
+     }
+ 

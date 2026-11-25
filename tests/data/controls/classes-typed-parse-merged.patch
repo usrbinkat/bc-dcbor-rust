@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/construct.rs
 +++ src/bounded/decode/construction/construct.rs
-@@ -989,7 +989,7 @@
-         &self,
-     ) -> TypedClass<super::operation::OperationClass<ConstructClass<S::Class>>> {
+@@ -1029,7 +1029,7 @@
+         S: super::Reduction<Observation = O>,
+     {
          match self {
--            TypedPosition::Parse(parse) => TypedClass::Parse(parse.class()),
+-            TypedPosition::Parse(parse) => TypedClass::Parse(parse.class::<D>()),
 +            TypedPosition::Parse(_) => TypedClass::Finished,
-             TypedPosition::Construct(construct) => TypedClass::Construct(construct.class::<S>()),
+             TypedPosition::Construct(construct) => TypedClass::Construct(construct.class::<D, S>()),
              TypedPosition::Finished => TypedClass::Finished,
          }

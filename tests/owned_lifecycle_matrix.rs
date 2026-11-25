@@ -30,7 +30,7 @@ fn every_admission_physical_failure_and_stop_of_an_owned_text_decode() {
                     &wire,
                     Options::normalizing(8),
                     schedule,
-                    &classes::reduced::<String>(),
+                    &classes::reduced::<dcbor_test_support::Instrumented, String>(),
                     |value| assert_eq!(value, &expected),
                 )
             },
@@ -55,7 +55,7 @@ fn malformed_inputs_keep_cleanup_custody_under_every_fault() {
                     wire,
                     Options::normalizing(8),
                     schedule,
-                    &classes::reduced::<String>(),
+                    &classes::reduced::<dcbor_test_support::Instrumented, String>(),
                     |value| panic!("malformed input published {value:?}"),
                 )
             },
@@ -70,7 +70,7 @@ fn quick_only_refuses_text_it_cannot_prove_normal() {
         &wire,
         Options::quick_only(8),
         &Schedule::BASELINE,
-        &classes::reduced::<String>(),
+        &classes::reduced::<dcbor_test_support::Instrumented, String>(),
         |value| panic!("unproven text published {value:?}"),
     );
     assert!(report.invalid && !report.complete && !report.failed);

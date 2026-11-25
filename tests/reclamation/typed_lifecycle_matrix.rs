@@ -32,7 +32,7 @@ fn normalized_nested_text_cancellation_retains_custody_at_every_boundary() {
                 &wire,
                 Options::normalizing(8),
                 schedule,
-                &parsed::<Vec<Vec<String>>>(),
+                &parsed::<support::Instrumented, Vec<Vec<String>>>(),
                 |value| assert_eq!(value, &expected),
             )
         },

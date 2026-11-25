@@ -9,12 +9,13 @@
 #![cfg(feature = "std")]
 #[global_allocator]
 static HEAP: heap::Heap = heap::Heap;
+use dcbor::ByteString;
 use dcbor::bounded::Limits;
 use dcbor::bounded::decode::construction::TypedPosition;
 use dcbor::bounded::decode::construction::in_place::StableOption;
 use dcbor::bounded::decode::construction::in_place::Transferable;
 use dcbor::bounded::encoding::TransferableSchema;
-use dcbor_test_support::classes::{self, Classes, Typed};
+use dcbor_test_support::classes::{self, Pipeline};
 use dcbor_test_support::heap;
 use dcbor_test_support::pipeline::{Expected, encode, matrix};
 use dcbor_test_support::rigor::{Rigor, rigor};
@@ -25,7 +26,7 @@ fn pipeline<T: Transferable<Limits> + TransferableSchema + 'static>(
     name: &str,
     wire: &[u8],
     expected: Expected,
-    classes: Classes<Typed<T>>,
+    classes: Pipeline<ByteString, T>,
 ) {
     matrix(
         &format!("{name}: {} from {wire:02x?}", core::any::type_name::<T>()),
@@ -45,7 +46,7 @@ fn scalar_pipeline_distinguishes_turn_exhaustion_from_injected_refusals() {
         "scalar with retained acquisition admissions",
         &[0x19, 0x01, 0x00],
         Expected::Complete,
-        classes::reduced::<u64>(),
+        classes::reduced::<ByteString, u64>(),
     );
 }
 
@@ -60,13 +61,13 @@ fn scalar_pipeline_distinguishes_turn_exhaustion_from_injected_refusals() {
 #[should_panic(expected = "the class merges states of different custody")]
 fn an_emission_class_merged_with_a_decode_boundary_is_rejected() {
     const PLANTED: classes::Class = classes::Class::Planted("planted");
-    let merged = Classes::<Typed<u64>> {
+    let merged = Pipeline::<ByteString, u64> {
         decode: |position| match position {
             TypedPosition::Parse(parse) if !parse.allocated => Some(PLANTED),
-            other => classes::typed::<u64>(other),
+            other => classes::typed::<ByteString, u64>(other),
         },
         emit: |_| Some(PLANTED),
-        ..classes::reduced::<u64>()
+        ..classes::reduced::<ByteString, u64>()
     };
     matrix(
         "an emission under a planted class",
@@ -82,7 +83,7 @@ fn text_survives_every_admission_physical_failure_and_stop() {
         "text",
         &dcbor::CBOR::from("\u{301}".repeat(16)).to_cbor_data(),
         Expected::Complete,
-        classes::reduced::<String>(),
+        classes::reduced::<ByteString, String>(),
     );
 }
 
@@ -98,7 +99,7 @@ fn vector_children_survive_every_admission_physical_failure_and_stop() {
         "vector",
         &TWO_TEXTS,
         Expected::Complete,
-        classes::reduced::<Vec<String>>(),
+        classes::reduced::<ByteString, Vec<String>>(),
     );
 }
 
@@ -111,7 +112,7 @@ fn an_empty_vector_survives_every_admission_physical_failure_and_stop() {
         "empty vector",
         &[0x80],
         Expected::Complete,
-        classes::reduced::<Vec<String>>(),
+        classes::reduced::<ByteString, Vec<String>>(),
     );
 }
 
@@ -199,13 +200,13 @@ fn tree_nodes_and_partial_children_survive_every_pipeline_boundary() {
         "reordered tree",
         &dcbor::CBOR::from(map).to_cbor_data(),
         Expected::Complete,
-        classes::parsed::<BTreeMap<String, String>>(),
+        classes::parsed::<ByteString, BTreeMap<String, String>>(),
     );
     pipeline::<BTreeMap<String, String>>(
         "empty tree",
         &[0xa0],
         Expected::Complete,
-        classes::parsed::<BTreeMap<String, String>>(),
+        classes::parsed::<ByteString, BTreeMap<String, String>>(),
     );
     let mut internal = dcbor::Map::new();
     for n in 0..12u64 {
@@ -215,7 +216,7 @@ fn tree_nodes_and_partial_children_survive_every_pipeline_boundary() {
         "internal node",
         &dcbor::CBOR::from(internal).to_cbor_data(),
         Expected::Complete,
-        classes::parsed::<BTreeMap<u64, u64>>(),
+        classes::parsed::<ByteString, BTreeMap<u64, u64>>(),
     );
     // Both remaining scalar key bindings use the same numeric view but
     // distinct source-kind/range validation.
@@ -223,13 +224,13 @@ fn tree_nodes_and_partial_children_survive_every_pipeline_boundary() {
         "boolean keys",
         &[0xa2, 0xf4, 0xf5, 0xf5, 0xf4],
         Expected::Complete,
-        classes::parsed::<BTreeMap<bool, bool>>(),
+        classes::parsed::<ByteString, BTreeMap<bool, bool>>(),
     );
     pipeline::<BTreeMap<usize, bool>>(
         "usize keys",
         &[0xa2, 0x00, 0xf4, 0x18, 0x18, 0xf5],
         Expected::Complete,
-        classes::parsed::<BTreeMap<usize, bool>>(),
+        classes::parsed::<ByteString, BTreeMap<usize, bool>>(),
     );
 }
 
@@ -249,7 +250,7 @@ fn tree_key_comparison_resumes_across_multiple_byte_quanta() {
         "long shared prefixes",
         &dcbor::CBOR::from(map).to_cbor_data(),
         Expected::Complete,
-        classes::parsed::<BTreeMap<String, u64>>(),
+        classes::parsed::<ByteString, BTreeMap<String, u64>>(),
     );
 }
 
@@ -267,7 +268,7 @@ fn nested_tree_values_retain_custody_at_every_pipeline_boundary() {
         "nested trees",
         &dcbor::CBOR::from(map).to_cbor_data(),
         Expected::Complete,
-        classes::parsed::<BTreeMap<u64, BTreeMap<String, String>>>(),
+        classes::parsed::<ByteString, BTreeMap<u64, BTreeMap<String, String>>>(),
     );
 }
 
@@ -281,7 +282,7 @@ fn tree_wrong_value_reclaims_completed_and_partial_entries() {
         "tree with a wrong value",
         &[0xa2, 0x61, b'a', 0x62, b'o', b'k', 0x61, b'b', 0x00],
         Expected::Invalid,
-        classes::parsed::<BTreeMap<String, String>>(),
+        classes::parsed::<ByteString, BTreeMap<String, String>>(),
     );
 }
 
@@ -291,13 +292,13 @@ fn stable_optional_acquisitions_survive_every_admission_physical_failure_and_sto
         "present stable option",
         &[0x63, b'q', 0xcc, 0x81],
         Expected::Complete,
-        classes::reduced::<StableOption<String, Limits>>(),
+        classes::reduced::<ByteString, StableOption<String, Limits>>(),
     );
     pipeline::<StableOption<String, Limits>>(
         "null stable option",
         &[0xf6],
         Expected::Complete,
-        classes::reduced::<StableOption<String, Limits>>(),
+        classes::reduced::<ByteString, StableOption<String, Limits>>(),
     );
 }
 
@@ -339,7 +340,12 @@ fn a_stabilized_text_survives_every_boundary_and_refuses_what_it_does_not_assign
             Expected::Invalid,
         ),
     ] {
-        pipeline::<StabilizedText>(name, wire, expected, classes::reduced::<StabilizedText>());
+        pipeline::<StabilizedText>(
+            name,
+            wire,
+            expected,
+            classes::reduced::<ByteString, StabilizedText>(),
+        );
     }
 }
 
@@ -365,7 +371,12 @@ fn a_minimal_big_integer_survives_every_boundary_and_refuses_a_non_minimal_encod
         ("one", plain.as_slice(), Expected::Complete),
         ("one as a bignum", tagged.as_slice(), Expected::Invalid),
     ] {
-        pipeline::<MinimalBigInt>(name, wire, expected, classes::reduced::<MinimalBigInt>());
+        pipeline::<MinimalBigInt>(
+            name,
+            wire,
+            expected,
+            classes::reduced::<ByteString, MinimalBigInt>(),
+        );
     }
 }
 
@@ -376,13 +387,13 @@ fn rejected_inputs_clean_up_their_decode_and_never_reach_preparation() {
         "decomposed text",
         &[0x63, b'e', 0xcc, 0x81],
         Expected::Invalid,
-        classes::reduced::<String>(),
+        classes::reduced::<ByteString, String>(),
     );
     // A byte string is not text.
     pipeline::<String>(
         "byte string as text",
         &[0x41, 0x00],
         Expected::Invalid,
-        classes::reduced::<String>(),
+        classes::reduced::<ByteString, String>(),
     );
 }
