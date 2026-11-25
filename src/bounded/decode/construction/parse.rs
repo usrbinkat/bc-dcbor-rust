@@ -477,8 +477,8 @@ pub enum ParserStage {
 
 /// What a parse's cleanup admits from its detail ([`ParseDetail`]), `C` its
 /// input's class: the record's stage (every phase before reclamation
-/// alike), the arena parts transferred and released, and its held input by
-/// the input's own reduction ([`DecodeInput`]); the parser's stage (every
+/// alike), the arena parts released, and its held input by the input's own
+/// reduction ([`DecodeInput`]); the parser's stage (every
 /// parsing phase alike), its node and frame arenas, each of plain data
 /// stepped to its end ([`StorageClass`] under
 /// [`ElementCleanup::Discarded`]), and its normalizer's own cleanup once
@@ -487,7 +487,12 @@ pub enum ParserStage {
 /// still held is released in the unit that ends the normalizer's phase, its
 /// request having paid for it, admitting nothing more. The input offset,
 /// header bytes, payload validated, bytes compared and children completed
-/// are never read by cleanup.
+/// are never read by cleanup. The arena parts transferred are not part of
+/// the class: the arena's release admits its items' unit and its permit's
+/// unit whatever was transferred, the count only selecting which written
+/// part is dropped in place, which admits nothing
+/// (`DocumentArena::release_parts_step`); what the parser still holds of a
+/// partial transfer is its node arena's own class (`entries`).
 ///
 /// [`StorageClass`]: crate::bounded::decode::storage::StorageClass
 /// [`ElementCleanup::Discarded`]: crate::bounded::decode::storage::ElementCleanup::Discarded
@@ -500,7 +505,6 @@ pub struct ParseClass<C> {
     pub entries: Option<crate::bounded::decode::storage::StorageClass>,
     pub stack: Option<crate::bounded::decode::storage::StorageClass>,
     pub normalizer: Option<crate::bounded::text_cursor::TextClass>,
-    pub transferred: usize,
     pub released: usize,
     pub input: Option<C>,
 }
@@ -570,7 +574,6 @@ impl<N> ParseDetail<N> {
                 .resources
                 .and_then(|resources| resources.normalizer)
                 .map(|position| position.class()),
-            transferred: self.transferred,
             released: self.released,
             input: self.input.as_ref().map(S::class),
         }

@@ -1,9 +1,9 @@
 --- src/bounded/decode/construction/parse.rs
 +++ src/bounded/decode/construction/parse.rs
-@@ -571,7 +571,7 @@
+@@ -574,7 +574,7 @@
+                 .resources
                  .and_then(|resources| resources.normalizer)
                  .map(|position| position.class()),
-             transferred: self.transferred,
 -            released: self.released,
 +            released: 0,
              input: self.input.as_ref().map(S::class),
