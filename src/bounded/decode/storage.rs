@@ -1243,7 +1243,10 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     /// owes the same units whether or not a growth's acquisition was under
     /// way: that acquisition is pending custody, which a refused build step
     /// may leave admitted and which no binding's progress carries. Admits
-    /// nothing and cannot refuse; idempotent.
+    /// nothing and cannot refuse; idempotent. Its one holder is the B-tree's
+    /// cleanup (`in_place::btree`), compiled only with the forked standard
+    /// library's collections, so it is too.
+    #[cfg(feature = "custom-std-collections")]
     pub(crate) fn enter_held_cleanup(&mut self, by: Performer) {
         self.enter_cleanup(by);
         if let State::Settled { growth, .. } = &mut self.state
