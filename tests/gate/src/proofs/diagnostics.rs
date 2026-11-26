@@ -242,8 +242,8 @@ impl Ran {
 
 /// Run `recorded`'s solver with its arguments and `extra` as a bounded
 /// workload of `workload`'s, stopped at `seconds`, its records in
-/// `out/name`. A signal at or past the deadline is the deadline's; one
-/// before it is the signal's.
+/// `out/name`. Any ending at or past the deadline is the deadline's; a
+/// signal before it is the signal's.
 pub fn step(
     workload: &crate::process::Workload,
     recorded: &Recorded,
@@ -272,13 +272,16 @@ pub fn step(
         .stderr(file("stderr")?)
         .status()
         .map_err(|error| format!("{}: {error}", recorded.solver.display()))?;
+    // An ending at or past the deadline is the deadline's, an exit's code
+    // included: the scope is stopped there, and CBMC catches the stop's
+    // SIGTERM and exits with the signal's number (`util/signal_catcher.cpp`,
+    // `exit(sig)`), a code no verification exits with.
     let ended = {
         use std::os::unix::process::ExitStatusExt;
+        let past = started.elapsed().as_secs() >= seconds;
         match (status.code(), status.signal()) {
+            (Some(_), _) | (None, Some(_)) if past => Ended::Deadline { seconds },
             (Some(code), _) => Ended::Exited { code },
-            (None, Some(_)) if started.elapsed().as_secs() >= seconds => {
-                Ended::Deadline { seconds }
-            }
             (None, Some(signal)) => Ended::Signaled { signal },
             (None, None) => return Err(format!("{name}: an exit status of no code or signal")),
         }
@@ -1296,6 +1299,29 @@ esac\n"
                 .contains("(1) x")
         );
         assert!(step(&unconfined(), &recorded, &directory, "s", &[], 60).is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A step that ends at or past its deadline is the deadline's, however
+    /// it ended: the scope is stopped there, and CBMC catches SIGTERM and
+    /// exits with the signal's number (`util/signal_catcher.cpp`, `exit(sig)`),
+    /// a code no verification exits with.
+    #[test]
+    fn a_step_ending_at_its_deadline_is_the_deadlines_whatever_its_exit() {
+        let directory = tempdir("deadline");
+        let evidence = discovery_evidence(&directory, &solver(&directory, 0));
+        let mut recorded = recorded(&evidence, "a::h").unwrap();
+        let caught = directory.join("caught");
+        std::fs::write(&caught, "#!/bin/sh\nsleep 2\nexit 15\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&caught, std::fs::Permissions::from_mode(0o755)).unwrap();
+        recorded.solver = caught;
+        let ran = step(&unconfined(), &recorded, &directory, "d", &[], 1).unwrap();
+        assert_eq!(
+            ran.ended,
+            Ended::Deadline { seconds: 1 },
+            "deadline-exit-taken: a solver stopped at its deadline was taken for its exit"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
