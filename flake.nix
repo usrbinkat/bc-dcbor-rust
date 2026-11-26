@@ -801,12 +801,37 @@
               "rustfmt"
             ];
           };
+          # The stable shell's cargo. Cargo runs `cargo clippy` and `cargo fmt`
+          # as external subcommands found in its home's bin before PATH
+          # (src/bin/cargo/main.rs, search_directories); a rustup proxy there
+          # runs another toolchain's clippy against this shell's build. Both
+          # are run here from this toolchain directly: cargo-clippy drops its
+          # first two arguments, runs $CARGO and its own clippy-driver;
+          # cargo-fmt drops `fmt` and runs $RUSTFMT.
+          stableCargo = pkgs.writeShellApplication {
+            name = "cargo";
+            text = ''
+              export CARGO=${pkgs.lib.getExe' stable "cargo"}
+              case "''${1:-}" in
+              clippy)
+                shift
+                exec ${pkgs.lib.getExe' stable "cargo-clippy"} clippy "$@"
+                ;;
+              fmt)
+                shift
+                exec ${pkgs.lib.getExe' stable "cargo-fmt"} fmt "$@"
+                ;;
+              esac
+              exec "$CARGO" "$@"
+            '';
+          };
         in
         {
           default = customShell;
           custom-std = customShell;
           stable = pkgs.mkShell {
             nativeBuildInputs = [
+              stableCargo
               stable
               pkgs.pkg-config
               pkgs.cmake
@@ -817,10 +842,10 @@
             RUSTDOC = pkgs.lib.getExe' stable "rustdoc";
             RUSTFMT = pkgs.lib.getExe' stable "rustfmt";
             DCBOR_CONFIGURATION = "rust-${stableVersion} ${target} library rust-src-${stableVersion} ${dependencyIdentity}";
-            # The toolchain first; nothing outside the shell is put on the
-            # path.
+            # The wrapper precedes the toolchain's own cargo; nothing outside
+            # the shell is put on the path.
             shellHook = ''
-              export PATH="${stable}/bin:$PATH"
+              export PATH="${stableCargo}/bin:${stable}/bin:$PATH"
             '';
           };
         }
