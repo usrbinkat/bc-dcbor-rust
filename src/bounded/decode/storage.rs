@@ -1234,6 +1234,25 @@ impl<T, P, O: Origin> Storage<T, P, O> {
         self.holder = None;
     }
 
+    /// Cleanup entry for a holder that enters it inside an admitted unit of
+    /// its own, before any unit of this arena runs: [`Self::enter_cleanup`],
+    /// then a staging growth, which holds nothing once its admissions are
+    /// settled, made idle. The arena is then released
+    /// ([`Self::is_released`]) exactly when its position holds no element,
+    /// allocation or block, so a holder that steps it only while unreleased
+    /// owes the same units whether or not a growth's acquisition was under
+    /// way: that acquisition is pending custody, which a refused build step
+    /// may leave admitted and which no binding's progress carries. Admits
+    /// nothing and cannot refuse; idempotent.
+    pub(crate) fn enter_held_cleanup(&mut self, by: Performer) {
+        self.enter_cleanup(by);
+        if let State::Settled { growth, .. } = &mut self.state
+            && matches!(growth, Growth::Staging)
+        {
+            *growth = Growth::Idle;
+        }
+    }
+
     /// One unit of cleanup of a settled arena with no block staged, its
     /// growth idle or staging (`held`). A staging growth holds nothing once
     /// cleanup entry settled its pending custody, and becomes idle in the

@@ -267,7 +267,21 @@ pub(super) fn reclaim<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
                     place.with_mut(state, |map| map.detach_in_place());
                 }
             }
-            meta(state)?.phase = Phase::ReclaimValue;
+            let m = meta(state)?;
+            m.phase = Phase::ReclaimValue;
+            // Every arena's cleanup entered in this admitted unit, before
+            // any unit of its own: each growth's admissions settled into
+            // their families by this cleanup's performer and a staging
+            // growth made idle (`Storage::enter_held_cleanup`). Whether an
+            // arena's acquisition was under way is pending custody, which a
+            // refused build step may leave admitted and the tree's progress
+            // does not carry; once entered, `ReleaseArenas` steps exactly the
+            // arenas whose position holds something, whatever it was.
+            let by = a.performer();
+            m.entries.enter_held_cleanup(by);
+            m.nodes.enter_held_cleanup(by);
+            m.order[0].enter_held_cleanup(by);
+            m.order[1].enter_held_cleanup(by);
             // A node's acquisition pending (`AllocateRelease`, `Allocate`)
             // had its credit settled at the operation's cleanup entry: the
             // ticket is forgotten, and no phase of cleanup acquires.
