@@ -711,7 +711,7 @@ fn admission_and_payment_correspondence_is_checked() {
 }
 
 /// The invalid transitions credit conservation is proved without
-/// (`src/bounded/policy/proofs.rs`, `legal_transitions_conserve_every_family`):
+/// (`src/bounded/policy/proofs.rs`, `every_legal_transition_preserves_conservation`):
 /// an obligation settled for more than it holds, and one settled again once
 /// nothing remains. The machine refuses both by the same rule: a settled
 /// obligation is kept with nothing remaining (`machine.rs` `settle`), so a

@@ -443,8 +443,8 @@ ledger-forfeit-consumed	tests/data/controls/ledger-forfeit-consumed.patch	kani	k
 ledger-violation-cleared	tests/data/controls/ledger-violation-cleared.patch	kani	kani	dcbor	-	-	lib	bounded::policy::proofs::every_event_updates_its_components_by_checked_adds	-	failed	the violation is sticky
 # A held obligation's forfeit settling nothing into its origin (bounded.rs,
 # `Retained::forfeit`): its remaining work leaves custody unrecorded, which
-# conservation over legal transitions reports.
-retained-forfeit-unrecorded	tests/data/controls/retained-forfeit-unrecorded.patch	kani	kani	dcbor	-	-	lib	bounded::policy::proofs::legal_transitions_conserve_every_family	-	failed	legal transitions conserve: A = C + F + H
+# conservation's induction step over legal transitions reports.
+retained-forfeit-unrecorded	tests/data/controls/retained-forfeit-unrecorded.patch	kani	kani	dcbor	-	-	lib	bounded::policy::proofs::every_legal_transition_preserves_conservation	-	failed	legal transitions conserve: A = C + F + H
 # A delta clearing a violation made before its interval, and conservation
 # ignoring the violation flag (policy.rs, `Credits::checked_sub`,
 # `Credits::conserved_with`).

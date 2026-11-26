@@ -1286,9 +1286,9 @@ checked updates (`bounded::policy::proofs`):
 - `ledger-violation-cleared.patch` lets a later fitting event clear the violation flag; ledger
   arithmetic's stickiness check must fail.
 - `retained-forfeit-unrecorded.patch` makes a held obligation's forfeit (`bounded.rs`,
-  `Retained::forfeit`) take its remaining work and record nothing into its origin; legal-transition
-  conservation (`legal_transitions_conserve_every_family`, "legal transitions conserve: A = C + F +
-  H") must fail on any forfeited obligation.
+  `Retained::forfeit`) take its remaining work and record nothing into its origin; conservation's
+  induction step (`every_legal_transition_preserves_conservation`, "legal transitions conserve: A =
+  C + F + H") must fail on any forfeited obligation.
 - `ledger-delta-hides-violation.patch` clears a delta's violation when the earlier snapshot was
   already violated (`Credits::checked_sub`); the delta harness's "a delta taken at or after a
   violation shows it" must fail.
