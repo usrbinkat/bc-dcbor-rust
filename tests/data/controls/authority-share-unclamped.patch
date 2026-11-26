@@ -1,0 +1,12 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -1165,7 +1165,8 @@
+     pub fn share_within(&self, ceilings: Ceilings) -> Self {
+         let mut shared = Self::with_counters(
+             Ceilings {
+-                live: ceilings.live.min(self.authority.ceilings.live),
++                // Planted: a share's live ceiling above its family's.
++                live: ceilings.live,
+                 ..ceilings
+             },
+             self.counters.clone(),

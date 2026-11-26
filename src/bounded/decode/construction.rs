@@ -276,6 +276,10 @@ mod attribution {
     type Value = Vec<String>;
     type Input = OwnedInitialized<'static, ByteString, A>;
 
+    /// The untyped parse's options: the documents these runs parse are
+    /// generated inputs of any shape, valid for [`Value`] or not, nested
+    /// deeper than its own profile; a typed decode of [`Value`] parses under
+    /// that profile instead ([`TypedDecoder`], [`typed_decode_bound`]).
     fn options() -> Options {
         Options::normalizing(4)
     }
@@ -1098,9 +1102,7 @@ mod attribution {
             // record is held in the document's.
             let public = copy_bound::<A, ()>(len(&bytes))
                 .unwrap()
-                .checked_then(
-                    typed_decode_bound::<ByteString, Value, A, ()>(len(&bytes), options()).unwrap(),
-                )
+                .checked_then(typed_decode_bound::<ByteString, Value, A, ()>(len(&bytes)).unwrap())
                 .expect("a typed decode chain's bound fits in u64");
             let chain = format!("typed decode chain of {name}");
             chains.push((chain.clone(), dimensions, public));

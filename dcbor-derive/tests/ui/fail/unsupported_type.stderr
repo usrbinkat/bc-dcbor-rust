@@ -1,19 +1,24 @@
 error[E0277]: the trait bound `VecDeque<bool>: TransferableSchema` is not satisfied
- --> tests/ui/fail/unsupported_type.rs:3:10
+ --> tests/ui/fail/unsupported_type.rs:4:20
   |
-3 | #[derive(CBORBoundedEncodable)]
-  |          ^^^^^^^^^^^^^^^^^^^^ the trait `TransferableSchema` is not implemented for `VecDeque<bool>`
+4 | struct Unsupported(std::collections::VecDeque<bool>);
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `TransferableSchema` is not implemented for `VecDeque<bool>`
   |
   = help: the following other types implement trait `TransferableSchema`:
             &T
             Arc<T>
+            AsciiText
             BTreeMap<K, V>
             Box<T>
             Date
+            FixedBytes<N>
             MinimalBigInt
-            Option<T>
-            StabilizedText
           and $N others
+note: required by a bound in `__dcbor_bound`
+ --> tests/ui/fail/unsupported_type.rs:3:10
+  |
+3 | #[derive(CBORBoundedEncodable)]
+  |          ^^^^^^^^^^^^^^^^^^^^ required by this bound in `__dcbor_bound`
   = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: the trait bound `VecDeque<bool>: Schema` is not satisfied
@@ -25,11 +30,16 @@ error[E0277]: the trait bound `VecDeque<bool>: Schema` is not satisfied
   = help: the following other types implement trait `Schema`:
             &T
             Arc<T>
+            AsciiText
             BTreeMap<K, V>
             Box<T>
             CBOR
             Date
-            MinimalBigInt
-            Option<T>
+            FixedBytes<N>
           and $N others
+note: required by a bound in `__dcbor_schema`
+ --> tests/ui/fail/unsupported_type.rs:3:10
+  |
+3 | #[derive(CBORBoundedEncodable)]
+  |          ^^^^^^^^^^^^^^^^^^^^ required by this bound in `__dcbor_schema`
   = note: this error originates in the derive macro `CBORBoundedEncodable` (in Nightly builds, run with -Z macro-backtrace for more info)

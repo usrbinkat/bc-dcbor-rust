@@ -15,7 +15,7 @@ import_stdlib!();
 
 use unicode_normalization::is_nfc;
 
-use crate::{CBOR, CBORCase, Error, Result};
+use crate::{Error, Result};
 
 /// The build script's table: [`assigned::DERIVED_AGE_VERSION`] and
 /// [`assigned::ASSIGNED`].
@@ -131,50 +131,14 @@ impl StabilizedText {
         Ok(Self(text))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
+    /// The empty text, stabilized as it holds no code point; allocates
+    /// nothing.
+    pub const fn empty() -> Self {
+        Self(String::new())
     }
 }
 
-impl TryFrom<String> for StabilizedText {
-    type Error = Error;
-
-    fn try_from(text: String) -> Result<Self> {
-        Self::new(text)
-    }
-}
-
-impl From<StabilizedText> for CBOR {
-    fn from(text: StabilizedText) -> Self {
-        CBOR::from(text.0)
-    }
-}
-
-/// A CBOR text, accepted as dCBOR accepts it (NFC), then refused at its
-/// first code point the pinned version does not assign; any other value
-/// is [`Error::WrongType`].
-impl TryFrom<CBOR> for StabilizedText {
-    type Error = Error;
-
-    fn try_from(cbor: CBOR) -> Result<Self> {
-        match cbor.into_case() {
-            CBORCase::Text(text) => Self::new(text),
-            _ => Err(Error::WrongType),
-        }
-    }
-}
-
-/// Bounded encoding: a stabilized text encodes as its text, which its
-/// construction already proved stabilized.
-impl crate::bounded::encoding::Schema for StabilizedText {
-    fn instruction(&self, index: usize) -> crate::bounded::encoding::Instruction<'_> {
-        crate::bounded::encoding::Schema::instruction(self.0.as_str(), index)
-    }
-}
+crate::checked_text::checked_text!(StabilizedText);
 
 #[cfg(test)]
 mod tests {

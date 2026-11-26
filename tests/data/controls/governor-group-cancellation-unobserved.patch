@@ -1,0 +1,8 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -185,3 +185,4 @@
+     fn cancelled(&self) -> bool {
+-        self.cancelled.load(Ordering::Acquire) || self.group.cancelled.load(Ordering::Acquire)
++        // Planted: the group's cancellation never read.
++        self.cancelled.load(Ordering::Acquire)
+     }

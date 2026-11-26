@@ -116,7 +116,15 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
         // zero-sized generic marker are not part of payload initialization.
         let fake: DeriveInput = syn::parse_quote!(struct #helper #base_ig #base_wc #fields);
         let payload_schema = Schema::parse(&fake).expect("validated variant payload");
-        let callbacks = super::named::expand_fields(&payload_schema, &fields, positional, false);
+        // A named payload is a map, closed when the enum is; a positional
+        // one has no keys to refuse.
+        let callbacks = super::named::expand_fields(
+            &payload_schema,
+            &fields,
+            positional,
+            schema.closed && !positional,
+            false,
+        );
         // A variant's payload is built by the field engine, its fields in key
         // order: positional keys are their indices, named ones their own.
         let mut keyed: Vec<_> = fields
@@ -266,6 +274,7 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
         &observed,
     );
     let constructors = super::constructors(schema);
+    let wire = super::wire(schema, &a);
     let c_layout = if c {
         quote! {
             #[repr(C)]
@@ -386,6 +395,7 @@ pub(super) fn expand(schema: &Schema<'_>, data: &syn::DataEnum) -> TokenStream2 
                         core::mem::size_of::<#tag_name>(),
                         &[#(#costs),*],
                     ));
+                const WIRE: dcbor::bounded::decode::Options = #wire;
 
                 fn build_step<'__dcbor_brand>(
                     __dcbor_ctx: dcbor::bounded::decode::construction::in_place::BindingContext<'__dcbor_brand, '_, '_, '_, Self, #a>,

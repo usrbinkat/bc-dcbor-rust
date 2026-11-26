@@ -1,6 +1,6 @@
 use super::*;
 use crate::bounded::boundary::{Bound, Predicate, boundary};
-use crate::bounded::decode::construction::reclamation::{PeekSlot, Slot};
+use crate::bounded::decode::construction::reclamation::{Cleanup, PeekSlot, Slot};
 use crate::bounded::decode::initialization::field;
 use crate::bounded::{CustodySink, PermitsObserved};
 use core::ptr::addr_of_mut;
@@ -118,11 +118,11 @@ impl<P> DocumentArena<P> {
     /// paired with its parts, per admitted unit: the node vector if it was
     /// transferred, then the permit if it was. The owner, a plain identity,
     /// needs no release. The caller holds the arena past every document view
-    /// of it. A cleanup step, bound on [`Releasing`]: no new allocation can
-    /// be requested through the capability it is given.
-    pub(crate) fn release_parts_step<A: Releasing<Permit = P>>(
+    /// of it. A cleanup step, under the cleanup capability: every unit is
+    /// admitted as cleanup, and no new allocation can be requested.
+    pub(crate) fn release_parts_step<A: Allocator<Permit = P>>(
         mut arena: Slot<'_, Self, ArenaParts>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<bool, A> {
         let (place, parts) = arena.parts();
         let ArenaParts {
@@ -132,8 +132,8 @@ impl<P> DocumentArena<P> {
         let raw = place.as_ptr(parts);
         match released {
             0 => {
-                Self::ITEMS.admit(a)?;
-                if Bound::new(Predicate::Prefix, 1).reached(a, transferred) {
+                Self::ITEMS.admit(cleanup)?;
+                if Bound::new(Predicate::Prefix, 1).reached(cleanup, transferred) {
                     // SAFETY: the parts pair with the arena's place, and a
                     // first part transferred is the node vector written,
                     // reached by field syntax and dropped once: the parts
@@ -142,8 +142,8 @@ impl<P> DocumentArena<P> {
                 }
             }
             1 => {
-                Self::PERMIT.admit(a)?;
-                if boundary!(a, Predicate::Prefix, transferred, STORAGE_PARTS).is_ge() {
+                Self::PERMIT.admit(cleanup)?;
+                if boundary!(cleanup, Predicate::Prefix, transferred, STORAGE_PARTS).is_ge() {
                     // SAFETY: as above, the storage's last part transferred
                     // is the permit written.
                     unsafe { core::ptr::drop_in_place(addr_of_mut!((*raw).entries.permit)) };

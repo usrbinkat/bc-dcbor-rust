@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/construct.rs
++++ src/bounded/decode/construction/construct.rs
+@@ -1199,7 +1199,8 @@
+     /// nothing.
+     pub fn new(input: OwnedInitialized<'s, I, A>) -> Self {
+         Self {
+-            stage: Stage::Parse(DocumentDecoder::parse(input, T::WIRE)),
++            // Planted: the parse under every document's profile, not the type's.
++            stage: Stage::Parse(DocumentDecoder::parse(input, crate::bounded::decode::Options::UNRESTRICTED)),
+         }
+     }
+ 

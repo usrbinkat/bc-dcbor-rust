@@ -1,19 +1,18 @@
 error[E0277]: `f64` has no CDDL rule (see `dcbor::cddl`, "What has a rule")
- --> tests/ui/fail/cddl_float_field.rs:7:10
-  |
-7 | #[derive(CBORCddl)]
-  |          ^^^^^^^^ no CDDL rule for `f64`
-  |
-  = help: the trait `Cddl` is not implemented for `f64`
-  = note: floating-point types, `MinimalBigInt`, `Date` and hash sets accept sets no CDDL type denotes; a rule for `StabilizedText` would have no oracle independent of its decoder's tables (see `dcbor::cddl`)
-  = help: the following other types implement trait `Cddl`:
-            i16
-            i32
-            i64
-            i8
-            u16
-            u32
-            u64
-            u8
-            usize
-  = note: this error originates in the derive macro `CBORCddl` (in Nightly builds, run with -Z macro-backtrace for more info)
+  --> tests/ui/fail/cddl_float_field.rs:10:14
+   |
+10 |     celsius: f64,
+   |              ^^^ no CDDL rule for `f64`
+   |
+   = help: the trait `Cddl` is not implemented for `f64`
+   = note: floating-point types, `MinimalBigInt`, `Date` and hash sets accept sets no CDDL type denotes; a rule for `StabilizedText` would have no oracle independent of its decoder's tables (see `dcbor::cddl`)
+   = help: the following other types implement trait `Cddl`:
+             i16
+             i32
+             i64
+             i8
+             u16
+             u32
+             u64
+             u8
+             usize

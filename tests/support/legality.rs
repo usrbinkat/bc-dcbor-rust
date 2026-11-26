@@ -17,7 +17,9 @@
 //!
 //! Which bindings declare a reduction (`Reduction`) is a separate matter:
 //! every scalar and unit (`Written`), the byte buffer (`String`,
-//! `ByteString`), stabilized text, the minimal big integer, both options,
+//! `ByteString`), the fixed-length byte string (`FixedBytes`), the checked
+//! texts (`StabilizedText`, `AsciiText`), the minimal big integer, both
+//! options,
 //! the tagged value, and the sequence (`Vec`, arrays) over elements of a
 //! uniform complete class (`Uniform`), whose older, complete records then
 //! all clean up alike, so their count is their custody
@@ -46,9 +48,9 @@ use dcbor::bounded::decode::construction::in_place::tagged::{
     Phase as TaggedPhase, TaggedObservation,
 };
 use dcbor::bounded::decode::construction::in_place::{
-    BufferCustody, BufferObservation, BufferPhase, ElementObservation, MinimalObservation,
-    OptionalObservation, OptionalPhase, SequenceCustody, SequenceObservation, SequencePhase,
-    SessionObservation, StabilizedObservation, StableOptionDecision as Decision,
+    BufferCustody, BufferObservation, BufferPhase, CheckedObservation, ElementObservation,
+    FixedObservation, MinimalObservation, OptionalObservation, OptionalPhase, SequenceCustody,
+    SequenceObservation, SequencePhase, SessionObservation, StableOptionDecision as Decision,
     StableOptionObservation, StableOptionPhase, Stage,
 };
 use dcbor::bounded::decode::construction::reclamation::Written;
@@ -286,15 +288,17 @@ pub fn buffer() -> Legality<BufferObservation> {
     }
 }
 
-/// A `StabilizedText`: its check, then its text, a byte buffer ([`buffer`]).
+/// A checked text (`StabilizedText`, `AsciiText`, one engine): its check,
+/// then its text, a byte buffer ([`buffer`]).
 /// Built: each window checked advances the bytes checked, the text's state
 /// still initial; then the text's own build steps, the bytes checked fixed.
 /// Cleaned: the text's own units, the bytes checked fixed. Its remaining
 /// cleanup and its claims are the text's: the check holds nothing. The
 /// observation does not carry the text's length, so a text step taken before
 /// every byte is checked is not refused here; the binding's charge witness
-/// (`a_stabilized_text_checks_every_byte_once_before_building`) holds that.
-pub fn stabilized() -> Legality<StabilizedObservation> {
+/// (`reclamation_owner.rs`, `checked_text_checks_every_byte_once`) holds
+/// that.
+pub fn checked() -> Legality<CheckedObservation> {
     let Legality {
         initial: first,
         build: grow,
@@ -305,7 +309,7 @@ pub fn stabilized() -> Legality<StabilizedObservation> {
     } = buffer();
     let text = first.expect("a byte buffer names its initial observation");
     Legality {
-        initial: Some(StabilizedObservation { checked: 0, text }),
+        initial: Some(CheckedObservation { checked: 0, text }),
         build: Rc::new(move |before, after| {
             if before.text == text && after.text == text {
                 after.checked > before.checked
@@ -357,6 +361,34 @@ pub fn minimal_bigint() -> Legality<MinimalObservation> {
         remaining: Rc::new(move |observation| rest(&observation.magnitude)),
         permits: Rc::new(move |observation| claims(&observation.magnitude)),
         physical: Rc::new(move |observation| allocations(&observation.magnitude)),
+    }
+}
+
+/// A `FixedBytes` (`in_place/fixed_bytes.rs`): its bytes copied inline,
+/// nothing acquired. Built: each copy advances the bytes copied, by at least
+/// one byte unless it completes (the empty type completes copying nothing),
+/// the last copy completing; nothing follows completion. Cleaned: one unit,
+/// from any state, to the initial one. It holds no permit and no
+/// allocation.
+pub fn fixed() -> Legality<FixedObservation> {
+    let initial = FixedObservation {
+        copied: 0,
+        complete: false,
+    };
+    Legality {
+        initial: Some(initial),
+        build: Rc::new(|before, after| {
+            !before.complete
+                && if after.complete {
+                    after.copied >= before.copied
+                } else {
+                    after.copied > before.copied
+                }
+        }),
+        clean: Rc::new(move |_, after| *after == initial),
+        remaining: Rc::new(|_| Some(1)),
+        permits: Rc::new(|_| Some(Vec::new())),
+        physical: Rc::new(|_| Some(Vec::new())),
     }
 }
 

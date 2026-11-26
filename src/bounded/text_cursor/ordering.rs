@@ -152,13 +152,13 @@ impl<P, O: Origin> Ordering<P, O> {
     /// One unit of the scratch's cleanup. Its characters are plain data: a
     /// settled scratch is discarded in one unit, whatever it holds; one
     /// cancelled while relocating or staging drains per element, which the
-    /// bound counts. Bound on [`Releasing`]: no new allocation can be
-    /// requested through the capability cleanup is given.
-    pub(super) fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// bound counts. Under the cleanup capability: every unit is admitted as
+    /// cleanup, and no new allocation can be requested.
+    pub(super) fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
-        allocator: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<bool, A> {
-        self.scratch.reclaim_copy_step(allocator)
+        self.scratch.reclaim_copy_step(cleanup)
     }
 
     /// The most calls [`Self::reclaim_step`] still takes, the one reporting

@@ -87,9 +87,7 @@ fn safe_acquire_inspect_construct_encode_transfer_and_retire() {
                     assert_eq!(document.value().root().encoded(), WIRE);
                     assert_eq!(document.value().bytes(), WIRE);
                     document.transfer(
-                        |document| {
-                            TypedDecoder::<_, String, Limits>::new(document.into_input(), OPTIONS)
-                        },
+                        |document| TypedDecoder::<_, String, Limits>::new(document.into_input()),
                         Retirement::Stopped,
                         |decoder| {
                             decoder.drive_threaded(

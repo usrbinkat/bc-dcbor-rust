@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place/fixed_bytes.rs
++++ src/bounded/decode/construction/in_place/fixed_bytes.rs
+@@ -167,7 +167,8 @@
+         if state.complete {
+             return Err(BoundedError::PlanMismatch.into());
+         }
+-        if bytes.len() != N {
++        // Planted: a byte string longer than the type's accepted.
++        if bytes.len() < N {
+             STEP.admit(a)?;
+             return Err(DecodeError::Invalid(Error::WrongLength {
+                 expected: N,

@@ -1,0 +1,8 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -73,3 +73,4 @@
+         self.admitting
+-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
++            // Planted: the flag taken whatever holds it.
++            .compare_exchange(self.admitting.load(Ordering::Relaxed), true, Ordering::Acquire, Ordering::Relaxed)
+             .map(|_| Admitting(&self.admitting))

@@ -141,19 +141,19 @@ impl<P, O: Origin> Dynamic<P, O> {
 
     /// One admitted unit releasing the entry descriptors, then the ordering
     /// and permutation scratch. Called only while [`Self::is_released`] is
-    /// false. Bounded on [`Releasing`]: no new allocation through the
-    /// supplied cleanup capability.
-    pub(super) fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// false. Under the cleanup capability: every unit is admitted as
+    /// cleanup, and no new allocation can be requested.
+    pub(super) fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<(), A> {
-        let cleanup = PreparationPlace::Cleanup;
+        let place = PreparationPlace::Cleanup;
         if !self.entries.is_released() {
-            at(cleanup, || self.entries.reclaim_copy_step(a))?;
+            at(place, || self.entries.reclaim_copy_step(cleanup))?;
         } else if !self.order.is_released() {
-            at(cleanup, || self.order.reclaim_step(a))?;
+            at(place, || self.order.reclaim_step(cleanup))?;
         } else {
-            at(cleanup, || self.permutation.reclaim_step(a))?;
+            at(place, || self.permutation.reclaim_step(cleanup))?;
         }
         Ok(())
     }

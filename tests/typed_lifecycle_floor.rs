@@ -15,7 +15,7 @@ use dcbor::bounded::decode::construction::reclamation::{
     Cleanup, Custody, PeekSlot, Reclaim, Reclaimed, Slot,
 };
 use dcbor::bounded::decode::construction::{Borrowed, TypedValue};
-use dcbor::bounded::decode::{ConstructResult, DecodeError, Options, wrong_type};
+use dcbor::bounded::decode::{ConstructResult, DecodeError, wrong_type};
 use dcbor::bounded::{Allocator, CustodySink, Limits, PermitsObserved};
 use dcbor_test_support::{
     self as support, Borrowing, Finding, Lent, Retirement, Stopped, pipeline::Unwitnessed,
@@ -163,21 +163,20 @@ unsafe impl<A: Allocator> Reclaim<A> for Probe {
     }
 }
 
-/// `wire`, borrowed into a scope of a recorded run, decoded as `T` under
-/// `options` ([`support::Holding::decoded`]), the published value held for
-/// `body` and retired as a published handle, which releases nothing; the
-/// scope then drains to nothing. The decode's own error is the run's
+/// `wire`, borrowed into a scope of a recorded run, decoded as `T` under its
+/// wire profile ([`support::Holding::decoded`]), the published value held
+/// for `body` and retired as a published handle, which releases nothing;
+/// the scope then drains to nothing. The decode's own error is the run's
 /// finding.
 fn decoded<T: Transferable<Limits> + 'static, R>(
     wire: &[u8],
-    options: Options,
     body: impl FnOnce(&TypedValue<'_, Borrowed<'_>, T, Limits>) -> R,
 ) -> R {
     support::recorded_run(|run| {
         let policy = run.policy(u64::MAX);
         let made = run.scoped(policy, &Unwitnessed, |owner| {
             owner
-                .decoded::<T, _>(policy, wire, options, |output| body(output.value()))?
+                .decoded::<T, _>(policy, wire, |output| body(output.value()))?
                 .map_err(support::failed("the typed decode"))
         })?;
         run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
@@ -191,13 +190,9 @@ fn construction_initialization_requires_an_admitted_turn() {
     let starts = support::recorded_run(|run| {
         let policy = run.policy(u64::MAX);
         run.scoped(policy, &Unwitnessed, |owner| {
-            owner.decoder::<_, Probe, _, _>(
-                policy,
-                Borrowing(&[0xf6]),
-                Options::normalizing(8),
-                &Unwitnessed,
-                |_| STARTS.get(),
-            )
+            owner.decoder::<_, Probe, _, _>(policy, Borrowing(&[0xf6]), &Unwitnessed, |_| {
+                STARTS.get()
+            })
         })
     });
     assert_eq!(starts, 0, "new ran custom initialization without admission");
@@ -205,15 +200,14 @@ fn construction_initialization_requires_an_admitted_turn() {
 
 #[test]
 fn publication_preserves_the_initialized_value_address() {
-    let (constructed, published) =
-        decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |output| {
-            assert_eq!(output.value().inline, [0x5a; 256]);
-            assert_eq!(output.bytes(), [0xf6]);
-            (
-                output.value().construction_address,
-                std::ptr::from_ref(output.value()) as usize,
-            )
-        });
+    let (constructed, published) = decoded::<Probe, _>(&[0xf6], |output| {
+        assert_eq!(output.value().inline, [0x5a; 256]);
+        assert_eq!(output.bytes(), [0xf6]);
+        (
+            output.value().construction_address,
+            std::ptr::from_ref(output.value()) as usize,
+        )
+    });
     assert_eq!(
         constructed, published,
         "completion moved the initialized value"
@@ -223,9 +217,7 @@ fn publication_preserves_the_initialized_value_address() {
 #[test]
 fn dropping_output_does_not_execute_a_value_destructor() {
     DROPS.set(0);
-    decoded::<Probe, _>(&[0xf6], Options::normalizing(8), |_| {
-        assert_eq!(DROPS.get(), 0)
-    });
+    decoded::<Probe, _>(&[0xf6], |_| assert_eq!(DROPS.get(), 0));
     assert_eq!(
         DROPS.get(),
         0,
@@ -264,7 +256,6 @@ fn every_probe_lifecycle_fault_keeps_custody_without_destructors() {
         INITIALIZED.set(0);
         let report = decode::<Probe>(
             &[0xf6],
-            Options::normalizing(8),
             schedule,
             &parsed::<support::Instrumented, Probe>(),
             |probe| {
@@ -329,9 +320,7 @@ mod large_schema {
                 wire.push(key);
             }
         }
-        decoded::<Large, _>(&wire, Options::normalizing(8), |output| {
-            output.value().assert_literal_fields()
-        });
+        decoded::<Large, _>(&wire, |output| output.value().assert_literal_fields());
     }
 
     #[test]
@@ -360,7 +349,6 @@ fn terminal_error_cannot_report_finished_with_live_custody() {
                 view.decoder::<_, Probe, _, _>(
                     policy,
                     Borrowing(&[0xf4]),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |decoder| {
                         match decoder.drive(policy, bound, Retirement::Published, |_| ()) {

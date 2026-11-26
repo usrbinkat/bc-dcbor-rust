@@ -9,8 +9,8 @@
 //! kind; a map's keys removed one by one, each value replaced by every
 //! other kind, an unknown key added; an array's elements removed, one
 //! appended, each replaced, its first (a variant's discriminant) changed; a
-//! tag stripped and changed; each mutation applied at the top and one level
-//! down. Every item is a dCBOR encoding, made by this crate's own encoder,
+//! byte string one byte shorter and one byte longer; a tag stripped and
+//! changed; each mutation applied at the top and one level down. Every item is a dCBOR encoding, made by this crate's own encoder,
 //! since the CDDL denotes data items and dCBOR conformance is the decoder's
 //! to enforce beyond it (`dcbor::cddl`, "What a rule denotes").
 //!
@@ -31,7 +31,11 @@
 //!   decoder refuses, or the reverse; and `0`, `-1`;
 //! - a non-integral float, an infinity and the canonical NaN: classes no
 //!   integer, text or container rule admits, and no fixture field decodes;
-//! - a text, a byte string, an empty and a nonempty array, an empty map;
+//! - a text, and both edges of the ASCII range (U+007F, the last code point
+//!   an ASCII text holds, and U+0080, the first it refuses), so an ASCII
+//!   rule rendered one too narrow or one too wide admits an item its
+//!   decoder refuses, or the reverse; a byte string, an empty and a nonempty
+//!   array, an empty map;
 //! - a tagged item under a tag no fixture names (`2`, a bignum's, around a
 //!   byte string) and under one (`1`, around an integer).
 //!
@@ -77,16 +81,18 @@
 //!     when no two elements convert to one `T`. An array's group constrains
 //!     each element by its own entry and occurrence (sections 2.1, 3.2);
 //!     no construct relates two elements, so distinctness has no CDDL form;
-//!   - `StabilizedText` (`stabilized_text.rs`:160-169): a text accepted
+//!   - `StabilizedText` (`stabilized_text.rs` `new`, through
+//!     `checked_text.rs`'s `TryFrom<CBOR>`): a text accepted
 //!     exactly when every code point is assigned in the pinned Unicode
 //!     version. Not inexpressible: `tstr .regexp` (section 3.8.3, XSD
 //!     regular expressions) with a character class of the pinned assigned
 //!     ranges would name it. Excluded instead because that class would be
 //!     generated from the one `DerivedAge.txt` the decoder's table is built
 //!     from (`build.rs`), so the check would compare the table with itself,
-//!     not with an independent oracle; and the oracle's support for a class
-//!     of that size at release 0.10.7 is not read. Its own tests are the
-//!     type's (`tests/stabilized_text.rs`).
+//!     not with an independent oracle. Its own tests are the type's
+//!     (`tests/stabilized_text.rs`). An ASCII text (`AsciiText`) has a rule:
+//!     its class, U+0000 to U+007F, is the range's definition, not a table,
+//!     and the validator's regular-expression engine checks it.
 //! - Mutations more than one level below a sample: the domain stops at one
 //!   nested level ([`mutations`]). A rule is generated per type, independent
 //!   of where the type occurs: `Cddl::cddl` takes only the rules being
@@ -100,13 +106,17 @@
 //!   set), and each decoder decodes a field through that field type's own
 //!   decoder, so an item at any depth matches a type's rule exactly as it
 //!   does one level down, where the domain checks it.
-//! - Lengths beyond a sample's: the length-free forms admit every length,
-//!   `tstr`, `bstr` (`src/cddl.rs`:249-259), `any` (:261-265), `[* T]`
-//!   (:274-284), `{ * K => V }` (:268-272, :290-303), so a longer text,
-//!   byte string, array or table is one class with a shorter one on both
-//!   sides. The forms that do fix a length are a map's required members
-//!   (`map`, :177-187) and a variant's arity (`variant`, :206-210), each
-//!   reached by the removal and append mutations above.
+//! - Lengths beyond a sample's, but one each side: the length-free forms
+//!   admit every length, `tstr`, `bstr` (`src/cddl.rs`), `any`, `[* T]`,
+//!   `{ * K => V }`, so a longer text, byte string, array or table is one
+//!   class with a shorter one on both sides. The forms that do fix a length
+//!   are a map's required members (`map`) and a variant's arity
+//!   (`variant`), each reached by the removal and append mutations above,
+//!   and a fixed-length byte string's `bstr .size N` (`FixedBytes`,
+//!   `src/fixed_bytes.rs`), whose decoders accept exactly `N` bytes: its
+//!   sample is `N` bytes, and the shorter and longer mutations reach `N - 1`
+//!   and `N + 1`, the edges on both sides; any other length is of one class
+//!   with the edge on its side.
 
 use dcbor::prelude::*;
 
@@ -150,6 +160,8 @@ fn kinds() -> Vec<(&'static str, CBOR)> {
         ("infinity", CBOR::from(f64::INFINITY)),
         ("NaN", CBOR::from(f64::NAN)),
         ("a text", CBOR::from("t")),
+        ("the last ASCII text", CBOR::from("\u{7F}")),
+        ("the first non-ASCII text", CBOR::from("\u{80}")),
         ("a byte string", CBOR::to_byte_string([1u8])),
         ("an empty array", CBOR::from(Vec::<CBOR>::new())),
         ("an array", CBOR::from(vec![CBOR::from(0u64)])),
@@ -271,6 +283,21 @@ fn mutate(item: &CBOR, depth: usize) -> Vec<Item> {
                     cbor: CBOR::from(changed),
                 });
             }
+        }
+        CBORCase::ByteString(bytes) => {
+            let data = bytes.data();
+            if let Some((_, shorter)) = data.split_last() {
+                out.push(Item {
+                    label: "a byte shorter".to_string(),
+                    cbor: CBOR::to_byte_string(shorter),
+                });
+            }
+            let mut longer = data.to_vec();
+            longer.push(0);
+            out.push(Item {
+                label: "a byte longer".to_string(),
+                cbor: CBOR::to_byte_string(longer),
+            });
         }
         CBORCase::Tagged(tag, inner) => {
             out.push(Item {

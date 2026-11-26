@@ -86,8 +86,10 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
     // address, and the field's own state is used for construction and
     // reclamation.
     unsafe impl<A: Allocator> InPlace<A> for Tracked {
-        // Construction and cleanup are the single String field's.
+        // Construction and cleanup are the single String field's, and so is
+        // the wire it accepts.
         const COST: ConstructionCost = <String as InPlace<A>>::COST;
+        const WIRE: Options = <String as InPlace<A>>::WIRE;
 
         fn build_step<'b>(
             ctx: BindingContext<'b, '_, '_, '_, Self, A>,
@@ -167,7 +169,6 @@ fn completed_field_values_not_just_permits_survive_later_refusal() {
                 owner.decoder::<_, Vec<Tracked>, _, _>(
                     policy,
                     support::Borrowing(&wire),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |operation| {
                         operation.with_policy(policy, |_, m| m.open());
@@ -254,7 +255,7 @@ fn output_moved_to_another_thread_releases_only_at_the_last_owner() {
     support::recorded_run(|run| {
         let decoding = run.policy(POOL);
         let output = run.with_policy(decoding, |m| {
-            decode_typed::<String, _>(&wire, 8, m)
+            decode_typed::<String, _>(&wire, m)
                 .map_err(|error| Finding::Driver(format!("the text did not decode: {error:?}")))
         })?;
         let output = std::cell::RefCell::new(Some(output));
@@ -389,7 +390,6 @@ fn held<N>(
 #[test]
 fn ownership_is_accounted_at_every_phase_transition_and_cancellation() {
     use dcbor::ByteString;
-    use dcbor::bounded::decode::Options;
     use dcbor::bounded::decode::construction::DecodeOwner;
     let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
     let wire = dcbor::CBOR::to_byte_string(&payload).to_cbor_data();
@@ -407,7 +407,6 @@ fn ownership_is_accounted_at_every_phase_transition_and_cancellation() {
                         owner.decoder::<_, ByteString, _, _>(
                             policy,
                             support::Copying(&wire),
-                            Options::normalizing(8),
                             &Unwitnessed,
                             |operation| {
                                 // Input retained: the copy and its record,

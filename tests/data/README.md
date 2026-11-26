@@ -654,7 +654,12 @@ re-opened by its own patch: `record-brand-contravariant.patch` lets a step's rec
 `record_after_cleanup.rs`, held in the binding's state into cleanup), and
 `record-brand-covariant.patch` lets a `'static` record another construction left be presented as
 this step's (`record_of_another_construction.rs`). Each fixture compiles under exactly the variance
-that admits its misuse. Their `.stderr` files are blessed on stable.
+that admits its misuse. The suite runs under both shells' compilers (`dcbor-derive/tests/ui.rs`),
+and each UI control has a row for each, stable and the custom-std nightly. The two contravariant
+fixtures refuse with the compiler's own `E0521` wording, which differs between the two compilers:
+each has one source (`tests/ui/versioned`) and an expectation per compiler, beside its wrapper
+(`tests/ui/versioned/stable`, `tests/ui/versioned/nightly`); every other fixture's one `.stderr`
+holds under both.
 
 A witness inside a recorded run detects its planted defect without ending the run there: it records
 the finding (`RecordedRun::defect`), a malformed custody observation is recorded the same way
@@ -1536,9 +1541,12 @@ disagreement by its kind and item:
 - `cddl-tag-omitted.patch` renders a tagged type's rule without its tag. The item with the tag
   stripped is admitted by the CDDL and refused by both decoders: a tag divergence on
   `tag 40000 stripped`.
-- `cddl-unknown-keys-forbidden.patch` closes every derived map to the keys no field names
+- `cddl-unknown-keys-forbidden.patch` closes every open derived map to the keys no field names
   (`src/cddl.rs`, `map`). A record with an unknown key is accepted by both decoders and refused by
   its CDDL: an unknown-key divergence on `unknown key 99 added`.
+- `cddl-closed-keys-admitted.patch` opens every closed derived map (`#[cbor(closed)]`) to the keys
+  no field names (`src/cddl.rs`, `map`). A closed record with an unknown key is refused by both
+  decoders and admitted by its CDDL: an unknown-key divergence on `Sealed`'s `unknown key 99 added`.
 - `cddl-range-one-too-wide.patch` renders every integer range one past its maximum (`src/cddl.rs`,
   `integer!`). `Record`'s `u8` field replaced by `u8::MAX + 1` is admitted by its CDDL and refused
   by both decoders: a domain divergence on `key 1 > replaced by u8::MAX + 1`.
@@ -1547,6 +1555,97 @@ disagreement by its kind and item:
   `the_domain_holds_every_kind_of_mutation_a_control_targets`, must fail naming the missing
   `replaced by tag 2 around a byte string` item, so a control's item cannot silently leave the
   domain.
+- `cddl-size-dropped.patch` renders a fixed-length byte string (`FixedBytes`, `src/fixed_bytes.rs`)
+  as any byte string, without `.size N`. `Digest`'s item with a field one byte longer is refused by
+  both decoders and admitted by its CDDL: a domain divergence on `key 0 > a byte longer`.
+- `cddl-domain-length-kind-dropped.patch` removes the longer byte string from the mutation domain
+  (`tests/cddl/src/lib.rs`, `mutate`); `the_domain_holds_every_kind_of_mutation_a_control_targets`
+  must fail naming the missing `key 0 > a byte longer` item.
 
 The correspondence holds over the generated domain only: its evidence class is checked, never
 proved.
+
+The schema controls plant defects of what a type declares of the wire it accepts:
+
+- `typed-decode-profile-ignored.patch` makes a typed decode parse under every document's profile
+  (`Options::UNRESTRICTED`) instead of its type's (`construct.rs`, `TypedDecoder::new`). A
+  `Vec<u64>` holding an unproven text then reaches construction, refused there as the wrong type:
+  `the_typed_decode_runs_under_its_types_wire_profile` must fail with "the parse of a type without
+  text admitted unproven text".
+- `fields-closed-key-skipped.patch` makes the bounded field engine skip a closed record's unknown
+  key as an open record's (`fields.rs`, `Search`). The symbolic decoder still refuses it:
+  `a_closed_record_refuses_every_key_no_field_names` (`tests/derive.rs`) must fail with "between the
+  fields: the bounded decoder".
+- `fixed-copy-unadmitted.patch` makes a fixed-length byte string's bounded binding write each copy
+  without admitting it (`in_place/fixed_bytes.rs`, `build_step`).
+  `a_fixed_byte_string_copies_every_byte_once_and_allocates_nothing` (`tests/reclamation_owner.rs`),
+  whose units are derived by hand from the rule, must fail at its first length with "FixedBytes<0>:
+  the bind, 1 copies of 0 bytes".
+- `fixed-length-unchecked.patch` makes the same binding accept a byte string longer than its type's,
+  copying the first `N` bytes. The symbolic decoder still refuses it:
+  `a_fixed_byte_string_is_certified_its_transitions_legal_and_within_its_cost` must fail at the
+  empty type with "FixedBytes<0> was built from".
+- `ascii-rule-widened.patch` makes the ASCII rule admit U+0080 (`ascii_text.rs`, `first_non_ascii`):
+  `the_ascii_range_is_exactly_below_u_0080` must fail with "U+0080 was accepted as ASCII".
+- `ascii-wire-normalizing.patch` declares an ASCII text's wire profile strict
+  (`in_place/checked.rs`, `AsciiText::WIRE`), so a text the quick check leaves unproven is
+  normalized and reaches the rule: `an_ascii_text_is_decoded_under_quick_checks_alone` must fail
+  with "an ASCII text's parse normalized an unproven text".
+
+The accounting controls plant defects of the accounting core's axioms (`src/bounded/policy.rs`,
+`Authority`), of its cleanup admission seam, and of the shared governance built on it
+(`src/bounded/governance.rs`), each detected by its own test in `bounded::policy::tests::authority`
+or `bounded::governance::tests`:
+
+- `authority-turn-raises-lifetime.patch` lets a running turn admit past the lifetime allowance, the
+  conflation of a turn with the lifetime ceiling the core removes:
+  `turns_never_raise_lifetime_authorization` must fail with "turns raised the lifetime allowance".
+- `authority-refusal-commits.patch` commits the lifetime total before the plan's checks
+  (`Authority::work`), so a unit the turn refuses is counted: `a_refused_admission_commits_nothing`
+  must fail with "a refused unit committed".
+- `authority-quantum-is-allowance.patch` takes the turn's allowance for the quantum, so a turn
+  granting nothing refuses an admissible unit as impossible instead of deferring it:
+  `the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn` must fail with "left:
+  Err(QuantumTooSmall)".
+- `cleanup-lifetime-gated.patch` holds a cleanup admission (`Authority::reclaim`) to the
+  foreground's lifetime work ceiling, so cleanup cannot complete once the foreground is spent:
+  `cleanup_is_never_refused_for_the_foreground` must fail with "cleanup was refused for the lifetime
+  allowance".
+- `cleanup-deadline-gated.patch` lets the deadline refuse cleanup as it refuses the foreground
+  (`Limits::admit`): the same test must fail with "cleanup was refused for the deadline".
+- `cleanup-charged-foreground.patch` makes the cleanup capability (`Cleanup`, `reclamation.rs`)
+  admit its units as the policy's foreground work:
+  `a_unit_under_the_cleanup_capability_is_charged_as_cleanup` must fail with "cleanup was charged to
+  the foreground".
+- `governor-operation-commits-first.patch` commits an operation's plan before its group decides
+  (`OperationBudget::admit`), so a group refusal commits the operation's unit:
+  `the_group_work_ceiling_is_aggregate` must fail with "a refused unit committed".
+- `governor-flag-ignored.patch` takes the group's admitting flag whatever holds it
+  (`Group::admitting`), so a contended admission is admitted:
+  `a_contended_group_admission_commits_nothing` must fail with "left: Ok(())".
+- `governor-permit-group-unreleased.patch` drops a governed permit without releasing the group's
+  live total: `live_storage_is_held_at_both_levels` must fail with "left: (8, 0)".
+- `governor-storage-refusal-kept.patch` keeps the operation's live reservation when the group
+  refuses the request: the same test must fail with "a group refusal kept the operation's
+  reservation".
+- `governor-cleanup-gated.patch` holds the group's cleanup count to its lifetime work ceiling
+  (`Group::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with "cleanup was
+  refused for a lifetime ceiling".
+- `governor-group-cancellation-unobserved.patch` reads only the operation's own cancellation
+  (`Operation::cancelled`): `a_cancellation_is_sticky_and_spares_cleanup` must fail with "a group
+  cancellation was not observed".
+- `governor-cancellation-gates-cleanup.patch` holds cleanup to the operation's standing
+  (`OperationBudget::reclaim`): the same test must fail with "cleanup was refused for a
+  cancellation".
+- `governor-allocation-standing-unchecked.patch` admits a request whatever the operation's standing
+  (`OperationBudget::allocate`): `a_monotonic_deadline_refuses_foreground_and_spares_cleanup` must
+  fail when a request past the deadline is granted, "unwrap_err()`on an`Ok` value".
+- `ascii-rule-widened.patch` admits U+0080 as ASCII (`ascii_text.rs`, `first_non_ascii`):
+  `the_ascii_range_is_exactly_below_u_0080` must fail with "U+0080 was accepted as ASCII".
+- `ascii-wire-normalizing.patch` declares an ASCII text's wire profile strict
+  (`in_place/checked.rs`, `InPlace::WIRE`), so a text the quick check cannot prove is normalized and
+  reaches the binding: `an_ascii_text_decodes_quick_only` must fail with "an unproven text reached
+  an ASCII text's binding".
+- `authority-share-unclamped.patch` leaves a share's live ceiling above its family's:
+  `no_ceiling_is_raised_by_a_builder_or_a_share` must fail when a request beyond the family's whole
+  ceiling is granted, "unwrap_err()`on an`Ok` value".

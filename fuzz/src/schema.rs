@@ -15,7 +15,9 @@ pub fn exercise_schema_schedule(data: &[u8]) {
     let data = &data[..data.len().min(1024)];
     let seed = data.first().copied().unwrap_or(0) as usize;
     let source = Record {
-        text: seed.is_multiple_of(2).then(|| String::from_utf8_lossy(data).into_owned()),
+        text: seed
+            .is_multiple_of(2)
+            .then(|| String::from_utf8_lossy(data).into_owned()),
         children: data.chunks(17).map(|chunk| chunk.to_vec()).collect(),
         number: data
             .iter()

@@ -248,6 +248,9 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for StableOption<T, A> {
     /// The option's own parts (`cost`) and its payload's.
     const COST: ConstructionCost =
         crate::const_cost!(cost::<Payload<T, A>, T, Self, A::Permit>(T::COST));
+    /// Its payload's: an omitted field or a `null` adds no level and no
+    /// text.
+    const WIRE: crate::bounded::decode::Options = T::WIRE;
 
     fn build_present<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,

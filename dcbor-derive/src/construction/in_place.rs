@@ -32,6 +32,64 @@ fn dispatch_depth(schema: &Schema<'_>, allocator: &Ident) -> TokenStream2 {
     })
 }
 
+/// The wire profile (`InPlace::WIRE`) of the schema's type under allocator
+/// `a`, composed from its parts' profiles exactly as its encoding nests
+/// them: a newtype is its field's; a unit struct is `null`, a scalar; an
+/// open map accepts unknown keys, whose values may be any well-formed value,
+/// so it is unrestricted, and a closed one is one level over its keys,
+/// unsigned integers, and its fields' values; an enum is the most of its
+/// variants', a unit variant a bare discriminant, a tuple variant one array
+/// level over its discriminant and its fields, a named variant an array
+/// around a map, open or closed as the enum is; a tagged type is one level
+/// over its untagged value's.
+fn wire(schema: &Schema<'_>, allocator: &Ident) -> TokenStream2 {
+    let options = quote!(dcbor::bounded::decode::Options);
+    let of = |ty: &Type| quote!(<#ty as dcbor::bounded::decode::construction::in_place::InPlace<#allocator>>::WIRE);
+    // A map of `fields`: unrestricted when open; when closed, its keys and
+    // its fields' values, one level deeper.
+    let map = |fields: &Fields| {
+        if schema.closed {
+            let values = fields.iter().map(|field| of(&field.ty));
+            quote!(#options::SCALAR #(.either(#values))* .nested())
+        } else {
+            quote!(#options::UNRESTRICTED)
+        }
+    };
+    let untagged = match (&schema.shape, &schema.input.data) {
+        (Shape::Unit, _) => quote!(#options::SCALAR),
+        (Shape::Newtype, Data::Struct(data)) => of(&data
+            .fields
+            .iter()
+            .next()
+            .expect("a newtype has one field")
+            .ty),
+        (Shape::Map(_), Data::Struct(data)) => map(&data.fields),
+        (Shape::Enum(variants), Data::Enum(data)) => {
+            let each = variants
+                .iter()
+                .zip(&data.variants)
+                .map(|(variant, native)| match &variant.kind {
+                    VariantKind::Unit => quote!(#options::SCALAR),
+                    VariantKind::Named(_) => {
+                        let payload = map(&native.fields);
+                        quote!(#options::SCALAR.either(#payload).nested())
+                    }
+                    VariantKind::Tuple(_) => {
+                        let fields = native.fields.iter().map(|field| of(&field.ty));
+                        quote!(#options::SCALAR #(.either(#fields))* .nested())
+                    }
+                });
+            quote!(#options::SCALAR #(.either(#each))*)
+        }
+        _ => unreachable!("validated schema shapes match their data"),
+    };
+    if schema.tag.is_some() {
+        quote!(#untagged.nested())
+    } else {
+        untagged
+    }
+}
+
 /// One variant of a generated construction state: its identifier, the name
 /// its observation reports in `Debug`, and the type of the custody it
 /// carries (the observation of the construction state the variant holds).
@@ -204,6 +262,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
     let name = schema.name();
     let a = schema.fresh("__DcborInPlaceAllocator");
     let depth = dispatch_depth(schema, &a);
+    let wire = wire(schema, &a);
     let mut generics = schema.input.generics.clone();
     generics
         .params
@@ -465,6 +524,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
         // composition over either.
         unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
             const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost = #cost;
+            const WIRE: dcbor::bounded::decode::Options = #wire;
 
             fn build_step<'__dcbor_brand>(
                 __dcbor_ctx: dcbor::bounded::decode::construction::in_place::BindingContext<'__dcbor_brand, '_, '_, '_, Self, #a>,

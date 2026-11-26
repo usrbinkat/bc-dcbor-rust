@@ -445,7 +445,6 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
                 let trace = owner.decoder::<_, ByteString, _, _>(
                     policy,
                     support::Copying(&wire),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |operation| {
                         operation.with_policy(policy, |_, m| m.measure());
@@ -472,7 +471,6 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
                 let held = owner.decoder::<_, ByteString, _, _>(
                     policy,
                     support::Copying(&wire),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |operation| {
                         operation.with_policy(policy, |_, m| m.measure());
@@ -507,7 +505,6 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
         "the pool of {capacity} bytes cannot hold the decode's peak of {peak}: the tenant's \
          release would not let it finish"
     );
-    let options = Options::normalizing(8);
     suite_with(capacity, |run, pool| {
         // The decode's policy: a share of the pool, its own trace over the
         // pool's storage.
@@ -522,7 +519,6 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
                 owner.decoder::<_, ByteString, _, _>(
                     decoding,
                     support::Copying(&wire),
-                    options,
                     &Unwitnessed,
                     |operation| {
                         operation.with_policy(decoding, |_, m| m.measure());
@@ -655,7 +651,6 @@ fn storage_refusal_holds_a_retained_decode_until_another_thread_releases_capacit
                 owner.decoder::<_, ByteString, _, _>(
                     decoding,
                     support::Copying(&wire),
-                    options,
                     &Unwitnessed,
                     |operation| {
                         let first = operation.controlled(

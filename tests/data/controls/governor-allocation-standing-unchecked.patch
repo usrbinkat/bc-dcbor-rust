@@ -1,0 +1,8 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -593,4 +593,4 @@
+         }
+-        self.standing()?;
++        // Planted: a request admitted whatever the operation's standing.
+         let requested = self.authority.request(bytes)?;
+         let operation = &self.operation;

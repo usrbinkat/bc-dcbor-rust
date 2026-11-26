@@ -904,6 +904,8 @@ unsafe impl<T: InPlace<A>, A: Allocator> InPlace<A> for Vec<T> {
     /// The sequence's own parts (`sequence_cost`) over each element's cost.
     const COST: ConstructionCost =
         crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
+    /// An array of `T`: one level over its element's.
+    const WIRE: crate::bounded::decode::Options = T::WIRE.nested();
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,
@@ -963,6 +965,8 @@ unsafe impl<T: InPlace<A>, A: Allocator, const N: usize> InPlace<A> for [T; N] {
     /// As for `Vec`, with no storage of its own.
     const COST: ConstructionCost =
         crate::const_cost!(sequence_cost::<T, Self, T::State, A::Permit>(T::COST));
+    /// As for `Vec`: one level over its element's.
+    const WIRE: crate::bounded::decode::Options = T::WIRE.nested();
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,

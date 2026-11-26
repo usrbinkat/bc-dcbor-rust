@@ -25,7 +25,11 @@
 //!
 //! Exactly the types whose accepted set CDDL can denote and whose rule has
 //! an oracle independent of the decoder's own tables. Integers are their
-//! ranges, text `tstr`, byte strings `bstr`, sequences arrays of their
+//! ranges, text `tstr`, an ASCII text ([`crate::AsciiText`]) `tstr .regexp
+//! "[\u0000-\u007F]*"`, which the validator matches against the whole text
+//! with its own regular-expression engine, byte strings `bstr`, a
+//! fixed-length byte string
+//! ([`crate::FixedBytes`]) `bstr .size N`, sequences arrays of their
 //! element, maps tables of their key and value, a [`CBOR`] value `any`. The
 //! floating-point types have none: their decoders accept an integer exactly
 //! when the type represents it exactly (`float.rs`), a set no CDDL type
@@ -168,13 +172,15 @@ pub struct Member {
     pub value: String,
 }
 
-/// The map of `members` in the order given, then every other key with any
-/// value (`* any => any`): a derived map ignores the keys no field names. A
-/// member's key is an integer value, whose colon form consumes the key
-/// before its value is matched (RFC 8610, section 3.5.4), so a known key of
-/// another type is never taken by the open member. Used by the derive.
+/// The map of `members` in the order given. An open map (`closed` false)
+/// then admits every other key with any value (`* any => any`): an open
+/// derived map ignores the keys no field names. A member's key is an
+/// integer value, whose colon form consumes the key before its value is
+/// matched (RFC 8610, section 3.5.4), so a known key of another type is never
+/// taken by the open member. A closed map (`#[cbor(closed)]`) admits its
+/// members alone: its decoders refuse every other key. Used by the derive.
 #[doc(hidden)]
-pub fn map(members: &[Member]) -> String {
+pub fn map(members: &[Member], closed: bool) -> String {
     let mut entries: Vec<String> = members
         .iter()
         .map(|member| {
@@ -182,8 +188,14 @@ pub fn map(members: &[Member]) -> String {
             format!("{occurrence}{}: {}", member.key, member.value)
         })
         .collect();
-    entries.push("* any => any".to_string());
-    format!("{{ {} }}", entries.join(", "))
+    if !closed {
+        entries.push("* any => any".to_string());
+    }
+    if entries.is_empty() {
+        "{ }".to_string()
+    } else {
+        format!("{{ {} }}", entries.join(", "))
+    }
 }
 
 /// `inner` under tag `tag`, the only form a tagged derived type decodes.
@@ -249,6 +261,17 @@ integer!(u8, u16, u32, u64, usize, i8, i16, i32, i64);
 impl Cddl for String {
     fn cddl(_: &mut Rules) -> String {
         "tstr".to_string()
+    }
+}
+
+/// The ASCII texts: a text matched as a whole by the XSD class of U+0000 to
+/// U+007F (RFC 8610, section 3.8.3, the code points written with CDDL's
+/// `\u` escapes as its section 3.8.3.1 recommends). The validator checks it
+/// with its own regular-expression engine, independent of the decoder's
+/// per-code-point comparison ([`crate::AsciiText`]).
+impl Cddl for crate::AsciiText {
+    fn cddl(_: &mut Rules) -> String {
+        r#"tstr .regexp "[\u0000-\u007F]*""#.to_string()
     }
 }
 
@@ -342,6 +365,10 @@ mod tests {
             "-9223372036854775808..9223372036854775807"
         );
         assert_eq!(String::cddl(&mut rules), "tstr");
+        assert_eq!(
+            crate::AsciiText::cddl(&mut rules),
+            r#"tstr .regexp "[\u0000-\u007F]*""#
+        );
         assert_eq!(ByteString::cddl(&mut rules), "bstr");
         assert_eq!(CBOR::cddl(&mut rules), "any");
         assert_eq!(Vec::<u8>::cddl(&mut rules), "[* 0..255]");
@@ -352,8 +379,9 @@ mod tests {
         assert!(rules.rules.is_empty(), "a primitive defined a rule");
     }
 
-    /// The derive's forms: a map's members in the order given, the open
-    /// member last; a tag; variants; a choice; a unit struct.
+    /// The derive's forms: a map's members in the order given, an open
+    /// map's open member last and a closed map's none; a tag; variants; a
+    /// choice; a unit struct.
     #[test]
     fn the_derive_forms_render_as_rfc_8610_writes_them() {
         let members = [
@@ -368,8 +396,10 @@ mod tests {
                 value: "uint".into(),
             },
         ];
-        assert_eq!(map(&members), "{ 0: tstr, ? 2: uint, * any => any }");
-        assert_eq!(map(&[]), "{ * any => any }");
+        assert_eq!(map(&members, false), "{ 0: tstr, ? 2: uint, * any => any }");
+        assert_eq!(map(&[], false), "{ * any => any }");
+        assert_eq!(map(&members, true), "{ 0: tstr, ? 2: uint }");
+        assert_eq!(map(&[], true), "{ }");
         assert_eq!(tagged(42, "tstr"), "#6.42(tstr)");
         assert_eq!(unit_variant(3), "3");
         assert_eq!(

@@ -1,7 +1,7 @@
 use super::super::super::*;
 
 pub(super) fn expand(schema: &Schema<'_>, fields: &syn::FieldsNamed) -> TokenStream2 {
-    expand_fields(schema, fields, false, true)
+    expand_fields(schema, fields, false, schema.closed, true)
 }
 
 /// The field engine's cost over fields of `types`, in key order, whose field
@@ -36,12 +36,16 @@ pub(super) fn field_state(ty: &TokenStream2, a: &Ident) -> TokenStream2 {
 /// implementation's associated type; emitted inside an anonymous constant
 /// (by the caller for an enum's variant, here for a complete type), it can
 /// be named only through that associated type, and constructed only by the
-/// generated `start`. When `complete_type` is set, the type's own `InPlace`
-/// and `Reclaim` over the field engine are emitted too.
+/// generated `start`. `closed` is whether the map refuses a key no field
+/// names (`Fields::CLOSED`), given by the caller: an enum's variant helper
+/// is parsed from a synthetic schema that carries none of the enum's
+/// attributes. When `complete_type` is set, the type's own `InPlace` and
+/// `Reclaim` over the field engine are emitted too.
 pub(super) fn expand_fields(
     schema: &Schema<'_>,
     fields: &syn::FieldsNamed,
     positional: bool,
+    closed: bool,
     complete_type: bool,
 ) -> TokenStream2 {
     let name = schema.name();
@@ -258,6 +262,7 @@ pub(super) fn expand_fields(
             const COUNT: usize = #count;
             const TAG: Option<u64> = #tag;
             const POSITIONAL: bool = #positional;
+            const CLOSED: bool = #closed;
             type Field = #state_name #state_tg;
             fn key(field: usize) -> u64 {
                 const KEYS: &[u64] = &[#(#keys),*];
@@ -320,6 +325,7 @@ pub(super) fn expand_fields(
         &a,
     );
     let constructors = super::constructors(schema);
+    let wire = super::wire(schema, &a);
     quote! {
         const _: () = {
             #callbacks
@@ -337,6 +343,7 @@ pub(super) fn expand_fields(
             // parts over each field's `COST`.
             unsafe impl #ig dcbor::bounded::decode::construction::in_place::InPlace<#a> for #name #tg #wc {
                 const COST: dcbor::bounded::decode::construction::in_place::ConstructionCost = #cost;
+                const WIRE: dcbor::bounded::decode::Options = #wire;
 
                 fn build_step<'__dcbor_brand>(
                     __dcbor_ctx: dcbor::bounded::decode::construction::in_place::BindingContext<'__dcbor_brand, '_, '_, '_, Self, #a>,

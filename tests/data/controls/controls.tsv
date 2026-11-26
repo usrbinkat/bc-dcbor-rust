@@ -44,8 +44,11 @@ session-index-unchecked	tests/data/controls/session-index-unchecked.patch	native
 sequence-built-in-cleanup	tests/data/controls/sequence-built-in-cleanup.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction::in_place::vector::tests::a_sequence_in_cleanup_refuses_a_build_and_admits_nothing	-	failed	a build in Reclaim: Ok
 # The public document handle restored: the recombination fixture compiles,
 # which trybuild reports in that fixture's block (trybuild 1.0.122
-# message.rs, `should_not_have_compiled`); the suite is blessed on stable.
+# message.rs, `should_not_have_compiled`). The suite runs under both shells'
+# compilers (dcbor-derive/tests/ui.rs), so each UI control has a row for
+# each: stable, and the custom-std nightly the crate is delivered on.
 context-recombination	tests/data/controls/context-recombination.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/context_recombination.rs	failed	Expected test case to fail to compile, but it succeeded.
+context-recombination-nightly	tests/data/controls/context-recombination.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/context_recombination.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The cleanup capability's three closed routes (reclamation.rs, Cleanup),
 # each re-opened by its own patch, its own compile-fail fixture compiling,
 # which trybuild reports in that fixture's block, the one block judged: an
@@ -55,11 +58,15 @@ context-recombination	tests/data/controls/context-recombination.patch	native	sta
 cleanup-grants-allocation	tests/data/controls/cleanup-grants-allocation.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_allocate.rs	failed	Expected test case to fail to compile, but it succeeded.
 cleanup-derefs-to-policy	tests/data/controls/cleanup-derefs-to-policy.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_deref.rs	failed	Expected test case to fail to compile, but it succeeded.
 cleanup-policy-public	tests/data/controls/cleanup-policy-public.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_field.rs	failed	Expected test case to fail to compile, but it succeeded.
+cleanup-grants-allocation-nightly	tests/data/controls/cleanup-grants-allocation.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_allocate.rs	failed	Expected test case to fail to compile, but it succeeded.
+cleanup-derefs-to-policy-nightly	tests/data/controls/cleanup-derefs-to-policy.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_deref.rs	failed	Expected test case to fail to compile, but it succeeded.
+cleanup-policy-public-nightly	tests/data/controls/cleanup-policy-public.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/cleanup_field.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The static dispatch-depth check removed from the standalone driver
 # (standalone.rs, `Standalone::new`, `admitted_depth`): a root declaring one
 # past MAX_DISPATCH_DEPTH compiles through it, which trybuild reports in the
 # fixture's block.
 standalone-depth-unchecked	tests/data/controls/standalone-depth-unchecked.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/standalone_depth_beyond_limit.rs	failed	Expected test case to fail to compile, but it succeeded.
+standalone-depth-unchecked-nightly	tests/data/controls/standalone-depth-unchecked.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/standalone_depth_beyond_limit.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The run-time dispatch-depth comparison made to pass whatever the depth
 # (reclamation.rs, `Depth::descend`): a binding declaring one level fewer
 # than it dispatches builds and is cleaned past its declaration, each case
@@ -91,13 +98,19 @@ record-unbound-context-accepted	tests/data/controls/record-unbound-context-accep
 record-fields-public	tests/data/controls/record-fields-public.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_forged.rs	failed	Expected test case to fail to compile, but it succeeded.
 record-clone-derived	tests/data/controls/record-clone-derived.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_cloned.rs	failed	Expected test case to fail to compile, but it succeeded.
 record-assembly-safe	tests/data/controls/record-assembly-safe.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_unproven.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-fields-public-nightly	tests/data/controls/record-fields-public.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_forged.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-clone-derived-nightly	tests/data/controls/record-clone-derived.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_cloned.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-assembly-safe-nightly	tests/data/controls/record-assembly-safe.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_unproven.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The brand's invariance (in_place.rs, `Brand`), each variance re-opened by
 # its own patch: contravariant, a record of its step stored as `'static`
 # (kept across steps, held in state into cleanup); covariant, a `'static`
 # record another construction left presented as this step's.
-record-brand-contravariant-kept-across-steps	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
-record-brand-contravariant-after-cleanup	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-kept-across-steps	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/versioned/stable/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-after-cleanup	tests/data/controls/record-brand-contravariant.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/versioned/stable/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
 record-brand-covariant	tests/data/controls/record-brand-covariant.patch	native	stable	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_of_another_construction.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-kept-across-steps-nightly	tests/data/controls/record-brand-contravariant.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/versioned/nightly/record_kept_across_steps.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-contravariant-after-cleanup-nightly	tests/data/controls/record-brand-contravariant.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/versioned/nightly/record_after_cleanup.rs	failed	Expected test case to fail to compile, but it succeeded.
+record-brand-covariant-nightly	tests/data/controls/record-brand-covariant.patch	native	nightly	dcbor-derive	-	fast	ui	bounded_derive_contract	tests/ui/fail/record_of_another_construction.rs	failed	Expected test case to fail to compile, but it succeeded.
 # The cleanup level not restored after a dispatch returns (reclamation.rs,
 # `Cleanup::descend`): a second sibling under one capability is refused at
 # its parent's level, which the resource-free witness names; no scope or
@@ -110,6 +123,56 @@ depth-not-restored	tests/data/controls/depth-not-restored.patch	native	nightly	d
 # level more over its input chain (parse.rs), which the records' census
 # reports first (construct.rs, depth).
 derive-depth-understated	tests/data/controls/derive-depth-understated.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction::in_place::tests::adversarial::every_bindings_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Scalars: declared 6, measured 2
+# A typed decode's parse under every document's profile instead of its
+# type's (construct.rs, TypedDecoder::new): a type that accepts no text
+# reaches construction with unproven text.
+typed-decode-profile-ignored	tests/data/controls/typed-decode-profile-ignored.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction_tests::the_typed_decode_runs_under_its_types_wire_profile	-	failed	the parse of a type without text admitted unproven text
+# The accounting core's axioms (policy.rs, `Authority`), one plant each: a
+# running turn admitting past the lifetime allowance; the lifetime total
+# committed before the plan's checks, so a refused unit commits; the turn's
+# allowance taken for the quantum, so a turn granting nothing refuses an
+# admissible unit as impossible; and a share's live ceiling left above its
+# family's.
+authority-turn-raises-lifetime	tests/data/controls/authority-turn-raises-lifetime.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::turns_never_raise_lifetime_authorization	-	failed	turns raised the lifetime allowance
+authority-refusal-commits	tests/data/controls/authority-refusal-commits.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_refused_admission_commits_nothing	-	failed	a refused unit committed
+authority-quantum-is-allowance	tests/data/controls/authority-quantum-is-allowance.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn	-	failed	left: Err(QuantumTooSmall)
+authority-share-unclamped	tests/data/controls/authority-share-unclamped.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::no_ceiling_is_raised_by_a_builder_or_a_share	-	failed	unwrap_err()` on an `Ok` value
+# The cleanup admission seam (policy.rs `Authority::reclaim`, `Limits::admit`;
+# reclamation.rs `Cleanup`'s `traverse`), one plant each: cleanup held to the
+# foreground's lifetime ceiling; the deadline refusing cleanup; and the
+# cleanup capability admitting its units as the policy's foreground work.
+cleanup-lifetime-gated	tests/data/controls/cleanup-lifetime-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the lifetime allowance
+cleanup-deadline-gated	tests/data/controls/cleanup-deadline-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the deadline
+cleanup-charged-foreground	tests/data/controls/cleanup-charged-foreground.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_unit_under_the_cleanup_capability_is_charged_as_cleanup	-	failed	cleanup was charged to the foreground
+# Shared governance (governance.rs), one plant each: the operation's plan
+# committed before the group decides; the group's admitting flag taken
+# whatever holds it; a permit's drop leaving the group's live total held; a
+# group storage refusal keeping the operation's reservation; and cleanup
+# held to the group's lifetime ceiling.
+governor-operation-commits-first	tests/data/controls/governor-operation-commits-first.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::the_group_work_ceiling_is_aggregate	-	failed	a refused unit committed
+governor-flag-ignored	tests/data/controls/governor-flag-ignored.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_contended_group_admission_commits_nothing	-	failed	left: Ok(())
+governor-permit-group-unreleased	tests/data/controls/governor-permit-group-unreleased.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::live_storage_is_held_at_both_levels	-	failed	left: (8, 0)
+governor-storage-refusal-kept	tests/data/controls/governor-storage-refusal-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::live_storage_is_held_at_both_levels	-	failed	a group refusal kept the operation's reservation
+governor-cleanup-gated	tests/data/controls/governor-cleanup-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::cleanup_is_never_refused_for_either_ceiling	-	failed	cleanup was refused for a lifetime ceiling
+# An operation's standing (governance.rs `OperationBudget::standing`), one
+# plant each: the group's cancellation never read; cleanup held to the
+# standing; and a request admitted whatever the standing.
+governor-group-cancellation-unobserved	tests/data/controls/governor-group-cancellation-unobserved.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_cancellation_is_sticky_and_spares_cleanup	-	failed	a group cancellation was not observed
+governor-cancellation-gates-cleanup	tests/data/controls/governor-cancellation-gates-cleanup.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_cancellation_is_sticky_and_spares_cleanup	-	failed	cleanup was refused for a cancellation
+governor-allocation-standing-unchecked	tests/data/controls/governor-allocation-standing-unchecked.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_monotonic_deadline_refuses_foreground_and_spares_cleanup	-	failed	unwrap_err()` on an `Ok` value
+# An ASCII text (ascii_text.rs, in_place/checked.rs), one plant each: the
+# rule widened to admit U+0080; the wire profile strict, so an unproven text
+# is normalized before the rule refuses it.
+ascii-rule-widened	tests/data/controls/ascii-rule-widened.patch	native	nightly	dcbor	all	fast	lib	ascii_text::tests::the_ascii_range_is_exactly_below_u_0080	-	failed	U+0080 was accepted as ASCII
+ascii-wire-normalizing	tests/data/controls/ascii-wire-normalizing.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction_tests::an_ascii_text_is_decoded_under_quick_checks_alone	-	failed	an ASCII text's parse normalized an unproven text
+# The ASCII text (ascii_text.rs, in_place/checked.rs), one plant each: the
+# rule widened to admit U+0080; and the wire profile strict, so a text the
+# quick check cannot prove reaches the binding.
+ascii-rule-widened	tests/data/controls/ascii-rule-widened.patch	native	nightly	dcbor	all	fast	lib	ascii_text::tests::the_ascii_range_is_exactly_below_u_0080	-	failed	U+0080 was accepted as ASCII
+ascii-wire-normalizing	tests/data/controls/ascii-wire-normalizing.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction::in_place::checked::tests::an_ascii_text_decodes_quick_only	-	failed	an unproven text reached an ASCII text's binding
+# A closed record's unknown key skipped by the bounded field engine as an
+# open record's is (fields.rs, Search): the symbolic decoder still refuses.
+fields-closed-key-skipped	tests/data/controls/fields-closed-key-skipped.patch	native	nightly	dcbor	all	fast	derive	a_closed_record_refuses_every_key_no_field_names	-	failed	between the fields: the bounded decoder
 parsed-depth-margin-changed	tests/data/controls/parsed-depth-margin-changed.patch	native	nightly	dcbor	all	fast	lib	bounded::decode::construction::construct::depth::every_records_declaration_exceeds_its_dispatch_by_its_recorded_margin	-	failed	Parsed: declared
 # `Constructed` declaring one level over its value's (construct.rs): the
 # records' census reports its value case, and the suspended construction's
@@ -522,9 +585,23 @@ cddl-key-off-by-one	tests/data/controls/cddl-key-off-by-one.patch	native	nightly
 cddl-tag-omitted	tests/data/controls/cddl-tag-omitted.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Stamped: tag divergence: `tag 40000 stripped`
 cddl-range-one-too-wide	tests/data/controls/cddl-range-one-too-wide.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: domain divergence: `key 1 > replaced by u8::MAX + 1`
 cddl-unknown-keys-forbidden	tests/data/controls/cddl-unknown-keys-forbidden.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Record: unknown-key divergence: `unknown key 99 added`
+cddl-closed-keys-admitted	tests/data/controls/cddl-closed-keys-admitted.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Sealed: unknown-key divergence: `unknown key 99 added`
+# A fixed-length byte string rendered as any byte string (src/fixed_bytes.rs,
+# its `Cddl`): Digest's item with a field one byte longer is refused by both
+# decoders and admitted by its CDDL.
+cddl-size-dropped	tests/data/controls/cddl-size-dropped.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	every_fixtures_cddl_admits_exactly_what_its_decoders_accept	-	failed	Digest: domain divergence: `key 0 > a byte longer`
 # The foreign-tag class dropped from the mutation domain (tests/cddl
 # src/lib.rs): the domain's own completeness check names the missing kind.
 cddl-domain-tag-kind-dropped	tests/data/controls/cddl-domain-tag-kind-dropped.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	the_domain_holds_every_kind_of_mutation_a_control_targets	-	failed	no `replaced by tag 2 around a byte string` item
+# The longer byte string dropped from the mutation domain (tests/cddl
+# src/lib.rs): the domain's own completeness check names the missing kind.
+cddl-domain-length-kind-dropped	tests/data/controls/cddl-domain-length-kind-dropped.patch	native	nightly	dcbor-cddl-check	-	fast	correspondence	the_domain_holds_every_kind_of_mutation_a_control_targets	-	failed	no `key 0 > a byte longer` item
+# A fixed-length byte string's bounded binding (in_place/fixed_bytes.rs,
+# `build_step`): its copy written without its admission, which the charge
+# witness names at the first length; and a byte string longer than the
+# type's accepted, which the rejection check names at the empty type.
+fixed-copy-unadmitted	tests/data/controls/fixed-copy-unadmitted.patch	native	nightly	dcbor	all	fast	reclamation_owner	a_fixed_byte_string_copies_every_byte_once_and_allocates_nothing	-	failed	FixedBytes<0>: the bind, 1 copies of 0 bytes
+fixed-length-unchecked	tests/data/controls/fixed-length-unchecked.patch	native	nightly	dcbor	all	fast	reclamation_owner	a_fixed_byte_string_is_certified_its_transitions_legal_and_within_its_cost	-	failed	FixedBytes<0> was built from
 # The preparation's window custody (encoding.rs): the window arena counted
 # as one cleanup unit while unreleased, as a plain-data clear, understating
 # its per-part drains, which the every-cut schedule names; and the terminal

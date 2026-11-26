@@ -91,6 +91,11 @@ pub enum Error {
     #[error("code point U+{0:04X} is not assigned in the pinned Unicode version")]
     UnassignedCodePoint(u32),
 
+    /// An ASCII text ([`crate::AsciiText`]) holds a code point at or above
+    /// U+0080. The parameter is the first such code point.
+    #[error("code point U+{0:04X} is not ASCII")]
+    NonAsciiText(u32),
+
     /// The decoded CBOR item didn't consume all input data.
     /// The parameter contains the number of unused bytes.
     ///
@@ -140,6 +145,11 @@ pub enum Error {
     #[error("missing CBOR map key")]
     MissingMapKey,
 
+    /// A decoded map holds a key that none of the fields of a closed record
+    /// (`#[cbor(closed)]`) names. An open record ignores such a key.
+    #[error("the CBOR map has a key no field of the closed record names")]
+    UnknownMapKey,
+
     /// A CBOR numeric value could not be represented in the specified target
     /// numeric type.
     ///
@@ -148,6 +158,12 @@ pub enum Error {
     /// precision.
     #[error("the CBOR numeric value could not be represented in the specified numeric type")]
     OutOfRange,
+
+    /// A byte string of a fixed-length type ([`crate::FixedBytes`]) holds
+    /// another number of bytes than the type's. `expected` is the type's
+    /// length, `actual` the byte string's.
+    #[error("expected a byte string of {expected} bytes, but got {actual}")]
+    WrongLength { expected: usize, actual: usize },
 
     /// The CBOR value is not of the expected type for a conversion or
     /// operation.

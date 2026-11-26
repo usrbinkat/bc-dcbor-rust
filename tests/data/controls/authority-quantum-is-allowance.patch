@@ -1,0 +1,12 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -225,7 +225,8 @@
+         let Some(turn) = self.turn else {
+             return Ok(None);
+         };
+-        if !self.quantum.covers(&work) {
++        // Planted: the turn's allowance taken for the quantum.
++        if !turn.allowance.covers(&work) {
+             return Err(LimitRefusal::QuantumTooSmall);
+         }
+         let spent = turn

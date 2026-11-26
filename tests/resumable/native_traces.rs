@@ -571,21 +571,17 @@ fn decoding(cases: &mut Cases) {
         0x83, 0x63, b'a', b'b', b'c', 0x63, b'1', b'2', b'3', 0x61, b'x',
     ];
     cases.synchronous("decode_typed Vec<String>", Outcome::Published, |m| {
-        reached(&decode_typed::<Vec<String>, _>(&texts, 8, m))
+        reached(&decode_typed::<Vec<String>, _>(&texts, m))
     });
     cases.synchronous("decode_typed String", Outcome::Published, |m| {
-        reached(&decode_typed::<String, _>(
-            &text_wire("\u{e9}t\u{e9}"),
-            8,
-            m,
-        ))
+        reached(&decode_typed::<String, _>(&text_wire("\u{e9}t\u{e9}"), m))
     });
     cases.synchronous("decode_typed ByteString", Outcome::Published, |m| {
         let wire = CBOR::to_byte_string([7u8; 70]).to_cbor_data();
-        reached(&decode_typed::<ByteString, _>(&wire, 8, m))
+        reached(&decode_typed::<ByteString, _>(&wire, m))
     });
     cases.synchronous("decode_typed wrong type", Outcome::Invalid, |m| {
-        reached(&decode_typed::<Vec<u64>, _>(&text_wire("x"), 8, m))
+        reached(&decode_typed::<Vec<u64>, _>(&text_wire("x"), m))
     });
 }
 
@@ -611,17 +607,12 @@ where
                 &pipeline::Unwitnessed,
                 |scope| {
                     scope.initialize(policy)?;
-                    let outcome = match scope.decoded::<T, _>(
-                        policy,
-                        wire,
-                        Options::normalizing(8),
-                        |value| {
-                            marks.published = Some(Publication {
-                                boundary: value.boundary(),
-                                permits: published_permits(value.value()),
-                            });
-                        },
-                    )? {
+                    let outcome = match scope.decoded::<T, _>(policy, wire, |value| {
+                        marks.published = Some(Publication {
+                            boundary: value.boundary(),
+                            permits: published_permits(value.value()),
+                        });
+                    })? {
                         Ok(()) => Ok(Outcome::Published),
                         Err(error) => {
                             marks.cleaning =
@@ -1016,10 +1007,10 @@ fn derived(cases: &mut Cases) {
     ];
     let choice = [0x82, 0x02, 0xa1, 0x00, 0x61, b'x'];
     cases.synchronous("decode_typed derived record", Outcome::Published, |m| {
-        reached(&decode_typed::<Record, _>(&record, 8, m))
+        reached(&decode_typed::<Record, _>(&record, m))
     });
     cases.synchronous("decode_typed derived choice", Outcome::Published, |m| {
-        reached(&decode_typed::<Choice, _>(&choice, 8, m))
+        reached(&decode_typed::<Choice, _>(&choice, m))
     });
     cases.synchronous("encode derived choice", Outcome::Published, |m| {
         reached(&encode(&Choice::Text("x".into()), m))

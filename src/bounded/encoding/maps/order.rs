@@ -95,13 +95,13 @@ impl<P, O: Origin> Order<P, O> {
     }
 
     /// One admitted unit releasing the merge scratch; true once released.
-    /// The caller supplies the place. Bounded on [`Releasing`]: no new
-    /// allocation through the supplied cleanup capability.
-    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// The caller supplies the place. Under the cleanup capability: every
+    /// unit is admitted as cleanup, and no new allocation can be requested.
+    pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<bool, A> {
-        self.scratch.reclaim_copy_step(a)
+        self.scratch.reclaim_copy_step(cleanup)
     }
 
     pub fn new() -> Self {

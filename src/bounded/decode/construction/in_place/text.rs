@@ -556,6 +556,7 @@ pub(crate) fn copy_buffer<H: Buffer, A: Allocator>(
 // `buffer_cost::<String, A::Permit>()`, the engine's own.
 unsafe impl<A: Allocator> InPlace<A> for String {
     const COST: ConstructionCost = crate::const_cost!(buffer_cost::<String, A::Permit>());
+    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::TEXT;
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,

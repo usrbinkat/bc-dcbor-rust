@@ -556,26 +556,34 @@ impl<I, P, O: Origin> ParserContinuation<I, P, O> {
 
     /// Close parser admission and reclaim one resource unit. Terminal errors
     /// enter this same path, retaining partial relocation and normalization.
-    /// Bound on [`Releasing`], not [`Allocator`]: cleanup admits work and
-    /// releases what it holds, and no new allocation can be requested
-    /// through the capability it is given, so a cleanup step's capability
-    /// (`reclamation::Cleanup`) reaches it.
-    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// The public entry: the cleanup capability minted over `allocator`
+    /// ([`reclamation::with_cleanup`]), then [`Self::reclaim_under`].
+    pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
     ) -> BoundedResult<bool, A> {
-        let cleanup = RetainedPlace::Cleanup;
+        reclamation::with_cleanup(allocator, |cleanup| self.reclaim_under(cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under the cleanup capability its caller's
+    /// cleanup holds: the one implementation, every unit admitted as
+    /// cleanup ([`Releasing::reclaim`]) and no allocation requestable.
+    pub(crate) fn reclaim_under<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        cleanup: &mut reclamation::Cleanup<'_, A>,
+    ) -> BoundedResult<bool, A> {
+        let place = RetainedPlace::Cleanup;
         match self.phase {
             Phase::ReclaimNormalizer => {
                 if self.normalizer_init == TextContinuation::<(), P, O>::INIT_STEPS {
                     // SAFETY: all resource-free metadata fields were initialized
                     // before the normalizer could acquire any resources.
                     let normalizer = unsafe { self.normalizer.assume_init_mut() };
-                    if !at(cleanup, || normalizer.reclaim_step(allocator))? {
+                    if !at(place, || normalizer.reclaim_under(cleanup))? {
                         return Ok(false);
                     }
                 }
-                CLEANUP.admit(allocator)?;
+                CLEANUP.admit(cleanup)?;
                 self.retire_normalizer();
                 // A normalized output still held is released in the same
                 // unit: its request paid for its release.
@@ -586,12 +594,12 @@ impl<I, P, O: Origin> ParserContinuation<I, P, O> {
             // discarded in one unit, whatever it holds; one cancelled while
             // relocating or staging drains per element, which the bound counts.
             Phase::ReclaimEntries => {
-                if at(cleanup, || self.entries.reclaim_copy_step(allocator))? {
+                if at(place, || self.entries.reclaim_copy_step(cleanup))? {
                     self.phase = Phase::ReclaimStack;
                 }
             }
             Phase::ReclaimStack => {
-                if at(cleanup, || self.stack.reclaim_copy_step(allocator))? {
+                if at(place, || self.stack.reclaim_copy_step(cleanup))? {
                     self.phase = Phase::Finished;
                     return Ok(true);
                 }
@@ -599,11 +607,11 @@ impl<I, P, O: Origin> ParserContinuation<I, P, O> {
             // Publication transferred everything; this call admits the
             // completion it reports, as every cleanup call admits its unit.
             Phase::Finished => {
-                CLEANUP.admit(allocator)?;
+                CLEANUP.admit(cleanup)?;
                 return Ok(true);
             }
             _ => {
-                CLEANUP.admit(allocator)?;
+                CLEANUP.admit(cleanup)?;
                 self.phase = Phase::ReclaimNormalizer;
             }
         }
@@ -953,9 +961,12 @@ impl<I, P, O: Origin> ParserContinuation<I, P, O> {
                     self.phase = Phase::Compare;
                 }
             }
+            // The emptied stack's release: cleanup of what the parse holds,
+            // admitted under the cleanup capability.
             Phase::ReleaseStack => {
+                let stack = &mut self.stack;
                 if at(RetainedPlace::Publication, || {
-                    self.stack.reclaim_copy_step(allocator)
+                    reclamation::with_cleanup(allocator, |cleanup| stack.reclaim_copy_step(cleanup))
                 })? {
                     self.phase = Phase::Publish;
                 }
@@ -1028,6 +1039,8 @@ impl<I, P, O: Origin> ParserContinuation<I, P, O> {
                     self.next_header();
                 }
             }
+            // `reclaim_step` mints the cleanup capability: a terminal error's
+            // cleanup is admitted as cleanup, never as foreground work.
             Phase::ReclaimNormalizer | Phase::ReclaimEntries | Phase::ReclaimStack => {
                 self.reclaim_step(allocator)?;
             }

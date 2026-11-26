@@ -3,6 +3,7 @@
 #[path = "../support/policy.rs"]
 mod policy;
 
+use dcbor::bounded::decode::ConstructResult;
 use dcbor::bounded::decode::construction::in_place::{
     BindingContext, Building, Built, ConstructionCost, InPlace, reported, step, unit,
 };
@@ -10,7 +11,6 @@ use dcbor::bounded::decode::construction::reclamation::{
     Cleanup, MAX_DISPATCH_DEPTH, PeekSlot, Reclaim, Reclaimed, Slot, Written,
 };
 use dcbor::bounded::decode::construction::{Borrowed, OwnedInitialized, TypedDecoder};
-use dcbor::bounded::decode::{ConstructResult, Options};
 use dcbor::bounded::{Allocator, BoundedResult, CustodySink, PermitsObserved};
 
 struct AtLimit;
@@ -20,7 +20,10 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
     type State = Written;
     const INITIAL: Written = Written::Empty;
 
-    fn reclaim_step(mut slot: Slot<'_, Self, Written>, cleanup: &mut Cleanup<'_, A>) -> BoundedResult<Reclaimed, A> {
+    fn reclaim_step(
+        mut slot: Slot<'_, Self, Written>,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<Reclaimed, A> {
         step(cleanup)?;
         *slot.custody() = Written::Empty;
         Ok(Reclaimed::Done)
@@ -39,7 +42,8 @@ unsafe impl<A: Allocator> Reclaim<A> for AtLimit {
 }
 
 unsafe impl<A: Allocator> InPlace<A> for AtLimit {
-    const COST: ConstructionCost = ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
+    const COST: ConstructionCost =
+        ConstructionCost::fixed(dcbor::const_cost!(unit(0).checked_mul(2)));
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,
@@ -54,7 +58,7 @@ unsafe impl<A: Allocator> InPlace<A> for AtLimit {
 }
 
 fn decode(input: OwnedInitialized<'static, Borrowed<'static>, policy::Policy>) {
-    let mut decoder = TypedDecoder::<_, AtLimit, _>::new(input, Options::normalizing(8));
+    let mut decoder = TypedDecoder::<_, AtLimit, _>::new(input);
     let _ = decoder.step(&mut policy::Policy);
 }
 

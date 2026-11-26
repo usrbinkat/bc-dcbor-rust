@@ -395,12 +395,13 @@ fn an_owned_encoding_is_written_under_its_own_policy() {
     assert_eq!(refusing.requests(), 1, "the storage was granted first");
     assert_eq!(refusing.live_bytes(), 0, "a refused write releases it");
 
+    // The output's two bytes exceed the whole one-byte live ceiling.
     let mut no_storage = Limits::new(u64::MAX, u64::MAX, 1);
     assert_eq!(
         prepared
             .encode_owned(&mut no_storage)
             .map(|encoded| encoded.as_ref().to_vec()),
-        Err(BoundedError::Refused(LimitRefusal::Storage))
+        Err(BoundedError::Refused(LimitRefusal::TooLarge))
     );
     assert_eq!(
         (no_storage.used(), no_storage.live_bytes()),

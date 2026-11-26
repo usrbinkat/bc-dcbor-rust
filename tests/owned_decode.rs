@@ -1,9 +1,9 @@
+use dcbor::bounded::decode::ConstructResult;
 use dcbor::bounded::decode::construction::{
     Acquisition, DecodeOwner, TypedDecoder, TypedValue,
     in_place::{BindingContext, Building, ConstructionCost, InPlace, admit, unit},
     reclamation::{Cleanup, Custody, PeekSlot, Reclaim, Reclaimed, Slot},
 };
-use dcbor::bounded::decode::{ConstructResult, Options};
 use dcbor::bounded::{
     BoundedError, BoundedResult, CustodySink, Limits, PermitsObserved, Reservation,
 };
@@ -144,7 +144,7 @@ fn run(cancel_at: Option<usize>) -> (usize, bool, dcbor::bounded::boundary::Reac
                 String,
                 Limits,
                 (),
-            >(wire.len() as u64, Options::normalizing(8))
+            >(wire.len() as u64)
             .expect("the typed decode bound of an input held in memory fits in u64"),
         ) + 3;
     support::recorded_run(|run| {
@@ -161,9 +161,7 @@ fn run(cancel_at: Option<usize>) -> (usize, bool, dcbor::bounded::boundary::Reac
                     owner.with_policy(policy, |owner, m| instrumented(owner, m, &wire, &released));
                 let published = owner.holding(input, Retirement::Published, |input| {
                     input.transfer(
-                        |input| {
-                            TypedDecoder::<_, String, Limits>::new(input, Options::normalizing(8))
-                        },
+                        TypedDecoder::<_, String, Limits>::new,
                         Retirement::Stopped,
                         |decoder| {
                             let published = decoder.controlled(
@@ -248,18 +246,13 @@ fn cancelled_operation_finishes_while_unrelated_output_remains_live() {
                     instrumented(scope, m, &[0x62, b'o', b'k'], &released)
                 });
                 view.holding(first, Retirement::Published, |first| {
-                    first.decode::<String, _>(policy, Options::normalizing(8), |output| {
+                    first.decode::<String, _>(policy, |output| {
                         let second = output.with_policy(policy, |_, m| {
                             instrumented(scope, m, &[0x62, b'o', b'k'], &released)
                         });
                         output.holding(second, Retirement::Published, |second| {
                             second.transfer(
-                                |input| {
-                                    TypedDecoder::<_, String, Limits>::new(
-                                        input,
-                                        Options::normalizing(8),
-                                    )
-                                },
+                                TypedDecoder::<_, String, Limits>::new,
                                 Retirement::Stopped,
                                 |cancelled| {
                                     cancelled.value().cancel();
@@ -269,9 +262,7 @@ fn cancelled_operation_finishes_while_unrelated_output_remains_live() {
                                             String,
                                             Limits,
                                             (),
-                                        >(
-                                            3, Options::normalizing(8)
-                                        )
+                                        >(3)
                                         .expect("the literal's typed decode bound fits in u64"),
                                     ) + 3;
                                     cancelled.finish(policy, bound, Retirement::Published)
@@ -448,12 +439,7 @@ fn owned_publication_preserves_construction_address_and_never_runs_payload_drop(
                 });
                 owner.holding(input, Retirement::Published, |input| {
                     input.transfer(
-                        |input| {
-                            TypedDecoder::<_, StableProbe, Limits>::new(
-                                input,
-                                Options::normalizing(8),
-                            )
-                        },
+                        TypedDecoder::<_, StableProbe, Limits>::new,
                         Retirement::Stopped,
                         |decoder| {
                             decoder.drive(
@@ -464,9 +450,7 @@ fn owned_publication_preserves_construction_address_and_never_runs_payload_drop(
                                         StableProbe,
                                         Limits,
                                         (),
-                                    >(
-                                        3, Options::normalizing(8)
-                                    )
+                                    >(3)
                                     .expect("the literal's typed decode bound fits in u64"),
                                 ),
                                 Retirement::Published,

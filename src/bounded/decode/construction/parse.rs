@@ -289,7 +289,7 @@ unsafe impl<'s, I: DecodeInput<A>, A: Allocator> Reclaim<A> for Parsed<'s, I, A>
                 let drained = at(ParsePlace::Parse, || {
                     // SAFETY: the parser prefix is complete, and the parser
                     // is held until this phase ends (`holds_parser`).
-                    unsafe { parser.assume_init_mut() }.reclaim_step(cleanup)
+                    unsafe { parser.assume_init_mut() }.reclaim_under(cleanup)
                 })?;
                 if drained {
                     // The drained parser dropped in place: the record's block

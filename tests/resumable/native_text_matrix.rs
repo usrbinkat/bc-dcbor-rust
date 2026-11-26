@@ -6,7 +6,6 @@ use super::support::{
     pipeline::{Refusal, Unwitnessed},
     reason_matrix, refusal_matrix,
 };
-use dcbor::bounded::WriteWork;
 use dcbor::bounded::decode::{DecodeError, Kind, Options, cursor::Decoder, decode};
 
 /// Encode `source` under `fault`: resumed to the literal `expected` bytes,
@@ -150,9 +149,7 @@ fn long_combining_run_requires_retained_progress_not_whole_run_admission() {
         |run, policy| {
             // One quantum before the first refusal; every later turn is one
             // quantum.
-            run.with_policy(policy, |m| {
-                m.set_limit(WriteWork::new(TURN.values, TURN.bytes))
-            });
+            run.with_policy(policy, |m| m.turn());
             run.holding(
                 text_encoder(&source),
                 Retirement::Released,
@@ -160,7 +157,7 @@ fn long_combining_run_requires_retained_progress_not_whole_run_admission() {
                 |operation| {
                     operation.suspend(
                         policy,
-                        LimitRefusal::Work,
+                        LimitRefusal::Turn,
                         normalize_turns(&source),
                         TurnSchedule::Retained,
                         Retirement::Released,

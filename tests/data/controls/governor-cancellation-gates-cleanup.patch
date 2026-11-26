@@ -1,0 +1,10 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -567,5 +567,7 @@
+         if self.terminal {
+             return Ok(());
+         }
++        // Planted: cleanup held to the operation's standing.
++        self.standing()?;
+         let work = WriteWork::new(values, bytes);
+         let planned = self.authority.plan_reclaim(work)?;

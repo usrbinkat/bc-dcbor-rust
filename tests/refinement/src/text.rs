@@ -6,7 +6,9 @@
 //!
 //! - `work V B ANSWER`, `allocate N ANSWER`; an answer is `admitted`,
 //!   `granted ID` or `refused REASON`, then `injected` when injected; a
-//!   reason is `work`, `storage`, `deadline`, `scheduled N`, `unrecorded`;
+//!   reason is `turn`, `quantum-too-small`, `work`, `requested`, `storage`,
+//!   `too-large`, `contended`, `deadline`, `cancelled`, `scheduled N` or
+//!   `unrecorded`;
 //! - `admit V B`, or `admit V B hold HOLD`; a hold is `KIND V B ID ACQ`;
 //! - `spend KIND V B ID ACQ PERMIT`, `forfeit KIND V B ID ACQ PERMIT RULE`,
 //!   `PERMIT` an identity or `-`;
@@ -96,6 +98,12 @@ pub(crate) fn refusal_name(refusal: LimitRefusal) -> String {
         LimitRefusal::Deadline => "deadline".into(),
         LimitRefusal::Scheduled(index) => format!("scheduled {index}"),
         LimitRefusal::Unrecorded => "unrecorded".into(),
+        LimitRefusal::Turn => "turn".into(),
+        LimitRefusal::QuantumTooSmall => "quantum-too-small".into(),
+        LimitRefusal::Requested => "requested".into(),
+        LimitRefusal::TooLarge => "too-large".into(),
+        LimitRefusal::Contended => "contended".into(),
+        LimitRefusal::Cancelled => "cancelled".into(),
     }
 }
 
@@ -425,6 +433,12 @@ impl<'t> Words<'t> {
             "storage" => Ok(LimitRefusal::Storage),
             "deadline" => Ok(LimitRefusal::Deadline),
             "unrecorded" => Ok(LimitRefusal::Unrecorded),
+            "turn" => Ok(LimitRefusal::Turn),
+            "quantum-too-small" => Ok(LimitRefusal::QuantumTooSmall),
+            "requested" => Ok(LimitRefusal::Requested),
+            "too-large" => Ok(LimitRefusal::TooLarge),
+            "contended" => Ok(LimitRefusal::Contended),
+            "cancelled" => Ok(LimitRefusal::Cancelled),
             "scheduled" => {
                 let index = self.count("scheduled call")?;
                 Ok(LimitRefusal::Scheduled(index))

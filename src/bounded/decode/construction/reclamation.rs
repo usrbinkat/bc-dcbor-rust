@@ -225,15 +225,19 @@ pub(crate) fn with_cleanup<A: Allocator, R>(
     })
 }
 
+/// Every admission made through the capability is cleanup: the route's
+/// admission ([`Budget::traverse`](crate::bounded::Budget::traverse)) is the
+/// policy's cleanup admission ([`Releasing::reclaim`]), so a cleanup unit is
+/// never charged to, nor refused by, the policy's foreground allowances.
 impl<A: Allocator> crate::bounded::Budget for Cleanup<'_, A> {
     type Refusal = A::Refusal;
 
     #[expect(
         clippy::disallowed_methods,
-        reason = "forwards an admission already made through the route"
+        reason = "the cleanup capability's admission is its policy's cleanup admission"
     )]
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
-        self.policy.traverse(values, bytes)
+        self.policy.reclaim(values, bytes)
     }
 
     fn boundary(&mut self, boundary: crate::bounded::boundary::Boundary) {
@@ -284,6 +288,14 @@ impl<A: Allocator> crate::bounded::Budget for Cleanup<'_, A> {
 
 impl<A: Allocator> Releasing for Cleanup<'_, A> {
     type Permit = A::Permit;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "forwards a cleanup admission already made through the route"
+    )]
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+        self.policy.reclaim(values, bytes)
+    }
 
     fn permit_identity(permit: &Self::Permit) -> Identity {
         A::permit_identity(permit)
@@ -1522,6 +1534,9 @@ impl<A: Allocator> Reclaimer<A> {
             }
         }
         let _stepping = Stepping(&self.stepping);
+        // Every unit of the step, the removal's and the record's own, is
+        // cleanup: admitted through the one capability minted here.
+        let mut cleanup = Cleanup::new(a);
         let Some(head) = NonNull::new(self.active.load(Ordering::Relaxed)) else {
             match self.front() {
                 Front::Empty => {
@@ -1535,7 +1550,7 @@ impl<A: Allocator> Reclaimer<A> {
                 Front::Ready => {}
             }
             if !self.removal_admitted.load(Ordering::Relaxed) {
-                super::operation::REMOVAL.admit(a)?;
+                super::operation::REMOVAL.admit(&mut cleanup)?;
                 self.removal_admitted.store(true, Ordering::Relaxed);
             }
             let Some(head) = self.remove() else {
@@ -1578,7 +1593,6 @@ impl<A: Allocator> Reclaimer<A> {
             // The record's own cleanup is its operation's task's, under the
             // cleanup capability the queue's dispatch mints over `a`.
             let advance = (*head.as_ptr()).advance;
-            let mut cleanup = Cleanup::new(a);
             let advanced = at(OperationPlace::Task, || advance(head, &mut cleanup));
             // Whatever the step deferred, refused or not, is the caller's
             // to perform.

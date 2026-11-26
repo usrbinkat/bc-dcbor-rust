@@ -90,7 +90,7 @@ fn an_owned_encoding_frees_storage_before_its_permit_on_every_refusal() {
     });
 }
 
-/// `wire` decoded as `T` under one level of nesting, an array of scalars at
+/// `wire` decoded as `T` under its wire profile, an array of scalars at
 /// most, its value dropped: the physical requests made and the result,
 /// failing request `fail_at`.
 fn typed<T: Transferable<Limits> + 'static>(
@@ -99,7 +99,7 @@ fn typed<T: Transferable<Limits> + 'static>(
 ) -> (Result<(), DecodeError<LimitRefusal>>, heap::Stats, Limits) {
     let mut limits = Limits::unlimited();
     let (result, stats) = heap::Observation::run(fail_at, || {
-        decode_typed::<T, _>(wire, 1, &mut limits).map(drop)
+        decode_typed::<T, _>(wire, &mut limits).map(drop)
     });
     (result, stats, limits)
 }

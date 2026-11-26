@@ -3,7 +3,9 @@
 # admission's place; derived bindings admit through the public helpers built
 # on the same rules. Code standing in for a third-party binding or policy
 # calls `Budget::traverse` itself, as the trait documents, and states so with
-# an `expect` naming why.
+# an `expect` naming why. Cleanup's admission, `Releasing::reclaim`, is reached
+# the same way, through the cleanup capability's `traverse` alone.
 disallowed-methods = [
-    { path = "dcbor::bounded::Budget::traverse", reason = "admit through a charge rule (`Unit`, `Capped`, `Scan`, `Rate`), whose admission carries its place" },
+  { path = "dcbor::bounded::Budget::traverse", reason = "admit through a charge rule (`Unit`, `Capped`, `Scan`, `Rate`), whose admission carries its place" },
+  { path = "dcbor::bounded::Releasing::reclaim", reason = "admit cleanup through a charge rule under the cleanup capability (`Cleanup`), whose admission is the policy's `reclaim`" },
 ]

@@ -30,7 +30,6 @@ fn normalized_nested_text_cancellation_retains_custody_at_every_boundary() {
         |schedule| {
             decode::<Vec<Vec<String>>>(
                 &wire,
-                Options::normalizing(8),
                 schedule,
                 &parsed::<support::Instrumented, Vec<Vec<String>>>(),
                 |value| assert_eq!(value, &expected),
@@ -46,7 +45,7 @@ fn large_optional_payload_is_initialized_at_its_published_address() {
         std::mem::size_of::<usize>()
     );
     for (wire, present) in [([0x00], true), ([0xf6], false)] {
-        decoded::<StableOption<Probe, Limits>, _>(&wire, Options::normalizing(8), |output| {
+        decoded::<StableOption<Probe, Limits>, _>(&wire, |output| {
             assert_eq!(output.value().is_some(), present);
             if let Some(value) = output.value().as_ref() {
                 assert_eq!(value.inline, [0x5a; 256]);
@@ -149,7 +148,7 @@ fn dispatch_depth_limit_admits_its_maximum() {
     assert_eq!(nested, 64 + <u8 as Reclaim<Limits>>::DISPATCH_DEPTH);
     assert!(nested >= MAX_DISPATCH_DEPTH);
 
-    decoded::<Deepest, _>(&[0xf6], Options::normalizing(8), |_| ());
+    decoded::<Deepest, _>(&[0xf6], |_| ());
 }
 
 #[test]
@@ -180,7 +179,7 @@ fn nested_construction_and_cleanup_run_on_a_fixed_size_native_stack() {
             let mut wire = [0x81; 33];
             wire[32] = 0;
             DROPS.set(0);
-            decoded::<Sixteen<Sixteen<Probe>>, _>(&wire, Options::normalizing(32), |output| {
+            decoded::<Sixteen<Sixteen<Probe>>, _>(&wire, |output| {
                 let leaf = sixteen!(sixteen!(output.value()));
                 assert_eq!(leaf.inline, [0x5a; 256]);
                 assert_eq!(leaf.construction_address, std::ptr::from_ref(leaf) as usize);
@@ -250,7 +249,7 @@ fn unwinding<T: Transferable<Limits> + 'static>(
                 owner
                     .lending(Retirement::Exhausted, Lent::new, |view| {
                         let scope = view.value().get();
-                        view.decoded::<T, _>(policy, wire, Options::normalizing(62), |value| {
+                        view.decoded::<T, _>(policy, wire, |value| {
                             assert_eq!(value.value().bytes(), wire);
                             assert_eq!(STARTS.get(), 1);
                             assert!(scope.outstanding() > 0, "the value holds no record");

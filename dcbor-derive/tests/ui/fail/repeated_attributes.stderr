@@ -4,11 +4,11 @@ error: repeated `n`
 5 |     #[cbor(n = 0, n = 1)]
   |                   ^
 
-error: repeated #[cbor(tag = N)] attribute
-  --> tests/ui/fail/repeated_attributes.rs:11:1
+error: repeated `tag`
+  --> tests/ui/fail/repeated_attributes.rs:11:8
    |
 11 | #[cbor(tag = 2)]
-   | ^^^^^^^^^^^^^^^^
+   |        ^^^
 
 error: repeated #[cbor(n = N)] attribute
   --> tests/ui/fail/repeated_attributes.rs:17:5
@@ -16,8 +16,20 @@ error: repeated #[cbor(n = N)] attribute
 17 |     #[cbor(n = 1)]
    |     ^^^^^^^^^^^^^^
 
-error: expected `tag = N`
+error: expected `tag = N` or `closed`
   --> tests/ui/fail/repeated_attributes.rs:22:17
    |
 22 | #[cbor(tag = 0, n = 1)]
    |                 ^
+
+error: repeated `closed`
+  --> tests/ui/fail/repeated_attributes.rs:27:8
+   |
+27 | #[cbor(closed)]
+   |        ^^^^^^
+
+error: `closed` takes no value
+  --> tests/ui/fail/repeated_attributes.rs:34:8
+   |
+34 | #[cbor(closed = true)]
+   |        ^^^^^^

@@ -64,6 +64,7 @@ unsafe impl Buffer for ByteString {
 // engine's own.
 unsafe impl<A: Allocator> InPlace<A> for ByteString {
     const COST: ConstructionCost = crate::const_cost!(buffer_cost::<Self, A::Permit>());
+    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::SCALAR;
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,

@@ -38,6 +38,12 @@ pub unsafe trait Fields<A: Allocator>: Sized {
     const COUNT: usize;
     const TAG: Option<u64> = None;
     const POSITIONAL: bool = false;
+    /// Whether a key no field names is refused, as
+    /// [`crate::Error::UnknownMapKey`], in the step that searched for it,
+    /// rather than skipped with its value: a closed record's map
+    /// (`#[cbor(closed)]`). Not a memory-safety obligation: the refusal
+    /// leaves the state as every refusal does.
+    const CLOSED: bool = false;
     /// One field's construction state, naming the field it belongs to: a
     /// value of it is the state of exactly one field, so no state can be
     /// paired with another field. Its observation names the field and
@@ -455,6 +461,15 @@ pub fn build<'b, T: Fields<A>, A: Allocator>(
                     }
                 }
                 return Ok(Building::Progress);
+            }
+            // A key no field names: a key of another kind, or an unsigned
+            // key the search narrowed to no field. A closed record refuses
+            // it in this admitted step, nothing changed; an open one skips
+            // it with its value.
+            if T::CLOSED {
+                return Err(crate::bounded::decode::DecodeError::Invalid(
+                    crate::Error::UnknownMapKey,
+                ));
             }
             let value = nodes
                 .node(super::super::next_index(node))

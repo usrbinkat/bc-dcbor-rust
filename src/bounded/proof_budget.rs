@@ -74,6 +74,20 @@ impl Counting {
     pub(crate) fn live(&self) -> u64 {
         self.live.get()
     }
+
+    /// The one rule of every admission, foreground and cleanup alike: the
+    /// attempt counted, then refused while refusing or at its scheduled
+    /// index, admitting nothing, or admitted.
+    fn count(&mut self, values: u64, bytes: u64) -> Result<(), ()> {
+        let attempt = self.attempts;
+        self.attempts += 1;
+        if self.refusing || self.refuse_attempt == Some(attempt) {
+            self.refused = true;
+            return Err(());
+        }
+        self.admitted = WriteWork::new(self.admitted.values + values, self.admitted.bytes + bytes);
+        Ok(())
+    }
 }
 
 /// A permit of [`Counting`]: its bytes, released from the live count when
@@ -93,14 +107,7 @@ impl Budget for Counting {
     type Refusal = ();
 
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), ()> {
-        let attempt = self.attempts;
-        self.attempts += 1;
-        if self.refusing || self.refuse_attempt == Some(attempt) {
-            self.refused = true;
-            return Err(());
-        }
-        self.admitted = WriteWork::new(self.admitted.values + values, self.admitted.bytes + bytes);
-        Ok(())
+        self.count(values, bytes)
     }
 
     fn boundary(&mut self, _: boundary::Boundary) {}
@@ -141,6 +148,12 @@ impl Budget for Counting {
 
 impl Releasing for Counting {
     type Permit = Permit;
+
+    /// The proof model counts cleanup as it counts every admission
+    /// ([`Counting::count`]): one account, so a harness's bound covers both.
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), ()> {
+        self.count(values, bytes)
+    }
 
     fn permit_identity(_: &Permit) -> Identity {
         Identity::UNOBSERVED

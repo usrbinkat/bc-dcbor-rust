@@ -11,7 +11,7 @@ use dcbor::bounded::decode::comparison::{KeyComparison, comparison_bound};
 use dcbor::bounded::decode::construction::DecodeOwner;
 use dcbor::bounded::decode::construction::in_place::Transferable;
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
-use dcbor::bounded::decode::{DecodeError, Options, decode_typed};
+use dcbor::bounded::decode::{DecodeError, decode_typed};
 use dcbor::bounded::encoding::{OwnedPrepared, OwnedWriter, Preparation, owned_prepare_bound};
 use dcbor::bounded::text_cursor::pipeline::TextPreparation;
 use dcbor::bounded::{BoundedError, LimitRefusal, Limits, ResourceBound, Step};
@@ -242,7 +242,7 @@ fn typed<T: Transferable<Limits> + Copy + 'static>(
 ) -> Result<T, DecodeError<LimitRefusal>> {
     let wire = value.to_cbor_data();
     let mut limits = Limits::unlimited();
-    let decoded = decode_typed::<T, _>(&wire, 0, &mut limits).map(|typed| *typed.value());
+    let decoded = decode_typed::<T, _>(&wire, &mut limits).map(|typed| *typed.value());
     assert_eq!(limits.live_bytes(), 0);
     decoded
 }
@@ -308,7 +308,7 @@ fn planned<R>(
             owner.lending(Retirement::Exhausted, Lent::new, |view| {
                 let owner = view.value().get();
                 view.copied(policy, wire, |input| {
-                    input.decode::<String, _>(policy, Options::quick_only(8), |value| {
+                    input.decode::<String, _>(policy, |value| {
                         let prepared = support::turns(
                             owned_prepare_bound::<ByteString, String, Limits, ()>(support::shape(
                                 value.value().value(),

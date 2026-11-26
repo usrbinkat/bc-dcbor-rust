@@ -70,11 +70,11 @@ where
         match outcome {
             Stepped::Published(()) => return Ok(()),
             Stepped::Progress => suspended = true,
-            Stepped::Failed(error) if error.class() == Class::Refused(&LimitRefusal::Work) => {
+            Stepped::Failed(error) if error.class() == Class::Refused(&LimitRefusal::Turn) => {
                 operation.with_policy(policy, |_, m| {
                     assert_eq!(
                         m.first_refusal().map(|(_, reason)| reason),
-                        Some(LimitRefusal::Work)
+                        Some(LimitRefusal::Turn)
                     );
                     assert_ne!(m.used(), before, "fixed quantum cannot admit the next unit");
                 });

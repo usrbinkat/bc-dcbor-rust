@@ -1,0 +1,8 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -491,4 +491,4 @@
+         if let Err(refusal) = Group::reserve(&group.live, &group.peak, group.ceilings.live, bytes) {
+-            operation.live.fetch_sub(bytes, Ordering::AcqRel);
++            // Planted: the operation's reservation kept on a group refusal.
+             return Err(refusal);
+         }

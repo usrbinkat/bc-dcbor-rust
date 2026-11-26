@@ -221,9 +221,9 @@ pub(super) fn reclaim<K: Reclaim<A>, V: Reclaim<A>, A: Allocator>(
         }
         Phase::ReleaseArenas => {
             if !m.entries.is_released() {
-                m.entries.reclaim_step(a)?;
+                m.entries.reclaim_under(a)?;
             } else if !m.nodes.is_released() {
-                m.nodes.reclaim_step(a)?;
+                m.nodes.reclaim_under(a)?;
             } else if !m.order[1].is_released() {
                 m.order[1].reclaim_copy_step(a)?;
             } else if !m.order[0].is_released() {

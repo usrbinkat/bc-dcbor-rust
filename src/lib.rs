@@ -103,6 +103,9 @@ pub use cbor::*;
 mod byte_string;
 pub use byte_string::ByteString;
 
+mod fixed_bytes;
+pub use fixed_bytes::FixedBytes;
+
 mod bool_value;
 
 mod float;
@@ -155,8 +158,13 @@ pub use set::{Set, SetIter};
 
 mod string;
 
+mod checked_text;
+
 mod stabilized_text;
 pub use stabilized_text::{StabilizedText, UNICODE_VERSION, is_assigned};
+
+mod ascii_text;
+pub use ascii_text::AsciiText;
 
 mod string_util;
 

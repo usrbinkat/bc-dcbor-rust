@@ -232,12 +232,7 @@ fn randomized_turn_allowances_never_change_canonical_results_or_replay_work()
                             _ => TURN,
                         };
                         let outcome = decoder.with_policy(policy, |decoder, m| {
-                            m.clear_refusal();
-                            let used = m.used();
-                            m.set_limit(WriteWork::new(
-                                used.values + allowance.values,
-                                used.bytes + allowance.bytes,
-                            ));
+                            m.turn_with(allowance);
                             contracted(m, decoder)
                         });
                         match outcome {
@@ -264,7 +259,7 @@ fn randomized_turn_allowances_never_change_canonical_results_or_replay_work()
                                 return Ok(());
                             }
                             Err(DecodeError::Resource(BoundedError::Refused(
-                                LimitRefusal::Work,
+                                LimitRefusal::Turn,
                             ))) => {
                                 decoder.with_policy(policy, |_, m| {
                                     assert_eq!(m.evidence(), Ok(()), "seed {seed}, turn {turn}");
@@ -299,7 +294,7 @@ fn generated_valid_inputs_complete_after_small_budget_refusal_without_replay()
         let mut wire = vec![0x81; seed % 16];
         wire.extend_from_slice(&[0x43, seed as u8, 0, 255]);
         suite(|run, policy| {
-            run.with_policy(policy, |m| m.set_limit(WriteWork::new(3, 16)));
+            run.with_policy(policy, |m| m.turn_with(WriteWork::new(3, 16)));
             run.holding(
                 Decoder::new(&wire, Options::normalizing(64)),
                 Retirement::Released,
@@ -309,7 +304,7 @@ fn generated_valid_inputs_complete_after_small_budget_refusal_without_replay()
                     // allowance set above, kept across steps until it refuses.
                     decoder.suspend(
                         policy,
-                        LimitRefusal::Work,
+                        LimitRefusal::Turn,
                         decode_turns(wire.len()),
                         TurnSchedule::Retained,
                         Retirement::Released,

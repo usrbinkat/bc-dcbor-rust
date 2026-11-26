@@ -67,8 +67,26 @@ pub enum TextPolicy {
     QuickOnly,
 }
 
+impl TextPolicy {
+    /// The policy of a value holding parts under `self` and `other`: quick
+    /// checks alone only when both parts admit only quick-proven text, so a
+    /// part that accepts any NFC text keeps strict validation.
+    pub const fn either(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::QuickOnly, Self::QuickOnly) => Self::QuickOnly,
+            _ => Self::Normalize,
+        }
+    }
+}
+
 /// What [`decode_with`] admits: the nesting limit, counting array, map and
 /// tag ancestors, and the text policy.
+///
+/// It is also a typed binding's wire profile
+/// ([`construction::in_place::InPlace::WIRE`]): the deepest nesting of any
+/// value the binding accepts and whether every text it accepts is proven by
+/// the quick check, which the typed decodes read from the type, never from
+/// the caller. Profiles compose by [`Self::nested`] and [`Self::either`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     pub max_depth: usize,
@@ -76,6 +94,54 @@ pub struct Options {
 }
 
 impl Options {
+    /// Every well-formed value at any nesting the input holds, its text
+    /// validated strictly: the profile of a binding that accepts arbitrary
+    /// content (a record that ignores unknown keys), and the default of a
+    /// binding that declares none. An input of `n` bytes nests at most `n`
+    /// levels, so the decode's stack and its bound stay within the input's
+    /// length ([`decode_bound_with`]).
+    pub const UNRESTRICTED: Self = Self {
+        max_depth: usize::MAX,
+        text: TextPolicy::Normalize,
+    };
+
+    /// A scalar that is no text: no nesting, and no text accepted, so the
+    /// quick checks refuse nothing it accepts.
+    pub const SCALAR: Self = Self {
+        max_depth: 0,
+        text: TextPolicy::QuickOnly,
+    };
+
+    /// A text that is any NFC string: no nesting, strict validation.
+    pub const TEXT: Self = Self {
+        max_depth: 0,
+        text: TextPolicy::Normalize,
+    };
+
+    /// The profile of a container (an array, a map, a tag) of values of
+    /// this profile: one level deeper, the same text policy. Saturating, so
+    /// [`Self::UNRESTRICTED`] stays unrestricted.
+    pub const fn nested(self) -> Self {
+        Self {
+            max_depth: self.max_depth.saturating_add(1),
+            text: self.text,
+        }
+    }
+
+    /// The profile of a value holding parts of `self` and of `other` at one
+    /// level: the deeper nesting and the stricter text policy
+    /// ([`TextPolicy::either`]).
+    pub const fn either(self, other: Self) -> Self {
+        Self {
+            max_depth: if self.max_depth > other.max_depth {
+                self.max_depth
+            } else {
+                other.max_depth
+            },
+            text: self.text.either(other.text),
+        }
+    }
+
     /// Strict NFC validation under `max_depth`: what [`decode()`] admits.
     pub const fn normalizing(max_depth: usize) -> Self {
         Self {
@@ -1286,17 +1352,16 @@ pub fn wrong_type<R>() -> DecodeError<R> {
 }
 
 /// The [`ResourceBound`] of [`decode_typed`] of an input of at most `len`
-/// bytes under `max_depth`: the one scope's own lifecycle
-/// ([`construction::scope_bound`]), the input copied into it
-/// ([`construction::copy_bound`]), and the typed decode of the copy
-/// ([`construction::typed_decode_bound`]), each with its operation's places
-/// and its own cleanup. Its [`ResourceBound::steps`] are the most steps the
-/// call takes. Refused, never saturated, when a quantity does not fit in
-/// `u64`.
-pub fn decode_typed_bound<T, A, R>(
-    len: u64,
-    max_depth: usize,
-) -> Result<ResourceBound, BoundedError<R>>
+/// bytes: the one scope's own lifecycle ([`construction::scope_bound`]), the
+/// input copied into it ([`construction::copy_bound`]), and the typed decode
+/// of the copy under `T`'s wire profile
+/// ([`construction::typed_decode_bound`], [`InPlace::WIRE`]), each with its
+/// operation's places and its own cleanup. Its [`ResourceBound::steps`] are
+/// the most steps the call takes. Refused, never saturated, when a quantity
+/// does not fit in `u64`.
+///
+/// [`InPlace::WIRE`]: construction::in_place::InPlace::WIRE
+pub fn decode_typed_bound<T, A, R>(len: u64) -> Result<ResourceBound, BoundedError<R>>
 where
     T: construction::in_place::InPlace<A>,
     A: Allocator,
@@ -1304,21 +1369,24 @@ where
 {
     let scope = construction::scope_bound::<A, R>()?;
     let copy = construction::copy_bound::<A, R>(len)?;
-    let typed = construction::typed_decode_bound::<ByteString, T, A, R>(
-        len,
-        Options::normalizing(max_depth),
-    )?;
+    let typed = construction::typed_decode_bound::<ByteString, T, A, R>(len)?;
     scope
         .checked_then(copy)
         .and_then(|acquired| acquired.checked_then(typed))
         .ok_or(BoundedError::Overflow)
 }
 
-/// Decode `input` strictly ([`decode()`]) and construct `T` from its root in
-/// one call: the retained construction (`construction::TypedDecoder`, the
-/// one typed-construction engine) driven to completion within the steps its
-/// bound allows ([`decode_typed_bound`]), as [`crate::bounded::prepare`]
-/// drives the retained preparation. A scope of its own holds the copied
+/// Decode `input` under `T`'s wire profile ([`InPlace::WIRE`]: the deepest
+/// nesting and the text policy of every value `T` accepts) and construct `T`
+/// from its root in one call: the retained construction
+/// (`construction::TypedDecoder`, the one typed-construction engine) driven
+/// to completion within the steps its bound allows ([`decode_typed_bound`]),
+/// as [`crate::bounded::prepare`] drives the retained preparation. A
+/// document nested past the profile is refused as
+/// [`DecodeError::DepthLimit`]; under [`TextPolicy::QuickOnly`] a text the
+/// quick check does not prove NFC is refused as
+/// [`DecodeError::UnprovenText`], which `T` would refuse in construction
+/// anyway. A scope of its own holds the copied
 /// input, the document and the value; the value is returned in its record
 /// with the input it was decoded from, so it outlives `input`. Dropping the
 /// returned value releases its record, the input and the scope through the
@@ -1331,9 +1399,10 @@ where
 /// refused cleanup unit leaves is released by the terminal drain when the
 /// scope is dropped. A run that does not complete within its steps has
 /// diverged from its plan ([`BoundedError::PlanMismatch`]).
+///
+/// [`InPlace::WIRE`]: construction::in_place::InPlace::WIRE
 pub fn decode_typed<T, A>(
     input: &[u8],
-    max_depth: usize,
     allocator: &mut A,
 ) -> ConstructResult<construction::TypedValue<'static, ByteString, T, A>, A>
 where
@@ -1342,7 +1411,7 @@ where
     A::Permit: Send,
 {
     let len = widen(input.len())?;
-    let mut steps = decode_typed_bound::<T, A, A::Refusal>(len, max_depth)?.steps()?;
+    let mut steps = decode_typed_bound::<T, A, A::Refusal>(len)?.steps()?;
     let mut owner = construction::DecodeOwner::<'static, A>::new();
     if let Err(error) = owner.initialize_step(allocator) {
         shut_down(&mut owner, &mut steps, allocator);
@@ -1358,10 +1427,7 @@ where
         }
     };
     drop(copy);
-    let mut decoder = construction::TypedDecoder::<'static, ByteString, T, A>::new(
-        copied,
-        Options::normalizing(max_depth),
-    );
+    let mut decoder = construction::TypedDecoder::<'static, ByteString, T, A>::new(copied);
     let value = match complete(
         &mut decoder,
         |decoder| decoder.cancel(),
@@ -1449,7 +1515,7 @@ fn shut_down<A: TerminalAllocator>(
 /// synchronous engine it replaced: a sequence built from array nodes built
 /// directly, so a node can disagree with its own count, which no decoded
 /// document does (V3); the one-call decode's credit settled at every
-/// refused request; and its error custody.
+/// refused request; its error custody; and its options.
 #[cfg(test)]
 mod construction_tests {
     use super::construction::Standalone;
@@ -1457,6 +1523,7 @@ mod construction_tests {
         Built, SequenceCustody, SequenceObservation, SessionObservation,
     };
     use super::*;
+    use crate::CBOR;
     use core::mem::MaybeUninit;
 
     /// A document of one array node claiming `claimed` elements over `held`
@@ -1586,7 +1653,7 @@ mod construction_tests {
     fn a_refused_request_ends_the_call_with_every_credit_settled() {
         let wire = [0x63, b'a', b'b', b'c'];
         let mut limits = Limits::unlimited();
-        let value = decode_typed::<String, _>(&wire, 8, &mut limits).unwrap();
+        let value = decode_typed::<String, _>(&wire, &mut limits).unwrap();
         assert_eq!(value.value(), "abc");
         assert_eq!(
             limits.credits().conserved_with(WriteWork::default()),
@@ -1598,7 +1665,7 @@ mod construction_tests {
         assert!(requests > 0);
         for at in 0..requests {
             let mut limits = Limits::unlimited().refusing_request(Some(at));
-            let refused = decode_typed::<String, _>(&wire, 8, &mut limits);
+            let refused = decode_typed::<String, _>(&wire, &mut limits);
             assert!(
                 matches!(
                     refused,
@@ -1628,7 +1695,7 @@ mod construction_tests {
     #[test]
     fn an_invalid_input_releases_everything_before_its_error_returns() {
         let mut limits = Limits::unlimited();
-        let refused = decode_typed::<Vec<u64>, _>(&[0x61, b'x'], 8, &mut limits);
+        let refused = decode_typed::<Vec<u64>, _>(&[0x61, b'x'], &mut limits);
         assert!(
             matches!(refused, Err(DecodeError::Invalid(Error::WrongType))),
             "{:?}",
@@ -1639,5 +1706,131 @@ mod construction_tests {
             Some(true)
         );
         assert_eq!(limits.live_bytes(), 0);
+    }
+
+    /// The built-in bindings' wire profiles, each composed from its parts:
+    /// scalars and byte strings, fixed-length ones included, no nesting and
+    /// no text, texts strict but an ASCII text quick-only, a
+    /// sequence one level over its element, an option its payload's, a
+    /// minimal big integer one tag level.
+    #[test]
+    fn every_built_in_binding_declares_its_wire_profile() {
+        use super::construction::in_place::InPlace;
+        fn wire<T: InPlace<Limits>>() -> Options {
+            T::WIRE
+        }
+        assert_eq!(wire::<u64>(), Options::quick_only(0));
+        assert_eq!(wire::<bool>(), Options::quick_only(0));
+        assert_eq!(wire::<f64>(), Options::quick_only(0));
+        assert_eq!(wire::<ByteString>(), Options::quick_only(0));
+        assert_eq!(wire::<crate::FixedBytes<32>>(), Options::quick_only(0));
+        assert_eq!(wire::<String>(), Options::normalizing(0));
+        assert_eq!(wire::<crate::StabilizedText>(), Options::normalizing(0));
+        assert_eq!(wire::<crate::AsciiText>(), Options::quick_only(0));
+        assert_eq!(wire::<Vec<crate::AsciiText>>(), Options::quick_only(1));
+        assert_eq!(
+            wire::<Option<crate::AsciiText>>(),
+            Options::quick_only(0),
+            "an option of an ASCII text is its payload's profile"
+        );
+        assert_eq!(wire::<crate::MinimalBigInt>(), Options::quick_only(1));
+        assert_eq!(wire::<Vec<u64>>(), Options::quick_only(1));
+        assert_eq!(wire::<[u64; 2]>(), Options::quick_only(1));
+        assert_eq!(wire::<Vec<Vec<String>>>(), Options::normalizing(2));
+        assert_eq!(wire::<Option<Vec<u64>>>(), Options::quick_only(1));
+        assert_eq!(
+            wire::<construction::in_place::StableOption<String, Limits>>(),
+            Options::normalizing(0)
+        );
+        assert_eq!(
+            Options::UNRESTRICTED.nested(),
+            Options::UNRESTRICTED,
+            "an unrestricted profile stays unrestricted under nesting"
+        );
+        assert_eq!(
+            Options::quick_only(3).either(Options::normalizing(1)),
+            Options::normalizing(3)
+        );
+    }
+
+    /// The one-call decode under its type's wire profile: a text the quick
+    /// check leaves unproven, canonical NFC, is refused by the parse of a
+    /// type that accepts no such text, as unproven, everything released and
+    /// every credit settled, and decoded by a type that accepts any NFC
+    /// text; a document nested past the type's profile is refused at the
+    /// profile's depth, and one within it decodes; and the call's work
+    /// stays within the bound of the profile it ran under.
+    #[test]
+    fn the_typed_decode_runs_under_its_types_wire_profile() {
+        let unproven = CBOR::from(vec![CBOR::from("q\u{301}")]).to_cbor_data();
+        let mut limits = Limits::unlimited();
+        let refused = decode_typed::<Vec<u64>, _>(&unproven, &mut limits);
+        assert!(
+            matches!(refused, Err(DecodeError::UnprovenText)),
+            "the parse of a type without text admitted unproven text: {:?}",
+            refused.map(|value| value.value().clone())
+        );
+        assert_eq!(
+            limits.credits().conserved_with(WriteWork::default()),
+            Some(true)
+        );
+        assert_eq!(limits.live_bytes(), 0);
+        let mut limits = Limits::unlimited();
+        let strict = decode_typed::<Vec<String>, _>(&unproven, &mut limits).unwrap();
+        assert_eq!(strict.value().as_slice(), ["q\u{301}"]);
+        let nested = CBOR::from(vec![vec![1u64]]).to_cbor_data();
+        let mut limits = Limits::unlimited();
+        let deep = decode_typed::<Vec<u64>, _>(&nested, &mut limits);
+        assert!(
+            matches!(deep, Err(DecodeError::DepthLimit { limit: 1 })),
+            "the parse admitted a document nested past its type's profile: {:?}",
+            deep.map(|value| value.value().clone())
+        );
+        assert_eq!(limits.live_bytes(), 0);
+        let mut limits = Limits::unlimited();
+        let within = decode_typed::<Vec<Vec<u64>>, _>(&nested, &mut limits).unwrap();
+        assert_eq!(within.value().as_slice(), [vec![1u64]]);
+        let used = limits.used();
+        let bound =
+            decode_typed_bound::<Vec<Vec<u64>>, Limits, LimitRefusal>(nested.len() as u64).unwrap();
+        assert!(
+            used.values <= bound.values && used.bytes <= bound.bytes,
+            "{used:?} beyond {bound:?}"
+        );
+    }
+
+    /// An ASCII text's profile is quick-only: a canonical NFC text the quick
+    /// check leaves unproven is refused by the parse, as unproven, before
+    /// any normalization runs or the type's rule sees it, everything
+    /// released; a quick-proven text that is not ASCII reaches the rule and
+    /// is refused by it, naming its first code point; an ASCII text decodes.
+    #[test]
+    fn an_ascii_text_is_decoded_under_quick_checks_alone() {
+        let unproven = CBOR::from("q\u{301}").to_cbor_data();
+        let mut limits = Limits::unlimited();
+        let refused = decode_typed::<crate::AsciiText, _>(&unproven, &mut limits);
+        assert!(
+            matches!(refused, Err(DecodeError::UnprovenText)),
+            "an ASCII text's parse normalized an unproven text: {:?}",
+            refused.map(|value| value.value().clone())
+        );
+        assert_eq!(limits.live_bytes(), 0);
+        let mut limits = Limits::unlimited();
+        let proven = CBOR::from("caf\u{e9}").to_cbor_data();
+        let refused = decode_typed::<crate::AsciiText, _>(&proven, &mut limits);
+        assert!(
+            matches!(
+                refused,
+                Err(DecodeError::Invalid(Error::NonAsciiText(0xE9)))
+            ),
+            "a non-ASCII text was not refused by the rule: {:?}",
+            refused.map(|value| value.value().clone())
+        );
+        assert_eq!(limits.live_bytes(), 0);
+        let mut limits = Limits::unlimited();
+        let ascii =
+            decode_typed::<crate::AsciiText, _>(&CBOR::from("id").to_cbor_data(), &mut limits)
+                .unwrap();
+        assert_eq!(ascii.value().as_str(), "id");
     }
 }

@@ -60,6 +60,9 @@ pub unsafe trait TreeKey: Ord {
 // every admitted unit, allocation and child cost.
 unsafe impl<K: TreeKey + InPlace<A>, V: InPlace<A>, A: Allocator> InPlace<A> for BTreeMap<K, V> {
     const COST: ConstructionCost = crate::const_cost!(cost::cost::<K, V, A>());
+    /// A map of `K` keys and `V` values: one level over the deeper of the
+    /// two, the stricter text policy.
+    const WIRE: crate::bounded::decode::Options = K::WIRE.either(V::WIRE).nested();
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,
         a: &mut A,

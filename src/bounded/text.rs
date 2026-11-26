@@ -837,7 +837,7 @@ mod tests {
         let mut scratch = Limits::unlimited().requesting_at_most(256);
         assert_eq!(
             crate::bounded::prepare(text.as_str(), &mut scratch).map(|prepared| prepared.len()),
-            Err(BoundedError::Refused(LimitRefusal::Storage))
+            Err(BoundedError::Refused(LimitRefusal::Requested))
         );
         assert!(
             scratch.requested_bytes() <= 256,

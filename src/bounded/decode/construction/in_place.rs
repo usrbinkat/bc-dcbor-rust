@@ -35,10 +35,12 @@ pub use stable_option::{
 };
 mod scalars;
 pub use optional::{OptionalClass, OptionalObservation, Phase as OptionalPhase, Placeholder};
+mod fixed_bytes;
+pub use fixed_bytes::{FixedClass, FixedObservation, FixedState};
 mod minimal_bigint;
 pub use minimal_bigint::{MinimalObservation, MinimalState};
-mod stabilized;
-pub use stabilized::{StabilizedObservation, StabilizedState};
+mod checked;
+pub use checked::{CheckedObservation, CheckedState};
 #[doc(hidden)]
 pub mod tagged;
 pub(crate) mod text;
@@ -435,6 +437,24 @@ pub unsafe trait InPlace<A: Allocator>: Reclaim<A> {
     /// it violates the unsafe implementation contract; every built-in and
     /// derived binding derives it from its own charges.
     const COST: ConstructionCost;
+
+    /// The wire profile of every value this binding accepts: the deepest
+    /// nesting of array, map and tag ancestors of any of its nodes, and
+    /// [`TextPolicy::QuickOnly`](crate::bounded::decode::TextPolicy::QuickOnly)
+    /// only when every text it accepts is one the NFC quick check proves
+    /// normal. The typed decodes parse under it
+    /// ([`super::TypedDecoder`], [`crate::bounded::decode::decode_typed`]),
+    /// so a document the binding would refuse in construction for its depth
+    /// or for an unproven text is refused by the parse, before construction
+    /// is reached, and the bound is the profile's. Not a memory-safety
+    /// obligation: a profile shallower than the binding's values, or quick
+    /// where it accepts unproven text, refuses values the binding accepts.
+    /// Built-in and derived bindings compose it exactly from their parts
+    /// ([`Options::nested`](crate::bounded::decode::Options::nested),
+    /// [`Options::either`](crate::bounded::decode::Options::either)); the
+    /// default, [`Options::UNRESTRICTED`](crate::bounded::decode::Options::UNRESTRICTED),
+    /// admits every well-formed document.
+    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::UNRESTRICTED;
 
     /// Construct a present map field, distinct from standalone nullable
     /// values. Called only by the engine ([`build_present`]), under the
@@ -951,6 +971,7 @@ macro_rules! integers {
         // unit and the cleanup step.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
             const COST: ConstructionCost = crate::const_cost!(scalar_cost::<$ty>());
+            const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::SCALAR;
 
             fn build_step<'b>(
                 ctx: BindingContext<'b, '_, '_, '_, Self, A>, a: &mut A,
@@ -1685,6 +1706,7 @@ mod tests {
             margin::<bool>(&[0xf5], 0);
             margin::<String>(&[0x62, b'a', b'b'], 0);
             margin::<ByteString>(&[0x42, 1, 2], 0);
+            margin::<crate::FixedBytes<2>>(&[0x42, 1, 2], 0);
             margin::<StabilizedText>(&[0x62, b'a', b'b'], 0);
             margin::<MinimalBigInt>(&[0x07], 0);
             // Sequences: their own level and their element's.

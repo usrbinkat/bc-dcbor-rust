@@ -78,6 +78,7 @@ unsafe impl<A: Allocator> Reclaim<A> for Value {
 // initialization contract, including its cost and all partial states.
 unsafe impl<A: Allocator> InPlace<A> for Value {
     const COST: ConstructionCost = <u64 as InPlace<A>>::COST;
+    const WIRE: dcbor::bounded::decode::Options = <u64 as InPlace<A>>::WIRE;
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,
@@ -130,7 +131,6 @@ fn run(stop: Option<usize>, terminal: bool) -> (usize, dcbor::bounded::boundary:
                 let turn = owner.decoder::<_, BTreeMap<Value, Value>, _, _>(
                     policy,
                     support::Copying(&wire),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |decoder| {
                         let mut turn = 0;

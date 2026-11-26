@@ -1,0 +1,11 @@
+--- src/fixed_bytes.rs
++++ src/fixed_bytes.rs
+@@ -144,6 +144,7 @@
+ /// 3.8.1), the set every decoder of the type accepts.
+ impl<const N: usize> crate::cddl::Cddl for FixedBytes<N> {
+     fn cddl(_: &mut crate::cddl::Rules) -> String {
+-        format!("bstr .size {N}")
++        // Planted: a fixed-length byte string rendered as any byte string.
++        "bstr".to_string()
+     }
+ }

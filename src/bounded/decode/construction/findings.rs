@@ -456,7 +456,7 @@ mod tests {
         Findings::new().conclude(&[("S", &finished, Expected::Complete)]);
 
         let refused = Answer::Refused {
-            refusal: LimitRefusal::Work,
+            refusal: LimitRefusal::Storage,
             injected: false,
         };
         let history = || Ok(Vec::from([(Call::Allocate(8), refused)]));

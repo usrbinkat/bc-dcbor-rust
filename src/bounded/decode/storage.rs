@@ -7,7 +7,7 @@
 //! whole state in one unit of at most a quantum.
 use super::super::boundary::{Valuation, boundary, position};
 use super::super::*;
-use super::construction::reclamation::Slot;
+use super::construction::reclamation::{Cleanup, Slot, with_cleanup};
 use super::construction::stable::{self, Admitted, Installed, PENDING_UNITS, Pending, Ticket};
 use super::initialization::init_field;
 use crate::sync::{Atomics, Representation};
@@ -1152,21 +1152,32 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     /// installed resources owned for the next. Settling an idle pending
     /// changes nothing, so every later call settles nothing again.
     ///
-    /// Bound on [`Releasing`], not [`Allocator`]: cleanup admits work and
-    /// releases what it holds, and no new allocation can be requested
-    /// through the capability it is given.
-    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// The public entry: the cleanup capability minted over `a`
+    /// ([`with_cleanup`]), so every unit is admitted as cleanup
+    /// ([`Releasing::reclaim`]), then [`Self::reclaim_under`].
+    pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,
     ) -> BoundedResult<bool, A> {
-        self.enter_cleanup(a.performer());
+        with_cleanup(a, |cleanup| self.reclaim_under(cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under the cleanup capability a caller's own
+    /// cleanup already holds: the one implementation. It takes the
+    /// capability, never a policy, so no cleanup unit can be admitted as
+    /// foreground work, and no new allocation can be requested through it.
+    pub(crate) fn reclaim_under<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        cleanup: &mut Cleanup<'_, A>,
+    ) -> BoundedResult<bool, A> {
+        self.enter_cleanup(cleanup.performer());
         let (next, result) = match mem::replace(&mut self.state, Self::EMPTY) {
             // A staging block never acquired holds nothing once its
             // admissions are settled: the arena's own cleanup follows.
             State::Settled {
                 arena,
                 growth: growth @ (Growth::Idle | Growth::Staging),
-            } => Self::reclaim_settled(arena, growth, a),
+            } => Self::reclaim_settled(arena, growth, cleanup),
             State::Settled { arena, growth } => {
                 Self::release_growth(growth);
                 (
@@ -1177,7 +1188,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     Ok(false),
                 )
             }
-            State::Relocating { mut from, mut into } => match Self::ELEMENT.admit(a) {
+            State::Relocating { mut from, mut into } => match Self::ELEMENT.admit(cleanup) {
                 Err(error) => (State::Relocating { from, into }, Err(error)),
                 Ok(()) => {
                     // The drained element: the grown allocation's newest
@@ -1189,7 +1200,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     } else {
                         relocated - 1
                     };
-                    boundary!(a, Predicate::Relocation => position(drained, held));
+                    boundary!(cleanup, Predicate::Relocation => position(drained, held));
                     if into.get().items.pop().is_none() {
                         from.remaining.next_back();
                     }
@@ -1202,7 +1213,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                 }
             },
             State::Relocated { mut into } if !into.peek().items.is_empty() => {
-                match Self::ELEMENT.admit(a) {
+                match Self::ELEMENT.admit(cleanup) {
                     Err(error) => (State::Relocated { into }, Err(error)),
                     Ok(()) => {
                         into.get().items.pop();
@@ -1210,7 +1221,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
                     }
                 }
             }
-            State::Relocated { into } => match WRITE.admit(a, Self::STATE_BYTES) {
+            State::Relocated { into } => match WRITE.admit(cleanup, Self::STATE_BYTES) {
                 Err(error) => (State::Relocated { into }, Err(error)),
                 Ok(()) => {
                     // SAFETY: every element was drained; the grown arena
@@ -1262,20 +1273,20 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     /// unit that ends it: an admitted one, or the allocation's release that
     /// admits nothing. A refused unit keeps it staging: the growth is what
     /// [`Storage::is_released`] reads, and a refused step changes nothing.
-    fn reclaim_settled<A: Releasing<Permit = P, Origin = O>>(
+    fn reclaim_settled<A: Allocator<Permit = P, Origin = O>>(
         mut arena: Owned<T, P>,
         held: Growth<T, P>,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> (State<T, P>, BoundedResult<bool, A>) {
         let admitted = if !arena.items.is_empty() {
-            Self::ELEMENT.admit(a).map(|()| {
+            Self::ELEMENT.admit(cleanup).map(|()| {
                 arena.items.pop();
                 false
             })
         } else if arena.release() {
             Ok(false)
         } else {
-            Self::STEP.admit(a).map(|()| true)
+            Self::STEP.admit(cleanup).map(|()| true)
         };
         let growth = match admitted {
             Ok(_) => Growth::Idle,
@@ -1376,24 +1387,24 @@ impl<T: Copy, P, O: Origin> Storage<T, P, O> {
     /// and its admissions are settled by that entry, so its arena is
     /// physically the idle one and is discarded the same way: the unit
     /// follows the arena's physical stage ([`Self::position`]), never what
-    /// its acquisition held. Bound on [`Releasing`], as
-    /// [`Self::reclaim_step`] is.
-    pub(crate) fn reclaim_copy_step<A: Releasing<Permit = P, Origin = O>>(
+    /// its acquisition held. Under the cleanup capability, as
+    /// [`Self::reclaim_under`] is.
+    pub(crate) fn reclaim_copy_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
-        a: &mut A,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<bool, A> {
-        self.enter_cleanup(a.performer());
+        self.enter_cleanup(cleanup.performer());
         if let State::Settled {
             arena,
             growth: Growth::Idle | Growth::Staging,
         } = &mut self.state
             && !arena.items.is_empty()
         {
-            Self::STEP.admit(a)?;
+            Self::STEP.admit(cleanup)?;
             arena.items.clear();
             return Ok(false);
         }
-        self.reclaim_step(a)
+        self.reclaim_under(cleanup)
     }
 }
 
@@ -1514,14 +1525,16 @@ mod tests {
                 allowances.push((call, remaining));
                 let before = storage.position();
                 let mut refused = Limits::unlimited().refusing(Some(0));
-                let done = match storage.reclaim_copy_step(&mut refused) {
+                let done = match storage.reclaim_copy_step(&mut Cleanup::new(&mut refused)) {
                     Err(BoundedError::Refused(_)) => {
                         assert_eq!(
                             storage.position(),
                             before,
                             "growth {growth_steps}, cleanup {call}: refused cleanup moved storage"
                         );
-                        storage.reclaim_copy_step(&mut policy).unwrap()
+                        storage
+                            .reclaim_copy_step(&mut Cleanup::new(&mut policy))
+                            .unwrap()
                     }
                     Ok(done) => {
                         // Prepaid releases do not require admission. Count
@@ -1806,11 +1819,11 @@ mod tests {
         let by = right.performer();
         let before = pending.position();
         assert!(matches!(
-            idle.reclaim_copy_step(&mut left),
+            idle.reclaim_copy_step(&mut Cleanup::new(&mut left)),
             Err(BoundedError::Refused(_))
         ));
         assert!(matches!(
-            pending.reclaim_copy_step(&mut right),
+            pending.reclaim_copy_step(&mut Cleanup::new(&mut right)),
             Err(BoundedError::Refused(_))
         ));
         assert_eq!(
@@ -1835,15 +1848,28 @@ mod tests {
                 pending.reclaim_copy_remaining(),
                 "cleanup remaining schedule differs at {turn}"
             );
-            let l = idle.reclaim_copy_step(&mut left).unwrap();
-            let r = pending.reclaim_copy_step(&mut right).unwrap();
+            let l = idle
+                .reclaim_copy_step(&mut Cleanup::new(&mut left))
+                .unwrap();
+            let r = pending
+                .reclaim_copy_step(&mut Cleanup::new(&mut right))
+                .unwrap();
             assert_eq!(l, r, "cleanup completion differs at {turn}");
             assert_eq!(
                 idle.position(),
                 pending.position(),
                 "cleanup schedule differs at {turn}"
             );
-            assert_eq!(left.used(), right.used(), "cleanup work differs at {turn}");
+            assert_eq!(
+                left.cleanup_used(),
+                right.cleanup_used(),
+                "cleanup work differs at {turn}"
+            );
+            assert_eq!(
+                left.used(),
+                left.cleanup_used(),
+                "cleanup charged as foreground"
+            );
             if l {
                 completed = true;
                 break;

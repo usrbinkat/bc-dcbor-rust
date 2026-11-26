@@ -25,14 +25,37 @@ use record::{Recording, Session};
 pub const TURN: WriteWork = WriteWork::new(3, 64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Why an admission was refused.
+/// Why an admission was refused: the one refusal of the accounting core
+/// ([`Authority`]), each variant naming the allowance it exhausted, and
+/// [`Self::recovery`] the one classification of what a caller does next.
 pub enum LimitRefusal {
-    /// A work limit: the turn's quantum or the cumulative allowance.
+    /// The current turn's quantum is spent; its lifetime allowance is not.
+    Turn,
+    /// One unit asks for more work than a whole turn's quantum: no turn can
+    /// admit it.
+    QuantumTooSmall,
+    /// The lifetime work allowance, in values or bytes.
     Work,
-    /// Live capacity or the requested-bytes allowance.
+    /// The lifetime allowance of requested allocation bytes.
+    Requested,
+    /// Live capacity: the request fits the ceiling, but not beside what is
+    /// held now.
     Storage,
-    /// The deterministic clock reached the deadline.
+    /// One request larger than the whole live ceiling: no release makes room.
+    TooLarge,
+    /// Another operation of the same group was admitting at the same
+    /// instant (`governance::Governor`): nothing was checked or admitted,
+    /// and the next turn's attempt is decided against the group's totals.
+    Contended,
+    /// The deadline passed: an operation's monotonic deadline
+    /// (`governance::OperationBudget::deadline`), or the instrument's
+    /// simulated expiry at a call of its admission clock
+    /// ([`Limits::expire_at_call`]).
     Deadline,
+    /// The operation, or its whole group, was cancelled
+    /// (`governance::Cancellation`): sticky, so no later foreground
+    /// admission succeeds; its cleanup proceeds.
+    Cancelled,
     /// The fault schedule refused the call with this index.
     Scheduled(usize),
     /// A recorded family's session has no permit record left for the grant
@@ -40,16 +63,329 @@ pub enum LimitRefusal {
     Unrecorded,
 }
 
+/// What a caller does after a refusal ([`LimitRefusal::recovery`]): the one
+/// classification, so no caller infers it from counters. It is the caller's
+/// question, not the engine's: whatever the refusal, the refused operation
+/// keeps its progress and may be stepped again ([`crate::bounded::Class::Refused`]);
+/// the recovery says whether a later step can be admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Resume the same operation in a later turn.
+    NextTurn,
+    /// Resume once held storage is released elsewhere; nothing promises it.
+    CapacityRelease,
+    /// No later step admits it: cancel and reclaim.
+    Stop,
+}
+
+impl LimitRefusal {
+    /// The recovery this refusal admits: a spent turn, a contended group
+    /// admission, and an injected refusal (which stands for one), resume in a
+    /// later turn; live capacity held elsewhere resumes after a release;
+    /// every exhausted lifetime allowance, an impossible unit or request, the
+    /// deadline, a cancellation and an unrecorded session stop.
+    pub const fn recovery(self) -> Recovery {
+        match self {
+            Self::Turn | Self::Contended | Self::Scheduled(_) => Recovery::NextTurn,
+            Self::Storage => Recovery::CapacityRelease,
+            Self::QuantumTooSmall
+            | Self::Work
+            | Self::Requested
+            | Self::TooLarge
+            | Self::Deadline
+            | Self::Cancelled
+            | Self::Unrecorded => Recovery::Stop,
+        }
+    }
+}
+
 impl core::error::Error for LimitRefusal {}
 
 impl core::fmt::Display for LimitRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Turn => f.write_str("turn quantum spent"),
+            Self::QuantumTooSmall => f.write_str("unit exceeds the turn quantum"),
             Self::Work => f.write_str("work limit"),
+            Self::Requested => f.write_str("requested-bytes limit"),
             Self::Storage => f.write_str("storage limit"),
+            Self::TooLarge => f.write_str("request exceeds the storage ceiling"),
+            Self::Contended => f.write_str("group admission contended"),
             Self::Deadline => f.write_str("deadline"),
+            Self::Cancelled => f.write_str("cancelled"),
             Self::Scheduled(index) => write!(f, "scheduled refusal of call {index}"),
             Self::Unrecorded => f.write_str("recording session exhausted"),
+        }
+    }
+}
+
+/// The ceilings of one authority, fixed when it is made: work in values and
+/// bytes, cumulative requested allocation bytes, and live requested
+/// capacity. A ceiling of `u64::MAX` is unlimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ceilings {
+    pub work: WriteWork,
+    pub requested: u64,
+    pub live: u64,
+}
+
+impl Ceilings {
+    /// Every ceiling `u64::MAX`.
+    pub const UNLIMITED: Self = Self {
+        work: WriteWork::new(u64::MAX, u64::MAX),
+        requested: u64::MAX,
+        live: u64::MAX,
+    };
+}
+
+/// An admission an [`Authority`] checked and has not committed: the totals
+/// and the turn it reaches ([`Authority::commit`]). Its fields are the
+/// core's alone, so no caller can commit totals the core did not compute.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Planned {
+    used: WriteWork,
+    cleanup: WriteWork,
+    turn: Option<Turn>,
+}
+
+/// One turn: what the scheduler granted it, at most the quantum, and what it
+/// admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Turn {
+    allowance: WriteWork,
+    used: WriteWork,
+}
+
+/// The accounting core: the one owner of an authority's ceilings, its
+/// committed lifetime totals, its turn, and the order in which an admission
+/// is checked. Every policy admits through [`Self::work`],
+/// [`Self::reclaim`] and [`Self::request`]; the live counter is the
+/// family's ([`Counters`]), reserved by [`Self::request`]'s caller in one
+/// atomic update after every other check has passed.
+///
+/// Its axioms, each held by this type's shape:
+///
+/// - Lifetime authorization never increases: the ceilings are set when the
+///   authority is made and nothing raises them; a turn's allowance bounds
+///   work within the lifetime allowance, never beside it.
+/// - A turn grants at most the quantum, the largest unit any turn admits: a
+///   unit beyond the quantum is impossible in every turn
+///   ([`LimitRefusal::QuantumTooSmall`]), and one beyond what this turn
+///   still allows waits for the next ([`LimitRefusal::Turn`]).
+/// - A refused admission changes no committed quantity: each check computes
+///   the totals the admission would reach, and they are stored only once
+///   every check has passed.
+/// - Refusal precedence is fixed: lifetime exhaustion, then an impossible
+///   unit, then the turn's allowance.
+/// - Cleanup is never refused for the foreground's allowance
+///   ([`Self::reclaim`]): it returns what an operation holds, so it is
+///   accounted apart from foreground work and no lifetime ceiling gates
+///   it; the quantum and the turn bound it as they bound every unit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Authority {
+    ceilings: Ceilings,
+    quantum: WriteWork,
+    /// Every admitted unit's work, foreground and cleanup.
+    used: WriteWork,
+    /// The part of [`Self::used`] admitted as cleanup: never more than it,
+    /// both raised together by every cleanup admission.
+    cleanup: WriteWork,
+    requested: u64,
+    turn: Option<Turn>,
+}
+
+impl Authority {
+    /// An authority of `ceilings` whose turns grant at most `quantum`, and
+    /// no turn running.
+    pub(crate) const fn new(ceilings: Ceilings, quantum: WriteWork) -> Self {
+        Self {
+            ceilings,
+            quantum,
+            used: WriteWork::new(0, 0),
+            cleanup: WriteWork::new(0, 0),
+            requested: 0,
+            turn: None,
+        }
+    }
+
+    /// The foreground work admitted: every unit's, less cleanup's. Every
+    /// cleanup admission raises both totals together ([`Self::reclaim`]),
+    /// so the difference never saturates; the policy ships, so it never
+    /// panics.
+    fn foreground(&self) -> WriteWork {
+        WriteWork::new(
+            self.used.values.saturating_sub(self.cleanup.values),
+            self.used.bytes.saturating_sub(self.cleanup.bytes),
+        )
+    }
+
+    /// Admit `work` as foreground, or refuse it with nothing committed
+    /// ([`Self::plan_work`], then [`Self::commit`]).
+    fn work(&mut self, work: WriteWork) -> Result<(), LimitRefusal> {
+        let planned = self.plan_work(work)?;
+        self.commit(planned);
+        Ok(())
+    }
+
+    /// Admit `work` as cleanup, or refuse it with nothing committed
+    /// ([`Self::plan_reclaim`], then [`Self::commit`]).
+    fn reclaim(&mut self, work: WriteWork) -> Result<(), LimitRefusal> {
+        let planned = self.plan_reclaim(work)?;
+        self.commit(planned);
+        Ok(())
+    }
+
+    /// The totals and turn a foreground admission of `work` reaches,
+    /// committing nothing: the lifetime ceiling over the foreground's total,
+    /// then the turn ([`Self::turn_after`]).
+    pub(crate) fn plan_work(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
+        let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
+        self.foreground()
+            .checked_then(work)
+            .filter(|foreground| self.ceilings.work.covers(foreground))
+            .ok_or(LimitRefusal::Work)?;
+        let turn = self.turn_after(work)?;
+        Ok(Planned {
+            used,
+            cleanup: self.cleanup,
+            turn,
+        })
+    }
+
+    /// The totals and turn a cleanup admission of `work` reaches,
+    /// committing nothing: no lifetime ceiling, only the turn
+    /// ([`Self::turn_after`]). The totals' one refusal of their own is a sum
+    /// beyond `u64`, which no bounded operation reaches.
+    pub(crate) fn plan_reclaim(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
+        let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
+        let cleanup = self.cleanup.checked_then(work).ok_or(LimitRefusal::Work)?;
+        let turn = self.turn_after(work)?;
+        Ok(Planned {
+            used,
+            cleanup,
+            turn,
+        })
+    }
+
+    /// Commit `planned`, made by this authority's [`Self::plan_work`] or
+    /// [`Self::plan_reclaim`] against its totals as they still are: its
+    /// caller commits a plan in the same call that made it, before any other
+    /// admission, so no plan is ever committed over another.
+    pub(crate) fn commit(&mut self, planned: Planned) {
+        self.used = planned.used;
+        self.cleanup = planned.cleanup;
+        self.turn = planned.turn;
+    }
+
+    /// The running turn once `work` is admitted, committing nothing: a unit
+    /// beyond the quantum refused as impossible, one beyond what the turn
+    /// still allows refused for the next turn; `None` with no turn running.
+    fn turn_after(&self, work: WriteWork) -> Result<Option<Turn>, LimitRefusal> {
+        let Some(turn) = self.turn else {
+            return Ok(None);
+        };
+        if !self.quantum.covers(&work) {
+            return Err(LimitRefusal::QuantumTooSmall);
+        }
+        let spent = turn
+            .used
+            .checked_then(work)
+            .filter(|spent| turn.allowance.covers(spent))
+            .ok_or(LimitRefusal::Turn)?;
+        Ok(Some(Turn {
+            used: spent,
+            ..turn
+        }))
+    }
+
+    /// Check a request of `bytes` against the requested and live ceilings,
+    /// committing nothing: the cumulative requested total it reaches, for
+    /// [`Self::granted`] once the live capacity is reserved.
+    pub(crate) fn request(&self, bytes: u64) -> Result<u64, LimitRefusal> {
+        if bytes > self.ceilings.live {
+            return Err(LimitRefusal::TooLarge);
+        }
+        self.requested
+            .checked_add(bytes)
+            .filter(|total| *total <= self.ceilings.requested)
+            .ok_or(LimitRefusal::Requested)
+    }
+
+    /// Commit a granted request's cumulative total ([`Self::request`]).
+    pub(crate) fn granted(&mut self, requested: u64) {
+        self.requested = requested;
+    }
+
+    /// The ceilings fixed when the authority was made.
+    pub(crate) const fn ceilings(&self) -> Ceilings {
+        self.ceilings
+    }
+
+    /// Every admitted unit's work, foreground and cleanup.
+    pub(crate) const fn used(&self) -> WriteWork {
+        self.used
+    }
+
+    /// The part of [`Self::used`] admitted as cleanup.
+    pub(crate) const fn cleanup(&self) -> WriteWork {
+        self.cleanup
+    }
+
+    /// The cumulative bytes of granted requests.
+    pub(crate) const fn requested(&self) -> u64 {
+        self.requested
+    }
+
+    /// Start a turn granting `allowance`, at most the quantum in each
+    /// quantity: only the turn's own usage is reset.
+    pub(crate) fn begin_turn(&mut self, allowance: WriteWork) {
+        self.turn = Some(Turn {
+            allowance: WriteWork::new(
+                allowance.values.min(self.quantum.values),
+                allowance.bytes.min(self.quantum.bytes),
+            ),
+            used: WriteWork::new(0, 0),
+        });
+    }
+
+    /// Spend the current turn: a turn granting nothing, so nothing more is
+    /// admitted until the next one.
+    pub(crate) fn end_turn(&mut self) {
+        self.begin_turn(WriteWork::new(0, 0));
+    }
+
+    /// No turn quantum: work is bounded by the lifetime allowance alone.
+    pub(crate) fn without_turns(&mut self) {
+        self.turn = None;
+    }
+
+    /// Forget the committed totals, the ceilings kept: the measurement
+    /// instrument's restart ([`Limits::measure`]), so a run measures only
+    /// what follows it. No production authority calls it.
+    fn restart(&mut self) {
+        self.used = WriteWork::new(0, 0);
+        self.cleanup = WriteWork::new(0, 0);
+        self.requested = 0;
+    }
+
+    /// The foreground work still admissible now: the lifetime allowance's
+    /// remainder, within the turn's when one is running.
+    pub(crate) fn remaining(&self) -> WriteWork {
+        let foreground = self.foreground();
+        let lifetime = WriteWork::new(
+            self.ceilings.work.values.saturating_sub(foreground.values),
+            self.ceilings.work.bytes.saturating_sub(foreground.bytes),
+        );
+        match self.turn {
+            None => lifetime,
+            Some(turn) => WriteWork::new(
+                lifetime
+                    .values
+                    .min(turn.allowance.values.saturating_sub(turn.used.values)),
+                lifetime
+                    .bytes
+                    .min(turn.allowance.bytes.saturating_sub(turn.used.bytes)),
+            ),
         }
     }
 }
@@ -102,6 +438,29 @@ impl HistoryCounts {
 pub enum Call {
     Work { values: u64, bytes: u64 },
     Allocate(u64),
+}
+
+/// One attempted admission as the policy accounts it: a foreground call, or
+/// a cleanup unit's work ([`super::Releasing::reclaim`]). Either is
+/// recorded as its [`Call`] ([`Self::call`]): the history names what was
+/// asked, the authority's accounts what it was charged to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    Foreground(Call),
+    Cleanup(WriteWork),
+}
+
+impl Attempt {
+    /// The call this attempt is recorded as.
+    const fn call(self) -> Call {
+        match self {
+            Self::Foreground(call) => call,
+            Self::Cleanup(work) => Call::Work {
+                values: work.values,
+                bytes: work.bytes,
+            },
+        }
+    }
 }
 
 /// What a policy answered a call.
@@ -736,17 +1095,14 @@ impl core::fmt::Debug for AdmissionTrace {
     }
 }
 
-/// Work and live requested-capacity limits, with the observation and fault
-/// injection a scheduler or test needs. The policy is used by one operation
-/// at a time; its reservations may move to and be released on other threads.
+/// The measurement and fault-injection instrument over the accounting core
+/// ([`Authority`]): its ceilings, totals and turns are the core's, and what
+/// this type adds is the instrument's alone (the fault schedule, the
+/// admission clock, measurement restarts, the trace and the recording). The
+/// policy is used by one operation at a time; its reservations may move to
+/// and be released on other threads.
 pub struct Limits {
-    /// Cumulative admitted work.
-    used: WriteWork,
-    /// Cumulative work allowance; a turn moves it one quantum past `used`.
-    limit: WriteWork,
-    storage: u64,
-    requested: u64,
-    requested_limit: u64,
+    authority: Authority,
     counters: Arc<Counters>,
     attempts: usize,
     requests: usize,
@@ -765,7 +1121,9 @@ pub struct Limits {
     fail_request: Option<usize>,
     fail_requests: usize,
     clock: u64,
-    deadline: Option<u64>,
+    /// The simulated expiry, a call of the admission clock
+    /// ([`Self::expire_at_call`]).
+    expiry: Option<u64>,
     observer: Option<fn(u64)>,
     strict: bool,
     terminal: bool,
@@ -782,20 +1140,28 @@ impl Limits {
     /// `values` and `bytes` of work in total and `storage` live requested
     /// bytes. The shared counter allocation belongs to policy setup.
     pub fn new(values: u64, bytes: u64, storage: u64) -> Self {
-        Self::with_counters(values, bytes, storage, Arc::new(Counters::default()))
+        Self::with_counters(
+            Self::ceilings(values, bytes, storage),
+            Arc::new(Counters::default()),
+        )
     }
 
-    fn with_counters(values: u64, bytes: u64, storage: u64, counters: Arc<Counters>) -> Self {
+    /// The ceilings of [`Self::new`]: no requested-bytes limit.
+    const fn ceilings(values: u64, bytes: u64, storage: u64) -> Ceilings {
+        Ceilings {
+            work: WriteWork::new(values, bytes),
+            requested: u64::MAX,
+            live: storage,
+        }
+    }
+
+    fn with_counters(ceilings: Ceilings, counters: Arc<Counters>) -> Self {
         let policy = counters
             .recording
             .as_ref()
             .map_or(0, |recording| recording.policy());
         Self {
-            used: WriteWork::default(),
-            limit: WriteWork::new(values, bytes),
-            storage,
-            requested: 0,
-            requested_limit: u64::MAX,
+            authority: Authority::new(ceilings, TURN),
             counters,
             attempts: 0,
             requests: 0,
@@ -810,7 +1176,7 @@ impl Limits {
             fail_request: None,
             fail_requests: 0,
             clock: 0,
-            deadline: None,
+            expiry: None,
             observer: None,
             strict: false,
             terminal: false,
@@ -830,7 +1196,7 @@ impl Limits {
             recording: Some(Recording::join(session)),
             ..Counters::default()
         };
-        Self::with_counters(values, bytes, storage, Arc::new(counters))
+        Self::with_counters(Self::ceilings(values, bytes, storage), Arc::new(counters))
     }
 
     /// A new unlimited family recorded in `session` ([`Self::recorded`],
@@ -865,11 +1231,26 @@ impl Limits {
         }
     }
 
-    /// A fresh policy over the same live storage: its reservations count
-    /// against this policy's capacity, peak and live bytes.
+    /// A fresh policy over the same live storage, of no work or
+    /// requested-bytes limit of its own ([`Self::share_within`] of
+    /// [`Ceilings::UNLIMITED`]).
     pub fn share(&self) -> Self {
-        let mut shared =
-            Self::with_counters(u64::MAX, u64::MAX, self.storage, self.counters.clone());
+        self.share_within(Ceilings::UNLIMITED)
+    }
+
+    /// A fresh policy over the same live storage, its reservations counting
+    /// against this policy's capacity, peak and live bytes, under `ceilings`
+    /// of its own: its work and requested bytes its own totals, and its live
+    /// ceiling at most this policy's, so a share never admits storage its
+    /// family's ceiling refuses.
+    pub fn share_within(&self, ceilings: Ceilings) -> Self {
+        let mut shared = Self::with_counters(
+            Ceilings {
+                live: ceilings.live.min(self.authority.ceilings.live),
+                ..ceilings
+            },
+            self.counters.clone(),
+        );
         shared.observer = self.observer;
         shared.strict = self.strict;
         shared
@@ -978,16 +1359,23 @@ impl Limits {
         self.fail_requests = count;
     }
 
-    /// Refuse cumulative requested allocation bytes beyond `bytes`.
+    /// Refuse cumulative requested allocation bytes beyond `bytes`: the
+    /// ceiling lowered to `bytes`, never raised.
     pub fn requesting_at_most(mut self, bytes: u64) -> Self {
-        self.requested_limit = bytes;
+        let ceiling = &mut self.authority.ceilings.requested;
+        *ceiling = (*ceiling).min(bytes);
         self
     }
 
-    /// Refuse every call once the deterministic clock reaches `deadline`.
-    /// The clock advances by one at each attempted call.
-    pub fn deadline(&mut self, deadline: Option<u64>) {
-        self.deadline = deadline;
+    /// The instrument's simulated expiry: refuse every foreground call
+    /// [`LimitRefusal::Deadline`] once the deterministic admission clock
+    /// ([`Self::clock`], one tick per attempted call, cleanup's included)
+    /// reaches `call`; cleanup ([`super::Releasing::reclaim`]) is never
+    /// refused for it. A clock of calls, not of time: it places an expiry at
+    /// an exact call so a test can stop there. A production deadline is a
+    /// monotonic instant (`governance::OperationBudget::deadline`).
+    pub fn expire_at_call(&mut self, call: Option<u64>) {
+        self.expiry = call;
     }
 
     /// Called with the bytes of each granted allocation, before the caller
@@ -1018,42 +1406,44 @@ impl Limits {
         self.counters.release_observer.is_some()
     }
 
-    /// Start a new turn: one quantum of work past what was admitted.
+    /// Start a new turn of one whole quantum ([`TURN`]): the turn's usage
+    /// reset, the lifetime allowance and its totals unchanged.
     pub fn fresh(&mut self) {
-        self.limit = WriteWork::new(
-            self.used.values.saturating_add(TURN.values),
-            self.used.bytes.saturating_add(TURN.bytes),
-        );
+        self.authority.begin_turn(TURN);
     }
 
-    /// A new scheduler turn: forget the current refusal and admit one more
-    /// quantum of work.
+    /// A new scheduler turn: forget the current refusal and start a turn of
+    /// one whole quantum.
     pub fn turn(&mut self) {
+        self.turn_with(TURN);
+    }
+
+    /// A new scheduler turn granting `allowance`, at most the quantum in each
+    /// quantity: forget the current refusal and start the turn. A unit within
+    /// the quantum but beyond the allowance is refused [`LimitRefusal::Turn`]
+    /// and waits for a later turn.
+    pub fn turn_with(&mut self, allowance: WriteWork) {
         self.clear_refusal();
-        self.fresh();
+        self.authority.begin_turn(allowance);
     }
 
-    /// Lift the work limit, as for setup outside a measured operation.
+    /// Run without a turn quantum, as for setup outside a measured
+    /// operation: work is bounded by the lifetime allowance alone.
     pub fn open(&mut self) {
-        self.limit = WriteWork::new(u64::MAX, u64::MAX);
-    }
-
-    /// Set the cumulative work limit.
-    pub fn set_limit(&mut self, limit: WriteWork) {
-        self.limit = limit;
+        self.authority.without_turns();
     }
 
     /// End the current turn: no further work is admitted until `fresh`.
     pub fn exhaust(&mut self) {
-        self.limit = self.used;
+        self.authority.end_turn();
     }
 
     /// Forget counts, logs and the fault schedule's progress so that only the
-    /// following calls are measured. Live storage is unaffected.
+    /// following calls are measured, and start a turn. Live storage and the
+    /// ceilings are unaffected.
     pub fn measure(&mut self) {
-        self.used = WriteWork::default();
+        self.authority.restart();
         self.fresh();
-        self.requested = 0;
         self.attempts = 0;
         self.requests = 0;
         self.refusals = 0;
@@ -1071,17 +1461,22 @@ impl Limits {
         self.trace = AdmissionTrace::new();
     }
 
-    /// Work remaining; successful admissions consume it permanently.
+    /// Foreground work admissible now: the lifetime allowance's remainder,
+    /// within the current turn's when one is running. Successful foreground
+    /// admissions consume it permanently; cleanup never does.
     pub fn remaining(&self) -> WriteWork {
-        WriteWork::new(
-            self.limit.values.saturating_sub(self.used.values),
-            self.limit.bytes.saturating_sub(self.used.bytes),
-        )
+        self.authority.remaining()
     }
 
-    /// Cumulative admitted work.
+    /// Cumulative admitted work, foreground and cleanup.
     pub fn used(&self) -> WriteWork {
-        self.used
+        self.authority.used
+    }
+
+    /// The part of [`Self::used`] admitted as cleanup
+    /// ([`super::Releasing::reclaim`]), which no lifetime ceiling counts.
+    pub fn cleanup_used(&self) -> WriteWork {
+        self.authority.cleanup
     }
 
     /// Requested capacities currently held by live reservations.
@@ -1121,7 +1516,7 @@ impl Limits {
 
     /// Cumulative bytes of granted allocation requests.
     pub fn requested_bytes(&self) -> u64 {
-        self.requested
+        self.authority.requested
     }
 
     /// Attempted calls, refused ones included.
@@ -1299,7 +1694,7 @@ impl Limits {
     /// subtraction a concurrent request of the same family may see the
     /// capacity taken and be refused; that happens only once the session is
     /// exhausted, when the run is no evidence.
-    fn admit(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
+    fn admit(&mut self, attempt: Attempt) -> Result<Option<(u64, Identity)>, LimitRefusal> {
         if self.strict {
             assert!(
                 self.refused.is_none(),
@@ -1311,7 +1706,9 @@ impl Limits {
         self.attempts += 1;
         let now = self.clock;
         self.clock = self.clock.saturating_add(1);
-        if self.deadline.is_some_and(|deadline| now >= deadline) {
+        if matches!(attempt, Attempt::Foreground(_))
+            && self.expiry.is_some_and(|expiry| now >= expiry)
+        {
             return Err(LimitRefusal::Deadline);
         }
         if let Some((at, reason)) = self.fail_at
@@ -1327,19 +1724,16 @@ impl Limits {
                 return Err(LimitRefusal::Scheduled(index));
             }
         }
-        match call {
-            Call::Work { values, bytes } => {
-                let used = self
-                    .used
-                    .checked_then(WriteWork::new(values, bytes))
-                    .ok_or(LimitRefusal::Work)?;
-                if !self.limit.covers(&used) {
-                    return Err(LimitRefusal::Work);
-                }
-                self.used = used;
+        match attempt {
+            Attempt::Cleanup(work) => {
+                self.authority.reclaim(work)?;
                 Ok(None)
             }
-            Call::Allocate(bytes) => {
+            Attempt::Foreground(Call::Work { values, bytes }) => {
+                self.authority.work(WriteWork::new(values, bytes))?;
+                Ok(None)
+            }
+            Attempt::Foreground(Call::Allocate(bytes)) => {
                 let request = self.requests;
                 self.requests += 1;
                 if self.fail_request == Some(request) {
@@ -1351,19 +1745,16 @@ impl Limits {
                     self.fail_requests -= 1;
                     return Err(LimitRefusal::Scheduled(index));
                 }
-                let requested = self
-                    .requested
-                    .checked_add(bytes)
-                    .filter(|total| *total <= self.requested_limit)
-                    .ok_or(LimitRefusal::Storage)?;
+                let requested = self.authority.request(bytes)?;
                 // Shared policies can admit concurrently. Check capacity and
                 // reserve it in one atomic update, retrying against the latest
                 // total when another admission or release wins the race.
+                let ceiling = self.authority.ceilings.live;
                 let mut previous = self.counters.live.load(Ordering::Acquire);
                 let live = loop {
                     let next = previous
                         .checked_add(bytes)
-                        .filter(|next| *next <= self.storage)
+                        .filter(|next| *next <= ceiling)
                         .ok_or(LimitRefusal::Storage)?;
                     match self.counters.live.compare_exchange_weak(
                         previous,
@@ -1389,7 +1780,7 @@ impl Limits {
                     },
                 };
                 self.counters.peak.fetch_max(live, Ordering::AcqRel);
-                self.requested = requested;
+                self.authority.granted(requested);
                 Ok(granted)
             }
         }
@@ -1412,7 +1803,8 @@ impl Limits {
         }
     }
 
-    fn admit_traced(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
+    fn admit_traced(&mut self, attempt: Attempt) -> Result<Option<(u64, Identity)>, LimitRefusal> {
+        let call = attempt.call();
         if self.terminal {
             // A terminal policy's calls are cleanup units, published like
             // any other: publication allocates nothing.
@@ -1424,7 +1816,7 @@ impl Limits {
             return result.map(|()| None);
         }
         self.last_injected = false;
-        let granted = self.admit(call);
+        let granted = self.admit(attempt);
         let result = granted.map(|_| ());
         if let Err(reason) = result {
             self.refusals += 1;
@@ -1439,7 +1831,7 @@ impl Limits {
             index: self.attempts - 1,
             call,
             result,
-            work: self.used,
+            work: self.authority.used,
             storage: (self.live_bytes(), self.peak_bytes()),
             position: None,
         });
@@ -1456,7 +1848,8 @@ impl Default for Limits {
 impl Budget for Limits {
     type Refusal = LimitRefusal;
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
-        self.admit_traced(Call::Work { values, bytes }).map(|_| ())
+        self.admit_traced(Attempt::Foreground(Call::Work { values, bytes }))
+            .map(|_| ())
     }
 
     fn boundary(&mut self, boundary: Boundary) {
@@ -1639,8 +2032,9 @@ impl Origin for Family {
 
 // SAFETY: terminal: constructing this policy only clones an existing Arc,
 // which allocates nothing and never unwinds, and its fields have
-// allocation-free, non-unwinding drops. traverse: terminal admissions bypass
-// the policy's limits and counters and never refuse work; recording a
+// allocation-free, non-unwinding drops. traverse: terminal admissions,
+// through `traverse` and `reclaim` alike, bypass the policy's limits and
+// counters and never refuse work; recording a
 // boundary is one relaxed `fetch_or` on the shared counters, a credit event
 // checked compare-exchange updates and a `fetch_or` on the same counters, and
 // publishing an observation into a recorded family's session claims a
@@ -1651,7 +2045,7 @@ impl Origin for Family {
 // clone of the permit's counters, never a reference to `permit`.
 unsafe impl super::TerminalAllocator for Limits {
     fn terminal(permit: &Reservation) -> Self {
-        let mut policy = Self::with_counters(u64::MAX, u64::MAX, u64::MAX, permit.counters.clone());
+        let mut policy = Self::with_counters(Ceilings::UNLIMITED, permit.counters.clone());
         policy.terminal = true;
         policy
     }
@@ -1659,6 +2053,15 @@ unsafe impl super::TerminalAllocator for Limits {
 
 impl super::Releasing for Limits {
     type Permit = Reservation;
+
+    /// The cleanup account ([`Authority::reclaim`]): attempted, clocked,
+    /// traced and published as every call is, and refused by the fault
+    /// schedule as every call is, the instrument's alone; never by the
+    /// deadline or the lifetime work ceiling.
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
+        self.admit_traced(Attempt::Cleanup(WriteWork::new(values, bytes)))
+            .map(|_| ())
+    }
 
     fn permit_identity(permit: &Reservation) -> Identity {
         permit.identity()
@@ -1676,7 +2079,7 @@ impl Allocator for Limits {
     /// so an observer that unwinds drops a permit that releases what was
     /// admitted: no admitted storage is ever left without an owner.
     fn allocate(&mut self, bytes: u64) -> Result<Reservation, LimitRefusal> {
-        let granted = self.admit_traced(Call::Allocate(bytes))?;
+        let granted = self.admit_traced(Attempt::Foreground(Call::Allocate(bytes)))?;
         let word = granted.map_or(bytes, |(index, _)| index);
         let permit = Reservation {
             counters: self.counters.clone(),
@@ -1699,9 +2102,27 @@ mod tests {
 
     #[test]
     fn refusals_name_their_cause() {
+        assert_eq!(format!("{}", LimitRefusal::Turn), "turn quantum spent");
+        assert_eq!(
+            format!("{}", LimitRefusal::QuantumTooSmall),
+            "unit exceeds the turn quantum"
+        );
         assert_eq!(format!("{}", LimitRefusal::Work), "work limit");
+        assert_eq!(
+            format!("{}", LimitRefusal::Requested),
+            "requested-bytes limit"
+        );
         assert_eq!(format!("{}", LimitRefusal::Storage), "storage limit");
+        assert_eq!(
+            format!("{}", LimitRefusal::TooLarge),
+            "request exceeds the storage ceiling"
+        );
+        assert_eq!(
+            format!("{}", LimitRefusal::Contended),
+            "group admission contended"
+        );
         assert_eq!(format!("{}", LimitRefusal::Deadline), "deadline");
+        assert_eq!(format!("{}", LimitRefusal::Cancelled), "cancelled");
         assert_eq!(
             format!("{}", LimitRefusal::Scheduled(7)),
             "scheduled refusal of call 7"
@@ -2152,5 +2573,278 @@ mod tests {
         assert_eq!(m.live_bytes(), u64::MAX);
         drop(permit);
         assert_eq!(m.live_bytes(), 0);
+    }
+
+    /// The accounting core's axioms ([`Authority`]), each through the
+    /// instrument's public surface.
+    mod authority {
+        use super::*;
+        use crate::bounded::Releasing;
+
+        const ONE: WriteWork = WriteWork::new(1, 0);
+
+        /// Lifetime authorization never increases: a policy of five values
+        /// stepped one quantum at a time admits exactly five, every later
+        /// turn refusing the lifetime allowance ([`LimitRefusal::Work`],
+        /// which stops), never the turn's; the turns' own usage is all that
+        /// a turn resets, and the remainder of a quantity the policy leaves
+        /// unlimited is the turn's.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn turns_never_raise_lifetime_authorization() {
+            let mut m = Limits::new(5, u64::MAX, u64::MAX);
+            let mut admitted = 0;
+            for _ in 0..10 {
+                m.turn();
+                while m.traverse(1, 0).is_ok() {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(admitted, 5, "turns raised the lifetime allowance");
+            assert_eq!(m.used(), WriteWork::new(5, 0));
+            m.turn();
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
+            // Each quantity's remainder is its own: the values are spent for
+            // good, the bytes the policy leaves unlimited are the turn's, and
+            // exactly that remainder is admissible.
+            assert_eq!(m.remaining(), WriteWork::new(0, TURN.bytes));
+            m.traverse(0, TURN.bytes).unwrap();
+            assert_eq!(m.remaining(), WriteWork::new(0, 0));
+            assert_eq!(LimitRefusal::Work.recovery(), Recovery::Stop);
+        }
+
+        /// A refused admission commits nothing: work refused for its turn,
+        /// for its quantum and for the lifetime allowance leaves the totals
+        /// as they were; a request refused for the requested ceiling, for
+        /// the whole live ceiling and for live capacity leaves the requested
+        /// total, live and peak bytes as they were.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn a_refused_admission_commits_nothing() {
+            // Ten values in all: the turn's and the quantum's refusals come
+            // well within the lifetime allowance, its own refusal last.
+            let mut m = Limits::new(10, u64::MAX, 8).requesting_at_most(10);
+            m.turn_with(WriteWork::new(2, 64));
+            m.traverse(2, 0).unwrap();
+            let before = (m.used(), m.remaining());
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            assert_eq!(
+                m.traverse(TURN.values + 1, 0),
+                Err(LimitRefusal::QuantumTooSmall)
+            );
+            assert_eq!(
+                (m.used(), m.remaining()),
+                before,
+                "a refused unit committed"
+            );
+            for _ in 0..2 {
+                m.turn();
+                m.traverse(TURN.values, 0).unwrap();
+            }
+            m.turn();
+            assert_eq!(m.traverse(TURN.values, 0), Err(LimitRefusal::Work));
+            assert_eq!(
+                m.used(),
+                WriteWork::new(2 + 2 * TURN.values, 0),
+                "a refused unit committed"
+            );
+            let held = m.allocate(6).unwrap();
+            let before = (m.requested_bytes(), m.live_bytes(), m.peak_bytes());
+            assert_eq!(m.allocate(9).unwrap_err(), LimitRefusal::TooLarge);
+            assert_eq!(m.allocate(3).unwrap_err(), LimitRefusal::Storage);
+            assert_eq!(m.allocate(5).unwrap_err(), LimitRefusal::Requested);
+            assert_eq!(
+                (m.requested_bytes(), m.live_bytes(), m.peak_bytes()),
+                before,
+                "a refused request committed"
+            );
+            drop(held);
+            assert_eq!(m.live_bytes(), 0);
+        }
+
+        /// The quantum bounds a unit in every turn, the allowance what one
+        /// turn admits: a unit beyond the quantum is impossible
+        /// ([`LimitRefusal::QuantumTooSmall`], which stops) whatever the
+        /// turn grants; one within the quantum and beyond what the turn
+        /// still allows waits ([`LimitRefusal::Turn`], the next turn), a
+        /// turn granting nothing included; a grant beyond the quantum is
+        /// held to it.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn() {
+            let mut m = Limits::turns();
+            assert_eq!(
+                m.traverse(TURN.values + 1, 0),
+                Err(LimitRefusal::QuantumTooSmall)
+            );
+            assert_eq!(LimitRefusal::QuantumTooSmall.recovery(), Recovery::Stop);
+            m.turn_with(WriteWork::new(0, 0));
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            assert_eq!(LimitRefusal::Turn.recovery(), Recovery::NextTurn);
+            m.turn_with(ONE);
+            m.traverse(1, 0).unwrap();
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            m.turn_with(WriteWork::new(u64::MAX, u64::MAX));
+            assert_eq!(m.remaining(), TURN, "a grant beyond the quantum");
+            m.exhaust();
+            assert_eq!(m.remaining(), WriteWork::new(0, 0));
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            m.open();
+            m.traverse(TURN.values + 1, 0).unwrap();
+        }
+
+        /// Refusal precedence is fixed: an exhausted lifetime allowance is
+        /// named before the turn's, and before an impossible unit.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn lifetime_exhaustion_precedes_the_turn_and_the_quantum() {
+            let mut m = Limits::new(1, u64::MAX, u64::MAX);
+            m.turn_with(ONE);
+            m.traverse(1, 0).unwrap();
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
+            assert_eq!(m.traverse(TURN.values + 1, 0), Err(LimitRefusal::Work));
+        }
+
+        /// A requested-bytes ceiling is only ever lowered, and a share's
+        /// live ceiling is at most its family's: a share asking for more
+        /// refuses a request beyond the family's whole ceiling, and its own
+        /// work ceiling refuses its own work.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn no_ceiling_is_raised_by_a_builder_or_a_share() {
+            let mut lowered = Limits::unlimited()
+                .requesting_at_most(4)
+                .requesting_at_most(100);
+            assert_eq!(lowered.allocate(5).unwrap_err(), LimitRefusal::Requested);
+            let family = Limits::new(u64::MAX, u64::MAX, 8);
+            let mut share = family.share_within(Ceilings {
+                work: WriteWork::new(0, u64::MAX),
+                ..Ceilings::UNLIMITED
+            });
+            assert_eq!(share.allocate(9).unwrap_err(), LimitRefusal::TooLarge);
+            assert_eq!(share.traverse(1, 0), Err(LimitRefusal::Work));
+            let held = share.allocate(8).unwrap();
+            assert_eq!(family.live_bytes(), 8, "a share's storage is its family's");
+            drop(held);
+            assert_eq!(family.live_bytes(), 0);
+        }
+
+        /// Every refusal's recovery, the one classification: a spent turn, a
+        /// contended group admission and an injected refusal resume next
+        /// turn, live capacity after a release, every other refusal stops, a
+        /// cancellation among them.
+        #[test]
+        fn every_refusal_has_one_recovery() {
+            for (refusal, recovery) in [
+                (LimitRefusal::Turn, Recovery::NextTurn),
+                (LimitRefusal::Contended, Recovery::NextTurn),
+                (LimitRefusal::Scheduled(3), Recovery::NextTurn),
+                (LimitRefusal::Storage, Recovery::CapacityRelease),
+                (LimitRefusal::QuantumTooSmall, Recovery::Stop),
+                (LimitRefusal::Work, Recovery::Stop),
+                (LimitRefusal::Requested, Recovery::Stop),
+                (LimitRefusal::TooLarge, Recovery::Stop),
+                (LimitRefusal::Deadline, Recovery::Stop),
+                (LimitRefusal::Cancelled, Recovery::Stop),
+                (LimitRefusal::Unrecorded, Recovery::Stop),
+            ] {
+                assert_eq!(refusal.recovery(), recovery, "{refusal:?}");
+            }
+        }
+
+        /// Cleanup completes whatever the foreground's state: with the
+        /// lifetime work allowance spent, and again past the deadline, a
+        /// cleanup admission is admitted where a foreground one is refused,
+        /// accounted apart ([`Limits::cleanup_used`]) and never taken from
+        /// the foreground's remainder.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn cleanup_is_never_refused_for_the_foreground() {
+            let mut m = Limits::new(1, u64::MAX, u64::MAX);
+            m.traverse(1, 0).unwrap();
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
+            assert_eq!(
+                m.reclaim(1, 0),
+                Ok(()),
+                "cleanup was refused for the lifetime allowance"
+            );
+            m.expire_at_call(Some(0));
+            assert_eq!(m.traverse(0, 0), Err(LimitRefusal::Deadline));
+            assert_eq!(
+                m.reclaim(1, 0),
+                Ok(()),
+                "cleanup was refused for the deadline"
+            );
+            assert_eq!(m.used(), WriteWork::new(3, 0));
+            assert_eq!(m.cleanup_used(), WriteWork::new(2, 0));
+            assert_eq!(
+                m.remaining(),
+                WriteWork::new(0, u64::MAX),
+                "cleanup was taken from the foreground's remainder"
+            );
+        }
+
+        /// Cleanup is scheduled as every unit is: a unit beyond the quantum
+        /// is impossible, and cleanup spends the running turn's allowance,
+        /// the one turn it shares with foreground work, so a spent turn
+        /// refuses both for the next.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's axioms are driven by direct admissions"
+        )]
+        fn cleanup_spends_the_turn_and_is_held_to_the_quantum() {
+            let mut m = Limits::turns();
+            assert_eq!(
+                m.reclaim(TURN.values + 1, 0),
+                Err(LimitRefusal::QuantumTooSmall)
+            );
+            m.turn_with(ONE);
+            m.reclaim(1, 0).unwrap();
+            assert_eq!(m.reclaim(1, 0), Err(LimitRefusal::Turn));
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            m.turn_with(ONE);
+            m.traverse(1, 0).unwrap();
+            assert_eq!(m.reclaim(1, 0), Err(LimitRefusal::Turn));
+            assert_eq!(m.cleanup_used(), ONE);
+            assert_eq!(m.used(), WriteWork::new(2, 0));
+        }
+
+        /// A unit admitted through the cleanup capability is the policy's
+        /// cleanup: under a policy of no foreground work at all it is
+        /// admitted, through the route, and charged to the cleanup account;
+        /// a foreground unit beside it is refused.
+        #[test]
+        fn a_unit_under_the_cleanup_capability_is_charged_as_cleanup() {
+            use crate::bounded::decode::construction::reclamation::Cleanup;
+            use crate::bounded::{Caller, Unit};
+            let unit = Unit::new(Caller, 1, 8);
+            let mut m = Limits::new(0, 0, u64::MAX);
+            assert!(
+                unit.admit(&mut Cleanup::new(&mut m)).is_ok(),
+                "cleanup was charged to the foreground"
+            );
+            assert_eq!(m.cleanup_used(), WriteWork::new(1, 8));
+            assert!(unit.admit(&mut m).is_err());
+            assert_eq!(m.used(), m.cleanup_used());
+        }
     }
 }

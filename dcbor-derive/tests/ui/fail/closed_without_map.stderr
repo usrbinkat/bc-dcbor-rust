@@ -1,0 +1,17 @@
+error: `closed` applies to a record or an enum with named variants: it refuses map keys no field names, and this type decodes no map of its own
+ --> tests/ui/fail/closed_without_map.rs:6:8
+  |
+6 | #[cbor(closed)]
+  |        ^^^^^^
+
+error: `closed` applies to a record or an enum with named variants: it refuses map keys no field names, and this type decodes no map of its own
+  --> tests/ui/fail/closed_without_map.rs:10:8
+   |
+10 | #[cbor(closed)]
+   |        ^^^^^^
+
+error: `closed` applies to a record or an enum with named variants: it refuses map keys no field names, and this type decodes no map of its own
+  --> tests/ui/fail/closed_without_map.rs:14:8
+   |
+14 | #[cbor(closed)]
+   |        ^^^^^^

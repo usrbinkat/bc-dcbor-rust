@@ -31,9 +31,9 @@ fn map(fields: &MapFields, start: usize, access: impl Fn(&Ident) -> TokenStream2
         let key = field.key;
         let value = access(&field.ident);
         let value = if field.optional {
-            quote!((#value).as_ref().map(|v| v as &dyn dcbor::bounded::encoding::Schema))
+            quote!((#value).as_ref().map(|v| __dcbor_schema(v)))
         } else {
-            quote!(Some(#value as &dyn dcbor::bounded::encoding::Schema))
+            quote!(Some(__dcbor_schema(#value)))
         };
         quote!(#index => __i::Field(#key, #value),)
     });
@@ -47,7 +47,7 @@ fn map(fields: &MapFields, start: usize, access: impl Fn(&Ident) -> TokenStream2
 pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
     let name = schema.name();
     let mut generics = schema.input.generics.clone();
-    for ty in schema.field_types() {
+    for ty in schema.generic_field_types() {
         generics
             .make_where_clause()
             .predicates
@@ -55,12 +55,18 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
     }
     let (ig, tg, wc) = generics.split_for_impl();
     let mut transfer = generics.clone();
-    for ty in schema.field_types() {
+    for ty in schema.generic_field_types() {
         transfer
             .make_where_clause()
             .predicates
             .push(syn::parse_quote!(#ty: dcbor::bounded::encoding::TransferableSchema));
     }
+    // The unsafe impl's obligation on every field type: a generic one's in
+    // its where clause, a concrete one's asserted beside it.
+    let transferable = assert_bounds(
+        &schema.concrete_field_types(),
+        quote!(dcbor::bounded::encoding::TransferableSchema),
+    );
     transfer
         .make_where_clause()
         .predicates
@@ -72,7 +78,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
             _ => __i::End,
         }),
         Shape::Newtype => quote!(match index {
-            0 => __i::Child(&self.0),
+            0 => __i::Child(__dcbor_schema(&self.0)),
             _ => __i::End,
         }),
         Shape::Map(fields) => {
@@ -90,7 +96,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
                             let index = i + 2;
                             let pattern = (0..*count).map(|j| if i == j { quote!(__value) } else { quote!(_) });
                             quote!(#index => match self {
-                                Self::#v(#(#pattern),*) => __i::Child(__value),
+                                Self::#v(#(#pattern),*) => __i::Child(__dcbor_schema(__value)),
                                 _ => unreachable!("variant selected by enclosing match"),
                             },)
                         });
@@ -123,17 +129,31 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
         }
     };
     quote! {
+        #transferable
         // SAFETY: references: generated instructions return only fields of
         // self and scalar heads. cursors: generated schemas create no entry
         // cursors; a field's cursors are its own type's. recursion: every
-        // field type is bound `TransferableSchema` and `Self: Sync` (the
-        // `transfer` where clause).
+        // field type is `TransferableSchema`, a field type naming a generic
+        // parameter by the `transfer` where clause, which also bounds
+        // `Self: Sync`, and every other by the assertion before this impl
+        // (`assert_bounds`), which does not compile otherwise.
         unsafe impl #transfer_ig dcbor::bounded::encoding::TransferableSchema
             for #name #transfer_tg #transfer_wc {}
         impl #ig dcbor::bounded::encoding::Schema for #name #tg #wc {
             fn instruction(&self, index: usize) -> dcbor::bounded::encoding::Instruction<'_> {
                 use dcbor::bounded::{Argument as __a, MajorType as __m};
                 use dcbor::bounded::encoding::Instruction as __i;
+                // Every field reaches its instruction through this bound,
+                // never an unsizing coercion at the field: a field type
+                // that is not `Schema` is refused `E0277`, required by this
+                // function's bound, a diagnostic both shells' compilers
+                // word alike, where an unmet coercion's wording differs
+                // between them (`dcbor-derive/tests/ui/fail/unsupported_type.rs`).
+                fn __dcbor_schema<'__s, __T: dcbor::bounded::encoding::Schema + '__s>(
+                    value: &'__s __T,
+                ) -> &'__s dyn dcbor::bounded::encoding::Schema {
+                    value
+                }
                 #body
             }
         }

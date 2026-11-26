@@ -1,0 +1,13 @@
+error[E0521]: borrowed data escapes outside of associated function
+ --> tests/ui/versioned/stable/../record_kept_across_steps.rs
+  |
+  |     fn build_step<'b>(
+  |                   -- lifetime `'b` defined here
+  |         ctx: BindingContext<'b, '_, '_, '_, Self, A>,
+  |         --- `ctx` is a reference that is only valid in the associated function body
+...
+  |         KEPT.with(|kept| *kept.borrow_mut() = Some(record));
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |         |
+  |         `ctx` escapes the associated function body here
+  |         argument requires that `'b` must outlive `'static`

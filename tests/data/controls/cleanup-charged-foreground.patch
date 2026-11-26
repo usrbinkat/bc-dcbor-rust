@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/reclamation.rs
++++ src/bounded/decode/construction/reclamation.rs
+@@ -237,7 +237,8 @@
+         reason = "the cleanup capability's admission is its policy's cleanup admission"
+     )]
+     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+-        self.policy.reclaim(values, bytes)
++        // Planted: the capability admits cleanup as the policy's foreground.
++        self.policy.traverse(values, bytes)
+     }
+ 
+     fn boundary(&mut self, boundary: crate::bounded::boundary::Boundary) {

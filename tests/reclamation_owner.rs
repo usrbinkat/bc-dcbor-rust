@@ -425,63 +425,206 @@ fn every_reducing_binding_is_certified_and_its_transitions_legal() {
     }
 }
 
-/// A stabilized text's construction ([`dcbor::StabilizedText`]): its declared
+/// A checked text's construction (one engine, its rules
+/// [`dcbor::StabilizedText`]'s and [`dcbor::AsciiText`]'s): its declared
 /// reduction, the text's, and its complete class are certified on every
 /// state it reaches ([`support::uniform`]), and every transition is in its
 /// successor relations, the check's then the text's
-/// ([`support::legality::stabilized`]); it is built, and refused, within
-/// its cost. Texts: empty, one byte, across a copy unit, of multibyte
-/// scalars, an assigned code point of the pinned version (U+1FA8A
-/// TROMBONE, `DerivedAge.txt` line 2106); refused: an unassigned one
-/// (U+0378), and an integer where a text is expected.
+/// ([`support::legality::checked`]); each `accepted` text is built, and each
+/// `refused` one and an integer where a text is expected are refused, within
+/// the cost. A refused text is dCBOR text: only the type's rule refuses it,
+/// by `refusal`'s variant naming the expected code point.
+fn checked_text_is_certified<T>(
+    type_name: &str,
+    text_of: fn(&T) -> &str,
+    accepted: &[&str],
+    refused: &[(&str, u32)],
+    refusal: fn(&dcbor::Error) -> Option<u32>,
+) where
+    T: dcbor::bounded::decode::construction::in_place::Transferable<Limits> + 'static,
+    T::State: dcbor::bounded::decode::construction::Uniform
+        + dcbor::bounded::decode::construction::reclamation::Custody<
+            Observation = dcbor::bounded::decode::construction::in_place::CheckedObservation,
+        >,
+{
+    use support::legality::checked;
+    use support::{builds_within_cost, certified, legal, rejects_within_cost, uniform};
+    let text = |text: &str| dcbor::CBOR::from(text).to_cbor_data();
+    for source in accepted {
+        let wire = text(source);
+        let name = format!("{type_name} from {wire:02x?}");
+        legal(&name, &uniform::<T>(&name, &wire), &checked());
+        builds_within_cost::<T>(&wire, |v| assert_eq!(text_of(v), *source));
+    }
+    // Nothing completes from these, so the complete class has no member to
+    // check: the reduction alone is certified.
+    let mut rejected: Vec<Vec<u8>> = refused.iter().map(|(source, _)| text(source)).collect();
+    rejected.push(vec![0x07]);
+    for wire in &rejected {
+        let name = format!("{type_name} from {wire:02x?}");
+        legal(&name, &certified::<T>(&name, wire), &checked());
+        rejects_within_cost::<T>(wire);
+    }
+    for &(source, point) in refused {
+        let wire = text(source);
+        assert_eq!(
+            String::try_from(dcbor::CBOR::try_from_data(&wire).unwrap()).unwrap(),
+            source,
+            "{source:?} is not dCBOR text"
+        );
+        let built = constructed::<T>(
+            &wire,
+            Discipline::Admitted,
+            |error| matches!(error, DecodeError::Invalid(error) if refusal(error) == Some(point)),
+            |_| {},
+        );
+        assert!(!built, "{source:?} was built as a {type_name}");
+    }
+}
+
+/// [`checked_text_is_certified`] under the stabilized-text rule. Texts:
+/// empty, one byte, across a copy unit, of multibyte scalars, an assigned
+/// code point of the pinned version (U+1FA8A TROMBONE, `DerivedAge.txt`
+/// line 2106); refused: an unassigned one (U+0378).
 #[test]
 fn a_stabilized_text_is_certified_its_transitions_legal_and_within_its_cost() {
     use dcbor::{Error, StabilizedText};
-    use support::legality::stabilized;
-    use support::{builds_within_cost, certified, legal, rejects_within_cost, uniform};
-    let text = |text: &str| dcbor::CBOR::from(text).to_cbor_data();
     let long = "x".repeat(65);
     let multibyte = "\u{e9}\u{1f600}".repeat(20);
-    let assigned = "\u{1fa8a}";
-    for source in ["", "x", long.as_str(), multibyte.as_str(), assigned] {
-        let wire = text(source);
-        let name = format!("StabilizedText from {wire:02x?}");
-        legal(
-            &name,
-            &uniform::<StabilizedText>(&name, &wire),
-            &stabilized(),
-        );
-        builds_within_cost::<StabilizedText>(&wire, |v| assert_eq!(v.as_str(), source));
-    }
-    // dCBOR accepts U+0378 as text: only the stabilized text refuses it.
-    let unassigned = text("\u{378}");
-    assert_eq!(
-        String::try_from(dcbor::CBOR::try_from_data(&unassigned).unwrap()).unwrap(),
-        "\u{378}"
-    );
-    // Nothing completes from these, so the complete class has no member to
-    // check: the reduction alone is certified.
-    for wire in [unassigned.as_slice(), &[0x07]] {
-        let name = format!("StabilizedText from {wire:02x?}");
-        legal(
-            &name,
-            &certified::<StabilizedText>(&name, wire),
-            &stabilized(),
-        );
-        rejects_within_cost::<StabilizedText>(wire);
-    }
-    let built = constructed::<StabilizedText>(
-        &unassigned,
-        Discipline::Admitted,
-        |error| {
-            matches!(
-                error,
-                DecodeError::Invalid(Error::UnassignedCodePoint(0x378))
-            )
+    checked_text_is_certified::<StabilizedText>(
+        "StabilizedText",
+        StabilizedText::as_str,
+        &["", "x", &long, &multibyte, "\u{1fa8a}"],
+        &[("\u{378}", 0x378)],
+        |error| match error {
+            Error::UnassignedCodePoint(point) => Some(*point),
+            _ => None,
         },
-        |_| {},
     );
-    assert!(!built, "U+0378 was built as a stabilized text");
+}
+
+/// [`checked_text_is_certified`] under the ASCII rule. Texts: empty, one
+/// byte, across a copy unit, both edges of the range (U+0000, U+007F)
+/// across copy units; refused: the first code point past the range
+/// (U+0080) after ASCII bytes, and a two-byte scalar the NFC quick check
+/// proves (U+00E9), which the quick-only wire profile admits and only the
+/// rule refuses.
+#[test]
+fn an_ascii_text_is_certified_its_transitions_legal_and_within_its_cost() {
+    use dcbor::{AsciiText, Error};
+    let long = "x".repeat(65);
+    let edges = "\u{0}\u{7f}".repeat(40);
+    checked_text_is_certified::<AsciiText>(
+        "AsciiText",
+        AsciiText::as_str,
+        &["", "x", &long, &edges],
+        &[("ab\u{80}", 0x80), ("\u{e9}", 0xE9)],
+        |error| match error {
+            Error::NonAsciiText(point) => Some(*point),
+            _ => None,
+        },
+    );
+}
+
+/// A fixed-length byte string's construction ([`dcbor::FixedBytes`]): its
+/// declared reduction and complete class are certified on every state it
+/// reaches ([`support::uniform`]), every transition is in its successor
+/// relations ([`support::legality::fixed`]), and it is built within its
+/// cost. Lengths: empty, one byte, within one copy unit, exactly one
+/// quantum, one past it, across several units. Refused, certified and
+/// within its cost, its refusal's custody released: a byte string one byte
+/// short and one byte long, each naming both lengths, and a text of the
+/// type's length, the wrong type.
+#[test]
+fn a_fixed_byte_string_is_certified_its_transitions_legal_and_within_its_cost() {
+    use dcbor::{Error, FixedBytes};
+    use support::legality::fixed;
+    use support::{builds_within_cost, certified, legal, rejects_within_cost, uniform};
+    fn lengths<const N: usize>() {
+        let source: [u8; N] = core::array::from_fn(|at| at as u8);
+        let wire = dcbor::CBOR::to_byte_string(source).to_cbor_data();
+        let name = format!("FixedBytes<{N}> from {N} bytes");
+        legal(&name, &uniform::<FixedBytes<N>>(&name, &wire), &fixed());
+        builds_within_cost::<FixedBytes<N>>(&wire, |v| assert_eq!(v.as_array(), &source));
+        for wrong in [N.checked_sub(1), Some(N + 1)].into_iter().flatten() {
+            let wire = dcbor::CBOR::to_byte_string(vec![1u8; wrong]).to_cbor_data();
+            let name = format!("FixedBytes<{N}> from {wrong} bytes");
+            legal(&name, &certified::<FixedBytes<N>>(&name, &wire), &fixed());
+            rejects_within_cost::<FixedBytes<N>>(&wire);
+            let built = constructed::<FixedBytes<N>>(
+                &wire,
+                Discipline::Admitted,
+                |error| {
+                    matches!(
+                        error,
+                        DecodeError::Invalid(Error::WrongLength { expected, actual })
+                            if *expected == N && *actual == wrong
+                    )
+                },
+                |_| {},
+            );
+            assert!(!built, "{name}: built");
+        }
+        let text = dcbor::CBOR::from("x".repeat(N).as_str()).to_cbor_data();
+        let name = format!("FixedBytes<{N}> from a text of {N} bytes");
+        legal(&name, &certified::<FixedBytes<N>>(&name, &text), &fixed());
+        rejects_within_cost::<FixedBytes<N>>(&text);
+    }
+    lengths::<0>();
+    lengths::<1>();
+    lengths::<32>();
+    lengths::<64>();
+    lengths::<65>();
+    lengths::<200>();
+}
+
+/// A fixed-length byte string copies each byte exactly once, in units of at
+/// most a quantum, each admitted before it is copied, and allocates
+/// nothing; a refusal of its length is one admitted unit. The units are
+/// derived here by hand from the rule, not from the binding: at the root
+/// its session's bind unit (1, 0), then the copies, then the session's
+/// begin-cleanup unit (1, 0) and the one cleanup unit (1, 0). The copies:
+/// one of no bytes for the empty type; one of 32; one of 64; 64 and 1 for
+/// 65; 64, 64 and 2 for 130. The refusal of 129 bytes where 130 are fixed:
+/// one unit of one value and no bytes. The copy's charge witness: a copy
+/// that wrote bytes without admitting them fails here.
+#[test]
+fn a_fixed_byte_string_copies_every_byte_once_and_allocates_nothing() {
+    use dcbor::FixedBytes;
+    use dcbor::bounded::WriteWork;
+    fn charged<const N: usize>(copies: u64) {
+        let source = [0x5au8; N];
+        let wire = dcbor::CBOR::to_byte_string(source).to_cbor_data();
+        let built = support::construction::<FixedBytes<N>>(&wire, None, |v| {
+            assert_eq!(v.as_array(), &source)
+        });
+        assert!(built.built, "FixedBytes<{N}> was not built");
+        assert!(
+            built.allocations.is_empty(),
+            "FixedBytes<{N}> allocated {:?}",
+            built.allocations
+        );
+        assert_eq!(
+            built.used,
+            WriteWork::new(3 + copies, N as u64),
+            "FixedBytes<{N}>: the bind, {copies} copies of {N} bytes, the begin-cleanup \
+             unit, then one cleanup unit"
+        );
+    }
+    charged::<0>(1);
+    charged::<32>(1);
+    charged::<64>(1);
+    charged::<65>(2);
+    charged::<130>(3);
+    let wire = dcbor::CBOR::to_byte_string([0x5au8; 129]).to_cbor_data();
+    let refused = support::construction::<FixedBytes<130>>(&wire, None, |_| {});
+    assert!(refused.rejected && !refused.built);
+    assert!(refused.allocations.is_empty());
+    assert_eq!(
+        refused.used,
+        WriteWork::new(4, 0),
+        "the bind, the one refusing unit, the begin-cleanup unit, then one cleanup unit"
+    );
 }
 
 /// How [`constructed`] schedules a construction's turns and its cleanup's.
@@ -590,65 +733,97 @@ where
     })
 }
 
-/// A stabilized text checks every byte of its text exactly once, in windows
-/// of at most a quantum ending on a scalar, before anything is allocated:
-/// its construction admits exactly a `String`'s, and one unit of one value
-/// and the window's bytes per window more. The windows are derived here by
-/// hand from the rule, not from the binding: none for the empty text; one
-/// of 4 bytes for U+1FA8A; 64, 64 and 2 for 130 one-byte scalars; 64 and 16
-/// for 40 two-byte ones; and, for one byte then sixteen four-byte scalars,
-/// 61, the quantum backed off to the scalar boundary below byte 64, then 4.
-/// A text refused for an unassigned code point admits its one window and
+/// A checked text checks every byte of its text exactly once, in windows of
+/// at most a quantum ending on a scalar, before anything is allocated: its
+/// construction admits exactly a `String`'s, and one unit of one value and
+/// the window's bytes per window more. Each case's windows, `(values,
+/// bytes)`, are derived by hand from the rule, not from the binding.
+/// `refused`, a two-byte text the rule refuses, admits its one window and
 /// allocates nothing; its cleanup is the one unit of a buffer with nothing
 /// installed, one value. Built at the root, its session adds its bind and
 /// begin-cleanup units, one value each (`SESSION_COST`), which the
-/// comparisons with a `String` above cancel. The check's charge witness: a
-/// check that inspected a window without admitting it fails here.
-#[test]
-fn a_stabilized_text_checks_every_byte_once_before_building() {
-    use dcbor::StabilizedText;
+/// comparisons with a `String` cancel. The check's charge witness: a check
+/// that inspected a window without admitting it fails here.
+fn checked_text_checks_every_byte_once<T>(
+    text_of: fn(&T) -> &str,
+    cases: &[(String, (u64, u64))],
+    refused: &str,
+) where
+    T: dcbor::bounded::decode::construction::in_place::InPlace<Limits>,
+{
     use dcbor::bounded::WriteWork;
-    let backed_off = format!("x{}", "\u{1fa8a}".repeat(16));
-    let cases = [
-        (String::new(), (0, 0)),
-        ("\u{1fa8a}".to_string(), (1, 4)),
-        ("x".repeat(130), (3, 130)),
-        ("\u{e9}".repeat(40), (2, 80)),
-        (backed_off, (2, 65)),
-    ];
     for (source, (values, bytes)) in cases {
         let wire = dcbor::CBOR::from(source.as_str()).to_cbor_data();
-        let stabilized = support::construction::<StabilizedText>(&wire, None, |v| {
-            assert_eq!(v.as_str(), source)
-        });
-        let text = support::construction::<String>(&wire, None, |v| assert_eq!(v, &source));
+        let checked = support::construction::<T>(&wire, None, |v| assert_eq!(text_of(v), source));
+        let text = support::construction::<String>(&wire, None, |v| assert_eq!(v, source));
         assert_eq!(
             WriteWork::new(
-                stabilized.used.values - text.used.values,
-                stabilized.used.bytes - text.used.bytes
+                checked.used.values - text.used.values,
+                checked.used.bytes - text.used.bytes
             ),
-            WriteWork::new(values, bytes),
+            WriteWork::new(*values, *bytes),
             "the check of {} bytes",
             source.len()
         );
-        assert_eq!(stabilized.allocations, text.allocations);
+        assert_eq!(checked.allocations, text.allocations);
     }
-    let wire = dcbor::CBOR::from("\u{378}").to_cbor_data();
-    let refused = support::construction::<StabilizedText>(&wire, None, |_| {});
+    assert_eq!(refused.len(), 2, "the refused text is two bytes");
+    let wire = dcbor::CBOR::from(refused).to_cbor_data();
+    let refused = support::construction::<T>(&wire, None, |_| {});
     assert!(refused.rejected && !refused.built);
     assert!(
         refused.allocations.is_empty(),
         "a refused text allocated {:?}",
         refused.allocations
     );
-    // The session's bind unit (1, 0), the one window of U+0378's two bytes
-    // (1, 2), the session's begin-cleanup unit (1, 0), then the buffer's
-    // one cleanup unit with nothing installed (1, 0).
+    // The session's bind unit (1, 0), the one window of the text's two bytes
+    // (1, 2), the session's begin-cleanup unit (1, 0), then the buffer's one
+    // cleanup unit with nothing installed (1, 0).
     assert_eq!(
         refused.used,
         WriteWork::new(4, 2),
-        "the bind, the one window of U+0378's two bytes, the begin-cleanup unit, \
-         then one cleanup unit"
+        "the bind, the one window of two bytes, the begin-cleanup unit, then one cleanup unit"
+    );
+}
+
+/// [`checked_text_checks_every_byte_once`] under the stabilized-text rule:
+/// none for the empty text; one of 4 bytes for U+1FA8A; 64, 64 and 2 for
+/// 130 one-byte scalars; 64 and 16 for 40 two-byte ones; and, for one byte
+/// then sixteen four-byte scalars, 61, the quantum backed off to the scalar
+/// boundary below byte 64, then 4. Refused: U+0378, unassigned.
+#[test]
+fn a_stabilized_text_checks_every_byte_once_before_building() {
+    use dcbor::StabilizedText;
+    let backed_off = format!("x{}", "\u{1fa8a}".repeat(16));
+    checked_text_checks_every_byte_once::<StabilizedText>(
+        StabilizedText::as_str,
+        &[
+            (String::new(), (0, 0)),
+            ("\u{1fa8a}".to_string(), (1, 4)),
+            ("x".repeat(130), (3, 130)),
+            ("\u{e9}".repeat(40), (2, 80)),
+            (backed_off, (2, 65)),
+        ],
+        "\u{378}",
+    );
+}
+
+/// [`checked_text_checks_every_byte_once`] under the ASCII rule: none for
+/// the empty text; one of 1 byte for U+007F; 64, 64 and 2 for 130 one-byte
+/// scalars; 64 exactly for 64, no window backed off, every ASCII scalar one
+/// byte. Refused: U+00E9, not ASCII.
+#[test]
+fn an_ascii_text_checks_every_byte_once_before_building() {
+    use dcbor::AsciiText;
+    checked_text_checks_every_byte_once::<AsciiText>(
+        AsciiText::as_str,
+        &[
+            (String::new(), (0, 0)),
+            ("\u{7f}".to_string(), (1, 1)),
+            ("x".repeat(130), (3, 130)),
+            ("\u{0}".repeat(64), (1, 64)),
+        ],
+        "\u{e9}",
     );
 }
 

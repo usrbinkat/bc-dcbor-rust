@@ -49,6 +49,7 @@ macro_rules! scalar {
         // changed. cost: `scalar_cost::<$ty>()` is the one admitted unit.
         unsafe impl<A: Allocator> InPlace<A> for $ty {
             const COST: ConstructionCost = crate::const_cost!(scalar_cost::<$ty>());
+            const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::SCALAR;
 
             fn build_step<'b>(
                 ctx: BindingContext<'b, '_, '_, '_, Self, A>,

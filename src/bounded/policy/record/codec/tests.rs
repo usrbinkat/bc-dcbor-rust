@@ -82,9 +82,15 @@ fn every_event() -> Vec<Event> {
         });
     }
     for refusal in [
+        LimitRefusal::Turn,
+        LimitRefusal::QuantumTooSmall,
         LimitRefusal::Work,
+        LimitRefusal::Requested,
         LimitRefusal::Storage,
+        LimitRefusal::TooLarge,
+        LimitRefusal::Contended,
         LimitRefusal::Deadline,
+        LimitRefusal::Cancelled,
         LimitRefusal::Scheduled(0),
         LimitRefusal::Scheduled(usize::MAX),
         LimitRefusal::Unrecorded,
@@ -192,8 +198,10 @@ fn words_naming_no_observation_are_refused() {
     let mut unknown_obligation = admit;
     unknown_obligation[3] = 4;
     cases.push(("unknown obligation", unknown_obligation));
+    // The first refusal code past the last one `refusal_code` writes (11,
+    // `Cancelled`): 12, stored as the answer 3 plus the code.
     let mut unknown_refusal = refused;
-    unknown_refusal[4] = 3 + 6;
+    unknown_refusal[4] = 3 + 12;
     cases.push(("unknown refusal", unknown_refusal));
     let mut refusal_argument = refused;
     refusal_argument[5] = 1;

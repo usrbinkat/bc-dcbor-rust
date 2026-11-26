@@ -3,7 +3,6 @@
 //! without replay, every physical request failed, and at the boundaries the
 //! layer selects ([`dcbor_test_support::rigor`]) the consumer retires,
 //! unwinds or cancels; the input is released exactly once, by the drain.
-use dcbor::bounded::decode::Options;
 use dcbor_test_support::classes;
 use dcbor_test_support::pipeline::{Expected, Schedule, decode, matrix};
 use dcbor_test_support::rigor::rigor;
@@ -28,7 +27,6 @@ fn every_admission_physical_failure_and_stop_of_an_owned_text_decode() {
             |schedule| {
                 decode::<String>(
                     &wire,
-                    Options::normalizing(8),
                     schedule,
                     &classes::reduced::<dcbor_test_support::Instrumented, String>(),
                     |value| assert_eq!(value, &expected),
@@ -53,7 +51,6 @@ fn malformed_inputs_keep_cleanup_custody_under_every_fault() {
             |schedule| {
                 decode::<String>(
                     wire,
-                    Options::normalizing(8),
                     schedule,
                     &classes::reduced::<dcbor_test_support::Instrumented, String>(),
                     |value| panic!("malformed input published {value:?}"),
@@ -63,15 +60,37 @@ fn malformed_inputs_keep_cleanup_custody_under_every_fault() {
     }
 }
 
+/// A type that accepts no text declares the quick-only text policy
+/// (`InPlace::WIRE`), so its owned decode refuses a text the quick check
+/// cannot prove normal, canonical though it is, inside the parse, before
+/// construction begins: it ends at fewer boundaries than the same type's
+/// decode of a quick-proven text, which the parse accepts and construction
+/// refuses as the wrong type. Under strict validation both would pass the
+/// parse and end alike in construction. A text type accepts the unproven
+/// text (`every_admission_physical_failure_and_stop_of_an_owned_text_decode`).
 #[test]
-fn quick_only_refuses_text_it_cannot_prove_normal() {
-    let wire = dcbor::CBOR::from("\u{301}").to_cbor_data();
-    let report = decode::<String>(
-        &wire,
-        Options::quick_only(8),
-        &Schedule::BASELINE,
-        &classes::reduced::<dcbor_test_support::Instrumented, String>(),
-        |value| panic!("unproven text published {value:?}"),
+fn a_type_without_text_refuses_unproven_text_in_the_parse() {
+    let run = |text: &str| {
+        let wire = dcbor::CBOR::from(vec![dcbor::CBOR::from(text)]).to_cbor_data();
+        decode::<Vec<u64>>(
+            &wire,
+            &Schedule::BASELINE,
+            &classes::reduced::<dcbor_test_support::Instrumented, Vec<u64>>(),
+            |value| panic!("a text published as {value:?}"),
+        )
+    };
+    let unproven = run("\u{301}");
+    let proven = run("x");
+    for (name, report) in [("unproven", &unproven), ("proven", &proven)] {
+        assert!(
+            report.invalid && !report.complete && !report.failed,
+            "{name}: refused as invalid"
+        );
+    }
+    assert!(
+        unproven.boundaries.len() < proven.boundaries.len(),
+        "the unproven text reached construction: {} boundaries, the proven text's {}",
+        unproven.boundaries.len(),
+        proven.boundaries.len()
     );
-    assert!(report.invalid && !report.complete && !report.failed);
 }

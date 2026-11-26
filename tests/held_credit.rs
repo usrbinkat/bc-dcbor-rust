@@ -125,15 +125,16 @@ fn a_sequences_held_credit_is_its_ledgers_held() {
     });
 }
 
-/// Byte buffers: a text, a stabilized text and a minimal big integer's
-/// magnitude, each holding its payload's release from its admission to its
-/// grant.
+/// Byte buffers: a text, a stabilized text, an ASCII text and a minimal big
+/// integer's magnitude, each holding its payload's release from its
+/// admission to its grant.
 #[test]
 fn a_buffers_held_credit_is_its_ledgers_held() {
     matrix::<String>("String", &[0x63, b'a', b'b', b'c'], |v| v == "abc");
     matrix::<dcbor::StabilizedText>("StabilizedText", &[0x62, b'a', b'b'], |v| {
         v.as_str() == "ab"
     });
+    matrix::<dcbor::AsciiText>("AsciiText", &[0x62, b'a', b'b'], |v| v.as_str() == "ab");
     // A bignum whose magnitude fits an integer is not minimal; 2^64 is.
     let mut bignum = vec![0xc2, 0x49, 0x01];
     bignum.extend([0; 8]);

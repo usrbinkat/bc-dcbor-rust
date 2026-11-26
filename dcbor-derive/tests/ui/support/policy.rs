@@ -39,15 +39,13 @@ impl dcbor::bounded::Budget for Policy {
 }
 impl dcbor::bounded::Releasing for Policy {
     type Permit = ();
+    fn reclaim(&mut self, _: u64, _: u64) -> Result<(), ()> {
+        Ok(())
+    }
     fn permit_identity(_: &()) -> dcbor::bounded::Identity {
         dcbor::bounded::Identity::UNOBSERVED
     }
-    fn custody(
-        _: &(),
-        _: dcbor::bounded::Identity,
-        _: dcbor::bounded::RecordStage,
-    ) {
-    }
+    fn custody(_: &(), _: dcbor::bounded::Identity, _: dcbor::bounded::RecordStage) {}
 }
 impl dcbor::bounded::Allocator for Policy {
     fn allocate(&mut self, _: u64) -> Result<(), ()> {

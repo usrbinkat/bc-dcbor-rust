@@ -1297,6 +1297,8 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
             End::Published | End::Reclaimed => return Ok(Step::Finished),
             // The cleanup unit that reports `Done` admits the completion,
             // so it is progress; the step after it reports `Finished`.
+            // Through the cleanup capability: a failed preparation's cleanup
+            // is admitted as cleanup, never as foreground work.
             End::Failed => return self.reclaim_step(a).map(|_| Step::Progress),
             End::Running => {}
         }
@@ -1380,21 +1382,31 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
     /// borrow of the source the traversal still holds: a reclaimed
     /// preparation refers to nothing, so the source it borrowed may be
     /// released while the preparation is still observed ([`Planned`]).
-    /// Bounded on [`Releasing`]: no new allocation through the supplied
-    /// cleanup capability.
-    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// The public entry: the cleanup capability minted over `a`
+    /// ([`reclamation::with_cleanup`]), then [`Self::reclaim_under`].
+    pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,
+    ) -> BoundedResult<Reclaimed, A> {
+        reclamation::with_cleanup(a, |cleanup| self.reclaim_under(cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under the cleanup capability its caller's
+    /// cleanup holds: the one implementation, every unit admitted as
+    /// cleanup ([`Releasing::reclaim`]) and no allocation requestable.
+    pub(crate) fn reclaim_under<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<Reclaimed, A> {
         // Idempotent: a holder that entered cleanup in an admitted unit of
         // its own ([`Self::enter_cleanup`], `Planned`'s transition) changes
         // nothing here.
-        self.enter_cleanup(a.performer());
-        let cleanup = PreparationPlace::Cleanup;
+        self.enter_cleanup(cleanup.performer());
+        let place = PreparationPlace::Cleanup;
         if let Some(text) = self.text_mut()
             && text.position().phase != text_cursor::Phase::Finished
         {
-            at(cleanup, || text.reclaim_step(a))?;
+            at(place, || text.reclaim_under(cleanup))?;
         } else if self.normalized.is_some() {
             // The copied encoding's release was paid for by its request.
             self.normalized = None;
@@ -1402,25 +1414,25 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
             // Frames and open maps are plain data: settled, each arena is
             // discarded in one unit; cancelled while relocating or staging,
             // drained per element, which the bound counts.
-            at(cleanup, || self.frames.reclaim_copy_step(a))?;
+            at(place, || self.frames.reclaim_copy_step(cleanup))?;
         } else if !self.map_frames.is_released() {
-            at(cleanup, || self.map_frames.reclaim_copy_step(a))?;
+            at(place, || self.map_frames.reclaim_copy_step(cleanup))?;
         } else if !self.bytes.is_released() {
-            at(cleanup, || self.bytes.reclaim_copy_step(a))?;
+            at(place, || self.bytes.reclaim_copy_step(cleanup))?;
         } else if !self.holes.is_released() {
-            at(cleanup, || self.holes.reclaim_copy_step(a))?;
+            at(place, || self.holes.reclaim_copy_step(cleanup))?;
         } else if !self.cursors.is_released() {
             // The cursors' windows were settled at entry: their positions
             // are plain data.
-            at(cleanup, || self.cursors.reclaim_copy_step(a))?;
+            at(place, || self.cursors.reclaim_copy_step(cleanup))?;
         } else if !self.windows.is_released() {
             // Settled at entry, every element is none, but an obligation's
             // type drops, so the arena drains one element per unit.
-            at(cleanup, || self.windows.reclaim_step(a))?;
+            at(place, || self.windows.reclaim_under(cleanup))?;
         } else if !self.dynamic.is_released() {
-            at(cleanup, || self.dynamic.reclaim_step(a))?;
+            at(place, || self.dynamic.reclaim_step(cleanup))?;
         } else {
-            CLEANUP_DONE.admit(a)?;
+            CLEANUP_DONE.admit(cleanup)?;
             self.release_source();
             if self.end == End::Failed {
                 self.end = End::Reclaimed;
@@ -3705,13 +3717,20 @@ pub struct RetiringPrepared<P> {
 impl<P> RetiringPrepared<P> {
     /// Release one of the plan's allocations and its permit, a release its
     /// growth paid for; once none is held, the call admits the completion it
-    /// reports as `Done`.
-    pub fn reclaim_step<B: Budget>(&mut self, b: &mut B) -> BoundedResult<Reclaimed, B> {
-        if self.plan.bytes.release() || self.plan.holes.release() {
-            return Ok(Reclaimed::Progress);
-        }
-        CLEANUP_DONE.admit(b)?;
-        Ok(Reclaimed::Done)
+    /// reports as `Done`, under the cleanup capability minted over `a`
+    /// ([`reclamation::with_cleanup`]): admitted as cleanup, never as
+    /// foreground work.
+    pub fn reclaim_step<A: Allocator<Permit = P>>(
+        &mut self,
+        a: &mut A,
+    ) -> BoundedResult<Reclaimed, A> {
+        reclamation::with_cleanup(a, |cleanup| {
+            if self.plan.bytes.release() || self.plan.holes.release() {
+                return Ok(Reclaimed::Progress);
+            }
+            CLEANUP_DONE.admit(cleanup)?;
+            Ok(Reclaimed::Done)
+        })
     }
 }
 
@@ -3944,7 +3963,7 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
             PlanPhase::ReclaimPreparation => {
                 // SAFETY: the prefix is complete, and the preparation is held
                 // until this phase ends (`holds_preparation`).
-                let reclaimed = unsafe { preparation.assume_init_mut() }.reclaim_step(cleanup)?;
+                let reclaimed = unsafe { preparation.assume_init_mut() }.reclaim_under(cleanup)?;
                 if reclaimed == Reclaimed::Done {
                     // The drained preparation dropped in place: the record's
                     // block runs no destructor, and each of its arenas keeps
@@ -5014,7 +5033,11 @@ mod bound_tests {
             held,
             "retirement released storage"
         );
-        let mut no_work = Limits::new(0, 0, 0);
+        // A turn granting nothing: cleanup is never refused for a lifetime
+        // ceiling, but every unit spends the turn, so this policy admits no
+        // cleanup unit at all.
+        let mut no_work = Limits::turns();
+        no_work.exhaust();
         let mut releases = 0;
         loop {
             let before = acquisition.live_bytes();

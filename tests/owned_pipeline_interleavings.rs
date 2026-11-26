@@ -5,7 +5,6 @@
 #![cfg(feature = "std")]
 #![forbid(unsafe_code)]
 use dcbor::ByteString;
-use dcbor::bounded::decode::Options;
 use dcbor::bounded::decode::construction::DecodeOwner;
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
 use dcbor::bounded::encoding::{OwnedPreparation, OwnedPrepared};
@@ -277,7 +276,7 @@ fn interleaved<H: Custodial<Reservation>>(
         let wire = dcbor::CBOR::from(text).to_cbor_data();
         turns += holding.holding(Lent::new(scope), Retirement::Exhausted, |view| {
             view.copied(policy, &wire, |input| {
-                input.decode::<String, _>(policy, Options::normalizing(8), |value| {
+                input.decode::<String, _>(policy, |value| {
                     let bound = preparation_turns(value.value().value());
                     value.transfer(
                         OwnedPreparation::prepare,
@@ -596,13 +595,9 @@ fn cross_thread_plan_retirement_races_with_shutdown_without_double_release() {
                                 let slot = if reverse { 1 - index } else { index };
                                 let wire = dcbor::CBOR::from(text).to_cbor_data();
                                 owner.copied(policy, &wire, |input| {
-                                    input.decode::<String, _>(
-                                        policy,
-                                        Options::normalizing(8),
-                                        |value| {
-                                            value.prepare(policy, |plan| plan.deposit(batch, slot))
-                                        },
-                                    )
+                                    input.decode::<String, _>(policy, |value| {
+                                        value.prepare(policy, |plan| plan.deposit(batch, slot))
+                                    })
                                 })???;
                             }
                             let shutdown =
@@ -642,7 +637,7 @@ where
         let policy = run.policy(u64::MAX);
         let made = run.scoped(policy, &Unwitnessed, |owner| {
             owner.copied(policy, wire, |input| {
-                input.decode::<T, _>(policy, Options::normalizing(16), |value| {
+                input.decode::<T, _>(policy, |value| {
                     inspect(value.value().value());
                     let turns = support::turns(
                         dcbor::bounded::encoding::owned_prepare_bound::<ByteString, T, Limits, ()>(

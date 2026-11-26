@@ -267,7 +267,7 @@ fn typed_output_owns_capacity_after_parser_scratch_release() {
     recorded_run(|run| {
         let decoding = run.policy(POOL);
         let value = run
-            .with_policy(decoding, |m| decode_typed::<String, _>(&wire, 8, m))
+            .with_policy(decoding, |m| decode_typed::<String, _>(&wire, m))
             .map_err(failed("typed output decode"))?;
         run.holding(value, Retirement::LastReference, &Unwitnessed, |value| {
             value.with_policy(decoding, |value, m| {
@@ -288,7 +288,6 @@ fn typed_output_owns_capacity_after_parser_scratch_release() {
 
 #[test]
 fn typed_field_copies_have_bounded_units() {
-    use dcbor::bounded::decode::Options;
     use dcbor::bounded::decode::construction::DecodeOwner;
     let text = "\u{1f600}\u{e9}".repeat(1024);
     let wire = text_wire(&text);
@@ -300,7 +299,7 @@ fn typed_field_copies_have_bounded_units() {
             |owner| {
                 owner.initialize(policy)?;
                 owner
-                    .decoded::<String, _>(policy, &wire, Options::normalizing(8), |value| {
+                    .decoded::<String, _>(policy, &wire, |value| {
                         value.with_policy(policy, |value, m| {
                             assert_eq!(value.value(), &text);
                             m.assert_units(TURN);
@@ -343,7 +342,7 @@ fn shared_pool_thousand_real_decodes_restore_exact_capacity() {
                 if fixture == 0 {
                     barrier.wait();
                 }
-                let result = decode_typed::<Vec<String>, _>(ARRAY, 8, m)
+                let result = decode_typed::<Vec<String>, _>(ARRAY, m)
                     .map_err(failed("worker typed decode"))?;
                 let value = held.retain(result);
                 assert_eq!(value.value(), &["abc", "123", "hello"]);
@@ -383,11 +382,14 @@ fn real_capacity_exhaustion_is_distinct_from_work_and_invalid_input() {
         });
         drop(owner);
         run.with_policy(policy, |pool| assert_eq!(pool.live_bytes(), 0));
-        let decoding = run.shared_policy(policy);
-        let result = run.with_policy(decoding, |m| {
-            m.set_limit(WriteWork::new(0, u64::MAX));
-            decode(ARRAY, 8, m)
-        });
+        let decoding = run.shared_policy_within(
+            policy,
+            dcbor::bounded::Ceilings {
+                work: WriteWork::new(0, u64::MAX),
+                ..dcbor::bounded::Ceilings::UNLIMITED
+            },
+        );
+        let result = run.with_policy(decoding, |m| decode(ARRAY, 8, m));
         match result {
             Err(DecodeError::Resource(BoundedError::Refused(LimitRefusal::Work))) => {}
             Ok(document) => run.holding(document, Retirement::Released, &Unwitnessed, |_| {

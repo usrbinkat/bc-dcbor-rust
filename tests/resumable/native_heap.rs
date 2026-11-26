@@ -9,11 +9,11 @@ use super::support::{
     self, Fault, Finding, PolicyId, RecordedRun, Retirement, Stopped, allowed, physical_matrix,
     pipeline::Unwitnessed, refusal_matrix, rigor::rigor,
 };
+use dcbor::bounded::decode::DecodeError;
 use dcbor::bounded::decode::construction::{
     DecodeOwner,
     in_place::{StableOption, Transferable},
 };
-use dcbor::bounded::decode::{DecodeError, Options};
 use dcbor::bounded::{
     BoundedError, Credits, Custodial, Failure, Family, Reservation, Step, WriteWork,
 };
@@ -35,7 +35,6 @@ fn cleaned(observer: &Observation, calls: usize) {
 /// and reservation.
 fn allocation_matrix<T: Transferable<Limits> + 'static>(wire: &[u8], check: impl Fn(&T)) {
     let name = format!("decode physically of {}", core::any::type_name::<T>());
-    let options = Options::normalizing(8);
     physical_matrix(&name, |failure| {
         suite(|run, policy| {
             let observer = Observation::begin(failure);
@@ -51,12 +50,11 @@ fn allocation_matrix<T: Transferable<Limits> + 'static>(wire: &[u8], check: impl
                     let decoded = owner.decoder::<_, T, _, _>(
                         policy,
                         support::Borrowing(wire),
-                        options,
                         &observer,
                         |decoding| {
                             decoding.drive(
                                 policy,
-                                support::borrowed_decode_turns::<T>(wire.len(), options),
+                                support::borrowed_decode_turns::<T>(wire.len()),
                                 Retirement::Published,
                                 |value| {
                                     check(value.value().value());
@@ -164,7 +162,6 @@ fn every_public_decoder_cancellation_transfers_custody_without_allocating() {
                 // policy with a trace of its own; the scope and its input are
                 // setup, unwitnessed, under the policy itself.
                 let decoding = run.shared_policy(setup);
-                let options = Options::normalizing(8);
                 // The decoder's state after its last turn, read while it is
                 // still held: its permits with their bytes, the policy's
                 // live bytes, and the observer's figures.
@@ -178,7 +175,6 @@ fn every_public_decoder_cancellation_transfers_custody_without_allocating() {
                         owner.decoder::<_, Vec<String>, _, _>(
                             setup,
                             support::Borrowing(&wire),
-                            options,
                             &observer,
                             |decoder| {
                                 assert_eq!(observer.snapshot().calls, 0, "constructors allocated");
@@ -652,6 +648,13 @@ fn a_dropped_owned_frees_its_buffer_before_releasing_its_permit() {
     }
     impl Releasing for Policy<'_> {
         type Permit = Checked;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a third-party policy forwards a cleanup admission already made through the route"
+        )]
+        fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
+            self.0.reclaim(values, bytes)
+        }
         fn permit_identity(permit: &Checked) -> Identity {
             Limits::permit_identity(&permit._reservation)
         }
@@ -1285,7 +1288,6 @@ fn an_abandoned_scope_conserves_credit_through_its_terminal_drain() {
                     owner.decoder::<_, Vec<String>, _, _>(
                         policy,
                         support::Borrowing(&wire),
-                        Options::normalizing(8),
                         &support::pipeline::Unwitnessed,
                         |decoder| {
                             decoder.controlled(

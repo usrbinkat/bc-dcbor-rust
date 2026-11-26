@@ -32,7 +32,6 @@ fn last_worker_handle_reclaims_an_abandoned_scope() {
         run.terminal::<String, _, _>(
             policy,
             &[0x62, b'o', b'k'],
-            dcbor::bounded::decode::Options::normalizing(8),
             &Unwitnessed,
             DropOrder::OwnerFirst,
             |value| {
@@ -59,15 +58,27 @@ fn last_worker_handle_reclaims_an_abandoned_scope() {
     });
 }
 
-/// A policy that holds its first admission at a rendezvous: it signals
-/// `entered`, then waits for `released`. The first admission of a queue step
-/// is the removal of the front record, made while the step holds the
-/// queue's stepping flag, so the holder is parked inside `step`. Everything
-/// else, every observation, identity, credit origin and settlement, is its
-/// inner policy's, forwarded unchanged.
+/// A policy that holds its first admission, foreground or cleanup, at a
+/// rendezvous: it signals `entered`, then waits for `released`. The first
+/// admission of a queue step is the removal of the front record, a cleanup
+/// admission made while the step holds the queue's stepping flag, so the
+/// holder is parked inside `step`. Everything else, every observation,
+/// identity, credit origin and settlement, is its inner policy's, forwarded
+/// unchanged.
 struct Gate {
     inner: Limits,
     gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+}
+
+impl Gate {
+    /// Park at the rendezvous once, before the first admission of either
+    /// account.
+    fn park(&mut self) {
+        if let Some((entered, released)) = self.gate.take() {
+            entered.wait();
+            released.wait();
+        }
+    }
 }
 
 impl Budget for Gate {
@@ -78,10 +89,7 @@ impl Budget for Gate {
         reason = "a third-party policy forwards an admission already made through the route"
     )]
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
-        if let Some((entered, released)) = self.gate.take() {
-            entered.wait();
-            released.wait();
-        }
+        self.park();
         self.inner.traverse(values, bytes)
     }
 
@@ -135,6 +143,15 @@ impl Budget for Gate {
 
 impl Releasing for Gate {
     type Permit = Reservation;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a third-party policy forwards a cleanup admission already made through the route"
+    )]
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
+        self.park();
+        Releasing::reclaim(&mut self.inner, values, bytes)
+    }
 
     fn permit_identity(permit: &Reservation) -> Identity {
         <Limits as Releasing>::permit_identity(permit)

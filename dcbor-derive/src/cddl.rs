@@ -1,7 +1,8 @@
 //! The CDDL rule of a derived type (`dcbor::cddl::Cddl`), generated from the
 //! validated schema the symbolic and bounded decoders are generated from: its
 //! map keys and their optionality, the keys no field names (accepted and
-//! ignored), its variants' discriminants and payloads, and its tag. Every
+//! ignored by an open map, refused by a closed one), its variants'
+//! discriminants and payloads, and its tag. Every
 //! form is written by `dcbor::cddl`'s helpers, the one definition of the
 //! CDDL text; this module passes them the schema alone.
 use super::*;
@@ -22,36 +23,45 @@ fn member(key: u64, optional: bool, ty: &Type) -> TokenStream2 {
     }
 }
 
-/// The bound a field of `ty` needs for its member: `Cddl`, or `Present`
-/// when it is optional.
-fn bound(optional: bool, ty: &Type) -> syn::WherePredicate {
-    if optional {
+/// The bound a field of `ty` needs for its member, `Cddl`, or `Present`
+/// when it is optional, as a where clause of `owner`'s impl states it: none
+/// for a type naming no generic parameter of `owner`, a trivial bound the
+/// member's own call (`member`) checks at the field
+/// (`Schema::generic_field_types`).
+fn bound(owner: &Schema<'_>, optional: bool, ty: &Type) -> Option<syn::WherePredicate> {
+    if !owner.mentions_parameter(ty) {
+        return None;
+    }
+    Some(if optional {
         syn::parse_quote!(#ty: dcbor::cddl::Present)
     } else {
         syn::parse_quote!(#ty: dcbor::cddl::Cddl)
-    }
+    })
 }
 
-/// The map of named `fields`, whose schema is `schema`'s map fields in
-/// declaration order (`MapFields::parse` keeps it), in the order of their
-/// keys, each field's bound added to `predicates`.
+/// The map of named `fields`, whose schema is `fields_schema`'s map fields
+/// in declaration order (`MapFields::parse` keeps it), in the order of their
+/// keys, each field's bound in `owner`'s impl added to `predicates`; closed
+/// when `closed`, admitting no key but its fields'.
 fn map(
-    schema: &MapFields,
+    owner: &Schema<'_>,
+    fields_schema: &MapFields,
     fields: &syn::FieldsNamed,
+    closed: bool,
     predicates: &mut Vec<syn::WherePredicate>,
 ) -> TokenStream2 {
-    let mut members: Vec<(u64, TokenStream2)> = schema
+    let mut members: Vec<(u64, TokenStream2)> = fields_schema
         .0
         .iter()
         .zip(&fields.named)
         .map(|(field, declared)| {
-            predicates.push(bound(field.optional, &declared.ty));
+            predicates.extend(bound(owner, field.optional, &declared.ty));
             (field.key, member(field.key, field.optional, &declared.ty))
         })
         .collect();
     members.sort_by_key(|(key, _)| *key);
     let members = members.into_iter().map(|(_, member)| member);
-    quote!(dcbor::cddl::map(&[#(#members),*]))
+    quote!(dcbor::cddl::map(&[#(#members),*], #closed))
 }
 
 pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
@@ -60,7 +70,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
     let mut predicates = Vec::new();
     let untagged = match (&schema.shape, &schema.input.data) {
         (Shape::Map(fields), Data::Struct(data)) => match &data.fields {
-            Fields::Named(named) => map(fields, named, &mut predicates),
+            Fields::Named(named) => map(schema, fields, named, schema.closed, &mut predicates),
             _ => unreachable!("a map schema is a named struct"),
         },
         (Shape::Newtype, Data::Struct(data)) => {
@@ -70,7 +80,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
                 .next()
                 .expect("a newtype has one field")
                 .ty;
-            predicates.push(bound(false, ty));
+            predicates.extend(bound(schema, false, ty));
             quote!(<#ty as dcbor::cddl::Cddl>::cddl(rules))
         }
         (Shape::Unit, _) => quote!(dcbor::cddl::unit()),
@@ -92,7 +102,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
                         }
                         (VariantKind::Tuple(_), Fields::Unnamed(fields)) => {
                             let items = fields.unnamed.iter().map(|field| {
-                                predicates.push(bound(false, &field.ty));
+                                predicates.extend(bound(schema, false, &field.ty));
                                 let ty = &field.ty;
                                 quote!(<#ty as dcbor::cddl::Cddl>::cddl(rules))
                             });
@@ -100,7 +110,7 @@ pub(super) fn expand(schema: &Schema<'_>) -> TokenStream2 {
                             quote!(dcbor::cddl::variant(#discriminant, &[#(#items),*]))
                         }
                         (VariantKind::Named(fields), Fields::Named(named)) => {
-                            let inner = map(fields, named, &mut predicates);
+                            let inner = map(schema, fields, named, schema.closed, &mut predicates);
                             quote!(dcbor::cddl::variant(#discriminant, &[#inner]))
                         }
                         _ => unreachable!("a variant's schema is its fields' kind"),

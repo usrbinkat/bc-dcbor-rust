@@ -23,8 +23,9 @@
 //! Fields of type `Option<T>` are omitted from the map when `None`.
 //! Decoding refuses a required field's absence (`MissingMapKey`) and a
 //! present field of another type, an optional one included (its error,
-//! never `None`), and ignores keys no field names. Each field's value is
-//! moved out of the decoded map into its conversion, never copied.
+//! never `None`), and ignores keys no field names unless the record is
+//! closed (below). Each field's value is moved out of the decoded map into
+//! its conversion, never copied.
 //!
 //! ```
 //! use dcbor::prelude::*;
@@ -67,6 +68,38 @@
 //! assert!(matches!(
 //!     Labels { names }.encode_cbor(),
 //!     Err(dcbor::Error::DuplicateMapKey)
+//! ));
+//! ```
+//!
+//! # Closed records
+//!
+//! `#[cbor(closed)]` on a record, or on an enum with named variants, closes
+//! each of its maps: a key no field names is refused as `UnknownMapKey` by
+//! the symbolic decoder, by the bounded decoder in the step that searched
+//! for it, and by the type's CDDL, which has no open member. A closed
+//! record's wire profile is its fields' (`InPlace::WIRE`), where an open
+//! record's is unrestricted, since its unknown keys may hold any value. On a
+//! type that decodes no map of its own, a newtype, a unit struct or an enum
+//! of no named variant, the attribute is a compile error.
+//!
+//! ```
+//! use dcbor::prelude::*;
+//! use dcbor_derive::CBORDecodable;
+//!
+//! #[derive(CBORDecodable)]
+//! #[cbor(closed)]
+//! struct Config {
+//!     #[cbor(n = 0)]
+//!     version: u8,
+//! }
+//!
+//! let mut map = Map::new();
+//! map.insert(0u64, 1u64).unwrap();
+//! assert_eq!(Config::try_from(CBOR::from(map.clone())).unwrap().version, 1);
+//! map.insert(1u64, "unknown").unwrap();
+//! assert!(matches!(
+//!     Config::try_from(CBOR::from(map)),
+//!     Err(dcbor::Error::UnknownMapKey)
 //! ));
 //! ```
 //!
@@ -178,10 +211,11 @@
 //! assert_eq!(encoded.as_ref(), [0xa2, 0x00, 0xf5, 0x01, 0x18, 0x18]);
 //!
 //! // The shape walk allocates nothing; preparation refuses at its first
-//! // allocation when no storage is allowed.
+//! // allocation when no storage is allowed: a request beyond the whole
+//! // ceiling, which no release makes room for.
 //! assert!(matches!(
 //!     prepare(&value, &mut Limits::new(1_000, 1_000, 0)).map(|prepared| prepared.len()),
-//!     Err(BoundedError::Refused(LimitRefusal::Storage))
+//!     Err(BoundedError::Refused(LimitRefusal::TooLarge))
 //! ));
 //! ```
 
@@ -243,10 +277,11 @@ pub fn derive_cbor_bounded_encodable(input: TokenStream) -> TokenStream {
 /// Derive retained in-place construction
 /// (`dcbor::bounded::decode::construction::in_place::InPlace` and
 /// `reclamation::Reclaim`) from the same schema as `TryFrom<CBOR>`: the same
-/// field keys, optional-field omission, unknown keys ignored, discriminants
-/// and tag, read from a strictly decoded document without a symbolic tree.
-/// The one typed-construction engine: `decode_typed` drives it to
-/// completion.
+/// field keys, optional-field omission, unknown keys ignored or, for a
+/// closed record, refused, discriminants and tag, read from a strictly
+/// decoded document without a symbolic tree, and the type's wire profile
+/// (`InPlace::WIRE`) composed from its parts. The one typed-construction
+/// engine: `decode_typed` drives it to completion.
 #[proc_macro_derive(CBORBoundedDecodable, attributes(cbor))]
 pub fn derive_cbor_bounded_decodable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -306,38 +341,55 @@ fn parse_n(attrs: &[syn::Attribute]) -> Result<Option<(u64, proc_macro2::Span)>>
     Ok(key)
 }
 
-fn parse_tag(input: &DeriveInput) -> Result<Option<u64>> {
+/// A type's own `#[cbor(...)]` attributes: its tag, and whether its maps
+/// are closed, with the span of the `closed` that declared it.
+struct TypeAttributes {
+    tag: Option<u64>,
+    closed: Option<proc_macro2::Span>,
+}
+
+/// The `tag = N` and `closed` of the type's `#[cbor(...)]` attributes, in
+/// one attribute or several, each at most once.
+fn parse_type_attributes(input: &DeriveInput) -> Result<TypeAttributes> {
+    use syn::spanned::Spanned;
     let mut tag = None;
+    let mut closed = None;
     for attr in &input.attrs {
-        if attr.path().is_ident("cbor") {
-            if tag.is_some() {
-                return Err(Error::new_spanned(
-                    attr,
-                    "repeated #[cbor(tag = N)] attribute",
-                ));
-            }
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("tag") {
-                    if tag.is_some() {
-                        return Err(meta.error("repeated `tag`"));
-                    }
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    tag = Some(lit.base10_parse::<u64>()?);
-                    Ok(())
-                } else {
-                    Err(meta.error("expected `tag = N`"))
+        if !attr.path().is_ident("cbor") {
+            continue;
+        }
+        let mut named = false;
+        attr.parse_nested_meta(|meta| {
+            named = true;
+            if meta.path.is_ident("tag") {
+                if tag.is_some() {
+                    return Err(meta.error("repeated `tag`"));
                 }
-            })?;
-            if tag.is_none() {
-                return Err(Error::new_spanned(
-                    attr,
-                    "missing `tag = N` in #[cbor(...)]",
-                ));
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                tag = Some(lit.base10_parse::<u64>()?);
+                Ok(())
+            } else if meta.path.is_ident("closed") {
+                if closed.is_some() {
+                    return Err(meta.error("repeated `closed`"));
+                }
+                if meta.input.peek(syn::Token![=]) || meta.input.peek(syn::token::Paren) {
+                    return Err(meta.error("`closed` takes no value"));
+                }
+                closed = Some(meta.path.span());
+                Ok(())
+            } else {
+                Err(meta.error("expected `tag = N` or `closed`"))
             }
+        })?;
+        if !named {
+            return Err(Error::new_spanned(
+                attr,
+                "missing `tag = N` or `closed` in #[cbor(...)]",
+            ));
         }
     }
-    Ok(tag)
+    Ok(TypeAttributes { tag, closed })
 }
 
 fn is_option(ty: &Type) -> bool {
@@ -438,16 +490,19 @@ enum Shape {
 }
 
 /// A derive input parsed and validated once; every derive generates from
-/// it.
+/// it. `closed` holds for a record, or an enum's named variants, declared
+/// `#[cbor(closed)]`: each of its maps refuses a key no field names, where
+/// an open one ignores it.
 struct Schema<'a> {
     input: &'a DeriveInput,
     tag: Option<u64>,
+    closed: bool,
     shape: Shape,
 }
 
 impl<'a> Schema<'a> {
     fn parse(input: &'a DeriveInput) -> Result<Self> {
-        let tag = parse_tag(input)?;
+        let TypeAttributes { tag, closed } = parse_type_attributes(input)?;
         let shape = match &input.data {
             Data::Struct(data) => match &data.fields {
                 Fields::Named(fields) => Shape::Map(MapFields::parse(fields)?),
@@ -506,7 +561,30 @@ impl<'a> Schema<'a> {
             }
             Data::Union(_) => return Err(Error::new_spanned(input, "unions are not supported")),
         };
-        Ok(Self { input, tag, shape })
+        let has_map = match &shape {
+            Shape::Map(_) => true,
+            Shape::Enum(variants) => variants
+                .iter()
+                .any(|variant| matches!(variant.kind, VariantKind::Named(_))),
+            Shape::Newtype | Shape::Unit => false,
+        };
+        let closed = match closed {
+            None => false,
+            Some(_) if has_map => true,
+            Some(span) => {
+                return Err(Error::new(
+                    span,
+                    "`closed` applies to a record or an enum with named variants: it refuses \
+                     map keys no field names, and this type decodes no map of its own",
+                ));
+            }
+        };
+        Ok(Self {
+            input,
+            tag,
+            closed,
+            shape,
+        })
     }
 
     fn name(&self) -> &Ident {
@@ -553,6 +631,106 @@ impl<'a> Schema<'a> {
             }
         }
         types
+    }
+
+    /// Whether `ty` names a generic parameter of the input, a type, const or
+    /// lifetime parameter, anywhere in its tokens: a type that does is
+    /// checked against its bound only where the impl's where clause states
+    /// it, so the bound is the impl's to state.
+    fn mentions_parameter(&self, ty: &Type) -> bool {
+        use quote::ToTokens;
+        fn walk(tokens: proc_macro2::TokenStream, names: &[String], lifetimes: &[String]) -> bool {
+            let mut lifetime = false;
+            for token in tokens {
+                match token {
+                    proc_macro2::TokenTree::Group(group) => {
+                        if walk(group.stream(), names, lifetimes) {
+                            return true;
+                        }
+                        lifetime = false;
+                    }
+                    proc_macro2::TokenTree::Punct(punct) => {
+                        lifetime = punct.as_char() == '\'';
+                    }
+                    proc_macro2::TokenTree::Ident(ident) => {
+                        let ident = ident.to_string();
+                        let pool = if lifetime { lifetimes } else { names };
+                        if pool.contains(&ident) {
+                            return true;
+                        }
+                        lifetime = false;
+                    }
+                    proc_macro2::TokenTree::Literal(_) => lifetime = false,
+                }
+            }
+            false
+        }
+        let mut names = Vec::new();
+        let mut lifetimes = Vec::new();
+        for param in &self.input.generics.params {
+            match param {
+                syn::GenericParam::Type(p) => names.push(p.ident.to_string()),
+                syn::GenericParam::Const(p) => names.push(p.ident.to_string()),
+                syn::GenericParam::Lifetime(p) => lifetimes.push(p.lifetime.ident.to_string()),
+            }
+        }
+        walk(ty.to_token_stream(), &names, &lifetimes)
+    }
+
+    /// The field types ([`Self::field_types`]) a where clause bounds: those
+    /// naming a generic parameter ([`Self::mentions_parameter`]). A bound on
+    /// a type naming none is a trivial bound: it constrains nothing the impl
+    /// is generic over, a concrete field's trait is checked where the
+    /// generated body uses it, the same error at the field, and rustc
+    /// reports an unmet trivial bound with a suggestion of the unstable
+    /// `trivial_bounds` feature on nightly alone, so one derive would
+    /// diagnose differently by channel.
+    fn generic_field_types(&self) -> Vec<&Type> {
+        self.field_types()
+            .into_iter()
+            .filter(|ty| self.mentions_parameter(ty))
+            .collect()
+    }
+
+    /// The field types naming no generic parameter: the complement of
+    /// [`Self::generic_field_types`], each deduplicated by its tokens. An
+    /// unsafe impl whose obligation is a bound on every field type asserts
+    /// these in its body instead ([`assert_bounds`]).
+    fn concrete_field_types(&self) -> Vec<&Type> {
+        use quote::ToTokens;
+        let mut seen: Vec<String> = Vec::new();
+        self.field_types()
+            .into_iter()
+            .filter(|ty| !self.mentions_parameter(ty))
+            .filter(|ty| {
+                let key = ty.to_token_stream().to_string();
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
+                }
+            })
+            .collect()
+    }
+}
+
+/// An item asserting that each of `types`, field types naming no generic
+/// parameter, implements `bound`: where a where clause would state a trivial
+/// bound ([`Schema::generic_field_types`]), an unsafe impl whose obligation
+/// is that bound on every field type states it here, so the obligation is
+/// still the compiler's to check, refused `E0277` at the field type.
+fn assert_bounds(types: &[&Type], bound: TokenStream2) -> TokenStream2 {
+    if types.is_empty() {
+        return quote!();
+    }
+    quote! {
+        const _: () = {
+            fn __dcbor_bound<__T: ?::core::marker::Sized + #bound>() {}
+            fn __dcbor_fields() {
+                #(__dcbor_bound::<#types>();)*
+            }
+        };
     }
 }
 
@@ -603,7 +781,7 @@ impl Schema<'_> {
     fn encodable(&self) -> TokenStream2 {
         let name = self.name();
         let mut generics = self.input.generics.clone();
-        for ty in self.field_types() {
+        for ty in self.generic_field_types() {
             generics
                 .make_where_clause()
                 .predicates
@@ -761,12 +939,24 @@ impl Schema<'_> {
 // Decodable expansion
 // ---------------------------------------------------------------------------
 
+/// A closed map's check once every field is taken from `map`
+/// (`dcbor::__derive::closed`): an entry left is a key no field names,
+/// refused `UnknownMapKey`. Nothing for an open map, which ignores it.
+fn closed_check(closed: bool, map: &Ident) -> TokenStream2 {
+    if closed {
+        quote! { dcbor::__derive::closed(#map)?; }
+    } else {
+        quote! {}
+    }
+}
+
 /// The extraction of every field of `fields` from `map`, a `&mut dcbor::Map`
 /// the decoder owns: each field's value removed and moved into its
 /// conversion (`dcbor::__derive::field`, `optional`), never a clone of a
 /// handle the map keeps. A required field absent is `MissingMapKey`; a
 /// present field that does not convert is its conversion's error, an
-/// optional one included; keys no field names are ignored.
+/// optional one included; keys no field names are left in the map, ignored
+/// by an open record and refused by a closed one ([`closed_check`]).
 fn map_extracts(fields: &MapFields, map: &Ident) -> Vec<TokenStream2> {
     fields
         .0
@@ -787,7 +977,7 @@ impl Schema<'_> {
     fn decodable(&self) -> TokenStream2 {
         let name = self.name();
         let mut generics = self.input.generics.clone();
-        for ty in self.field_types() {
+        for ty in self.generic_field_types() {
             generics
                 .make_where_clause()
                 .predicates
@@ -797,7 +987,7 @@ impl Schema<'_> {
         // required or positional field's through `?`, and an optional field
         // present in the map but not converting through `Map::get`, which
         // refuses rather than reading the field as absent.
-        for ty in self.field_types() {
+        for ty in self.generic_field_types() {
             generics
                 .make_where_clause()
                 .predicates
@@ -822,13 +1012,16 @@ impl Schema<'_> {
             Shape::Map(fields) => {
                 let map = Ident::new("map", proc_macro2::Span::call_site());
                 let extracts = map_extracts(fields, &map);
+                let closed = closed_check(self.closed, &map);
                 // `ref mut`: a record of no fields never takes from the map,
                 // and a `mut` binding left unmutated would warn in the
                 // user's crate.
                 quote! {
                     match cbor.into_case() {
                         dcbor::CBORCase::Map(ref mut map) => {
-                            #ok(#name { #(#extracts),* })
+                            let value = #name { #(#extracts),* };
+                            #closed
+                            #ok(value)
                         }
                         _ => #err(dcbor::Error::WrongType),
                     }
@@ -844,7 +1037,7 @@ impl Schema<'_> {
                     #err(dcbor::Error::WrongType)
                 }
             },
-            Shape::Enum(variants) => decodable_enum(name, variants),
+            Shape::Enum(variants) => decodable_enum(name, variants, self.closed),
         };
 
         match self.tag {
@@ -885,8 +1078,10 @@ impl Schema<'_> {
 /// conversion; a named payload's map is moved out and each field removed
 /// from it into its conversion ([`map_extracts`]). No handle is cloned, so
 /// a case held only by the decoded value moves rather than being copied.
-/// Every path is fully qualified, as the encoding expansion's are.
-fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
+/// A closed enum's named payload refuses a key no field names
+/// ([`closed_check`]). Every path is fully qualified, as the encoding
+/// expansion's are.
+fn decodable_enum(name: &Ident, variants: &[Variant], closed: bool) -> TokenStream2 {
     let ok = quote! { ::core::result::Result::Ok };
     let err = quote! { ::core::result::Result::Err };
     let mut unit_arms = Vec::new();
@@ -916,6 +1111,7 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
             VariantKind::Named(fields) => {
                 let map = Ident::new("inner_map", proc_macro2::Span::call_site());
                 let extracts = map_extracts(fields, &map);
+                let closed = closed_check(closed, &map);
                 array_arms.push(quote! {
                     #disc => {
                         if payload.len() != 1 {
@@ -923,7 +1119,9 @@ fn decodable_enum(name: &Ident, variants: &[Variant]) -> TokenStream2 {
                         }
                         match payload.take_value()?.into_case() {
                             dcbor::CBORCase::Map(ref mut inner_map) => {
-                                #ok(#name::#vname { #(#extracts),* })
+                                let value = #name::#vname { #(#extracts),* };
+                                #closed
+                                #ok(value)
                             }
                             _ => #err(dcbor::Error::WrongType),
                         }
@@ -1016,6 +1214,44 @@ mod tests {
             message,
             "discriminant 3 is already the discriminant of `First`"
         );
+    }
+
+    /// A field type is bound in a where clause exactly when it names a
+    /// generic parameter of the input, a type, lifetime or const parameter,
+    /// anywhere within it; every other field type is concrete, asserted by
+    /// an unsafe impl's obligation instead, each once.
+    #[test]
+    fn only_field_types_naming_a_parameter_are_bound() -> Result<()> {
+        use quote::ToTokens;
+        let input: DeriveInput = syn::parse_quote! {
+            struct Mixed<'a, T, const N: usize> {
+                #[cbor(n = 0)]
+                plain: u64,
+                #[cbor(n = 1)]
+                generic: Vec<T>,
+                #[cbor(n = 2)]
+                borrowed: &'a str,
+                #[cbor(n = 3)]
+                sized: [u8; N],
+                #[cbor(n = 4)]
+                again: u64,
+                #[cbor(n = 5)]
+                named_like: Option<TT>,
+            }
+        };
+        let schema = Schema::parse(&input)?;
+        let text = |types: Vec<&Type>| -> Vec<String> {
+            types
+                .into_iter()
+                .map(|ty| ty.to_token_stream().to_string())
+                .collect()
+        };
+        assert_eq!(
+            text(schema.generic_field_types()),
+            ["Vec < T >", "& 'a str", "[u8 ; N]"]
+        );
+        assert_eq!(text(schema.concrete_field_types()), ["u64", "TT"]);
+        Ok(())
     }
 
     /// Fields are written in encoded-key order whatever their declaration

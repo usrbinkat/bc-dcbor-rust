@@ -10,7 +10,7 @@ use dcbor::bounded::WriteWork;
 fn expired_before_first_admission_executes_no_work_and_allocates_nothing() {
     let wire = [0x81, 0x01];
     suite(|run, policy| {
-        run.with_policy(policy, |m| m.deadline(Some(0)));
+        run.with_policy(policy, |m| m.expire_at_call(Some(0)));
         run.holding(
             decoder(&wire),
             Retirement::Released,
@@ -59,7 +59,7 @@ fn expire_at(
 ) -> (Vec<Call>, dcbor::bounded::boundary::Reached) {
     suite(|run, policy| {
         run.with_policy(policy, |m| {
-            m.deadline(Some(u64::try_from(stop).expect("a call index fits in u64")));
+            m.expire_at_call(Some(u64::try_from(stop).expect("a call index fits in u64")));
         });
         run.holding(
             decoder(wire),
@@ -83,7 +83,7 @@ fn expire_at(
                     );
                     assert_eq!(m.calls(), &baseline.calls[..=stop]);
                     let paid = m.used();
-                    m.deadline(None);
+                    m.expire_at_call(None);
                     paid
                 });
                 operation.drive_faulted(

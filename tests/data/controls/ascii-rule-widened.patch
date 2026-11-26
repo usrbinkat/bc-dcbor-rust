@@ -1,0 +1,8 @@
+--- src/ascii_text.rs
++++ src/ascii_text.rs
+@@ -19,3 +19,4 @@
+ pub(crate) fn first_non_ascii(text: &str) -> Option<char> {
+-    text.chars().find(|c| !c.is_ascii())
++    // Planted: U+0080 admitted as ASCII.
++    text.chars().find(|c| u32::from(*c) > 0x80)
+ }

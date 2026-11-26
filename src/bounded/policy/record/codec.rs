@@ -112,6 +112,12 @@ fn refusal_code(refusal: LimitRefusal) -> Option<(u64, u64)> {
         LimitRefusal::Deadline => (3, 0),
         LimitRefusal::Scheduled(index) => (4, u64::try_from(index).ok()?),
         LimitRefusal::Unrecorded => (5, 0),
+        LimitRefusal::Turn => (6, 0),
+        LimitRefusal::QuantumTooSmall => (7, 0),
+        LimitRefusal::Requested => (8, 0),
+        LimitRefusal::TooLarge => (9, 0),
+        LimitRefusal::Contended => (10, 0),
+        LimitRefusal::Cancelled => (11, 0),
     })
 }
 
@@ -122,6 +128,12 @@ fn refusal_of(code: u64, argument: u64) -> Option<LimitRefusal> {
         (3, 0) => Some(LimitRefusal::Deadline),
         (4, index) => usize::try_from(index).ok().map(LimitRefusal::Scheduled),
         (5, 0) => Some(LimitRefusal::Unrecorded),
+        (6, 0) => Some(LimitRefusal::Turn),
+        (7, 0) => Some(LimitRefusal::QuantumTooSmall),
+        (8, 0) => Some(LimitRefusal::Requested),
+        (9, 0) => Some(LimitRefusal::TooLarge),
+        (10, 0) => Some(LimitRefusal::Contended),
+        (11, 0) => Some(LimitRefusal::Cancelled),
         _ => None,
     }
 }

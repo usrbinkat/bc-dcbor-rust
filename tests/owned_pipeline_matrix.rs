@@ -349,6 +349,47 @@ fn a_stabilized_text_survives_every_boundary_and_refuses_what_it_does_not_assign
     }
 }
 
+/// An ASCII text through the whole pipeline, its stops classed by its
+/// declared reduction (its text's): a text of both ASCII edges decodes and
+/// encodes back; U+00E9, which dCBOR accepts as text and the quick check
+/// proves, is refused as invalid by the ASCII rule and its decode cleaned
+/// up; a text the quick check leaves unproven (`q` U+0301) is refused by the
+/// parse under the type's quick-only profile, before the binding sees it.
+/// The reduction's claims are certified on the same inputs.
+#[test]
+fn an_ascii_text_survives_every_boundary_and_refuses_what_is_not_ascii() {
+    use dcbor::AsciiText;
+    let ascii = dcbor::CBOR::from("\u{0}id\u{7f}").to_cbor_data();
+    let accented = dcbor::CBOR::from("\u{e9}").to_cbor_data();
+    let unproven = dcbor::CBOR::from("q\u{301}").to_cbor_data();
+    dcbor_test_support::uniform::<AsciiText>("an ASCII text-construction-certification", &ascii);
+    dcbor_test_support::certified::<AsciiText>(
+        "a non-ASCII text-construction-certification",
+        &accented,
+    );
+    for (name, wire, expected) in [
+        ("an ASCII text", ascii.as_slice(), Expected::Complete),
+        ("a non-ASCII text", accented.as_slice(), Expected::Invalid),
+    ] {
+        pipeline::<AsciiText>(
+            name,
+            wire,
+            expected,
+            classes::reduced::<ByteString, AsciiText>(),
+        );
+    }
+    let mut limits = dcbor::bounded::Limits::unlimited();
+    let refused = dcbor::bounded::decode::decode_typed::<AsciiText, _>(&unproven, &mut limits);
+    assert!(
+        matches!(
+            refused,
+            Err(dcbor::bounded::decode::DecodeError::UnprovenText)
+        ),
+        "an unproven text reached the ASCII binding"
+    );
+    assert_eq!(limits.live_bytes(), 0);
+}
+
 /// A minimal big integer through the whole pipeline, its stops classed by
 /// its declared reduction (its magnitude's): 2^64, a bignum, and 1, a plain
 /// integer, decode and encode back; `c2 41 01`, which dCBOR accepts as a

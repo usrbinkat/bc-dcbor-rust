@@ -208,6 +208,9 @@ pub(crate) const fn minimal_cost<P>() -> Option<ConstructionCost> {
 // and a byte string's.
 unsafe impl<A: Allocator> InPlace<A> for MinimalBigInt {
     const COST: ConstructionCost = crate::const_cost!(minimal_cost::<A::Permit>());
+    /// A plain integer, or a bignum's tag around its byte string: one tag
+    /// level, no text.
+    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::SCALAR.nested();
 
     fn build_step<'b>(
         ctx: BindingContext<'b, '_, '_, '_, Self, A>,

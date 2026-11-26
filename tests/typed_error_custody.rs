@@ -7,7 +7,7 @@ use dcbor::bounded::decode::construction::in_place::{
 use dcbor::bounded::decode::construction::reclamation::{
     Cleanup, PeekSlot, Reclaim, Reclaimed, Slot, Written,
 };
-use dcbor::bounded::decode::{ConstructResult, DecodeError, Options, wrong_type};
+use dcbor::bounded::decode::{ConstructResult, DecodeError, wrong_type};
 use dcbor::bounded::{Allocator, BoundedResult, CustodySink, PermitsObserved};
 use dcbor_test_support::{self as support, Retirement, Stopped, pipeline::Unwitnessed};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,7 +102,6 @@ fn terminal_error_does_not_reinitialize_or_destroy_partial_construction() {
                 owner.decoder::<_, Fails, _, _>(
                     policy,
                     support::Borrowing(&wire),
-                    Options::normalizing(8),
                     &Unwitnessed,
                     |decoder| {
                         let held = decoder.with_policy(policy, |_, limits| limits.live_bytes());

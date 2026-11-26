@@ -1,4 +1,4 @@
-#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@b70538330f20adc9665afa2976471eb5b85ebd1f nixpkgs@f4a03c008967841f2a0b3cb7c436fc6fc31671f6
+#	configuration	rust-nightly-2026-10-04 x86_64-unknown-linux-gnu library usrbinkat/rust@b0f2ead83480ccdaec13ed32a22a14279e8099e9 btree-patch-sha256:9deb04d30ff0a00f0d539ecd162ec6224c7a6d143bdbbbbc0df701e0aa85112b hashbrown@ccb26a32445a94dbf228acf518efa216c6dbfeef rust-overlay@67021b279bfffe654a0201ede805748a255ae5a7 nixpkgs@2786a2a72088ecf32aea5b3ec52099e6a7cff78f
 16	16	measured	observed	published	-	borrow: Initialization bytes
 1	1	measured	observed	published	-	borrow: Initialization values
 88	88	joint	observed	published	-	borrow: total allocated
@@ -32,13 +32,13 @@
 5993	5544	joint	observed	published	-	owned preparation of 500 empty strings: public peak
 5993	5224	joint	observed	published	-	owned preparation of 500 empty strings: public retained
 1	1	measured	observed	exact	-	retired copy: Release values
-39528785	1703199	joint	observed	published	-	typed decode chain of 16 texts of 400 pairs: public bytes
-2490503	382633	joint	observed	published	-	typed decode chain of 16 texts of 400 pairs: public values
-2503049	124287	joint	observed	published	-	typed decode chain of 4 texts of 100 pairs: public bytes
-157104	24457	joint	observed	published	-	typed decode chain of 4 texts of 100 pairs: public values
-1604812	848403	joint	observed	published	-	typed decode chain of 4000 empty strings: public allocated
+39451070	1703199	joint	observed	published	-	typed decode chain of 16 texts of 400 pairs: public bytes
+2489287	382633	joint	observed	published	-	typed decode chain of 16 texts of 400 pairs: public values
+2497478	124287	joint	observed	published	-	typed decode chain of 4 texts of 100 pairs: public bytes
+157015	24457	joint	observed	published	-	typed decode chain of 4 texts of 100 pairs: public values
+1604364	848403	joint	observed	published	-	typed decode chain of 4000 empty strings: public allocated
 659369	651027	joint	observed	published	-	typed decode chain of 4000 empty strings: public peak
 659369	651027	joint	observed	published	-	typed decode chain of 4000 empty strings: public retained
-205032	108647	joint	observed	published	-	typed decode chain of 500 empty strings: public allocated
+204584	108647	joint	observed	published	-	typed decode chain of 500 empty strings: public allocated
 84837	83495	joint	observed	published	-	typed decode chain of 500 empty strings: public peak
 84837	83495	joint	observed	published	-	typed decode chain of 500 empty strings: public retained

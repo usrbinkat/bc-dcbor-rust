@@ -75,7 +75,6 @@ fn an_owner_whose_scope_block_fails_physically_settles_each_obligation_in_its_ow
 #[cfg(feature = "custom-std-collections")]
 #[test]
 fn terminal_tree_cleanup_allocates_nothing_in_either_drop_order() {
-    use dcbor::bounded::decode::Options;
     use dcbor_test_support::{self as support, DropOrder, pipeline::Physical};
     use std::collections::BTreeMap;
 
@@ -95,7 +94,6 @@ fn terminal_tree_cleanup_allocates_nothing_in_either_drop_order() {
             run.terminal::<BTreeMap<u64, String>, _, _>(
                 policy,
                 &wire,
-                Options::normalizing(8),
                 &heap,
                 order,
                 // The live handle remains usable after the authority's

@@ -1,4 +1,5 @@
 //! Retained NFC preparation and canonical text emission over immutable input.
+use super::decode::construction::reclamation::{Cleanup, with_cleanup};
 use super::decode::storage::Storage;
 use super::*;
 use unicode_normalization::char::{canonical_combining_class, compose};
@@ -897,17 +898,27 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
     }
 
     /// Cancel and release one retained resource unit. Admission closes before
-    /// cleanup starts; subsequent calls cannot resume text production. Bound
-    /// on [`Releasing`], not [`Allocator`]: no new allocation can be
-    /// requested through the capability cleanup is given.
-    pub fn reclaim_step<A: Releasing<Permit = P, Origin = O>>(
+    /// cleanup starts; subsequent calls cannot resume text production. The
+    /// public entry: the cleanup capability minted over `allocator`
+    /// ([`with_cleanup`]), then [`Self::reclaim_under`].
+    pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         allocator: &mut A,
+    ) -> BoundedResult<bool, A> {
+        with_cleanup(allocator, |cleanup| self.reclaim_under(cleanup))
+    }
+
+    /// [`Self::reclaim_step`] under the cleanup capability its caller's
+    /// cleanup holds: the one implementation, every unit admitted as
+    /// cleanup ([`Releasing::reclaim`]) and no allocation requestable.
+    pub(crate) fn reclaim_under<A: Allocator<Permit = P, Origin = O>>(
+        &mut self,
+        cleanup: &mut Cleanup<'_, A>,
     ) -> BoundedResult<bool, A> {
         match self.phase {
             Phase::ReclaimOrdering => {
                 if at(TextPlace::ReleasingScratch, || {
-                    self.ordering.reclaim_step(allocator)
+                    self.ordering.reclaim_step(cleanup)
                 })? {
                     self.phase = Phase::ReclaimChars;
                 }
@@ -917,7 +928,7 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
             // or staging drains per element, which the bound counts.
             Phase::ReclaimChars => {
                 if at(TextPlace::ReleasingChars, || {
-                    self.chars.reclaim_copy_step(allocator)
+                    self.chars.reclaim_copy_step(cleanup)
                 })? {
                     // The output, if one was requested, is released in the
                     // same unit: its request paid for its release.
@@ -929,8 +940,8 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
             }
             Phase::Finished => return Ok(true),
             _ => {
-                CLEANUP.admit(allocator)?;
-                self.cancel_output(allocator.performer());
+                CLEANUP.admit(cleanup)?;
+                self.cancel_output(cleanup.performer());
                 self.phase = Phase::ReclaimOrdering;
             }
         }
@@ -1086,9 +1097,13 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
                     self.phase = Phase::ReleaseOrdering;
                 }
             }
+            // The ordered scratch's release, and below the emitted
+            // characters': cleanup of what the continuation holds, admitted
+            // under the cleanup capability.
             Phase::ReleaseOrdering => {
+                let ordering = &mut self.ordering;
                 if at(TextPlace::ReleasingScratch, || {
-                    self.ordering.reclaim_step(allocator)
+                    with_cleanup(allocator, |cleanup| ordering.reclaim_step(cleanup))
                 })? {
                     self.phase = Phase::Compose;
                 }
@@ -1254,8 +1269,9 @@ impl<S, P, O: Origin> TextContinuation<S, P, O> {
                 self.emit_at += 1;
             }
             Phase::ReleaseChars => {
+                let chars = &mut self.chars;
                 if at(TextPlace::ReleasingChars, || {
-                    self.chars.reclaim_copy_step(allocator)
+                    with_cleanup(allocator, |cleanup| chars.reclaim_copy_step(cleanup))
                 })? {
                     self.phase = Phase::Publish;
                 }

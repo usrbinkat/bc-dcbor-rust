@@ -1,0 +1,8 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -215,3 +215,5 @@
+     fn work(&mut self, work: WriteWork) -> Result<(), LimitRefusal> {
++        // Planted: the total committed before the plan's checks.
++        self.used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
+         let planned = self.plan_work(work)?;
+         self.commit(planned);

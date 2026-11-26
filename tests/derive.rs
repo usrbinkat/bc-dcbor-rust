@@ -998,7 +998,7 @@ where
     // The decode is held to its own bound ([`decode_typed`]); these tests
     // are its interpretation of the wire bytes, not its budget.
     let mut limits = Limits::unlimited();
-    let built = decode_typed::<T, _>(&bytes, 16, &mut limits).unwrap();
+    let built = decode_typed::<T, _>(&bytes, &mut limits).unwrap();
     assert_eq!(
         built.value(),
         &symbolic,
@@ -1025,12 +1025,12 @@ fn bounded_construction_of_a_tagged_type_requires_its_tag() {
     let wrapped = Labelled { data: vec![1, 2] };
     let tagged = wrapped.tagged_cbor_data().unwrap();
     let mut limits = Limits::unlimited();
-    let built = decode_typed::<Labelled, _>(&tagged, 16, &mut limits).unwrap();
+    let built = decode_typed::<Labelled, _>(&tagged, &mut limits).unwrap();
     assert_eq!(built.value(), &wrapped);
     let untagged = wrapped.untagged_cbor().unwrap().to_cbor_data();
-    assert!(decode_typed::<Labelled, _>(&untagged, 16, &mut limits).is_err());
+    assert!(decode_typed::<Labelled, _>(&untagged, &mut limits).is_err());
     let other = CBOR::to_tagged_value(99, wrapped.untagged_cbor().unwrap()).to_cbor_data();
-    assert!(decode_typed::<Labelled, _>(&other, 16, &mut limits).is_err());
+    assert!(decode_typed::<Labelled, _>(&other, &mut limits).is_err());
     drop(built);
     assert_eq!(
         limits.live_bytes(),
@@ -1049,20 +1049,224 @@ fn bounded_construction_rejects_what_the_symbolic_conversion_rejects() {
     missing.insert(0u64, true).unwrap();
     let bytes = CBOR::from(missing).to_cbor_data();
     assert!(matches!(
-        decode_typed::<Record, _>(&bytes, 16, &mut limits),
+        decode_typed::<Record, _>(&bytes, &mut limits),
         Err(DecodeError::Invalid(dcbor::Error::MissingMapKey))
     ));
     let bytes = CBOR::from(42u64).to_cbor_data();
     assert!(matches!(
-        decode_typed::<Record, _>(&bytes, 16, &mut limits),
+        decode_typed::<Record, _>(&bytes, &mut limits),
         Err(DecodeError::Invalid(dcbor::Error::WrongType))
     ));
     let bytes = CBOR::from(5u64).to_cbor_data();
     assert!(matches!(
-        decode_typed::<Reason, _>(&bytes, 16, &mut limits),
+        decode_typed::<Reason, _>(&bytes, &mut limits),
         Err(DecodeError::Invalid(dcbor::Error::WrongType))
     ));
     assert_eq!(limits.live_bytes(), 0);
+}
+
+/// Tuple variants only: a bare discriminant, and arrays of a discriminant
+/// and their fields, one of a nested sequence and one holding a text.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[repr(C, u8)]
+enum Positional {
+    #[cbor(n = 0)]
+    Bare,
+    #[cbor(n = 1)]
+    Sequence(Vec<u64>),
+    #[cbor(n = 2)]
+    Labelled(u64, String),
+}
+
+/// A tagged newtype of bytes: one tag level over its field's.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[cbor(tag = 7)]
+struct TaggedBytes(ByteString);
+
+/// The derive composes each type's wire profile (`InPlace::WIRE`) as its
+/// encoding nests its parts: a unit struct is `null`, a scalar; a newtype
+/// is its field's; a record accepts unknown keys, any value under them, so
+/// it is unrestricted, tagged or not; a unit-only enum is a bare
+/// discriminant; a tuple variant is one array level over its discriminant
+/// and its fields, the enum the most of its variants', strict text policy
+/// where any field takes text; a tag is one level more. A derived newtype
+/// over a sequence of integers refuses a document nested past its profile
+/// at the profile's depth, everything released.
+#[test]
+fn the_derive_composes_each_types_wire_profile_from_its_parts() {
+    use dcbor::bounded::decode::construction::in_place::InPlace;
+    use dcbor::bounded::decode::{DecodeError, Options};
+    fn wire<T: InPlace<Limits>>() -> Options {
+        T::WIRE
+    }
+    assert_eq!(wire::<Nothing>(), Options::quick_only(0));
+    assert_eq!(wire::<Newtype>(), Options::quick_only(1));
+    assert_eq!(wire::<Record>(), Options::UNRESTRICTED);
+    assert_eq!(wire::<Labelled>(), Options::UNRESTRICTED);
+    assert_eq!(wire::<Reason>(), Options::quick_only(0));
+    assert_eq!(wire::<Positional>(), Options::normalizing(2));
+    assert_eq!(wire::<TaggedBytes>(), Options::quick_only(1));
+    let mut limits = Limits::unlimited();
+    let nested = CBOR::from(vec![vec![1u64]]).to_cbor_data();
+    assert!(matches!(
+        decode_typed::<Newtype, _>(&nested, &mut limits),
+        Err(DecodeError::DepthLimit { limit: 1 })
+    ));
+    assert_eq!(limits.live_bytes(), 0);
+    round_trip(&Positional::Bare);
+    round_trip(&Positional::Sequence(vec![1, 2]));
+    round_trip(&Positional::Labelled(3, "three".to_string()));
+    let tagged = TaggedBytes(ByteString::new([1, 2]));
+    let built =
+        decode_typed::<TaggedBytes, _>(&tagged.tagged_cbor_data().unwrap(), &mut limits).unwrap();
+    assert_eq!(built.value(), &tagged);
+}
+
+/// A closed record (`#[cbor(closed)]`), holding a closed record and a
+/// sequence.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[cbor(closed)]
+struct Sealed {
+    #[cbor(n = 1)]
+    count: u64,
+    #[cbor(n = 4)]
+    note: Option<String>,
+    #[cbor(n = 6)]
+    inner: SealedInner,
+}
+
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[cbor(closed)]
+struct SealedInner {
+    #[cbor(n = 0)]
+    values: Vec<u64>,
+}
+
+/// A closed enum: its named variant's map is closed, its tuple variant has
+/// no keys to refuse.
+#[derive(Clone, Debug, PartialEq, CBORCodable, CBORBoundedEncodable, CBORBoundedDecodable)]
+#[repr(C, u8)]
+#[cbor(closed)]
+enum SealedChoice {
+    #[cbor(n = 0)]
+    Pair(u64, u64),
+    #[cbor(n = 1)]
+    Named {
+        #[cbor(n = 0)]
+        value: u64,
+    },
+}
+
+fn sealed() -> Sealed {
+    Sealed {
+        count: 3,
+        note: None,
+        inner: SealedInner { values: vec![1, 2] },
+    }
+}
+
+/// `value`'s map with `key` added, holding `0`.
+fn with_key(value: CBOR, key: CBOR) -> CBOR {
+    let CBORCase::Map(mut map) = value.into_case() else {
+        panic!("a record encodes as a map");
+    };
+    map.insert(key, 0u64).unwrap();
+    CBOR::from(map)
+}
+
+/// Both decoders of a closed record refuse a key no field names, as
+/// `UnknownMapKey`: an unsigned key between its fields' and past them, and
+/// a text key, at the top and in the closed record it holds, everything
+/// released; an optional field left absent is no unknown key. An open
+/// record accepts the same keys (`decoding_moves_named_fields_out_of_their_map`).
+#[test]
+fn a_closed_record_refuses_every_key_no_field_names() {
+    use dcbor::bounded::decode::DecodeError;
+    round_trip(&sealed());
+    round_trip(&Sealed {
+        note: Some("n".into()),
+        ..sealed()
+    });
+    let top = sealed().encode_cbor().unwrap();
+    // `sealed()`, its inner record holding `key` beside its field.
+    let nested = |key: CBOR| {
+        let inner = sealed().inner.encode_cbor().unwrap();
+        let mut map = Map::new();
+        map.insert(1u64, sealed().count).unwrap();
+        map.insert(6u64, with_key(inner, key)).unwrap();
+        CBOR::from(map)
+    };
+    let cases = [
+        (
+            "between the fields",
+            with_key(top.clone(), CBOR::from(2u64)),
+        ),
+        ("past the fields", with_key(top.clone(), CBOR::from(99u64))),
+        ("a text key", with_key(top.clone(), CBOR::from("x"))),
+        ("nested", nested(CBOR::from(5u64))),
+    ];
+    for (what, cbor) in cases {
+        assert!(
+            matches!(
+                Sealed::try_from(cbor.clone()),
+                Err(dcbor::Error::UnknownMapKey)
+            ),
+            "{what}: the symbolic decoder"
+        );
+        let mut limits = Limits::unlimited();
+        let refused = decode_typed::<Sealed, _>(&cbor.to_cbor_data(), &mut limits);
+        assert!(
+            matches!(
+                refused,
+                Err(DecodeError::Invalid(dcbor::Error::UnknownMapKey))
+            ),
+            "{what}: the bounded decoder: {:?}",
+            refused.map(|value| value.value().clone())
+        );
+        assert_eq!(limits.live_bytes(), 0, "{what}: storage kept");
+    }
+    let named = SealedChoice::Named { value: 1 }.encode_cbor().unwrap();
+    let CBORCase::Array(items) = named.into_case() else {
+        unreachable!("a variant encodes as an array");
+    };
+    let widened = CBOR::from(vec![
+        items[0].clone(),
+        with_key(items[1].clone(), CBOR::from(9u64)),
+    ]);
+    assert!(matches!(
+        SealedChoice::try_from(widened.clone()),
+        Err(dcbor::Error::UnknownMapKey)
+    ));
+    assert!(matches!(
+        decode_typed::<SealedChoice, _>(&widened.to_cbor_data(), &mut Limits::unlimited()),
+        Err(DecodeError::Invalid(dcbor::Error::UnknownMapKey))
+    ));
+    round_trip(&SealedChoice::Pair(1, 2));
+    round_trip(&SealedChoice::Named { value: 1 });
+}
+
+/// A closed record's wire profile is its fields', one map level over them,
+/// where an open record's is unrestricted: its unknown keys may hold any
+/// value. A closed enum's named variant is an array around such a map.
+#[test]
+fn a_closed_records_wire_profile_is_its_fields() {
+    use dcbor::bounded::decode::construction::in_place::InPlace;
+    use dcbor::bounded::decode::{DecodeError, Options};
+    fn wire<T: InPlace<Limits>>() -> Options {
+        T::WIRE
+    }
+    assert_eq!(wire::<SealedInner>(), Options::quick_only(2));
+    assert_eq!(wire::<Sealed>(), Options::normalizing(3));
+    assert_eq!(wire::<SealedChoice>(), Options::quick_only(2));
+    // Deeper than the profile: refused by the parse at its depth.
+    let deep = with_key(
+        sealed().encode_cbor().unwrap(),
+        CBOR::from(vec![vec![vec![0u64]]]),
+    );
+    assert!(matches!(
+        decode_typed::<Sealed, _>(&deep.to_cbor_data(), &mut Limits::unlimited()),
+        Err(DecodeError::DepthLimit { limit: 3 })
+    ));
 }
 
 /// A float field takes the shared canonical reduction on the bounded path.

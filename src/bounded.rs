@@ -129,6 +129,11 @@
 //! }
 //! impl Releasing for Policy {
 //!     type Permit = Permit;
+//!     // Cleanup returns what an operation holds: this policy's work
+//!     // allowance never refuses it.
+//!     fn reclaim(&mut self, _: u64, _: u64) -> Result<(), Self::Refusal> {
+//!         Ok(())
+//!     }
 //!     fn permit_identity(_: &Permit) -> Identity {
 //!         Identity::UNOBSERVED
 //!     }
@@ -718,6 +723,7 @@ use boundary::{Bound, Predicate};
 pub mod decode;
 mod decomposition;
 pub mod encoding;
+pub mod governance;
 /// Kani harnesses of the arenas' growth recurrence (register item 4):
 /// compiled only by `cargo kani`.
 #[cfg(kani)]
@@ -737,8 +743,8 @@ pub use policy::record::{
     Boundary, Capacity, Incomplete, Invalidation, OBSERVED_WORDS, Observed, Session,
 };
 pub use policy::{
-    Admission, AdmissionTrace, Answer, Call, Credits, Event, Family, HistoryCounts, LimitRefusal,
-    Limits, RecordStage, Reservation, TURN, TransferRefusal, Unreadable,
+    Admission, AdmissionTrace, Answer, Call, Ceilings, Credits, Event, Family, HistoryCounts,
+    LimitRefusal, Limits, RecordStage, Recovery, Reservation, TURN, TransferRefusal, Unreadable,
 };
 
 /// Why a bounded preparation or write stopped.
@@ -1705,6 +1711,22 @@ pub trait Releasing: Budget {
     /// Held while the allocation it was given for exists.
     type Permit;
 
+    /// Admit `values` and `bytes` of cleanup before it is performed: the
+    /// admission every cleanup unit makes, reached only through the cleanup
+    /// capability (`Cleanup`, in `decode::construction::reclamation`),
+    /// whose [`Budget::traverse`] is this. Held to [`Budget::traverse`]'s
+    /// units and its refusal contract, a refused unit changing nothing.
+    ///
+    /// Cleanup returns what an operation holds, so it is never refused for
+    /// the foreground's own allowances: no lifetime work ceiling and no
+    /// deadline gates it. What still bounds it is scheduling: a unit is at
+    /// most one turn's quantum and spends the running turn's allowance, so
+    /// cleanup yields to the scheduler as every other unit does. A policy
+    /// accounts what it admits here apart from its foreground work. Required:
+    /// a budget that does not state its cleanup admission would charge
+    /// cleanup to its foreground, the one thing this seam forbids.
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal>;
+
     /// The identity of `permit`, read from the permit itself:
     /// [`Identity::UNOBSERVED`] for a permit of a family that records
     /// nothing. Observation only; a physical effect ([`Effect`]) and the
@@ -1743,8 +1765,8 @@ pub trait Allocator: Releasing {
 ///
 /// - *terminal*: `terminal` and dropping its result neither allocate nor
 ///   unwind.
-/// - *traverse*: the returned policy's `traverse` always succeeds, does
-///   bounded allocation-free work, and never unwinds.
+/// - *traverse*: the returned policy's `traverse` and `reclaim` always
+///   succeed, do bounded allocation-free work, and never unwind.
 /// - *allocate*: the returned policy's `allocate` allocates nothing:
 ///   reclamation is forbidden from requesting new storage.
 /// - *borrow*: the returned policy does not borrow `permit`.
@@ -1808,6 +1830,14 @@ impl<B: Budget + ?Sized> Budget for &mut B {
 
 impl<R: Releasing + ?Sized> Releasing for &mut R {
     type Permit = R::Permit;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "forwards a cleanup admission already made through the route"
+    )]
+    fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+        (**self).reclaim(values, bytes)
+    }
 
     fn permit_identity(permit: &Self::Permit) -> Identity {
         R::permit_identity(permit)
@@ -3143,14 +3173,13 @@ pub(crate) mod places {
         pub(crate) fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
             self.ledger.lock().expect("the ledger is not poisoned")
         }
-    }
 
-    impl Budget for Ledgered {
-        type Refusal = core::convert::Infallible;
-
-        fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+        /// The one record of an admission, foreground or cleanup alike: the
+        /// attribution ledger measures what each place admits, whichever
+        /// account a policy charges it to.
+        fn record(&mut self, values: u64, bytes: u64) {
             if self.terminal {
-                return Ok(());
+                return;
             }
             assert!(
                 ROUTED.with(Cell::get) > 0,
@@ -3161,6 +3190,14 @@ pub(crate) mod places {
                 entered()
             );
             self.ledger().work(WriteWork::new(values, bytes));
+        }
+    }
+
+    impl Budget for Ledgered {
+        type Refusal = core::convert::Infallible;
+
+        fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+            self.record(values, bytes);
             Ok(())
         }
 
@@ -3213,6 +3250,13 @@ pub(crate) mod places {
 
     impl Releasing for Ledgered {
         type Permit = Permit;
+
+        /// Recorded as every admission is ([`Ledgered::record`]): a place's
+        /// term bounds its cleanup units as it bounds the rest.
+        fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), Self::Refusal> {
+            self.record(values, bytes);
+            Ok(())
+        }
 
         /// The attribution ledger records no identities.
         fn permit_identity(_: &Permit) -> Identity {
@@ -4459,10 +4503,17 @@ pub(crate) mod places {
             monotone("parse_bound", sizes(), |n| {
                 parse_bound::<ByteString, Limits, ()>(n, options).unwrap()
             });
-            monotone("typed_decode_bound", sizes(), |n| {
-                typed_decode_bound::<ByteString, Vec<String>, Limits, ()>(n, options).unwrap()
-            });
         }
+        // A strict profile, a quick one, and the unrestricted default's.
+        monotone("typed_decode_bound strict", sizes(), |n| {
+            typed_decode_bound::<ByteString, Vec<String>, Limits, ()>(n).unwrap()
+        });
+        monotone("typed_decode_bound quick", sizes(), |n| {
+            typed_decode_bound::<ByteString, Vec<u64>, Limits, ()>(n).unwrap()
+        });
+        monotone("decode_bound_with unrestricted", sizes(), |n| {
+            decode::decode_bound_with::<()>(n, Options::UNRESTRICTED).unwrap()
+        });
         monotone("construction_bound", sizes(), |n| {
             construction_bound::<ByteString, Vec<String>, Limits, ()>(n).unwrap()
         });

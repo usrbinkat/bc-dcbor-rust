@@ -1,0 +1,14 @@
+--- src/cddl.rs
++++ src/cddl.rs
+@@ -184,9 +184,10 @@
+             format!("{occurrence}{}: {}", member.key, member.value)
+         })
+         .collect();
+-    if !closed {
++    // Planted: a closed derived map opened to the keys no field names.
++    if closed || !closed {
+         entries.push("* any => any".to_string());
+     }
+     if entries.is_empty() {
+         "{ }".to_string()
+     } else {

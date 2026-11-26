@@ -76,6 +76,17 @@ where
     map.take(key)?.map(convert).transpose()
 }
 
+/// A closed record's map once every field is taken from it ([`field`],
+/// [`optional`]): refused [`Error::UnknownMapKey`] when an entry is left, a
+/// key no field of the record names.
+pub fn closed(map: &Map) -> Result<()> {
+    if map.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::UnknownMapKey)
+    }
+}
+
 /// The payload of a decoded variant array, its discriminant already read.
 pub struct Payload(<Vec<CBOR> as IntoIterator>::IntoIter);
 

@@ -2339,7 +2339,7 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
     }
 
     /// `wire` borrowed as an input of the held scope, then decoded as `T`
-    /// under `options`, each within its bound ([`borrow_bound`],
+    /// under its wire profile, each within its bound ([`borrow_bound`],
     /// [`typed_decode_bound`]): the borrow's operation held while it runs,
     /// its input moved into the decode, the decode held while it runs, and
     /// the published value held for `body`, retired as a published handle
@@ -2353,12 +2353,11 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
         &mut self,
         policy: PolicyId,
         wire: &'s [u8],
-        options: Options,
         body: impl FnOnce(&mut Holding<'_, '_, TypedValue<'s, Borrowed<'s>, T, Limits>, W>) -> R,
     ) -> Reached<R, DecodeFailure> {
-        let decoded = borrowed_decode_turns::<T>(wire.len(), options);
+        let decoded = borrowed_decode_turns::<T>(wire.len());
         let window = self.window;
-        self.decoder::<_, T, W, _>(policy, Borrowing(wire), options, window, |decoding| {
+        self.decoder::<_, T, W, _>(policy, Borrowing(wire), window, |decoding| {
             match decoding.drive(policy, decoded, Retirement::Published, body) {
                 Ok(made) => Ok(Ok(made)),
                 Err(Stopped::Operation(error)) => Ok(Err(error)),
@@ -2371,8 +2370,8 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
     /// The one borrow-then-decode composition: `wire` borrowed as an input
     /// of the held scope within its bound ([`borrow_bound`]), the borrow's
     /// operation held while it runs under this holding's witness, its input
-    /// moved into a typed decoder of `T` under `options` constructed inside
-    /// `window`, and that decoder held under `window` ([`Self::witnessed`]),
+    /// moved into a typed decoder of `T` constructed inside `window`, and
+    /// that decoder held under `window` ([`Self::witnessed`]),
     /// retired as stopped unless it is exhausted, for `body` to schedule
     /// ([`Self::decoded`] drives it to publication under the holding's own
     /// witness). Any stop of the borrow is the run's finding.
@@ -2382,16 +2381,13 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
         &mut self,
         policy: PolicyId,
         source: S,
-        options: Options,
         window: &V,
         body: impl FnOnce(&mut Holding<'_, '_, TypedDecoder<'s, S::Input, T, Limits>, V>) -> R,
     ) -> Result<R, Finding> {
         self.input(policy, source, |input| {
             input.moved(
                 window,
-                |input| {
-                    window.window(|| TypedDecoder::<'s, S::Input, T, Limits>::new(input, options))
-                },
+                |input| window.window(|| TypedDecoder::<'s, S::Input, T, Limits>::new(input)),
                 Retirement::Stopped,
                 // The decoder is another value than the input it consumes.
                 None,
@@ -2450,7 +2446,7 @@ pub enum DropOrder {
 
 impl RecordedRun {
     /// `wire` copied into a scope initialized under `policy` and decoded as
-    /// `T` under `options`, every turn and every retirement inside `window`;
+    /// `T`, every turn and every retirement inside `window`;
     /// the published value held for `body` once the authority's own
     /// retirement stands where `order` puts it, then both retired in that
     /// order by the scope's terminal cleanup, never its drain, each
@@ -2462,7 +2458,6 @@ impl RecordedRun {
         &mut self,
         policy: PolicyId,
         wire: &[u8],
-        options: Options,
         window: &W,
         order: DropOrder,
         body: impl FnOnce(&mut Holding<'_, '_, TypedValue<'static, ByteString, T, Limits>, W>) -> R,
@@ -2475,9 +2470,7 @@ impl RecordedRun {
             DropOrder::ValueFirst => {
                 self.holding(DecodeOwner::new(), Retirement::Scope, window, |owner| {
                     owner.initialize(policy)?;
-                    owner.copied(policy, wire, |input| {
-                        input.decode::<T, _>(policy, options, body)
-                    })?
+                    owner.copied(policy, wire, |input| input.decode::<T, _>(policy, body))?
                 })
             }
             DropOrder::OwnerFirst => self.holding(
@@ -2490,9 +2483,7 @@ impl RecordedRun {
                         lent.holding(DecodeOwner::new(), Retirement::Abandoned, |owner| {
                             owner.initialize(policy)?;
                             owner.copied(policy, wire, |input| {
-                                input.decode::<T, _>(policy, options, |value| {
-                                    value.deposit(values, 0)
-                                })
+                                input.decode::<T, _>(policy, |value| value.deposit(values, 0))
                             })??;
                             Ok::<_, Finding>(())
                         })?;
@@ -2596,22 +2587,21 @@ impl<'s, I: DecodeInput<Limits> + 's, W: pipeline::Physical>
         .map_err(Finding::from)
     }
 
-    /// Decode held input without transporting custody in an error.
+    /// Decode held input as `T`, under its wire profile, without
+    /// transporting custody in an error.
     pub fn decode<T: Transferable<Limits> + 's, R>(
         &mut self,
         policy: PolicyId,
-        options: Options,
         body: impl FnOnce(&mut Holding<'_, '_, TypedValue<'s, I, T, Limits>, W>) -> R,
     ) -> Result<R, Finding> {
         let bound = turns(
             dcbor::bounded::decode::construction::typed_decode_bound::<I, T, Limits, ()>(
                 self.value().value().bytes().len() as u64,
-                options,
             )
             .expect("typed decode bound fits in u64"),
         );
         self.transfer(
-            |input| TypedDecoder::new(input, options),
+            |input| TypedDecoder::new(input),
             Retirement::Stopped,
             |decoder| decoder.drive(policy, bound, Retirement::Published, body),
         )
@@ -3562,9 +3552,21 @@ impl RecordedRun {
     }
 
     /// Keep a policy share in this run, with its own trace and the original
-    /// family's storage and credit accounting.
+    /// family's storage and credit accounting, of no work or requested-bytes
+    /// limit of its own ([`Self::shared_policy_within`]).
     pub fn shared_policy(&mut self, id: PolicyId) -> PolicyId {
-        let share = self.with_policy(id, |policy| policy.share());
+        self.shared_policy_within(id, dcbor::bounded::Ceilings::UNLIMITED)
+    }
+
+    /// Keep a policy share in this run under `ceilings` of its own
+    /// ([`Limits::share_within`]), with its own trace and the original
+    /// family's storage and credit accounting.
+    pub fn shared_policy_within(
+        &mut self,
+        id: PolicyId,
+        ceilings: dcbor::bounded::Ceilings,
+    ) -> PolicyId {
+        let share = self.with_policy(id, |policy| policy.share_within(ceilings));
         self.adopt(share)
     }
 
@@ -3849,25 +3851,24 @@ pub fn decode_turns(len: usize) -> usize {
 }
 
 /// The turn bound for an owned typed decode of `T` from arbitrary input of
-/// `len` bytes, or its cleanup, under any depth limit
+/// `len` bytes, or its cleanup, under `T`'s wire profile
 /// (`decode::construction::typed_decode_bound`), or a construction alone.
 pub fn typed_turns<T: InPlace<Limits>>(len: usize) -> usize {
     turns(
         dcbor::bounded::decode::construction::typed_decode_bound::<ByteString, T, Limits, ()>(
             len as u64,
-            any_depth(len),
         )
         .expect("the typed decode bound of an input held in memory fits in u64"),
     )
 }
 
 /// The turn bound for a typed decode of `T` from a borrowed input of `len`
-/// bytes under `options` (`decode::construction::typed_decode_bound`): the
-/// bound of the scope's decode ([`Holding::decoded`], [`Holding::decoder`]).
-pub fn borrowed_decode_turns<T: InPlace<Limits>>(len: usize, options: Options) -> usize {
+/// bytes (`decode::construction::typed_decode_bound`): the bound of the
+/// scope's decode ([`Holding::decoded`], [`Holding::decoder`]).
+pub fn borrowed_decode_turns<T: InPlace<Limits>>(len: usize) -> usize {
     turns(
         dcbor::bounded::decode::construction::typed_decode_bound::<Borrowed<'_>, T, Limits, ()>(
-            len as u64, options,
+            len as u64,
         )
         .expect("typed decode bound fits in u64"),
     )
@@ -5804,8 +5805,9 @@ impl<T, E: Debug, R: Labelled> From<&Stopped<T, E, R>> for Finding {
     }
 }
 
-/// After a refusal: when the refused call is a unit of work wider than a
-/// turn's quantum, no turn can ever admit it and the operation is stalled
+/// After a refusal: when the policy refused a unit of work wider than its
+/// quantum ([`LimitRefusal::QuantumTooSmall`], the accounting core's own
+/// classification), no turn can ever admit it and the operation is stalled
 /// ([`Stopped::Stalled`]), returned at once rather than after every turn of
 /// the bound is spent retrying it. The position is read only when
 /// `observed`.
@@ -5818,9 +5820,9 @@ fn stalled<T, E, O: Resumable<Limits>>(
         Some(Admission {
             index,
             call: Call::Work { values, bytes },
-            result: Err(LimitRefusal::Work),
+            result: Err(LimitRefusal::QuantumTooSmall),
             ..
-        }) if values > TURN.values || bytes > TURN.bytes => Some(Stopped::Stalled {
+        }) => Some(Stopped::Stalled {
             call: index,
             values,
             bytes,
@@ -5833,25 +5835,25 @@ fn stalled<T, E, O: Resumable<Limits>>(
 /// Whether a fresh turn can satisfy a refused turn's `error`: a refusal the
 /// run's fault schedule injected in that turn (the policy's injected count
 /// past `injected`, its count before the turn), which the schedule admits on
-/// the retry, or an ordinary work refusal, which a fresh quantum admits
-/// ([`refused`] fails a unit no quantum holds). Nothing else is retryable:
-/// an ordinary storage refusal needs a release no turn makes, an expired
-/// deadline stays expired, and an unrecorded grant stays unrecorded. A
-/// driver returns those to its caller at once, never spinning on them to its
-/// bound.
+/// the retry, or a spent turn ([`LimitRefusal::Turn`]), which a fresh one
+/// admits. Nothing else is retryable: a unit beyond the quantum fits no turn
+/// ([`stalled`]), an ordinary storage refusal needs a release no turn makes,
+/// an exhausted lifetime allowance and an expired deadline stay so, and an
+/// unrecorded grant stays unrecorded. A driver returns those to its caller
+/// at once, never spinning on them to its bound.
 fn retryable<E: Failure<Refusal = LimitRefusal>>(m: &Limits, error: &E, injected: usize) -> bool {
-    m.injected_refusals() > injected || error.class() == Class::Refused(&LimitRefusal::Work)
+    m.injected_refusals() > injected || error.class() == Class::Refused(&LimitRefusal::Turn)
 }
 
-/// Positively identify a non-injected work refusal that a fresh quantum can
-/// satisfy. Step-level fixtures use this predicate without treating arbitrary
-/// resource failures as retryable progress.
+/// Positively identify a non-injected spent turn ([`LimitRefusal::Turn`])
+/// that a fresh turn can satisfy. Step-level fixtures use this predicate
+/// without treating arbitrary resource failures as retryable progress.
 pub fn ordinary_exhaustion<E: Failure<Refusal = LimitRefusal>>(m: &Limits, error: &E) -> bool {
-    if error.class() != Class::Refused(&LimitRefusal::Work) {
+    if error.class() != Class::Refused(&LimitRefusal::Turn) {
         return false;
     }
     let refused = m.refused_calls();
-    let Some(&(index, LimitRefusal::Work, false)) = refused.last() else {
+    let Some(&(index, LimitRefusal::Turn, false)) = refused.last() else {
         return false;
     };
     assert_eq!(index + 1, m.attempts(), "refusal witness is stale");
@@ -6305,8 +6307,8 @@ where
             Ok(Step::Finished) => return Err(Stopped::Finished),
             Err(error) if error.refused() => {
                 if matches!(schedule, TurnSchedule::Fresh)
-                    && error.class() == Class::Refused(&LimitRefusal::Work)
-                    && reason != LimitRefusal::Work
+                    && error.class() == Class::Refused(&LimitRefusal::Turn)
+                    && reason != LimitRefusal::Turn
                     && m.injected_refusals() == 0
                 {
                     if let Some(stall) = stalled(m, operation, true) {
@@ -6519,7 +6521,7 @@ impl RefusalRun {
                 if injected {
                     events.push((call, true));
                 } else {
-                    assert_eq!(reason, LimitRefusal::Work, "unexpected ordinary refusal");
+                    assert_eq!(reason, LimitRefusal::Turn, "unexpected ordinary refusal");
                     assert!(matches!(call, Call::Work { .. }));
                 }
             } else {
@@ -7978,7 +7980,7 @@ mod tests {
     )]
     fn shared_storage_does_not_claim_aggregate_work_request_or_deadline_authority() {
         let mut parent = Limits::new(0, 0, 8).requesting_at_most(0);
-        parent.deadline(Some(0));
+        parent.expire_at_call(Some(0));
         let mut first = parent.share();
         let mut second = parent.share();
         first.traverse(1, 64).unwrap();
@@ -8055,7 +8057,7 @@ mod tests {
         );
         assert_eq!(baseline.calls.len(), 4);
         assert_eq!(baseline.admitted.len(), 3);
-        assert_eq!(baseline.refusals, [(1, LimitRefusal::Work, false)]);
+        assert_eq!(baseline.refusals, [(1, LimitRefusal::Turn, false)]);
     }
 
     #[test]
@@ -8067,7 +8069,7 @@ mod tests {
                 let policy = run.policy(u64::MAX);
                 let refusals = run.scoped(policy, &pipeline::Unwitnessed, |owner| {
                     owner.copied(policy, &wire, |input| {
-                        input.decode::<String, _>(policy, Options::normalizing(8), |value| {
+                        input.decode::<String, _>(policy, |value| {
                             value.prepare(policy, |plan| {
                                 plan.transfer(
                                     dcbor::bounded::encoding::OwnedPrepared::into_writer,
@@ -8217,7 +8219,7 @@ mod tests {
             )?;
             let (mut refusals, by) =
                 run.with_policy(policy, |m| (RefusalRun::of(m), m.performer()));
-            assert_eq!(refusals.refusals, [(1, LimitRefusal::Work, false)]);
+            assert_eq!(refusals.refusals, [(1, LimitRefusal::Turn, false)]);
             refusals.refusals[0].2 = true;
             run.inspect_evidence(move |observed, _| refusals.recorded_in(observed, by, 0));
             Ok(())
@@ -9091,7 +9093,6 @@ mod tests {
                     owner.decoder::<_, String, _, _>(
                         policy,
                         Copying(&wire),
-                        Options::normalizing(8),
                         &pipeline::Unwitnessed,
                         |decoder| {
                             decoder.drive(
@@ -9143,7 +9144,6 @@ mod tests {
                     let published = owner.decoder::<_, String, _, _>(
                         policy,
                         Copying(&wire),
-                        Options::normalizing(8),
                         &pipeline::Unwitnessed,
                         |decoder| {
                             decoder.controlled(
@@ -9241,7 +9241,6 @@ mod tests {
                     owner.decoder::<_, String, _, _>(
                         policy,
                         Copying(&wire),
-                        Options::normalizing(8),
                         &pipeline::Unwitnessed,
                         |decoder| {
                             decoder.drive(
@@ -10141,7 +10140,7 @@ mod tests {
             let policy = run.policy(u64::MAX);
             run.scoped(policy, &pipeline::Unwitnessed, |owner| {
                 owner.copied(policy, &wire, |input| {
-                    input.decode::<String, _>(policy, Options::normalizing(8), |value| {
+                    input.decode::<String, _>(policy, |value| {
                         assert_eq!(value.value().value(), "abc");
                         value.checkpoint();
                     })
@@ -10948,13 +10947,12 @@ pub mod pipeline {
         let bound =
             dcbor::bounded::decode::construction::typed_decode_bound::<ByteString, T, Limits, ()>(
                 wire.len() as u64,
-                OPTIONS,
             )
             .expect("the typed decode bound of an input held in memory fits in u64");
         acquired(context, owner, wire, classes.input, |input| {
             let calls = context.heap.requests();
             input.transfer(
-                |input| TypedDecoder::<_, T, Limits>::new(input, OPTIONS),
+                |input| TypedDecoder::<_, T, Limits>::new(input),
                 Retirement::Stopped,
                 |decoding| {
                     assert_eq!(context.heap.requests(), calls, "decode constructor allocated");
@@ -11034,8 +11032,8 @@ pub mod pipeline {
     }
 
     /// A custom input installed through the public resource-binding
-    /// interface ([`instrumented`]), then decoded as `T` under `options`,
-    /// its boundaries classed by `classes`; the published value, whose
+    /// interface ([`instrumented`]), then decoded as `T`, its boundaries
+    /// classed by `classes`; the published value, whose
     /// address moving its handle never changes, is given to `inspect` and
     /// retired. The scope and the input are setup the pipeline does not put
     /// under test: they run before the measured part begins, and the
@@ -11045,7 +11043,6 @@ pub mod pipeline {
         context: &Context<P>,
         owner: &mut Holding<'_, '_, DecodeOwner<'static, Limits>, P>,
         wire: &[u8],
-        options: Options,
         classes: &Pipeline<Instrumented, T>,
         released: &Arc<AtomicUsize>,
         inspect: impl FnOnce(&T),
@@ -11061,14 +11058,14 @@ pub mod pipeline {
             T,
             Limits,
             (),
-        >(wire.len() as u64, options)
+        >(wire.len() as u64)
         .expect("the typed decode bound of an input held in memory fits in u64");
         let (reached, before_retirement) = owner.holding(input, Retirement::Published, |input| {
             input.with_policy(context.policy, |_, m| m.measure());
             context.arm(input);
             let calls = context.heap.requests();
             input.transfer(
-                |input| TypedDecoder::<_, T, Limits>::new(input, options),
+                |input| TypedDecoder::<_, T, Limits>::new(input),
                 Retirement::Stopped,
                 |decoding| {
                     assert_eq!(
@@ -11450,20 +11447,19 @@ pub mod pipeline {
             })
         }
 
-        /// Decode `wire`, which may be any bytes, as `T` under `options` from
-        /// a custom input (`decoding`), observed (`observe`), its
-        /// boundaries classed by `classes`, a published value given to
+        /// Decode `wire`, which may be any bytes, as `T` under its wire
+        /// profile from a custom input (`decoding`), observed (`observe`),
+        /// its boundaries classed by `classes`, a published value given to
         /// `inspect`. The drain releases the input exactly once.
         pub fn decode<T: Transferable<Limits> + 'static>(
             wire: &[u8],
-            options: Options,
             schedule: &Schedule,
             classes: &Pipeline<Instrumented, T>,
             inspect: impl FnOnce(&T),
         ) -> Report {
             let released = Arc::new(AtomicUsize::new(0));
             let report = observe::<P>(wire, schedule, CAPACITY, |context, owner, _| {
-                decoding::<T, P>(context, owner, wire, options, classes, &released, inspect)
+                decoding::<T, P>(context, owner, wire, classes, &released, inspect)
             });
             assert_eq!(
                 released.load(Ordering::SeqCst),
@@ -11527,12 +11523,11 @@ pub mod pipeline {
     /// [`Under::decode`] under the heap guard.
     pub fn decode<T: Transferable<Limits> + 'static>(
         wire: &[u8],
-        options: Options,
         schedule: &Schedule,
         classes: &Pipeline<Instrumented, T>,
         inspect: impl FnOnce(&T),
     ) -> Report {
-        Under::<heap::Observation>::decode::<T>(wire, options, schedule, classes, inspect)
+        Under::<heap::Observation>::decode::<T>(wire, schedule, classes, inspect)
     }
 
     /// Observation without effect: `schedule` run again reading no position

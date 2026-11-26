@@ -1968,6 +1968,8 @@ const OPTIONAL: &str = "crate::bounded::decode::construction::in_place::optional
 
 const SCALARS: &str = "crate::bounded::decode::construction::in_place::scalars";
 
+const FIXED: &str = "crate::bounded::decode::construction::in_place::fixed_bytes";
+
 const BTREE: &str = "crate::bounded::decode::construction::in_place::btree";
 
 const VECTOR: &str = "crate::bounded::decode::construction::in_place::vector";
@@ -2042,9 +2044,19 @@ const UNSAFE_IMPLS: &[(&str, &str, &str)] = &[
     (VALUES, "TransferableSchema", "num_bigint :: BigInt"),
     (VALUES, "TransferableSchema", "crate :: MinimalBigInt"),
     (
-        "crate::bounded::decode::construction::in_place::stabilized",
+        "crate::bounded::decode::construction::in_place::checked",
         "TransferableSchema",
         "StabilizedText",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::checked",
+        "TransferableSchema",
+        "AsciiText",
+    ),
+    (
+        "crate::fixed_bytes",
+        "TransferableSchema",
+        "FixedBytes < N >",
     ),
     ("crate::map", "Entries", "Map"),
     (
@@ -2053,6 +2065,11 @@ const UNSAFE_IMPLS: &[(&str, &str, &str)] = &[
         "expand",
     ),
     ("crate::bounded::policy", "TerminalAllocator", "Limits"),
+    (
+        "crate::bounded::governance",
+        "TerminalAllocator",
+        "OperationBudget",
+    ),
     (ENCODING, "Reclaim", "Planned < 's , I , T , A >"),
     (ENCODING, "Task", "Prepare < 's , I , T , A >"),
     (INPUT, "DecodeInput", "ByteString"),
@@ -2111,15 +2128,38 @@ const UNSAFE_IMPLS: &[(&str, &str, &str)] = &[
         "MinimalBigInt",
     ),
     (
-        "crate::bounded::decode::construction::in_place::stabilized",
+        "crate::bounded::decode::construction::in_place::checked",
         "Reclaim",
         "StabilizedText",
     ),
     (
-        "crate::bounded::decode::construction::in_place::stabilized",
+        "crate::bounded::decode::construction::in_place::checked",
         "InPlace",
         "StabilizedText",
     ),
+    (
+        "crate::bounded::decode::construction::in_place::checked",
+        "Placeholder",
+        "StabilizedText",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::checked",
+        "Reclaim",
+        "AsciiText",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::checked",
+        "InPlace",
+        "AsciiText",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::checked",
+        "Placeholder",
+        "AsciiText",
+    ),
+    (FIXED, "Reclaim", "FixedBytes < N >"),
+    (FIXED, "InPlace", "FixedBytes < N >"),
+    (FIXED, "Placeholder", "FixedBytes < N >"),
     (BTREE, "InPlace", "BTreeMap < K , V >"),
     (BTREE, "Reclaim", "BTreeMap < K , V >"),
     (BTREE, "TreeKey", "String"),
@@ -2924,6 +2964,11 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "the policy's accounting totals and limits, no pointer derived",
     ),
     (
+        "crate::bounded::governance",
+        "*",
+        "the group's and its operations' accounting totals and limits, no pointer derived",
+    ),
+    (
         "crate::bounded::decode::storage",
         "Storage::reclaim_remaining",
         "a count of cleanup calls",
@@ -2987,6 +3032,16 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "crate::bounded::decode",
         "Terms::peak_of",
         "bound arithmetic of the synchronous decode",
+    ),
+    (
+        "crate::bounded::decode",
+        "Options::nested",
+        "wire profile composition in a constant: one level deeper, saturating at the unrestricted depth, no policy",
+    ),
+    (
+        "crate::bounded::decode",
+        "Options::either",
+        "wire profile composition in a constant: the deeper of two depths, no policy",
     ),
     (
         "crate::bounded::decode",
@@ -3264,8 +3319,13 @@ const BOUNDARY_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "checked lengths refused as Overflow",
     ),
     (
-        "crate::bounded::decode::construction::in_place::stabilized",
-        "stabilized_cost",
+        "crate::bounded::decode::construction::in_place::checked",
+        "checked_cost",
+        "the construction cost algebra",
+    ),
+    (
+        "crate::bounded::decode::construction::in_place::fixed_bytes",
+        "fixed_cost",
         "the construction cost algebra",
     ),
     (

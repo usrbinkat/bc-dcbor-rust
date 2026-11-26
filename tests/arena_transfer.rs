@@ -176,7 +176,7 @@ fn transferred(
             assert_eq!(
                 decoder.suspend(
                     a,
-                    LimitRefusal::Work,
+                    LimitRefusal::Turn,
                     1,
                     support::TurnSchedule::Retained,
                     Retirement::Published

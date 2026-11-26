@@ -22,7 +22,7 @@ use super::reclamation::{
 use super::stable::{self, PENDING_UNITS, Pending};
 use crate::bounded::boundary::{Bound, Predicate};
 use crate::bounded::decode::initialization::field;
-use crate::bounded::decode::{ConstructResult, DecodeError, Options};
+use crate::bounded::decode::{ConstructResult, DecodeError};
 use crate::bounded::{
     Allocator, BoundedError, BoundedResult, Budget, Custodial, CustodySink, PermitsObserved,
     Places, ResourceBound, Resumable, Step, TerminalAllocator, Unit, WriteWork, at, observed_all,
@@ -852,20 +852,17 @@ impl Places for ConstructTerms {
 }
 
 /// The [`ResourceBound`] of decoding `T` from an input handle of at most
-/// `len` bytes under `options` ([`TypedDecoder`]): the parse
-/// ([`super::parse::parse_bound`]), then the construction while the document
-/// is still held ([`construction_bound`]). Both records are what
-/// publication retains until the scope reclaims the document's.
-pub fn typed_decode_bound<I, T, A, R>(
-    len: u64,
-    options: Options,
-) -> Result<ResourceBound, BoundedError<R>>
+/// `len` bytes ([`TypedDecoder`]): the parse under `T`'s wire profile
+/// ([`super::parse::parse_bound`], [`InPlace::WIRE`]), then the construction
+/// while the document is still held ([`construction_bound`]). Both records
+/// are what publication retains until the scope reclaims the document's.
+pub fn typed_decode_bound<I, T, A, R>(len: u64) -> Result<ResourceBound, BoundedError<R>>
 where
     I: DecodeInput<A>,
     T: InPlace<A>,
     A: Allocator,
 {
-    super::parse::parse_bound::<I, A, R>(len, options)?
+    super::parse::parse_bound::<I, A, R>(len, T::WIRE)?
         .checked_then(construction_bound::<I, T, A, R>(len)?)
         .ok_or(BoundedError::Overflow)
 }
@@ -1196,10 +1193,13 @@ where
     A: TerminalAllocator + 's,
     A::Permit: Send,
 {
-    /// A typed decode of `input`. Construction allocates nothing.
-    pub fn new(input: OwnedInitialized<'s, I, A>, options: Options) -> Self {
+    /// A typed decode of `input`, parsed under `T`'s wire profile
+    /// ([`InPlace::WIRE`]): a document nested past it, or holding a text it
+    /// leaves unproven, is refused by the parse. Construction allocates
+    /// nothing.
+    pub fn new(input: OwnedInitialized<'s, I, A>) -> Self {
         Self {
-            stage: Stage::Parse(DocumentDecoder::parse(input, options)),
+            stage: Stage::Parse(DocumentDecoder::parse(input, T::WIRE)),
         }
     }
 
@@ -1286,6 +1286,7 @@ mod released {
     use super::*;
     use crate::ByteString;
     use crate::bounded::Limits;
+    use crate::bounded::decode::Options;
 
     #[test]
     fn a_construction_records_cleanup_releases_every_capability_and_admits_nothing_after_done() {
@@ -1343,6 +1344,7 @@ mod depth {
     use super::*;
     use crate::ByteString;
     use crate::bounded::Limits;
+    use crate::bounded::decode::Options;
     use crate::bounded::encoding::{OwnedPreparation, OwnedPrepared, Planned};
 
     /// A value whose chain dominates its input's: three sequences over a

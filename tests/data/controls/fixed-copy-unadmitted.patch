@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place/fixed_bytes.rs
++++ src/bounded/decode/construction/in_place/fixed_bytes.rs
+@@ -179,7 +179,8 @@
+             return Err(BoundedError::PlanMismatch.into());
+         }
+         let end = start + Bound::new(Predicate::Quantum, stable::QUANTUM).clamp(a, N - start);
+-        COPY.admit(a, (end - start) as u64)?;
++        // Planted: the copy written without its admission.
++        let _ = COPY;
+         // SAFETY: `start..end` lies within both the node's `N` bytes and the
+         // value's, which the transparent representation lays out as an
+         // array of `N` bytes from the place's start; bytes need no

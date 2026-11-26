@@ -15,15 +15,25 @@ fn policy(run: &mut support::RecordedRun, refuse_at: Option<usize>) -> support::
     policy
 }
 
+/// The policy limits a run under [`policy`] can reach: its lifetime work,
+/// its live storage, and a request beyond the whole ceiling. It runs no
+/// turns and lowers no requested-bytes ceiling.
+fn limit(refusal: LimitRefusal) -> bool {
+    matches!(
+        refusal,
+        LimitRefusal::Work | LimitRefusal::Storage | LimitRefusal::TooLarge
+    )
+}
+
 /// A refusal is either the scheduled one, at exactly the scheduled call, or a
-/// work or storage limit. Anything else is an encoder invariant failure.
+/// policy limit ([`limit`]). Anything else is an encoder invariant failure.
 fn expected_failure(error: BoundedError<LimitRefusal>, policy: &Limits, scheduled: Option<usize>) {
     match error {
         BoundedError::Refused(LimitRefusal::Scheduled(at)) => {
             assert_eq!(Some(at), scheduled);
             assert_eq!(at, policy.attempts() - 1);
         }
-        BoundedError::Refused(LimitRefusal::Work | LimitRefusal::Storage) => {}
+        BoundedError::Refused(refusal) if limit(refusal) => {}
         other => panic!("encoding invariant failed: {other:?}"),
     }
 }
@@ -215,8 +225,8 @@ fn retained_schedule(input: &[u8], schedule: usize) {
                 Err(support::Stopped::Operation(DecodeError::Invalid(_))) => Terminal::Invalid,
                 Err(support::Stopped::Operation(DecodeError::DepthLimit { .. })) => Terminal::Depth,
                 Err(support::Stopped::Operation(DecodeError::Resource(BoundedError::Refused(
-                    LimitRefusal::Work | LimitRefusal::Storage,
-                )))) => Terminal::Limit,
+                    refusal,
+                )))) if limit(refusal) => Terminal::Limit,
                 Err(stop) => return Err(support::Finding::from(stop)),
             };
             Ok(run.with_policy(policy, |m| {

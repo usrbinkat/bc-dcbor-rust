@@ -1,0 +1,15 @@
+--- tests/cddl/src/lib.rs
++++ tests/cddl/src/lib.rs
+@@ -286,10 +286,8 @@
+             }
+             let mut longer = data.to_vec();
+             longer.push(0);
+-            out.push(Item {
+-                label: "a byte longer".to_string(),
+-                cbor: CBOR::to_byte_string(longer),
+-            });
++            // Planted: the longer byte string dropped from the domain.
++            drop(longer);
+         }
+         CBORCase::Tagged(tag, inner) => {
+             out.push(Item {

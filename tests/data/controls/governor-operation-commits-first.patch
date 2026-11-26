@@ -1,0 +1,12 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -377,7 +377,8 @@
+         planned: Planned,
+         group: impl FnOnce(&Group) -> Result<(), LimitRefusal>,
+     ) -> Result<(), LimitRefusal> {
+-        group(&self.operation.group)?;
++        // Planted: the operation committed before the group decides.
+         self.authority.commit(planned);
++        group(&self.operation.group)?;
+         Ok(())
+     }

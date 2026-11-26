@@ -16,24 +16,30 @@
 //! dCBOR item is, is that crate's "The value classes it excludes".
 //!
 //! The fixtures cover each schema form the derive emits: required and
-//! optional map fields, the keys no field names, a nested derived type, a
-//! tag, an enum's unit, tuple and named variants, a newtype, a unit struct,
+//! optional map fields, the keys no field names, ignored by an open map and
+//! refused by a closed one (`#[cbor(closed)]`: a record, one nested in it, a
+//! tagged one, an enum's named variant, and one of no fields), a nested
+//! derived type, a tag, an enum's unit, tuple and named variants, a newtype,
+//! a unit struct,
 //! a generic type at two instantiations (alone and side by side in one
 //! document), integer ranges at both ends of `i64` and of the unsigned
-//! widths, text, byte strings, booleans and a table.
+//! widths, text, ASCII text (`tstr .regexp "[\u0000-\u007F]*"`, required
+//! and optional), byte strings, fixed-length byte strings (`bstr .size N`,
+//! required and optional), booleans and a table.
 //!
 //! Planted controls (`tests/data/controls/cddl-*.patch`), each in the
 //! generator or the CDDL forms: a field optional in the decoders rendered
 //! required; a key off by one; a tag omitted; the keys no field names
-//! forbidden. Each must fail `every_fixtures_cddl_admits_exactly_what_its_
-//! decoders_accept` with its named divergence.
+//! forbidden in an open map, and admitted in a closed one. Each must fail
+//! `every_fixtures_cddl_admits_exactly_what_its_decoders_accept` with its
+//! named divergence.
 
 use dcbor::bounded::Limits;
 use dcbor::bounded::decode::construction::in_place::Transferable;
 use dcbor::bounded::decode::decode_typed;
 use dcbor::cddl::document;
 use dcbor::prelude::*;
-use dcbor::{CBORBoundedDecodable, CBORCddl, CBORCodable};
+use dcbor::{AsciiText, CBORBoundedDecodable, CBORCddl, CBORCodable, FixedBytes};
 use dcbor_cddl_check::{Decoder, findings, mutations};
 use std::collections::BTreeMap;
 
@@ -105,6 +111,79 @@ struct Pairs {
     listed: Pair<Vec<u8>, bool>,
 }
 
+/// A closed record (`#[cbor(closed)]`), holding a closed record: each map
+/// refuses a key no field names, its CDDL without the open member.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(closed)]
+struct Sealed {
+    #[cbor(n = 0)]
+    name: String,
+    #[cbor(n = 2)]
+    note: Option<String>,
+    #[cbor(n = 3)]
+    inner: SealedInner,
+}
+
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(closed)]
+struct SealedInner {
+    #[cbor(n = 0)]
+    flag: bool,
+}
+
+/// A closed record under a tag.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(tag = 40001, closed)]
+struct SealedStamp {
+    #[cbor(n = 0)]
+    at: u64,
+}
+
+/// A closed enum: its named variant's map is closed.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[repr(u8)]
+#[cbor(closed)]
+enum SealedShape {
+    #[cbor(n = 0)]
+    Point,
+    #[cbor(n = 1)]
+    Rect {
+        #[cbor(n = 0)]
+        w: u16,
+        #[cbor(n = 1)]
+        h: Option<u16>,
+    },
+}
+
+/// A closed record of no fields: the empty map alone.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(closed)]
+struct SealedEmpty {}
+
+/// Fixed-length byte strings (`FixedBytes`), required and optional: each
+/// field's map value is `bstr .size N`, a byte string of another length
+/// refused by both decoders.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(closed)]
+struct Digest {
+    #[cbor(n = 0)]
+    id: FixedBytes<2>,
+    #[cbor(n = 1)]
+    key: Option<FixedBytes<4>>,
+}
+
+/// ASCII texts (`AsciiText`), required and optional: each field's map value
+/// is `tstr .regexp "[\u0000-\u007F]*"`, a text with a code point at or past
+/// U+0080 refused by both decoders.
+#[derive(CBORCodable, CBORBoundedDecodable, CBORCddl)]
+#[cbor(closed)]
+struct Label {
+    #[cbor(n = 0)]
+    name: AsciiText,
+    #[cbor(n = 1)]
+    alias: Option<AsciiText>,
+}
+
 /// A table field: decoded symbolically only (the bounded B-tree binding is
 /// the forked collections' alone).
 #[derive(CBORCodable, CBORCddl)]
@@ -125,7 +204,7 @@ where
 
 /// The bounded decoder of `T`, unlimited: its acceptance alone is compared.
 fn bounded<T: Transferable<Limits> + 'static>(bytes: &[u8]) -> bool {
-    decode_typed::<T, _>(bytes, 16, &mut Limits::unlimited()).is_ok()
+    decode_typed::<T, _>(bytes, &mut Limits::unlimited()).is_ok()
 }
 
 /// The CBOR of a derived value, as its symbolic encoder writes it.
@@ -268,6 +347,103 @@ fn every_finding() -> Vec<String> {
     );
     check(
         all_ref,
+        "Sealed",
+        document::<Sealed>(),
+        vec![
+            encoded(Sealed {
+                name: "s".into(),
+                note: Some("n".into()),
+                inner: SealedInner { flag: true },
+            }),
+            encoded(Sealed {
+                name: String::new(),
+                note: None,
+                inner: SealedInner { flag: false },
+            }),
+        ],
+        &[
+            ("symbolic", &symbolic::<Sealed>),
+            ("bounded", &bounded::<Sealed>),
+        ],
+    );
+    check(
+        all_ref,
+        "SealedStamp",
+        document::<SealedStamp>(),
+        vec![
+            SealedStamp { at: 7 }
+                .tagged_cbor()
+                .expect("a tagged fixture encodes"),
+        ],
+        &[
+            ("symbolic", &symbolic::<SealedStamp>),
+            ("bounded", &bounded::<SealedStamp>),
+        ],
+    );
+    check(
+        all_ref,
+        "SealedShape",
+        document::<SealedShape>(),
+        vec![
+            encoded(SealedShape::Point),
+            encoded(SealedShape::Rect { w: 3, h: Some(4) }),
+            encoded(SealedShape::Rect { w: 0, h: None }),
+        ],
+        &[
+            ("symbolic", &symbolic::<SealedShape>),
+            ("bounded", &bounded::<SealedShape>),
+        ],
+    );
+    check(
+        all_ref,
+        "SealedEmpty",
+        document::<SealedEmpty>(),
+        vec![encoded(SealedEmpty {})],
+        &[
+            ("symbolic", &symbolic::<SealedEmpty>),
+            ("bounded", &bounded::<SealedEmpty>),
+        ],
+    );
+    check(
+        all_ref,
+        "Digest",
+        document::<Digest>(),
+        vec![
+            encoded(Digest {
+                id: FixedBytes::new([0, 255]),
+                key: Some(FixedBytes::new([1, 2, 3, 4])),
+            }),
+            encoded(Digest {
+                id: FixedBytes::new([7, 7]),
+                key: None,
+            }),
+        ],
+        &[
+            ("symbolic", &symbolic::<Digest>),
+            ("bounded", &bounded::<Digest>),
+        ],
+    );
+    check(
+        all_ref,
+        "Label",
+        document::<Label>(),
+        vec![
+            encoded(Label {
+                name: AsciiText::new("\u{0}id\u{7F}").expect("an ASCII fixture"),
+                alias: Some(AsciiText::new("k").expect("an ASCII fixture")),
+            }),
+            encoded(Label {
+                name: AsciiText::empty(),
+                alias: None,
+            }),
+        ],
+        &[
+            ("symbolic", &symbolic::<Label>),
+            ("bounded", &bounded::<Label>),
+        ],
+    );
+    check(
+        all_ref,
         "Ledger",
         document::<Ledger>(),
         vec![
@@ -332,6 +508,34 @@ fn every_fixtures_document_is_its_schema_in_rfc_8610() {
          Pair-2 = { 0: [* 0..255], 1: bool, * any => any }\n"
     );
     assert_eq!(
+        document::<Sealed>(),
+        "dcbor-root = Sealed\n\
+         Sealed = { 0: tstr, ? 2: tstr, 3: SealedInner }\n\
+         SealedInner = { 0: bool }\n"
+    );
+    assert_eq!(
+        document::<SealedStamp>(),
+        "dcbor-root = SealedStamp\nSealedStamp = #6.40001({ 0: uint })\n"
+    );
+    assert_eq!(
+        document::<SealedShape>(),
+        "dcbor-root = SealedShape\n\
+         SealedShape = 0 / [1, { 0: 0..65535, ? 1: 0..65535 }]\n"
+    );
+    assert_eq!(
+        document::<SealedEmpty>(),
+        "dcbor-root = SealedEmpty\nSealedEmpty = { }\n"
+    );
+    assert_eq!(
+        document::<Digest>(),
+        "dcbor-root = Digest\nDigest = { 0: bstr .size 2, ? 1: bstr .size 4 }\n"
+    );
+    assert_eq!(
+        document::<Label>(),
+        "dcbor-root = Label\n\
+         Label = { 0: tstr .regexp \"[\\u0000-\\u007F]*\", ? 1: tstr .regexp \"[\\u0000-\\u007F]*\" }\n"
+    );
+    assert_eq!(
         document::<Ledger>(),
         "dcbor-root = Ledger\n\
          Ledger = { 0: { * tstr => uint }, ? 1: -128..127, * any => any }\n"
@@ -349,6 +553,10 @@ fn the_domain_holds_every_kind_of_mutation_a_control_targets() {
             .tagged_cbor()
             .expect("a tagged fixture encodes"),
         encoded(Shape::Circle(1)),
+        encoded(Digest {
+            id: FixedBytes::new([0, 255]),
+            key: None,
+        }),
     ]);
     let labels: Vec<&str> = domain.iter().map(|item| item.label.as_str()).collect();
     for wanted in [
@@ -366,6 +574,10 @@ fn the_domain_holds_every_kind_of_mutation_a_control_targets() {
         "replaced by 1.5",
         "replaced by NaN",
         "replaced by tag 2 around a byte string",
+        "key 0 > a byte shorter",
+        "key 0 > a byte longer",
+        "key 0 > replaced by the last ASCII text",
+        "key 0 > replaced by the first non-ASCII text",
     ] {
         assert!(labels.contains(&wanted), "no `{wanted}` item: {labels:?}");
     }

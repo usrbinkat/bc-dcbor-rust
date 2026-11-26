@@ -22,4 +22,19 @@ struct RepeatedField {
 #[cbor(tag = 0, n = 1)]
 struct Contradictory;
 
+#[derive(CBORBoundedEncodable)]
+#[cbor(closed)]
+#[cbor(closed)]
+struct RepeatedClosed {
+    #[cbor(n = 0)]
+    field: u64,
+}
+
+#[derive(CBORBoundedEncodable)]
+#[cbor(closed = true)]
+struct ClosedValue {
+    #[cbor(n = 0)]
+    field: u64,
+}
+
 fn main() {}

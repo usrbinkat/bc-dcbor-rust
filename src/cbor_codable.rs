@@ -3,7 +3,8 @@ import_stdlib!();
 use half::f16;
 
 use crate::{
-    ByteString, CBOR, CBORCase, Date, Map, MinimalBigInt, Result, Set, Simple, StabilizedText,
+    AsciiText, ByteString, CBOR, CBORCase, Date, Map, MinimalBigInt, Result, Set, Simple,
+    StabilizedText,
 };
 
 /// # CBOR Encoding and Decoding Traits
@@ -31,8 +32,9 @@ use crate::{
 ///
 /// The types whose `From<_> for CBOR` cannot fail (integers, floats,
 /// `bool`, text, byte strings, [`CBOR`], [`CBORCase`], [`Map`], [`Set`],
-/// [`Date`], [`Simple`], [`StabilizedText`], [`crate::MinimalBigInt`], and
-/// the num-bigint integers) implement it by that conversion, so the two
+/// [`Date`], [`Simple`], [`StabilizedText`], [`AsciiText`], [`crate::MinimalBigInt`],
+/// [`crate::FixedBytes`], and the num-bigint integers) implement it by that
+/// conversion, so the two
 /// agree wherever both apply; that conversion stays their infallible form,
 /// and the owned encoding moves the value into it. Every other type
 /// implements it explicitly: sequences, options, boxes and references by
@@ -158,6 +160,7 @@ infallible!(by value:
     Date,
     Simple,
     StabilizedText,
+    AsciiText,
 );
 
 infallible!(by reference: Map, Set, MinimalBigInt);
@@ -361,6 +364,7 @@ mod tests {
         agree(true);
         agree(String::from("e\u{301}"));
         agree(ByteString::new([1, 2]));
+        agree(crate::FixedBytes::new([1u8, 2]));
         agree(CBOR::from("x"));
         agree(Map::new());
         agree(Set::try_from_values([2u8, 1]).unwrap());
@@ -368,6 +372,7 @@ mod tests {
         agree(CBORCase::Unsigned(2));
         agree(Date::from_timestamp(1.5));
         agree(StabilizedText::new("x".to_string()).unwrap());
+        agree(AsciiText::new("x").unwrap());
         agree(MinimalBigInt::from(u64::MAX));
         agree(MinimalBigInt::from(i64::MIN));
         assert_eq!("x".encode_cbor().unwrap(), CBOR::from("x"));

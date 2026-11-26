@@ -1,0 +1,12 @@
+--- src/bounded/decode/construction/in_place/fields.rs
++++ src/bounded/decode/construction/in_place/fields.rs
+@@ -466,7 +466,8 @@
+             // key the search narrowed to no field. A closed record refuses
+             // it in this admitted step, nothing changed; an open one skips
+             // it with its value.
+-            if T::CLOSED {
++            // Planted: a closed record's unknown key skipped as an open one's.
++            if T::CLOSED && T::COUNT == usize::MAX {
+                 return Err(crate::bounded::decode::DecodeError::Invalid(
+                     crate::Error::UnknownMapKey,
+                 ));

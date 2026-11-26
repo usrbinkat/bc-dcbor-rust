@@ -1,7 +1,6 @@
 //! Standalone bounded decoding with cooperative retirement pressure.
 //! Each batch is fully drained; busy-period age is an upper bound on record
 //! retirement age, not a per-record completion timestamp or open-loop latency.
-use dcbor::bounded::decode::Options;
 use dcbor::bounded::decode::construction::reclamation::Reclaimed;
 use dcbor::bounded::decode::construction::{Borrowed, DecodeOwner, TypedDecoder};
 use dcbor::bounded::{Failure, Limits, ResourceBound, Resumable, Step};
@@ -53,7 +52,6 @@ fn main() {
     assert!(operations > 0 && batch > 0);
     let text = "x".repeat(length);
     let wire = dcbor::CBOR::from(text.clone()).to_cbor_data();
-    let options = Options::normalizing(8);
     let borrow_bound =
         turns(dcbor::bounded::decode::construction::borrow_bound::<Limits, ()>().unwrap());
     let decode_bound =
@@ -63,7 +61,7 @@ fn main() {
                 String,
                 Limits,
                 (),
-            >(wire.len() as u64, options)
+            >(wire.len() as u64)
             .unwrap(),
         );
     let scope_bound =
@@ -110,7 +108,7 @@ fn main() {
             &mut foreground_steps,
         );
         let value = drive(
-            &mut TypedDecoder::<_, String, Limits>::new(input, options),
+            &mut TypedDecoder::<_, String, Limits>::new(input),
             &mut foreground,
             decode_bound,
             &mut foreground_steps,

@@ -1,0 +1,12 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -1707,7 +1707,7 @@
+         let now = self.clock;
+         self.clock = self.clock.saturating_add(1);
+-        if matches!(attempt, Attempt::Foreground(_))
+-            && self.expiry.is_some_and(|expiry| now >= expiry)
++        // Planted: the expiry refuses cleanup as it refuses the foreground.
++        if self.expiry.is_some_and(|expiry| now >= expiry)
+         {
+             return Err(LimitRefusal::Deadline);
+         }

@@ -1,0 +1,8 @@
+--- src/bounded/decode/construction/in_place/checked.rs
++++ src/bounded/decode/construction/in_place/checked.rs
+@@ -327,3 +327,4 @@
+     /// normalization runs ([`crate::bounded::decode::TextPolicy::QuickOnly`]).
+-    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::quick_only(0);
++    // Planted: an ASCII text decoded under strict normalization.
++    const WIRE: crate::bounded::decode::Options = crate::bounded::decode::Options::TEXT;
+ 
