@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -3285,7 +3285,7 @@
+@@ -3284,7 +3284,7 @@
                  .filter(|set| set.len() == names.len())
          });
          let expected: BTreeSet<&str> = reconciled.iter().map(String::as_str).collect();

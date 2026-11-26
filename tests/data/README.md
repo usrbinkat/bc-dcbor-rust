@@ -428,13 +428,16 @@ registry selects for that channel and those runners (`controls::selected`), each
 and every fault. `tests/controls.sh CHANNEL [RUNNER...]` runs that selection, every runner when none
 is named, holding the checkout's workload lock (`target/gate-workload.lock`) for its whole run.
 
+Test adequacy and implementation validation are separate tracks, each run without the other.
+`./run_tests.sh` validates the implementation: every feature leg of the library and its workspace,
+clippy and formatting. `tests/red-green.sh` checks test adequacy: the evidence tooling's own tests,
+then the planted controls of the channel it is given (`tests/controls.sh`). No implementation
+validation, calibration or qualification reads a control run's verdict.
+
 A calibration's readiness (`readiness.json`) is established and validated by one validator, live and
 whenever a kept receipt is read (`Readiness::validate`). It requires:
 
-- exactly the native control runs of the nightly and stable channels (`proofs::REQUIRED_CONTROLS`),
-  each finished, of the calibration's commit and of the registry the calibration's copy holds,
-  judging exactly the controls that registry selects, every result passed and its faults recorded
-  exactly (`proofs::control_run`);
+- the calibration's commit, recorded;
 - the workload lock held by the calibration itself (`proofs::WorkloadLock`), so no control or proof
   run of the checkout competes with it;
 - a valid settling policy (`proofs::settling_policy`): seven readings of `/proc/loadavg` at least 5
@@ -445,11 +448,11 @@ whenever a kept receipt is read (`Readiness::validate`). It requires:
 
 A receipt that only says it is ready establishes nothing.
 
-A calibration (`tests/proofs.sh calibrate PLAN NIGHTLY_LOGS STABLE_LOGS`, `proofs::calibration`)
-validates its plan once and establishes its readiness. It then checks each planned harness alone,
-one Kani run each with its own identity, environment and load (`LOGS/calibration/HARNESS.N.log` and
-its evidence), in two passes: every harness once, then, to `proofs::SAMPLES` executions, only a
-harness whose every execution was a sample.
+A calibration (`tests/proofs.sh calibrate PLAN`, `proofs::calibration`) validates its plan once and
+establishes its readiness. It then checks each planned harness alone, one Kani run each with its own
+identity, environment and load (`LOGS/calibration/HARNESS.N.log` and its evidence), in two passes:
+every harness once, then, to `proofs::SAMPLES` executions, only a harness whose every execution was
+a sample.
 
 A discovery (`tests/proofs.sh discover HARNESS...`, `gate proofs-discover`, `proofs::discover`) is
 the one source of a loop-bound selector's `function`, `file`, `loops_in_function` and `loop`: one

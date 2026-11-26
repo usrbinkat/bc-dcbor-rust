@@ -132,9 +132,10 @@ impl Journal {
 
 /// What a calibration is asked to run: in the copy `root` of the commit
 /// `logs/commit.txt` names, the plan at `plan`, built into `target_dir`, its
-/// records under `logs`, the run's selected `launcher`, after the control
-/// runs whose logs are `control_logs` ([`super::REQUIRED_CONTROLS`]), holding
-/// the checkout's workload lock at `workload_lock` ([`super::WORKLOAD_LOCK`]).
+/// records under `logs`, the run's selected `launcher`, holding the
+/// checkout's workload lock at `workload_lock` ([`super::WORKLOAD_LOCK`]).
+/// No planted-control run is a prerequisite: a calibration measures the
+/// implementation alone.
 #[derive(Clone, Copy, Debug)]
 pub struct CalibrationRequest<'a> {
     pub root: &'a Path,
@@ -142,7 +143,6 @@ pub struct CalibrationRequest<'a> {
     pub target_dir: &'a Path,
     pub logs: &'a Path,
     pub launcher: &'a Path,
-    pub control_logs: &'a [&'a Path],
     pub workload_lock: &'a Path,
 }
 
@@ -266,7 +266,6 @@ fn schedule(
         target_dir,
         logs,
         launcher,
-        control_logs,
         ..
     } = request;
     let workload = runtime.workload;
@@ -313,9 +312,7 @@ fn schedule(
         readiness(
             &logs.join(READINESS_RECORD),
             &Prerequisites {
-                root,
                 commit: commit.trim(),
-                control_logs,
                 lock,
             },
             runtime.settling,

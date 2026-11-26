@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -42,7 +42,7 @@
+@@ -34,7 +34,7 @@
              .truncate(false)
              .open(path)
              .map_err(|error| format!("{}: {error}", path.display()))?;

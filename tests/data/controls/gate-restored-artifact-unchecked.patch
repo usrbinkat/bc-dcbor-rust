@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2191,7 +2191,7 @@
+@@ -2190,7 +2190,7 @@
              // baseline's, the same source built at the same location.
              Applicability::Control(authorization) => {
                  if let Some(baseline) = authorization.restored_baseline()

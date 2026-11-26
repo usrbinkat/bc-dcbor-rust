@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/readiness.rs
 +++ tests/gate/src/proofs/readiness.rs
-@@ -73,7 +73,7 @@
+@@ -65,7 +65,7 @@
  /// descriptor's close then releases it once every copy is closed.
  impl Drop for WorkloadLock {
      fn drop(&mut self) {

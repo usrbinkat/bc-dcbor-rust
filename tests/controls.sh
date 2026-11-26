@@ -30,10 +30,10 @@
 #
 # The runners named after the channel scope the run to their controls
 # (`gate control list`, `controls::selected`), every runner when none is
-# named: a calibration's readiness requires the native controls of the
-# nightly and the stable channel exactly (tests/gate `proofs::REQUIRED_CONTROLS`),
-# each run's final record naming its channel, its runners and every selected
-# control's result (`gate control evidence`, `verdict.json`). The run holds
+# named, each run's final record naming its channel, its runners and every
+# selected control's result (`gate control evidence`, `verdict.json`). The
+# verdict is test adequacy's alone: no implementation validation, calibration
+# or qualification reads it (tests/red-green.sh runs this track). The run holds
 # the checkout's workload lock (target/gate-workload.lock) exclusively from
 # before its first control to its verdict: no other control run, proof run
 # or calibration of the checkout runs beside it.
@@ -42,7 +42,7 @@
 # controls alone, each required to be one the channel and runners select (an
 # unknown name refuses the run before anything runs): the same sequence per
 # control, its selection in the run's identity, and no final record, since
-# a partial run is no channel's verdict and no readiness may cite it.
+# a partial run is no channel's verdict.
 #
 # Usage: tests/controls.sh {nightly|stable|kani} [RUNNER...] [--only NAME...]
 set -uo pipefail

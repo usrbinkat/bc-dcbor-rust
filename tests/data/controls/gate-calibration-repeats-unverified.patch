@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs/calibration.rs
 +++ tests/gate/src/proofs/calibration.rs
-@@ -421,7 +421,7 @@
+@@ -418,7 +418,7 @@
                          }
                      },
                  };

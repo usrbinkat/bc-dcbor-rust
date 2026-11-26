@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2503,7 +2503,7 @@
+@@ -2502,7 +2502,7 @@
              }
          }
      }

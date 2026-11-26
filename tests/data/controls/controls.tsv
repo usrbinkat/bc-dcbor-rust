@@ -818,11 +818,9 @@ gate-census-inclusion-unchecked	tests/data/controls/gate-census-inclusion-unchec
 # given not kept beside its identity; a record read through its manifest
 # without its digest checked (`Artifacts::read`); a live record that cannot
 # be inspected taken for an absent one (`Artifacts::holds`); a calibration
-# repeating a harness whose execution was no sample (`calibration`); a failed
-# control run, or one judging another control than the registry selects,
-# cited as a calibration's readiness (`control_run`); a kept readiness not
-# settled, or short of a required control run, accepted
-# (`Readiness::validate`); the workload lock not held (`WorkloadLock`); a
+# repeating a harness whose execution was no sample (`calibration`); a kept
+# readiness not settled accepted (`Readiness::validate`); the workload lock
+# not held (`WorkloadLock`); a
 # calibration's journal shared with another run's (`Journal::reserve`); an
 # adoption published by a rename that replaces, or claimed durable when it
 # was not synchronized (`adoption::publish_with`); a source changed while the
@@ -833,11 +831,8 @@ gate-rejected-run-adopted	tests/data/controls/gate-rejected-run-adopted.patch	na
 gate-document-unretained	tests/data/controls/gate-document-unretained.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	x.1.evidence/plan.json: No such file
 gate-manifest-record-unverified	tests/data/controls/gate-manifest-record-unverified.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	document-mutated: accepted
 gate-calibration-repeats-unverified	tests/data/controls/gate-calibration-repeats-unverified.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_runs_each_harness_alone_and_repeats_only_the_verified	-	failed	a failed first observation was repeated
-gate-control-run-unverified	tests/data/controls/gate-control-run-unverified.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_control_run_is_cited_only_complete_against_its_registry	-	failed	control-failed: accepted
-gate-registry-selection-unchecked	tests/data/controls/gate-registry-selection-unchecked.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_control_run_is_cited_only_complete_against_its_registry	-	failed	control-substituted: accepted
 gate-readiness-settling-unvalidated	tests/data/controls/gate-readiness-settling-unvalidated.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	no-reading: accepted
-gate-readiness-scope-unrequired	tests/data/controls/gate-readiness-scope-unrequired.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	stable-missing: accepted
-gate-workload-unlocked	tests/data/controls/gate-workload-unlocked.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_is_ready_only_after_its_control_runs_and_settling	-	failed	lock-held: accepted
+gate-workload-unlocked	tests/data/controls/gate-workload-unlocked.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_is_ready_only_with_the_workload_lock_and_settling	-	failed	lock-held: accepted
 gate-journal-shared	tests/data/controls/gate-journal-shared.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_failed_calibration_still_records_its_schedule	-	failed	journal-unreservable:
 gate-record-absence-assumed	tests/data/controls/gate-record-absence-assumed.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_live_record_is_absent_only_when_not_found	-	failed	record-uninspectable: accepted
 gate-publication-replaces	tests/data/controls/gate-publication-replaces.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::adoption::tests::publication_replaces_nothing	-	failed	failed: empty-directory
@@ -846,18 +841,16 @@ gate-source-move-unchecked	tests/data/controls/gate-source-move-unchecked.patch	
 gate-source-kind-unframed	tests/data/controls/gate-source-kind-unframed.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::the_source_digest_distinguishes_kinds_modes_and_partitions	-	failed	file-or-link: one digest for two states
 # The bindings a run's acceptance and identity rest on, each weakened by one
 # plant and refused by the case it lets through: an adopted run read without
-# its acceptance receipt (`RunRecords::adopted`); a kept readiness whose
-# control runs are not recomputed from its retained registry and final
-# records, or whose recorded facts are not its records' (`Readiness::validate`);
-# the workload lock released before the calibration's last record
+# its acceptance receipt (`RunRecords::adopted`); the workload lock released
+# before the calibration's last record
 # (`calibration`); a calibration run of more than one harness validated
 # (`KaniRequest::validate`); a sample's loop-bound policy digest, source state,
 # invocation, build or launcher not bound to the records the run kept
 # (`eligible_sample`); a readiness rejection lost when its receipt cannot be
 # preserved (`readiness`). Where a later rule still refuses the case the plant
-# lets through (runner-widened by the runner-set check, calibration-two by the
-# deadline plan), the pattern is the case's own prefix: the test names a case
-# only when its own fault is missing from the refusal.
+# lets through (calibration-two by the deadline plan), the pattern is the
+# case's own prefix: the test names a case only when its own fault is missing
+# from the refusal.
 gate-adoption-receipt-unrequired	tests/data/controls/gate-adoption-receipt-unrequired.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::adoption::tests::an_unaccepted_publication_is_refused_until_recovered	-	failed	publication: an unaccepted publication was read
 # Readers must not consume a receipt before acceptance finishes; receipt
 # rollback must synchronize its deletion and preserve the synchronization error.
@@ -865,8 +858,6 @@ gate-adoption-read-unlocked	tests/data/controls/gate-adoption-read-unlocked.patc
 gate-adoption-removal-unsynchronized	tests/data/controls/gate-adoption-removal-unsynchronized.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::adoption::tests::a_failed_receipt_synchronizes_its_removal	-	failed	the receipt removal was not synchronized
 gate-adoption-recovery-follows-link	tests/data/controls/gate-adoption-recovery-follows-link.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::adoption::tests::recovery_never_follows_a_publication_symlink	-	failed	recovery-followed-link: Ok(
 gate-adoption-unlock-omitted	tests/data/controls/gate-adoption-unlock-omitted.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::adoption::tests::completion_unlocks_even_when_an_inherited_descriptor_remains	-	failed	completion left its lock held by an inherited descriptor
-gate-readiness-verdict-unrecomputed	tests/data/controls/gate-readiness-verdict-unrecomputed.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	runner-widened:
-gate-readiness-facts-unbound	tests/data/controls/gate-readiness-facts-unbound.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_kept_readiness_is_held_to_the_one_validator	-	failed	facts-unbound: accepted
 gate-calibration-lock-released-early	tests/data/controls/gate-calibration-lock-released-early.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_calibration_holds_the_workload_lock_through_its_last_record	-	failed	lock-released-early
 gate-execution-purpose-unchecked	tests/data/controls/gate-execution-purpose-unchecked.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_kani_request_is_validated_before_anything_is_reserved	-	failed	calibration-two:
 gate-sample-policy-unbound	tests/data/controls/gate-sample-policy-unbound.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	policy-digest-unbound: accepted
@@ -874,7 +865,7 @@ gate-sample-tree-unbound	tests/data/controls/gate-sample-tree-unbound.patch	nati
 gate-sample-invocation-unbound	tests/data/controls/gate-sample-invocation-unbound.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	invocation-unbound: accepted
 gate-sample-build-unbound	tests/data/controls/gate-sample-build-unbound.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	build-unbound: accepted
 gate-sample-launcher-unbound	tests/data/controls/gate-sample-launcher-unbound.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_sample_binds_its_identity_to_its_records	-	failed	launcher-unbound: accepted
-gate-readiness-rejection-overwritten	tests/data/controls/gate-readiness-rejection-overwritten.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_failed_calibration_still_records_its_schedule	-	failed	readiness-unrecordable: the control run has not finished
+gate-readiness-rejection-overwritten	tests/data/controls/gate-readiness-rejection-overwritten.patch	native	nightly	dcbor-gate	-	fast	lib	proofs::tests::a_failed_calibration_still_records_its_schedule	-	failed	readiness-unrecordable: a load reading failed
 # The workload lock released by its descriptor's close alone
 # (tests/gate/src/proofs/readiness.rs, `WorkloadLock`'s drop): a copy of
 # the descriptor still open, as a concurrently forked subprocess holds one,

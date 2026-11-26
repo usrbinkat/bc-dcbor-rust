@@ -9,14 +9,13 @@
 # source, one results row each, proved only when it verified, and the
 # verdict. Run from the proof shell, which puts `cargo kani` on PATH.
 #
-# With `calibrate PLAN NIGHTLY_LOGS STABLE_LOGS`, the run is a calibration
-# instead (`gate proofs-calibrate`, tests/gate/src/proofs.rs `calibration`):
-# ready only once the native control runs of the nightly and the stable
-# channel whose log directories are NIGHTLY_LOGS and STABLE_LOGS finished
-# and passed on this commit, every control the registry selects for them
-# judged (their `verdict.json`, `proofs::REQUIRED_CONTROLS`), no other gate
-# workload runs (the calibration holds target/gate-workload.lock itself) and
-# the system settled under the declared policy (`readiness.json`); then each
+# With `calibrate PLAN`, the run is a calibration instead (`gate
+# proofs-calibrate`, tests/gate/src/proofs.rs `calibration`): ready once no
+# other gate workload runs (the calibration holds target/gate-workload.lock
+# itself) and the system settled under the declared policy
+# (`readiness.json`). No planted-control run is a prerequisite: proofs
+# validate the implementation, and test adequacy is tests/red-green.sh's
+# separate track. Then each
 # harness the plan names (`plan_of`) checked alone, one Kani run each, under
 # its plan's operational limit, measured and qualifying nothing, each run's
 # records adoptable as calibration evidence (`gate proofs-adopt
@@ -48,7 +47,7 @@
 # (target/proof-source.lock) for the whole run: a second proof run is
 # refused, never interleaved with this one's copy or workload.
 #
-# Usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]
+# Usage: tests/proofs.sh [calibrate PLAN | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/gate-common.sh
@@ -62,11 +61,10 @@ for tool in cargo cargo-kani rustc sha256sum git tar flock realpath; do
     fi
 done
 plan=""
-control_logs=()
 discover=()
 diagnose=()
 usage() {
-    echo "usage: tests/proofs.sh [calibrate PLAN NIGHTLY_LOGS STABLE_LOGS | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]" >&2
+    echo "usage: tests/proofs.sh [calibrate PLAN | discover HARNESS... | diagnose DISCOVERY_LOGS HARNESS HARNESS_FILE [FOCUS...]]" >&2
     exit 2
 }
 workload_lock="$PWD/target/gate-workload.lock"
@@ -81,9 +79,8 @@ hold_workload_lock() {
 }
 case "$#:${1:-}" in
     0:) ;;
-    4:calibrate)
+    2:calibrate)
         plan="$(realpath -e "$2")" || exit 2
-        control_logs=("$(realpath -e "$3")" "$(realpath -e "$4")") || exit 2
         ;;
     *:discover)
         (($# >= 2)) || usage
@@ -141,7 +138,7 @@ kani_identity="$(gate proofs-identity "$launcher")" || {
 echo "identity: $(cat "$logs/identity.txt")"
 if [[ -n "$plan" ]]; then
     gate proofs-calibrate "$source_copy" "$PWD/target/kani" "$logs" "$launcher" "$plan" \
-        "$workload_lock" "${control_logs[@]}"
+        "$workload_lock"
     status=$?
     if ! still_at_commit; then
         event "FAIL the checkout moved off $commit during the run"

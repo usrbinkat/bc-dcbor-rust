@@ -53,9 +53,8 @@ pub use eligibility::{
     AdoptionReceipt, CalibrationSample, RunRecords, eligible_sample, ran_sample,
 };
 pub use readiness::{
-    Clocks, ControlRun, ControlVerdict, LockRecord, Prerequisites, REQUIRED_CONTROLS, Readiness,
-    Settled, SettlingPolicy, SystemClocks, WORKLOAD_LOCK, WorkloadLock, control_run,
-    control_verdict, readiness, settle, settling_policy,
+    Clocks, ControlVerdict, LockRecord, Prerequisites, Readiness, Settled, SettlingPolicy,
+    SystemClocks, WORKLOAD_LOCK, WorkloadLock, control_verdict, readiness, settle, settling_policy,
 };
 
 /// The build's name in the census.
@@ -4249,31 +4248,17 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A readiness the one validator accepts ([`Readiness::validate`]),
-    /// made from real records: the fixture registry's text, and the native
-    /// control runs of the nightly and the stable channel of commit `c` as
-    /// `tests/controls.sh` leaves them ([`ControlRuns`]), each read by the
-    /// one validation with its final record's text; the workload lock
-    /// acquired after both finished; the production policy; and the seven
-    /// readings after it that settle it, spanning thirty seconds.
+    /// A readiness the one validator accepts ([`Readiness::validate`]): of
+    /// commit `c`; the workload lock acquired; the production policy; and
+    /// the seven readings after it that settle it, spanning thirty seconds.
     pub(crate) fn valid_readiness() -> Readiness {
         static VALID: std::sync::OnceLock<Readiness> = std::sync::OnceLock::new();
         VALID
             .get_or_init(|| {
-                let scratch = Scratch::new("valid-readiness");
-                let root = scratch.0.join("tree");
-                let runs = ControlRuns::new(&root, &scratch.0);
-                let registry = crate::controls::registry(&root).unwrap();
-                let controls = runs
-                    .logs()
-                    .iter()
-                    .map(|logs| control_run(logs, "c", &registry).unwrap())
-                    .collect();
                 let acquired = now().unwrap();
                 Readiness {
                     version: RUNTIME_VERSION,
-                    registry: registry.text,
-                    controls,
+                    commit: "c".to_string(),
                     workload_lock: Some(LockRecord {
                         path: "/checkout/target/gate-workload.lock".to_string(),
                         acquired,
@@ -4807,8 +4792,8 @@ pub(crate) mod tests {
     /// harness's samples of different artifacts, a sample of another
     /// harness, a kept plan that is not the identity's revision, a policy
     /// deadline that is not the plan's limit, a malformed deadline beside a
-    /// valid one, a readiness with no reading, and a readiness short of a
-    /// required control run.
+    /// valid one, a readiness with no reading, and a readiness that held no
+    /// workload lock.
     #[test]
     fn an_unsupported_prediction_is_refused() {
         const FIRST: &str = "00000000-0000-0000-0000-000000000001";
@@ -5043,16 +5028,16 @@ pub(crate) mod tests {
                 "its 0 readings settle at None, not at its last",
             ),
             (
-                "readiness-without-stable",
+                "readiness-unlocked",
                 |tree, document| {
                     let digest = rewritten(tree, READINESS_RECORD, |bytes| {
                         let mut readiness = valid_readiness();
-                        readiness.controls.pop();
+                        readiness.workload_lock = None;
                         *bytes = serde_json::to_vec(&readiness).unwrap();
                     });
                     cited(document, digest)
                 },
-                "a calibration follows exactly",
+                "it held no workload lock",
             ),
             (
                 // One valid deadline beside a malformed one: never read as
@@ -7237,9 +7222,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The fixture registry's rows: a native control of each channel a
-    /// calibration requires, a Miri control of the nightly channel and a
-    /// Kani control, the last two outside a calibration's prerequisite.
+    /// The fixture registry's rows: a native control of each channel, a
+    /// Miri control of the nightly channel and a Kani control, the last two
+    /// outside a native run's selection.
     const REGISTRY: &[&str] = &[
         "n\ttests/data/controls/n.patch\tnative\tnightly\tdcbor\tall\tfast\tlib\ta::b\t-\tfailed\tboom",
         "s\ttests/data/controls/s.patch\tnative\tstable\tdcbor\tall\tfast\tlib\ta::c\t-\tfailed\tboom",
@@ -7247,15 +7232,14 @@ pub(crate) mod tests {
         "k\ttests/data/controls/k.patch\tkani\tkani\tdcbor\t-\t-\tlib\ta::x\t-\tfailed\ta planted failure",
     ];
 
-    /// The native control runs a calibration of commit `c` follows, laid out
-    /// as `tests/controls.sh` leaves them: the registry ([`REGISTRY`]) under
-    /// `root`, and under `logs` one log directory per channel, each with its
+    /// The native control runs of commit `c`, laid out as
+    /// `tests/controls.sh` leaves them: the registry ([`REGISTRY`]) under
+    /// `root`, and under `logs` the nightly run's log directory, with its
     /// commit, its identity, every selected control's evidence seen red and
     /// green in a restored copy, and its final record made by the one maker
     /// ([`control_verdict`]).
     pub(crate) struct ControlRuns {
         pub(crate) nightly: std::path::PathBuf,
-        pub(crate) stable: std::path::PathBuf,
     }
 
     impl ControlRuns {
@@ -7302,7 +7286,6 @@ pub(crate) mod tests {
             };
             Self {
                 nightly: run("nightly"),
-                stable: run("stable"),
             }
         }
 
@@ -7317,29 +7300,22 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-
-        pub(crate) fn logs(&self) -> [&Path; 2] {
-            [&self.nightly, &self.stable]
-        }
     }
 
-    /// A control run is cited only complete against its registry: finished,
-    /// passed, of the calibration's commit and its own identity, of the
-    /// registry the calibration's copy holds, judging exactly the controls
-    /// that registry selects for its channel and runners, and recording
-    /// exactly its results' faults. An unfinished run, a failed control, a
-    /// run of another commit or registry, a run short of a selected control
-    /// and a record whose faults were cleared are each refused.
+    /// A control run's final record, made by the one maker
+    /// ([`control_verdict`]), judges exactly the controls the registry
+    /// selects for its channel and runners, in order, with its commit and
+    /// identity as its runner recorded them; a control not seen red is that
+    /// result's fault and the record's.
     #[test]
-    fn a_control_run_is_cited_only_complete_against_its_registry() {
-        let scratch = Scratch::new("control-runs");
+    fn a_control_verdict_judges_the_registrys_selection() {
+        let scratch = Scratch::new("control-verdict");
         let root = scratch.0.join("tree");
         let runs = ControlRuns::new(&root, &scratch.0);
         let registry = crate::controls::registry(&root).unwrap();
-        let cite = |logs: &Path, commit: &str| control_run(logs, commit, &registry);
-        let cited = cite(&runs.nightly, "c").unwrap();
+        let verdict = control_verdict(&root, &runs.nightly, "nightly", &["native"]).unwrap();
         assert_eq!(
-            cited
+            verdict
                 .results
                 .iter()
                 .map(|result| (result.control.as_str(), result.runner.as_str()))
@@ -7348,82 +7324,27 @@ pub(crate) mod tests {
             "the nightly native run judges its one native control, not the Miri or the Kani one"
         );
         assert_eq!(
-            cited.verdict_sha256,
-            crate::process::sha256(&runs.nightly.join("verdict.json")).unwrap()
+            (verdict.commit.as_str(), verdict.identity.as_str()),
+            ("c", "identity-nightly")
         );
-        assert_eq!(cited.registry_sha256, registry.sha256);
-        assert_eq!(
-            cited.verdict.as_bytes(),
-            std::fs::read(runs.nightly.join("verdict.json")).unwrap(),
-            "the cited run does not retain its final record's text"
-        );
-        let found = refused("control-other-commit", cite(&runs.nightly, "d"));
-        assert!(
-            found.contains("is of commit c, the calibration's is d"),
-            "{found}"
-        );
-        // A control not seen red: its own result's fault, the run failed.
+        assert_eq!(verdict.registry_sha256, registry.sha256);
+        assert!(verdict.faults.is_empty(), "{verdict:#?}");
         std::fs::write(runs.nightly.join("n/red.judged"), "n: pass\n").unwrap();
-        ControlRuns::record(&root, &runs.nightly, "nightly");
-        let found = refused("control-failed", cite(&runs.nightly, "c"));
-        assert!(found.contains("the control run did not pass"), "{found}");
-        std::fs::write(runs.nightly.join("n/red.judged"), "refused\n").unwrap();
-        ControlRuns::record(&root, &runs.nightly, "nightly");
-        // The record edited: a selected control's result removed, or the
-        // faults cleared while a result keeps one.
-        let path = runs.nightly.join("verdict.json");
-        let kept = std::fs::read(&path).unwrap();
-        let rewrite = |change: &dyn Fn(&mut ControlVerdict)| {
-            let mut verdict: ControlVerdict = serde_json::from_slice(&kept).unwrap();
-            change(&mut verdict);
-            std::fs::write(&path, serde_json::to_vec(&verdict).unwrap()).unwrap();
-        };
-        rewrite(&|verdict| verdict.results[0].control = "s".to_string());
-        let found = refused("control-substituted", cite(&runs.nightly, "c"));
-        assert!(found.contains("judged [(\"s\", \"native\")]"), "{found}");
-        rewrite(&|verdict| verdict.results.clear());
-        let found = refused("control-short", cite(&runs.nightly, "c"));
+        let failed = control_verdict(&root, &runs.nightly, "nightly", &["native"]).unwrap();
         assert!(
-            found.contains("the registry selects [(\"n\", \"native\")]"),
-            "{found}"
-        );
-        rewrite(&|verdict| {
-            verdict.results[0]
-                .faults
-                .push("n: not seen red".to_string())
-        });
-        let found = refused("control-faults-cleared", cite(&runs.nightly, "c"));
-        assert!(found.contains("the control run did not pass"), "{found}");
-        std::fs::write(&path, &kept).unwrap();
-        cite(&runs.nightly, "c").unwrap();
-        // The registry changed after the run.
-        let other = crate::controls::Registry {
-            sha256: DIGEST.to_string(),
-            ..registry.clone()
-        };
-        let found = refused(
-            "control-other-registry",
-            control_run(&runs.nightly, "c", &other),
-        );
-        assert!(found.contains("ran the registry"), "{found}");
-        std::fs::remove_file(&path).unwrap();
-        let found = refused("control-unfinished", cite(&runs.nightly, "c"));
-        assert!(
-            found.contains("the control run has not finished"),
-            "{found}"
+            !failed.faults.is_empty() && failed.faults == crate::controls::faults(&failed.results),
+            "control-failed: a control not seen red left no fault: {failed:#?}"
         );
     }
 
-    /// A calibration is ready only after both required control runs, with
-    /// the workload lock held, once the system settled; its receipt is kept
-    /// whether ready or not, and a ready one's bytes are the [`Ready`] every
-    /// calibration run keeps. A missing control run, another holder of the
-    /// workload lock and an unsettled system each refuse it.
+    /// A calibration is ready only with the workload lock held, once the
+    /// system settled; its receipt is kept whether ready or not, and a ready
+    /// one's bytes are the [`Ready`] every calibration run keeps. It reads no
+    /// planted-control run. Another holder of the workload lock and an
+    /// unsettled system each refuse it.
     #[test]
-    fn a_calibration_is_ready_only_after_its_control_runs_and_settling() {
+    fn a_calibration_is_ready_only_with_the_workload_lock_and_settling() {
         let scratch = Scratch::new("readiness");
-        let root = scratch.0.join("tree");
-        let runs = ControlRuns::new(&root, &scratch.0);
         let lock_path = scratch.0.join("gate-workload.lock");
         let lock = WorkloadLock::acquire(&lock_path).unwrap();
         let found = refused("lock-held", WorkloadLock::acquire(&lock_path).map(|_| ()));
@@ -7438,16 +7359,13 @@ pub(crate) mod tests {
             justification: "test".to_string(),
         };
         let calm = || Ok::<_, String>("0.10 0.10 0.10 1/100 1".to_string());
-        let logs = runs.logs();
-        let prerequisites = |control_logs| Prerequisites {
-            root: &root,
+        let prerequisites = Prerequisites {
             commit: "c",
-            control_logs,
             lock: &lock,
         };
         let ready = readiness(
             &scratch.0.join("ready.json"),
-            &prerequisites(&logs),
+            &prerequisites,
             &policy,
             &mut { calm },
             &mut TestClocks::stepping(10),
@@ -7463,6 +7381,7 @@ pub(crate) mod tests {
         );
         let receipt: Readiness = serde_json::from_slice(&ready.bytes).unwrap();
         receipt.validate(Some("c")).unwrap();
+        assert_eq!(receipt.commit, "c");
         assert_eq!(receipt.observations.len(), 2);
         assert_eq!(
             receipt
@@ -7471,33 +7390,17 @@ pub(crate) mod tests {
                 .map(|lock| lock.path.as_str()),
             lock_path.to_str()
         );
-        assert_eq!(
-            receipt.registry,
-            crate::controls::registry(&root).unwrap().text
-        );
         let found = refused("readiness-other-commit", receipt.validate(Some("d")));
         assert!(
-            found.contains("is of commit c, the calibration's is d"),
+            found.contains("it is of commit c, the calibration's is d"),
             "{found}"
         );
-        // Only the nightly run: not the prerequisite.
-        let found = refused(
-            "readiness-nightly-only",
-            readiness(
-                &scratch.0.join("nightly-only.json"),
-                &prerequisites(&logs[..1]),
-                &policy,
-                &mut { calm },
-                &mut TestClocks::stepping(10),
-            ),
-        );
-        assert!(found.contains("a calibration follows exactly"), "{found}");
         // An unsettled system: the receipt kept with every reading.
         let found = refused(
             "readiness-unsettled",
             readiness(
                 &scratch.0.join("unsettled.json"),
-                &prerequisites(&logs),
+                &prerequisites,
                 &policy,
                 &mut || Ok("3.00 1 1 1/1 1".to_string()),
                 &mut TestClocks::stepping(10),
@@ -7507,119 +7410,23 @@ pub(crate) mod tests {
         let kept: Readiness =
             serde_json::from_slice(&std::fs::read(scratch.0.join("unsettled.json")).unwrap())
                 .unwrap();
-        assert!(!kept.ready && kept.observations.len() == 4 && kept.controls.len() == 2);
-        // A control run unfinished: nothing is settled.
-        std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
-        let found = refused(
-            "readiness-control-unfinished",
-            readiness(
-                &scratch.0.join("unfinished.json"),
-                &prerequisites(&logs),
-                &policy,
-                &mut { calm },
-                &mut TestClocks::stepping(10),
-            ),
-        );
-        assert!(found.contains("no finished, passed control run"), "{found}");
+        assert!(!kept.ready && kept.observations.len() == 4 && kept.commit == "c");
     }
 
-    /// The retained final record of `run` rewritten by `change`, its digest
-    /// and every fact the run records made consistent with it again, so only
-    /// the record's relationship to the registry is planted.
-    fn reverdict(run: &mut ControlRun, change: impl Fn(&mut ControlVerdict)) {
-        let mut verdict: ControlVerdict = serde_json::from_str(&run.verdict).unwrap();
-        change(&mut verdict);
-        run.verdict = serde_json::to_string_pretty(&verdict).unwrap();
-        run.verdict_sha256 = crate::process::sha256_bytes(run.verdict.as_bytes()).unwrap();
-        run.identity = verdict.identity;
-        run.commit = verdict.commit;
-        run.channel = verdict.channel;
-        run.runners = verdict.runners;
-        run.registry_sha256 = verdict.registry_sha256;
-        run.results = verdict.results;
-        run.finished = verdict.finished;
-    }
-
-    /// A kept readiness establishes nothing by saying it is ready: the one
-    /// validator recomputes every control run from the registry text and the
-    /// final records it retains. A receipt not ready or with no reading; one
-    /// short of a required run; one whose retained final record, its digest
-    /// and its facts made consistent, widens its runners, renames a control,
-    /// judges one twice, records a fault or names another registry; one
-    /// whose registry text was changed; one whose recorded facts are not its
-    /// final record's; one whose control run finished after the lock was
-    /// acquired, or whose lock was acquired after settling began, or that
-    /// held none; and one with a reading that does not read as recorded, a
-    /// reading early, a window short of the minimum span, more readings than
-    /// its limit, or readings past its settling point is each refused.
+    /// A kept readiness establishes nothing by saying it is ready. A receipt
+    /// not ready or with no reading; one of no commit; one whose lock was
+    /// acquired after settling began, or that held none; and one with a
+    /// reading that does not read as recorded, a reading early, a window
+    /// short of the minimum span, more readings than its limit, readings
+    /// past its settling point or an unjustified policy is each refused.
     #[test]
     fn a_kept_readiness_is_held_to_the_one_validator() {
         valid_readiness().validate(Some("c")).unwrap();
         type Plant = fn(&mut Readiness);
-        let cases: [(&str, Plant, &str); 19] = [
+        let cases: [(&str, Plant, &str); 11] = [
             ("not-ready", |r| r.ready = false, "not ready"),
             ("no-reading", |r| r.observations.clear(), "settle at None"),
-            (
-                "stable-missing",
-                |r| {
-                    r.controls.pop();
-                },
-                "a calibration follows exactly",
-            ),
-            (
-                "runner-widened",
-                |r| reverdict(&mut r.controls[0], |v| v.runners.push("tree".to_string())),
-                "the registry selects [(\"n\", \"native\"), (\"m\", \"tree\")]",
-            ),
-            (
-                "control-renamed",
-                |r| {
-                    reverdict(&mut r.controls[0], |v| {
-                        v.results[0].control = "s".to_string()
-                    })
-                },
-                "judged [(\"s\", \"native\")], the registry selects [(\"n\", \"native\")]",
-            ),
-            (
-                "control-twice",
-                |r| {
-                    reverdict(&mut r.controls[0], |v| {
-                        let again = v.results[0].clone();
-                        v.results.push(again);
-                    })
-                },
-                "judged [(\"n\", \"native\"), (\"n\", \"native\")]",
-            ),
-            (
-                "control-failed",
-                |r| {
-                    reverdict(&mut r.controls[1], |v| {
-                        v.results[0].faults.push("s: not seen red".to_string());
-                        v.faults = crate::controls::faults(&v.results);
-                    })
-                },
-                "the control run did not pass",
-            ),
-            (
-                "registries-differ",
-                |r| reverdict(&mut r.controls[1], |v| v.registry_sha256 = "0".repeat(64)),
-                "ran the registry 0000",
-            ),
-            (
-                "registry-altered",
-                |r| r.registry.push_str("# altered after the runs\n"),
-                "ran the registry",
-            ),
-            (
-                "facts-unbound",
-                |r| r.controls[0].results[0].control = "s".to_string(),
-                "the nightly control run's recorded facts are not what its verdict records",
-            ),
-            (
-                "finished-after-lock",
-                |r| reverdict(&mut r.controls[0], |v| v.finished.seconds += 3600),
-                "the nightly control run finished at",
-            ),
+            ("no-commit", |r| r.commit.clear(), "it names no commit"),
             (
                 "lock-after-settling",
                 |r| {
@@ -8058,12 +7865,10 @@ exit $((failures > 0))
             }
         }
 
-        /// The native control runs of commit `c` the fixture's calibrations
-        /// follow, the registry in its tree ([`ControlRuns`]), and the
-        /// commit recorded in its logs.
-        fn control_runs(&self) -> ControlRuns {
+        /// The commit `c` recorded in the fixture's logs, as
+        /// tests/proofs.sh records the clean commit a calibration runs on.
+        fn commit(&self) {
             self.scratch.write("logs/commit.txt", "c\n");
-            ControlRuns::new(&self.root, &self.scratch.0)
         }
 
         /// The fixture's workload lock.
@@ -8071,42 +7876,42 @@ exit $((failures > 0))
             self.scratch.0.join("gate-workload.lock")
         }
 
-        /// The readiness of a calibration that follows the fixture's control
-        /// runs, made by the one maker ([`readiness`]) with the workload lock
-        /// held.
+        /// The fixture's load reading: `scratch/loadavg` when a test wrote
+        /// one, a calm system otherwise.
+        fn loadavg(&self) -> Result<String, String> {
+            let path = self.scratch.0.join("loadavg");
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Ok(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok("0.10 0.10 0.10 1/100 1".to_string())
+                }
+                Err(error) => Err(format!("{}: {error}", path.display())),
+            }
+        }
+
+        /// The readiness of a calibration of commit `c`, made by the one
+        /// maker ([`readiness`]) with the workload lock held.
         fn ready(&self) -> Ready {
-            let runs = self.control_runs();
+            self.commit();
             let lock = WorkloadLock::acquire(&self.lock_path()).unwrap();
             readiness(
                 &self.scratch.0.join("ready.json"),
                 &Prerequisites {
-                    root: &self.root,
                     commit: "c",
-                    control_logs: &runs.logs(),
                     lock: &lock,
                 },
                 &Self::settling(),
-                &mut || Ok("0.10 0.10 0.10 1/100 1".to_string()),
+                &mut || self.loadavg(),
                 &mut TestClocks::stepping(1),
             )
             .unwrap()
         }
 
-        /// A calibration of the fixture's plan at `plan` by `launcher`,
-        /// after `control_logs`, its records under the fixture's logs, its
-        /// last record written as in operation.
-        fn calibrate(
-            &self,
-            plan: &Path,
-            launcher: &Path,
-            control_logs: &[&Path],
-        ) -> Result<Schedule, String> {
-            self.calibrate_recording(
-                plan,
-                launcher,
-                control_logs,
-                &crate::process::create_evidence,
-            )
+        /// A calibration of the fixture's plan at `plan` by `launcher`, of
+        /// commit `c`, its records under the fixture's logs, its last record
+        /// written as in operation.
+        fn calibrate(&self, plan: &Path, launcher: &Path) -> Result<Schedule, String> {
+            self.calibrate_recording(plan, launcher, &crate::process::create_evidence)
         }
 
         /// A calibration as [`Self::calibrate`] runs one, its last record
@@ -8115,9 +7920,9 @@ exit $((failures > 0))
             &self,
             plan: &Path,
             launcher: &Path,
-            control_logs: &[&Path],
             record: &calibration::RecordWriter<'_>,
         ) -> Result<Schedule, String> {
+            self.commit();
             calibration(
                 CalibrationRequest {
                     root: &self.root,
@@ -8125,13 +7930,12 @@ exit $((failures > 0))
                     target_dir: &self.target,
                     logs: &self.logs,
                     launcher,
-                    control_logs,
                     workload_lock: &self.lock_path(),
                 },
                 Runtime {
                     workload: &self.workload,
                     settling: &Self::settling(),
-                    sample: &mut || Ok("0.10 0.10 0.10 1/100 1".to_string()),
+                    sample: &mut || self.loadavg(),
                     clocks: &mut TestClocks::stepping(1),
                     record,
                 },
@@ -8223,10 +8027,7 @@ exit $((failures > 0))
         let fixture = KaniFixture::new("calibration");
         let launcher = fixture.launcher("cargo-kani", 60000, "y", "");
         let (plan_path, _) = fixture.plan(60000);
-        let runs = fixture.control_runs();
-        let schedule = fixture
-            .calibrate(&plan_path, &launcher, &runs.logs())
-            .unwrap();
+        let schedule = fixture.calibrate(&plan_path, &launcher).unwrap();
         assert_eq!(
             schedule,
             fixture.schedule(),
@@ -8559,7 +8360,6 @@ exit $((failures > 0))
         let fixture = KaniFixture::new("lock-through-last-record");
         let launcher = fixture.launcher("cargo-kani", 60000, "none", "");
         let (plan_path, _) = fixture.plan(60000);
-        let runs = fixture.control_runs();
         let lock_path = fixture.lock_path();
         let attempts = std::cell::RefCell::new(Vec::new());
         let record = |path: &Path, bytes: &[u8]| {
@@ -8569,7 +8369,7 @@ exit $((failures > 0))
             crate::process::create_evidence(path, bytes)
         };
         let schedule = fixture
-            .calibrate_recording(&plan_path, &launcher, &runs.logs(), &record)
+            .calibrate_recording(&plan_path, &launcher, &record)
             .unwrap();
         assert!(schedule.complete(), "{schedule:#?}");
         let attempts = attempts.into_inner();
@@ -8582,7 +8382,7 @@ exit $((failures > 0))
     }
 
     /// A calibration's schedule is its last record whatever failed: its
-    /// readiness refused (a control run missing, another gate workload
+    /// readiness refused (a load reading failed, another gate workload
     /// holding the lock, or the receipt unpreservable beside a refused
     /// prerequisite, both faults kept), or its journal not reservable, each
     /// records every planned execution as never run, keeps every fault,
@@ -8600,20 +8400,23 @@ exit $((failures > 0))
         let expected: Vec<(String, usize)> = (1..=SAMPLES)
             .flat_map(|pass| [("x".to_string(), pass), ("y".to_string(), pass)])
             .collect();
-        type Plant = fn(&KaniFixture, &ControlRuns) -> Option<std::fs::File>;
+        type Plant = fn(&KaniFixture) -> Option<std::fs::File>;
+        // The fixture's policy admits every load (`KaniFixture::settling`):
+        // a reading that is no `/proc/loadavg` reading refuses settling.
+        const UNREADABLE: &str = "no load reading";
         let cases: [(&str, Plant, &[&str], bool); 4] = [
             (
-                "control-run-missing",
-                |_, runs| {
-                    std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
+                "load-unreadable",
+                |fixture| {
+                    fixture.scratch.write("loadavg", UNREADABLE);
                     None
                 },
-                &["the control run has not finished"],
+                &["a load reading failed"],
                 false,
             ),
             (
                 "workload-competing",
-                |fixture, _| {
+                |fixture| {
                     let held = std::fs::File::create(fixture.lock_path()).unwrap();
                     held.try_lock().unwrap();
                     Some(held)
@@ -8625,13 +8428,13 @@ exit $((failures > 0))
                 // The prerequisite refused and its receipt unpreservable:
                 // neither fault hides the other.
                 "readiness-unrecordable",
-                |fixture, runs| {
-                    std::fs::remove_file(runs.stable.join("verdict.json")).unwrap();
+                |fixture| {
+                    fixture.scratch.write("loadavg", UNREADABLE);
                     std::fs::write(fixture.logs.join(READINESS_RECORD), "another run's\n").unwrap();
                     None
                 },
                 &[
-                    "the control run has not finished",
+                    "a load reading failed",
                     "the readiness was not preserved either",
                     "readiness.json: File exists",
                 ],
@@ -8639,7 +8442,7 @@ exit $((failures > 0))
             ),
             (
                 "journal-unreservable",
-                |fixture, _| {
+                |fixture| {
                     std::fs::write(fixture.logs.join("calibration.jsonl"), "another run's\n")
                         .unwrap();
                     None
@@ -8652,9 +8455,9 @@ exit $((failures > 0))
             let fixture = KaniFixture::new(&format!("failed-{name}"));
             let launcher = fixture.launcher("cargo-kani", 60000, "none", "exit 99");
             let (plan_path, _) = fixture.plan(60000);
-            let runs = fixture.control_runs();
-            let _held = plant(&fixture, &runs);
-            let found = refused(name, fixture.calibrate(&plan_path, &launcher, &runs.logs()));
+            fixture.commit();
+            let _held = plant(&fixture);
+            let found = refused(name, fixture.calibrate(&plan_path, &launcher));
             let kept = fixture.schedule();
             for fault in faults {
                 assert!(found.contains(fault), "{name}: {fault}: {found}");

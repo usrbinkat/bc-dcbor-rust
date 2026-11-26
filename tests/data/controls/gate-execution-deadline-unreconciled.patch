@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -2278,7 +2278,7 @@
+@@ -2277,7 +2277,7 @@
      let recorded = record["deadline_milliseconds"]
          .as_u64()
          .ok_or_else(malformed)?;

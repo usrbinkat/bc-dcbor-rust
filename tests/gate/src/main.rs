@@ -217,7 +217,7 @@ const USAGE: &str = "usage: gate evidence ROOT | refine FILE... | current FILE |
                      proofs ROOT TARGET LOGS LAUNCHER | \
                      proofs-discover ROOT TARGET LOGS LAUNCHER HARNESS... | \
                      proofs-diagnose EVIDENCE HARNESS HARNESS_FILE ROOT [FOCUS...] | \
-                     proofs-calibrate ROOT TARGET LOGS LAUNCHER PLAN WORKLOAD_LOCK CONTROL_LOGS... | \
+                     proofs-calibrate ROOT TARGET LOGS LAUNCHER PLAN WORKLOAD_LOCK | \
                      proofs-adopt EVIDENCE ROOT | \
                      miri models | \
                      miri inventory LOG OUT | \
@@ -1168,12 +1168,12 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             }
         }
         // A calibration of the harnesses a plan names, holding the checkout's
-        // workload lock, after the control runs whose logs follow it
-        // (`proofs::REQUIRED_CONTROLS`): each harness checked alone under its
-        // plan's operational limit, qualifying nothing and writing no results
-        // row (`proofs::calibration`). Each scheduled execution is printed;
-        // the command fails unless the schedule is complete, every planned
-        // harness with its samples and nothing failed.
+        // workload lock: each harness checked alone under its plan's
+        // operational limit, qualifying nothing and writing no results row
+        // (`proofs::calibration`). No planted-control run is read. Each
+        // scheduled execution is printed; the command fails unless the
+        // schedule is complete, every planned harness with its samples and
+        // nothing failed.
         [
             "proofs-calibrate",
             root,
@@ -1182,11 +1182,9 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
             launcher,
             plan,
             workload_lock,
-            control_logs @ ..,
-        ] if !control_logs.is_empty() => {
+        ] => {
             let launcher =
                 dcbor_gate::proofs::selected_launcher(Path::new(launcher)).map_err(Broken)?;
-            let control_logs: Vec<&Path> = control_logs.iter().map(Path::new).collect();
             let schedule =
                 match dcbor_gate::proofs::calibrate(dcbor_gate::proofs::CalibrationRequest {
                     root: Path::new(root),
@@ -1194,7 +1192,6 @@ fn run(arguments: &[&str], configuration: &str) -> Result<ExitCode, Broken> {
                     target_dir: Path::new(target_dir),
                     logs: Path::new(logs),
                     launcher: &launcher,
-                    control_logs: &control_logs,
                     workload_lock: Path::new(workload_lock),
                 }) {
                     Ok(schedule) => schedule,

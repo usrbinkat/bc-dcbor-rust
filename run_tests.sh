@@ -49,13 +49,15 @@ if [[ "$DCBOR_RIGOR" == exhaustive ]]; then
     done
 fi
 
-# The evidence gates' own oracles and their planted-defect controls: the
-# record format, the model-bounds and census rows, and the gate tool
-# (outcomes, rows, Miri results and judgements, bound derivation, the reach
-# map, the mutation comparison and verdicts, the cost recorder, the
-# launchers' contracts).
-section "Evidence tooling controls"
-cargo test --quiet -p dcbor-record -p dcbor-model-bounds -p dcbor-census -p dcbor-gate
+# Implementation validation only. The evidence tooling's own tests (the
+# record format, the model-bounds and census rows, the gate tool) and the
+# planted controls are test adequacy, a separate track: tests/red-green.sh.
+# Nothing here runs or reads them.
+TOOLING=(dcbor-record dcbor-model-bounds dcbor-census dcbor-gate)
+tooling_excludes=()
+for package in "${TOOLING[@]}"; do
+    tooling_excludes+=(--exclude "$package")
+done
 
 select_targets() {
     local features="$1" path target
@@ -126,10 +128,11 @@ cargo clippy --all-targets -- -D warnings
 section "Host step-latency qualification"
 DCBOR_LATENCY_QUALIFICATION=1 cargo test --quiet --test resumable_contract latency::
 
-# The legs above select the root package; every member's own targets, the
-# derive crate's included, are tested and linted here on the stock toolchain.
-section "Workspace: every member's targets"
-cargo test --quiet --workspace --features derive,hashbrown,multithreaded,num-bigint -- "${skips[@]}"
-cargo clippy --workspace --all-targets --features derive,hashbrown,multithreaded,num-bigint -- -D warnings
+# The legs above select the root package; every other member's own targets,
+# the derive crate's included, are tested and linted here on the stock
+# toolchain, the evidence tooling (TOOLING) excepted.
+section "Workspace: every member's targets but the evidence tooling"
+cargo test --quiet --workspace "${tooling_excludes[@]}" --features derive,hashbrown,multithreaded,num-bigint -- "${skips[@]}"
+cargo clippy --workspace "${tooling_excludes[@]}" --all-targets --features derive,hashbrown,multithreaded,num-bigint -- -D warnings
 
 cargo fmt --all -- --check

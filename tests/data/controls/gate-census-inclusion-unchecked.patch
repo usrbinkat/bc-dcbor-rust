@@ -1,6 +1,6 @@
 --- tests/gate/src/proofs.rs
 +++ tests/gate/src/proofs.rs
-@@ -3419,7 +3419,7 @@
+@@ -3418,7 +3418,7 @@
          let text = std::fs::read_to_string(&path)
              .map_err(|error| format!("{}: {error}", path.display()))?;
          let inclusion = instances::inclusion(family);

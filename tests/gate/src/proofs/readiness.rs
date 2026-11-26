@@ -1,23 +1,15 @@
-//! A calibration's readiness: the control runs it follows, each complete
-//! against the registry; no other gate workload running (the workload lock
-//! held); the settling of the system it waited on; and the one validator of
-//! the receipt ([`Readiness::validate`]), which the live calibration and every
-//! reader of a kept receipt apply alike, recomputing every control run from
-//! the registry and verdict bytes the receipt retains.
+//! A calibration's readiness: its commit; no other gate workload running (the
+//! workload lock held); the settling of the system it waited on; and the one
+//! validator of the receipt ([`Readiness::validate`]), which the live
+//! calibration and every reader of a kept receipt apply alike. Readiness
+//! reads nothing of the planted controls: a calibration measures the
+//! implementation, and test adequacy (tests/controls.sh, `verdict.json`,
+//! [`ControlVerdict`]) is a separate track no proof run waits on.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::{Instant, RUNTIME_VERSION, Ready, strict_json, typed};
-use crate::controls::{ControlResult, Registry, Runner};
-
-/// The control runs a calibration must follow, each by its channel and the
-/// runners it ran: the native controls of the nightly and the stable
-/// toolchains. The Kani controls are not among them, since they run under
-/// the predictions a calibration produces; the Miri controls are obligations
-/// of their own, not this prerequisite.
-pub const REQUIRED_CONTROLS: &[(&str, &[&str])] =
-    &[("nightly", &["native"]), ("stable", &["native"])];
+use super::{Instant, RUNTIME_VERSION, Ready};
+use crate::controls::{ControlResult, Runner};
 
 /// The lock every gate workload holds exclusively while it runs, relative to
 /// the checkout (`tests/controls.sh`, `tests/proofs.sh`, and a calibration's
@@ -80,8 +72,8 @@ impl Drop for WorkloadLock {
 /// The workload lock a readiness was established under, as the gate records
 /// it: its path and when the calibration acquired it. The record is the
 /// gate's attestation; what it is checked against is the order of the
-/// records around it ([`Readiness::validate`]): every control run finished
-/// before it was acquired, and it was acquired before settling began.
+/// records around it ([`Readiness::validate`]): it was acquired before
+/// settling began.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LockRecord {
@@ -89,8 +81,8 @@ pub struct LockRecord {
     pub acquired: Instant,
 }
 
-/// The operational policy a calibration waits on before its first run, after
-/// the control runs that preceded it: the system's load read every
+/// The operational policy a calibration waits on before its first run, once
+/// it holds the workload lock: the system's load read every
 /// `interval_milliseconds` at least (`/proc/loadavg`), settled once
 /// `consecutive` readings in a row each show at most `max_running` runnable
 /// tasks and a one-minute load of at most `max_load1_hundredths`
@@ -123,7 +115,7 @@ pub fn settling_policy() -> SettlingPolicy {
         justification: "a calibration's harness is one solver process; a run queue of at most \
                         the sampler and one other task and a one-minute load of at most 1.00, \
                         held over seven readings spanning at least thirty seconds, is the \
-                        operational criterion that the control runs' workload has decayed; \
+                        operational criterion that every earlier workload has decayed; \
                         fifteen minutes without it refuses the calibration"
             .to_string(),
     }
@@ -375,7 +367,8 @@ pub fn settle(
 /// registry's identity (the digest of `controls.tsv`'s bytes), every
 /// selected control's result in the registry's order, every fault, and when
 /// it was written, the run's last act before its runner released the
-/// workload lock.
+/// workload lock. The test-adequacy track's own verdict: no calibration,
+/// qualification or other proof run reads it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlVerdict {
@@ -395,8 +388,8 @@ pub struct ControlVerdict {
 /// ([`crate::controls::registry`]), every selected control's result judged
 /// from its evidence ([`crate::controls::evidence`]), the run's commit and
 /// identity as its runner recorded them, every fault, a run that selected
-/// nothing among them, and the time it was made. The one maker of the record
-/// [`control_run`] reads (`gate control evidence`).
+/// nothing among them, and the time it was made. The one maker of
+/// `verdict.json` (`gate control evidence`).
 pub fn control_verdict(
     root: &Path,
     logs: &Path,
@@ -433,197 +426,15 @@ pub fn control_verdict(
     })
 }
 
-/// A control run a calibration follows ([`verified_run`], its only maker):
-/// its logs (provenance), and its final record's text as read (`verdict`)
-/// with its digest, and every fact of it the readiness relies on, each as
-/// that text records it: its identity, commit, channel and runners, the
-/// registry it ran, every selected control's result, and when it finished.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ControlRun {
-    pub logs: String,
-    pub identity: String,
-    pub commit: String,
-    pub channel: String,
-    pub runners: Vec<String>,
-    pub registry_sha256: String,
-    pub results: Vec<ControlResult>,
-    pub finished: Instant,
-    pub verdict: String,
-    pub verdict_sha256: String,
-}
-
-impl ControlRun {
-    /// Whether the run's own record establishes a completed, passed run:
-    /// an identity; a registry and a verdict digest; at least one result,
-    /// each of a control named once under one of the run's runners, and
-    /// every one passed.
-    fn complete(&self) -> Result<(), String> {
-        let fault = |what: String| {
-            Err(format!(
-                "the {} control run {} {what}",
-                self.channel, self.identity
-            ))
-        };
-        if self.identity.trim().is_empty() {
-            return fault("names no identity".to_string());
-        }
-        if !super::sha256_text(&self.registry_sha256) || !super::sha256_text(&self.verdict_sha256) {
-            return fault("records no registry or verdict digest".to_string());
-        }
-        if self.results.is_empty() {
-            return fault("judged no control".to_string());
-        }
-        let mut named = BTreeSet::new();
-        for result in &self.results {
-            if !named.insert((result.control.as_str(), result.runner.as_str())) {
-                return fault(format!(
-                    "judged {} under {} twice",
-                    result.control, result.runner
-                ));
-            }
-            if !self.runners.contains(&result.runner) {
-                return fault(format!(
-                    "judged {} under {}, which it did not run",
-                    result.control, result.runner
-                ));
-            }
-            if !result.faults.is_empty() {
-                return fault(format!(
-                    "did not pass {} under {}: {:?}",
-                    result.control, result.runner, result.faults
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The one validation of a control run's final record, live or retained:
-/// `verdict` (its text, the logs at `logs` naming its run) read and digested
-/// from those bytes, of [`RUNTIME_VERSION`], naming the run's `identity`, of
-/// `commit` when one is given, of the `registry`'s digest; its results
-/// exactly the registry's selection for its channel and runners
-/// ([`crate::controls::selected`]), in order; its faults exactly its
-/// results' faults, and none; complete ([`ControlRun::complete`]).
-fn verified_run(
-    logs: String,
-    verdict: &str,
-    identity: &str,
-    commit: Option<&str>,
-    registry: &Registry,
-) -> Result<ControlRun, String> {
-    let fail = |what: String| Err(format!("{logs}/verdict.json: {what}"));
-    let verdict_sha256 = crate::process::sha256_bytes(verdict.as_bytes())?;
-    let record: ControlVerdict = typed(
-        strict_json(verdict.as_bytes()).map_err(|fault| format!("{logs}/verdict.json: {fault}"))?,
-        "verdict.json",
-    )?;
-    if record.version != RUNTIME_VERSION {
-        return fail(format!("is of version {}", record.version));
-    }
-    if record.identity != identity {
-        return fail(format!(
-            "names the identity {}, the run's is {identity}",
-            record.identity
-        ));
-    }
-    if let Some(commit) = commit
-        && record.commit != commit
-    {
-        return fail(format!(
-            "is of commit {}, the calibration's is {commit}",
-            record.commit
-        ));
-    }
-    if record.registry_sha256 != registry.sha256 {
-        return fail(format!(
-            "ran the registry {}, the calibration's is {}",
-            record.registry_sha256, registry.sha256
-        ));
-    }
-    let runners: Vec<Runner> = record
-        .runners
-        .iter()
-        .map(|runner| Runner::parse(runner).ok_or_else(|| Runner::unknown(runner)))
-        .collect::<Result<_, _>>()?;
-    let expected: Vec<(&str, &str)> =
-        crate::controls::selected(&registry.controls, &record.channel, &runners)
-            .into_iter()
-            .map(|control| (control.name.as_str(), control.runner.name()))
-            .collect();
-    let judged: Vec<(&str, &str)> = record
-        .results
-        .iter()
-        .map(|result| (result.control.as_str(), result.runner.as_str()))
-        .collect();
-    if judged != expected {
-        return fail(format!(
-            "judged {judged:?}, the registry selects {expected:?} for {} under {:?}",
-            record.channel, record.runners
-        ));
-    }
-    if record.faults != crate::controls::faults(&record.results) || !record.faults.is_empty() {
-        return fail(format!(
-            "records the faults {:?}: the control run did not pass",
-            record.faults
-        ));
-    }
-    let run = ControlRun {
-        logs,
-        identity: record.identity,
-        commit: record.commit,
-        channel: record.channel,
-        runners: record.runners,
-        registry_sha256: record.registry_sha256,
-        results: record.results,
-        finished: record.finished,
-        verdict: verdict.to_string(),
-        verdict_sha256,
-    };
-    run.complete()?;
-    Ok(run)
-}
-
-/// The control run whose logs are `logs`, of `commit`, against the
-/// `registry` ([`crate::controls::registry`]): its final record read once
-/// and held, with the identity its runner recorded (`identity.txt`), to the
-/// one validation ([`verified_run`]). A run unfinished (no final record), of
-/// another registry, short of a selected control or failed is refused.
-pub fn control_run(logs: &Path, commit: &str, registry: &Registry) -> Result<ControlRun, String> {
-    let path = logs.join("verdict.json");
-    let bytes = std::fs::read(&path).map_err(|error| {
-        format!(
-            "{}: {error}: the control run has not finished",
-            path.display()
-        )
-    })?;
-    let verdict = String::from_utf8(bytes)
-        .map_err(|error| format!("{}: not UTF-8: {error}", path.display()))?;
-    let identity_path = logs.join("identity.txt");
-    let identity = std::fs::read_to_string(&identity_path)
-        .map_err(|error| format!("{}: {error}", identity_path.display()))?;
-    verified_run(
-        logs.display().to_string(),
-        &verdict,
-        identity.trim(),
-        Some(commit),
-        registry,
-    )
-}
-
 /// A calibration's readiness, preserved before its first run
-/// (`readiness.json`): the registry's text the control runs are recomputed
-/// against; the control runs it follows, each with its final record's text;
-/// the workload lock it held ([`WORKLOAD_LOCK`], [`LockRecord`]); the
-/// settling policy, every reading taken under it, and whether the
-/// calibration was ready, or why not.
+/// (`readiness.json`): the commit it calibrates; the workload lock it held
+/// ([`WORKLOAD_LOCK`], [`LockRecord`]); the settling policy, every reading
+/// taken under it, and whether the calibration was ready, or why not.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Readiness {
     pub version: u64,
-    pub registry: String,
-    pub controls: Vec<ControlRun>,
+    pub commit: String,
     pub workload_lock: Option<LockRecord>,
     pub policy: SettlingPolicy,
     pub observations: Vec<Settled>,
@@ -633,77 +444,35 @@ pub struct Readiness {
 
 impl Readiness {
     /// The one validator of a readiness, live or read back from a run's
-    /// evidence: of [`RUNTIME_VERSION`]; ready, with no error; every control
-    /// run recomputed from the retained registry text and its retained final
-    /// record by the one validation ([`verified_run`], of `commit` when
-    /// given), and its recorded facts exactly what that record states; its
-    /// control runs exactly [`REQUIRED_CONTROLS`], one each, all of one
-    /// commit; the workload lock recorded, acquired after every control run
-    /// finished and before the first reading; its policy valid
+    /// evidence: of [`RUNTIME_VERSION`]; ready, with no error; of a commit,
+    /// and of `commit` when given; the workload lock recorded, acquired
+    /// before the first reading; its policy valid
     /// ([`SettlingPolicy::validate`]); and its readings settled by the one
     /// evaluation ([`settled_at`]) at its last reading, within its limit.
     /// Refused naming the first that does not hold: a receipt that only says
     /// it is ready establishes nothing.
     pub fn validate(&self, commit: Option<&str>) -> Result<(), String> {
-        let invalid = |what: String| {
-            format!(
+        let fault = |what: String| {
+            Err(format!(
                 "{} is not a valid readiness: {what}",
                 super::READINESS_RECORD
-            )
+            ))
         };
-        let fault = |what: String| Err(invalid(what));
         if self.version != RUNTIME_VERSION {
             return fault(format!("version {}", self.version));
         }
         if !self.ready || self.error.is_some() {
             return fault(format!("not ready: {:?}", self.error));
         }
-        let registry = Registry::of_text(&self.registry).map_err(invalid)?;
-        for run in &self.controls {
-            let recomputed = verified_run(
-                run.logs.clone(),
-                &run.verdict,
-                &run.identity,
-                commit,
-                &registry,
-            )
-            .map_err(invalid)?;
-            if recomputed != *run {
-                return fault(format!(
-                    "the {} control run's recorded facts are not what its verdict records",
-                    run.channel
-                ));
-            }
+        if self.commit.trim().is_empty() {
+            return fault("it names no commit".to_string());
         }
-        let mut scopes: Vec<(&str, Vec<&str>)> = self
-            .controls
-            .iter()
-            .map(|run| {
-                (
-                    run.channel.as_str(),
-                    run.runners.iter().map(String::as_str).collect(),
-                )
-            })
-            .collect();
-        scopes.sort();
-        let mut required: Vec<(&str, Vec<&str>)> = REQUIRED_CONTROLS
-            .iter()
-            .map(|(channel, runners)| (*channel, runners.to_vec()))
-            .collect();
-        required.sort();
-        if scopes != required {
+        if let Some(commit) = commit
+            && self.commit != commit
+        {
             return fault(format!(
-                "its control runs are {scopes:?}, a calibration follows exactly {required:?}"
-            ));
-        }
-        let commits: BTreeSet<&str> = self
-            .controls
-            .iter()
-            .map(|run| run.commit.as_str())
-            .collect();
-        if commits.len() != 1 {
-            return fault(format!(
-                "its control runs are of the commits {commits:?}, not of one commit"
+                "it is of commit {}, the calibration's is {commit}",
+                self.commit
             ));
         }
         let Some(lock) = self
@@ -716,17 +485,6 @@ impl Readiness {
                 self.workload_lock
             ));
         };
-        if let Some(running) = self
-            .controls
-            .iter()
-            .find(|run| run.finished > lock.acquired)
-        {
-            return fault(format!(
-                "the {} control run finished at {:?}, after the workload lock was acquired at \
-                 {:?}: it was still running",
-                running.channel, running.finished, lock.acquired
-            ));
-        }
         if let Some(first) = self.observations.first()
             && first.at < lock.acquired
         {
@@ -753,25 +511,20 @@ impl Readiness {
     }
 }
 
-/// What a calibration's readiness is established from: the copy `root`
-/// whose registry the control runs must have run, the calibration's
-/// `commit`, the control runs' logs `control_logs`, and the workload lock
-/// the calibration holds.
+/// What a calibration's readiness is established from: the calibration's
+/// `commit` and the workload lock it holds.
 pub struct Prerequisites<'a> {
-    pub root: &'a Path,
     pub commit: &'a str,
-    pub control_logs: &'a [&'a Path],
     pub lock: &'a WorkloadLock,
 }
 
-/// The readiness of a calibration ([`Prerequisites`]): every control run
-/// established against the copy's registry ([`control_run`]), the system
-/// settled under `policy` ([`settle`]), the receipt validated by the one
-/// validator ([`Readiness::validate`]), and preserved at `path` whether
-/// ready or not, every reading beside why. The receipt's bytes, as
-/// preserved, are what every calibration run of it keeps ([`Ready`]). A
-/// receipt that cannot be preserved fails the readiness, its own rejection,
-/// if any, kept beside the failure to preserve it.
+/// The readiness of a calibration ([`Prerequisites`]): the system settled
+/// under `policy` ([`settle`]), the receipt validated by the one validator
+/// ([`Readiness::validate`]), and preserved at `path` whether ready or not,
+/// every reading beside why. The receipt's bytes, as preserved, are what
+/// every calibration run of it keeps ([`Ready`]). A receipt that cannot be
+/// preserved fails the readiness, its own rejection, if any, kept beside the
+/// failure to preserve it.
 pub fn readiness(
     path: &Path,
     prerequisites: &Prerequisites<'_>,
@@ -779,32 +532,11 @@ pub fn readiness(
     sample: &mut dyn FnMut() -> Result<String, String>,
     clocks: &mut dyn Clocks,
 ) -> Result<Ready, String> {
-    let registry = crate::controls::registry(prerequisites.root);
-    let controls: Result<Vec<ControlRun>, String> = registry
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|registry| {
-            prerequisites
-                .control_logs
-                .iter()
-                .map(|logs| control_run(logs, prerequisites.commit, registry))
-                .collect()
-        });
-    let (controls, observations, mut error) = match controls {
-        Err(fault) => (
-            Vec::new(),
-            Vec::new(),
-            Some(format!("no finished, passed control run: {fault}")),
-        ),
-        Ok(controls) => {
-            let (observations, settled) = settle(policy, sample, clocks);
-            (controls, observations, settled.err())
-        }
-    };
+    let (observations, settled) = settle(policy, sample, clocks);
+    let mut error = settled.err();
     let mut receipt = Readiness {
         version: RUNTIME_VERSION,
-        registry: registry.map(|registry| registry.text).unwrap_or_default(),
-        controls,
+        commit: prerequisites.commit.to_string(),
         workload_lock: Some(LockRecord {
             path: prerequisites.lock.path().display().to_string(),
             acquired: prerequisites.lock.acquired(),
