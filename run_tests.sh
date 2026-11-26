@@ -9,7 +9,7 @@ TERM_BOLD='\033[1m'
 TERM_RESET='\033[0m'
 
 section() {
-	echo -e "${TERM_PURPLE}${TERM_BOLD}=== $1 ===${TERM_RESET}"
+    echo -e "${TERM_PURPLE}${TERM_BOLD}=== $1 ===${TERM_RESET}"
 }
 
 # The verification layer every matrix in every leg runs: fast, the default,
@@ -19,11 +19,11 @@ section() {
 # compiled implementation is independent of the added features below.
 export DCBOR_RIGOR="${DCBOR_RIGOR:-fast}"
 case "$DCBOR_RIGOR" in
-fast | exhaustive) ;;
-*)
-	echo "DCBOR_RIGOR must be fast or exhaustive" >&2
-	exit 2
-	;;
+    fast | exhaustive) ;;
+    *)
+        echo "DCBOR_RIGOR must be fast or exhaustive" >&2
+        exit 2
+        ;;
 esac
 section "rigor: $DCBOR_RIGOR"
 
@@ -34,19 +34,19 @@ section "rigor: $DCBOR_RIGOR"
 # which skips them; the fast layer runs their edges and a sample in every
 # leg.
 EXHAUSTIVE_SWEEPS=(
-	float::tests::every_f32_reduces_as_its_reference_and_decodes_only_if_canonical
-	float::tests::f32_and_f64_symbolic_and_bounded_agree
+    float::tests::every_f32_reduces_as_its_reference_and_decodes_only_if_canonical
+    float::tests::f32_and_f64_symbolic_and_bounded_agree
 )
 skips=()
 if [[ "$DCBOR_RIGOR" == exhaustive ]]; then
-	for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
-		skips+=(--skip "$sweep")
-	done
-	section "Exhaustive numeric sweeps"
-	for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
-		CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true \
-			cargo test --quiet --release --lib -- --exact "$sweep"
-	done
+    for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
+        skips+=(--skip "$sweep")
+    done
+    section "Exhaustive numeric sweeps"
+    for sweep in "${EXHAUSTIVE_SWEEPS[@]}"; do
+        CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true \
+            cargo test --quiet --release --lib -- --exact "$sweep"
+    done
 fi
 
 # The evidence gates' own oracles and their planted-defect controls: the
@@ -58,27 +58,27 @@ section "Evidence tooling controls"
 cargo test --quiet -p dcbor-record -p dcbor-model-bounds -p dcbor-census -p dcbor-gate
 
 select_targets() {
-	local features="$1" path target
-	targets=(--lib --bins --benches)
-	if [[ "$DCBOR_RIGOR" == exhaustive || "$features" == *no_std* || "$features" == *multithreaded* ]]; then
-		# no_std changes collection/error infrastructure; multithreaded changes
-		# CBOR's shared ownership representation. Both affect arbitrary users.
-		targets+=(--tests)
-		return
-	fi
-	for path in tests/*.rs; do
-		target="${path##*/}"
-		target="${target%.rs}"
-		case "$target" in
-		normalization | version-numbers)
-			# Unicode normalization and package version synchronization
-			# contain no derive, hashbrown or bigint-dependent behavior.
-			# The full default/workspace runs cover them; exhaustive
-			# checks this independence assumption in every feature leg.
-			;;
-		*) targets+=(--test "$target") ;;
-		esac
-	done
+    local features="$1" path target
+    targets=(--lib --bins --benches)
+    if [[ "$DCBOR_RIGOR" == exhaustive || "$features" == *no_std* || "$features" == *multithreaded* ]]; then
+        # no_std changes collection/error infrastructure; multithreaded changes
+        # CBOR's shared ownership representation. Both affect arbitrary users.
+        targets+=(--tests)
+        return
+    fi
+    for path in tests/*.rs; do
+        target="${path##*/}"
+        target="${target%.rs}"
+        case "$target" in
+            normalization | version-numbers)
+                # Unicode normalization and package version synchronization
+                # contain no derive, hashbrown or bigint-dependent behavior.
+                # The full default/workspace runs cover them; exhaustive
+                # checks this independence assumption in every feature leg.
+                ;;
+            *) targets+=(--test "$target") ;;
+        esac
+    done
 }
 
 # Each feature set is tested and linted: code compiled only under some
@@ -87,19 +87,19 @@ select_targets() {
 # prints its test, its message and its location.
 # argument: "feature1,feature2,..."
 test_only_features() {
-	local features="$1"
-	section "no default + $features"
-	select_targets "$features"
-	cargo test --quiet "${targets[@]}" --no-default-features --features "$features" -- "${skips[@]}"
-	cargo clippy --all-targets --no-default-features --features "$features" -- -D warnings
+    local features="$1"
+    section "no default + $features"
+    select_targets "$features"
+    cargo test --quiet "${targets[@]}" --no-default-features --features "$features" -- "${skips[@]}"
+    cargo clippy --all-targets --no-default-features --features "$features" -- -D warnings
 }
 
 test_additional_features() {
-	local features="$1"
-	section "default + $features"
-	select_targets "$features"
-	cargo test --quiet "${targets[@]}" --features "$features" -- "${skips[@]}"
-	cargo clippy --all-targets --features "$features" -- -D warnings
+    local features="$1"
+    section "default + $features"
+    select_targets "$features"
+    cargo test --quiet "${targets[@]}" --features "$features" -- "${skips[@]}"
+    cargo clippy --all-targets --features "$features" -- -D warnings
 }
 
 test_only_features "no_std"
