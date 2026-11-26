@@ -1959,18 +1959,18 @@ mod tests {
     }
 
     /// A place's copy is the same place: its pointer, and so its
-    /// provenance, unchanged.
+    /// provenance, unchanged. The copy is made through a `Clone` bound
+    /// alone, so the place's own `Clone` impl runs, never a bitwise copy.
     #[test]
-    #[expect(
-        clippy::clone_on_copy,
-        reason = "the test runs the place's `Clone` impl itself, which a copy bypasses"
-    )]
     fn a_copied_place_is_the_same_place() {
+        fn cloned<T: Clone>(value: &T) -> T {
+            value.clone()
+        }
         let mut slot = MaybeUninit::<u64>::uninit();
         let mut custody = ();
         // SAFETY: the test owns the destination; nothing else reaches it.
         let place = unsafe { Place::<u64, Build>::root(NonNull::from(&mut slot)) };
-        let copied = <Place<u64, Build> as Clone>::clone(&place);
+        let copied = cloned(&place);
         assert_eq!(place.as_ptr(&mut custody), copied.as_ptr(&mut custody));
     }
 
