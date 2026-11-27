@@ -6575,10 +6575,10 @@ mod bound_tests {
             assert_eq!(shape.entries, 2, "{moves} moves");
             limits.assert_units(TURN);
             assert!(
-                !limits.calls().contains(&Call::Work {
-                    values: 0,
-                    bytes: 0
-                }),
+                !limits
+                    .calls()
+                    .iter()
+                    .any(|call| call.work() == Some(WriteWork::default())),
                 "{moves} moves: an empty unit admitted: {:?}",
                 limits.calls()
             );

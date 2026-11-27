@@ -433,32 +433,33 @@ impl HistoryCounts {
     }
 }
 
-/// One admission request.
+/// One admission request, named by the account it is charged to: a
+/// foreground unit's work ([`Budget::traverse`]), a cleanup unit's work
+/// ([`super::Releasing::reclaim`]), or a storage request
+/// ([`Allocator::allocate`]). The history records each as asked, so a
+/// reader tells a cleanup admission from a foreground one by the call alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Call {
     Work { values: u64, bytes: u64 },
+    Reclaim { values: u64, bytes: u64 },
     Allocate(u64),
 }
 
-/// One attempted admission as the policy accounts it: a foreground call, or
-/// a cleanup unit's work ([`super::Releasing::reclaim`]). Either is
-/// recorded as its [`Call`] ([`Self::call`]): the history names what was
-/// asked, the authority's accounts what it was charged to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Attempt {
-    Foreground(Call),
-    Cleanup(WriteWork),
-}
+impl Call {
+    /// Whether this call is charged to the foreground account: a work unit
+    /// or a storage request, every call but cleanup.
+    pub const fn is_foreground(self) -> bool {
+        !matches!(self, Self::Reclaim { .. })
+    }
 
-impl Attempt {
-    /// The call this attempt is recorded as.
-    const fn call(self) -> Call {
+    /// The work this call asks for: a work or cleanup unit's; `None` for a
+    /// storage request.
+    pub const fn work(self) -> Option<WriteWork> {
         match self {
-            Self::Foreground(call) => call,
-            Self::Cleanup(work) => Call::Work {
-                values: work.values,
-                bytes: work.bytes,
-            },
+            Self::Work { values, bytes } | Self::Reclaim { values, bytes } => {
+                Some(WriteWork::new(values, bytes))
+            }
+            Self::Allocate(_) => None,
         }
     }
 }
@@ -1661,7 +1662,7 @@ impl Limits {
         &mut self.trace
     }
 
-    /// Panic unless every recorded work call fit in `quantum`.
+    /// Panic unless every recorded work and cleanup unit fit in `quantum`.
     #[cfg_attr(
         kani,
         expect(
@@ -1671,9 +1672,9 @@ impl Limits {
     )]
     pub fn assert_units(&self, quantum: WriteWork) {
         for (index, call) in self.calls().into_iter().enumerate() {
-            if let Call::Work { values, bytes } = call {
+            if let Some(work) = call.work() {
                 assert!(
-                    values <= quantum.values && bytes <= quantum.bytes,
+                    work.values <= quantum.values && work.bytes <= quantum.bytes,
                     "indivisible operation {index}: {call:?} exceeds {quantum:?}"
                 );
             }
@@ -1694,7 +1695,7 @@ impl Limits {
     /// subtraction a concurrent request of the same family may see the
     /// capacity taken and be refused; that happens only once the session is
     /// exhausted, when the run is no evidence.
-    fn admit(&mut self, attempt: Attempt) -> Result<Option<(u64, Identity)>, LimitRefusal> {
+    fn admit(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
         if self.strict {
             assert!(
                 self.refused.is_none(),
@@ -1706,9 +1707,7 @@ impl Limits {
         self.attempts += 1;
         let now = self.clock;
         self.clock = self.clock.saturating_add(1);
-        if matches!(attempt, Attempt::Foreground(_))
-            && self.expiry.is_some_and(|expiry| now >= expiry)
-        {
+        if call.is_foreground() && self.expiry.is_some_and(|expiry| now >= expiry) {
             return Err(LimitRefusal::Deadline);
         }
         if let Some((at, reason)) = self.fail_at
@@ -1724,16 +1723,16 @@ impl Limits {
                 return Err(LimitRefusal::Scheduled(index));
             }
         }
-        match attempt {
-            Attempt::Cleanup(work) => {
-                self.authority.reclaim(work)?;
+        match call {
+            Call::Reclaim { values, bytes } => {
+                self.authority.reclaim(WriteWork::new(values, bytes))?;
                 Ok(None)
             }
-            Attempt::Foreground(Call::Work { values, bytes }) => {
+            Call::Work { values, bytes } => {
                 self.authority.work(WriteWork::new(values, bytes))?;
                 Ok(None)
             }
-            Attempt::Foreground(Call::Allocate(bytes)) => {
+            Call::Allocate(bytes) => {
                 let request = self.requests;
                 self.requests += 1;
                 if self.fail_request == Some(request) {
@@ -1803,20 +1802,20 @@ impl Limits {
         }
     }
 
-    fn admit_traced(&mut self, attempt: Attempt) -> Result<Option<(u64, Identity)>, LimitRefusal> {
-        let call = attempt.call();
+    fn admit_traced(&mut self, call: Call) -> Result<Option<(u64, Identity)>, LimitRefusal> {
         if self.terminal {
-            // A terminal policy's calls are cleanup units, published like
-            // any other: publication allocates nothing.
+            // A terminal policy's units are admitted uncounted and its
+            // requests refused, each published as asked: publication
+            // allocates nothing.
             let result = match call {
-                Call::Work { .. } => Ok(()),
+                Call::Work { .. } | Call::Reclaim { .. } => Ok(()),
                 Call::Allocate(_) => Err(LimitRefusal::Storage),
             };
             self.publish_call(call, result);
             return result.map(|()| None);
         }
         self.last_injected = false;
-        let granted = self.admit(attempt);
+        let granted = self.admit(call);
         let result = granted.map(|_| ());
         if let Err(reason) = result {
             self.refusals += 1;
@@ -1848,8 +1847,7 @@ impl Default for Limits {
 impl Budget for Limits {
     type Refusal = LimitRefusal;
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
-        self.admit_traced(Attempt::Foreground(Call::Work { values, bytes }))
-            .map(|_| ())
+        self.admit_traced(Call::Work { values, bytes }).map(|_| ())
     }
 
     fn boundary(&mut self, boundary: Boundary) {
@@ -2059,7 +2057,7 @@ impl super::Releasing for Limits {
     /// schedule as every call is, the instrument's alone; never by the
     /// deadline or the lifetime work ceiling.
     fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
-        self.admit_traced(Attempt::Cleanup(WriteWork::new(values, bytes)))
+        self.admit_traced(Call::Reclaim { values, bytes })
             .map(|_| ())
     }
 
@@ -2079,7 +2077,7 @@ impl Allocator for Limits {
     /// so an observer that unwinds drops a permit that releases what was
     /// admitted: no admitted storage is ever left without an owner.
     fn allocate(&mut self, bytes: u64) -> Result<Reservation, LimitRefusal> {
-        let granted = self.admit_traced(Attempt::Foreground(Call::Allocate(bytes)))?;
+        let granted = self.admit_traced(Call::Allocate(bytes))?;
         let word = granted.map_or(bytes, |(index, _)| index);
         let permit = Reservation {
             counters: self.counters.clone(),
@@ -2845,6 +2843,72 @@ mod tests {
             assert_eq!(m.cleanup_used(), WriteWork::new(1, 8));
             assert!(unit.admit(&mut m).is_err());
             assert_eq!(m.used(), m.cleanup_used());
+        }
+
+        /// The history names the account each unit was charged to: a
+        /// foreground unit is recorded as work, a unit through the cleanup
+        /// capability as reclaim, refused or admitted, so a reader of the
+        /// history alone tells which calls an expiry may refuse.
+        #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the policy's history is driven by direct admissions"
+        )]
+        fn the_history_names_each_units_account() {
+            use crate::bounded::decode::construction::reclamation::Cleanup;
+            use crate::bounded::{Caller, Capacity, Session, Unit};
+            let session = Session::new(Capacity::DEFAULT);
+            let mut m = Limits::recorded_unlimited(&session);
+            m.traverse(1, 0).unwrap();
+            Unit::new(Caller, 1, 8)
+                .admit(&mut Cleanup::new(&mut m))
+                .unwrap();
+            m.expire_at_call(Some(0));
+            Unit::new(Caller, 2, 0)
+                .admit(&mut Cleanup::new(&mut m))
+                .unwrap();
+            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Deadline));
+            assert_eq!(
+                m.calls(),
+                [
+                    Call::Work {
+                        values: 1,
+                        bytes: 0
+                    },
+                    Call::Reclaim {
+                        values: 1,
+                        bytes: 8
+                    },
+                    Call::Reclaim {
+                        values: 2,
+                        bytes: 0
+                    },
+                    Call::Work {
+                        values: 1,
+                        bytes: 0
+                    },
+                ],
+                "a cleanup unit was recorded as foreground work"
+            );
+            assert!(
+                Call::Work {
+                    values: 1,
+                    bytes: 0
+                }
+                .is_foreground()
+            );
+            assert!(Call::Allocate(1).is_foreground());
+            assert!(
+                !Call::Reclaim {
+                    values: 1,
+                    bytes: 0
+                }
+                .is_foreground()
+            );
+            drop(m);
+            session
+                .finish()
+                .unwrap_or_else(|incomplete| panic!("the session is incomplete: {incomplete:?}"));
         }
     }
 }

@@ -47,16 +47,22 @@ struct Baseline {
     used: WriteWork,
 }
 
-/// A decode of `wire` whose deadline expires at call `stop`: the expiration
-/// is observed there, at the clock it names; once the deadline is lifted the
+/// A decode of `wire` whose deadline expires at call `stop`. The expiry
+/// refuses foreground calls alone, so the call it refuses is the first
+/// foreground call of the unobstructed run at or after `stop`: a cleanup
+/// unit at `stop` is admitted as in that run. The expiration is observed at
+/// the refused call, at the clock it names; once the deadline is lifted the
 /// same operation resumes to the literal document, attempting the
-/// unobstructed run's calls with only the expired one repeated. Returns the
-/// calls admitted and the boundary valuations the decode reached.
+/// unobstructed run's calls with only the expired one repeated. With no
+/// foreground call at or after `stop` the expiry refuses nothing and the
+/// decode completes as the unobstructed run does. Returns the calls admitted
+/// and the boundary valuations the decode reached.
 fn expire_at(
     wire: &[u8],
     baseline: &Baseline,
     stop: usize,
 ) -> (Vec<Call>, dcbor::bounded::boundary::Reached) {
+    let refused = (stop..baseline.calls.len()).find(|&at| baseline.calls[at].is_foreground());
     suite(|run, policy| {
         run.with_policy(policy, |m| {
             m.expire_at_call(Some(u64::try_from(stop).expect("a call index fits in u64")));
@@ -66,22 +72,28 @@ fn expire_at(
             Retirement::Released,
             &Unwitnessed,
             |operation| {
-                assert_eq!(
-                    operation.suspend(
-                        policy,
-                        LimitRefusal::Deadline,
-                        decode_turns(wire.len()),
-                        TurnSchedule::Fresh,
-                        Retirement::Released,
-                    )?,
-                    stop
-                );
-                let paid = operation.with_policy(policy, |_, m| {
+                if let Some(refused) = refused {
                     assert_eq!(
-                        m.clock(),
-                        u64::try_from(stop).expect("a call index fits in u64") + 1
+                        operation.suspend(
+                            policy,
+                            LimitRefusal::Deadline,
+                            decode_turns(wire.len()),
+                            TurnSchedule::Fresh,
+                            Retirement::Released,
+                        )?,
+                        refused,
+                        "an expiry at call {stop} refused another call than the first \
+                         foreground one after it"
                     );
-                    assert_eq!(m.calls(), &baseline.calls[..=stop]);
+                }
+                let paid = operation.with_policy(policy, |_, m| {
+                    if let Some(refused) = refused {
+                        assert_eq!(
+                            m.clock(),
+                            u64::try_from(refused).expect("a call index fits in u64") + 1
+                        );
+                        assert_eq!(m.calls(), &baseline.calls[..=refused]);
+                    }
                     let paid = m.used();
                     m.expire_at_call(None);
                     paid
@@ -137,9 +149,10 @@ fn expiration_between_admissions_preserves_paid_work_and_can_resume() {
     };
     // An expiration between admissions: at the decode's last, which every
     // earlier admission precedes. The exhaustive layer expires the deadline
-    // at every admission and requires each to attempt exactly what the
-    // refusal of that call attempts: the evidence that the engine treats an
-    // expiration as any refusal.
+    // at every admission, a cleanup unit's included, and requires each to
+    // attempt exactly what the refusal of the first foreground call at or
+    // after it attempts: the evidence that the engine treats an expiration
+    // as any refusal, and that cleanup is never refused for it.
     reason_matrix(
         "deadline expirations of a flat array decode",
         rigor(),

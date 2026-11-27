@@ -1,0 +1,10 @@
+--- src/bounded/policy/record/codec.rs
++++ src/bounded/policy/record/codec.rs
+@@ -169,5 +169,6 @@
+                 Call::Work { values, bytes } => (1, values, bytes),
+                 Call::Allocate(bytes) => (2, 0, bytes),
+-                Call::Reclaim { values, bytes } => (3, values, bytes),
++                // Planted: a cleanup unit stored as foreground work.
++                Call::Reclaim { values, bytes } => (1, values, bytes),
+             };
+             let (outcome, a, b) = match answer {

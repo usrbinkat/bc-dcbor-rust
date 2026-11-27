@@ -216,21 +216,27 @@ fn key_comparison_quantum_is_checked_separately_from_payload_scans() {
             Retirement::Released,
             &Unwitnessed,
             |operation| {
-                operation.drive(policy, decode_turns(wire.len()), Retirement::Released, |doc| {
-                    assert_eq!(doc.value().root().kind(), Kind::Map(2));
-                    assert_eq!(doc.value().root().encoded(), wire);
-                    // Byte-string validation charges zero values. Comparisons
-                    // charge visits.
-                    let oversized: Vec<_> = doc.with_policy(policy, |_, m| {
-                        m.calls()
-                            .into_iter()
-                            .filter(|c| {
-                                matches!(c, Call::Work { values, bytes } if *values > 0 && *bytes > 64)
-                            })
-                            .collect()
-                    });
-                    assert!(oversized.is_empty(), "unbounded comparison: {oversized:?}");
-                })
+                operation.drive(
+                    policy,
+                    decode_turns(wire.len()),
+                    Retirement::Released,
+                    |doc| {
+                        assert_eq!(doc.value().root().kind(), Kind::Map(2));
+                        assert_eq!(doc.value().root().encoded(), wire);
+                        // Byte-string validation charges zero values. Comparisons
+                        // charge visits.
+                        let oversized: Vec<_> = doc.with_policy(policy, |_, m| {
+                            m.calls()
+                                .into_iter()
+                                .filter(|c| {
+                                    c.work()
+                                        .is_some_and(|work| work.values > 0 && work.bytes > 64)
+                                })
+                                .collect()
+                        });
+                        assert!(oversized.is_empty(), "unbounded comparison: {oversized:?}");
+                    },
+                )
             },
         )?;
         run.with_policy(policy, |m| assert_eq!(m.live_bytes(), 0));
@@ -266,7 +272,7 @@ fn arena_growth_quantum_is_checked_without_text_or_payload_processing() {
                             assert!(
                                 m.calls()
                                     .iter()
-                                    .all(|c| !matches!(c, Call::Work { bytes, .. } if *bytes > 64)),
+                                    .all(|c| !c.work().is_some_and(|work| work.bytes > 64)),
                                 "growth relocation exceeds quantum: {:?}",
                                 m.calls()
                             );

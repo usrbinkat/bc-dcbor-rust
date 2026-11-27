@@ -1611,6 +1611,9 @@ or `bounded::governance::tests`:
   admit its units as the policy's foreground work:
   `a_unit_under_the_cleanup_capability_is_charged_as_cleanup` must fail with "cleanup was charged to
   the foreground".
+- `history-reclaim-as-work.patch` stores a cleanup unit's call under the work kind (`codec.rs`,
+  `encode`), so the history reads it back as foreground work: `the_history_names_each_units_account`
+  must fail with "a cleanup unit was recorded as foreground work".
 - `governor-operation-commits-first.patch` commits an operation's plan before its group decides
   (`OperationBudget::admit`), so a group refusal commits the operation's unit:
   `the_group_work_ceiling_is_aggregate` must fail with "a refused unit committed".

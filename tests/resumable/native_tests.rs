@@ -42,6 +42,17 @@ fn boundary_schedules_preserve_literal_child_order_and_exact_consumption() {
     );
 }
 
+/// The refusal the policy itself makes of `call` when its allowance is
+/// spent: a foreground unit's lifetime work, a cleanup unit's turn (cleanup
+/// is never refused for a lifetime ceiling), a request's live storage.
+fn refusal_of(call: Call) -> LimitRefusal {
+    match call {
+        Call::Work { .. } => LimitRefusal::Work,
+        Call::Reclaim { .. } => LimitRefusal::Turn,
+        Call::Allocate(_) => LimitRefusal::Storage,
+    }
+}
+
 #[test]
 fn every_actual_admission_refusal_is_observed_and_stops_execution() {
     let baseline = synchronous_case(
@@ -54,10 +65,7 @@ fn every_actual_admission_refusal_is_observed_and_stops_execution() {
     // Synchronous decode stops at the first refusal; identical allowance
     // makes the exact attempted prefix its contract, with no resumption.
     support::synchronous_matrix("literal array decode", baseline.len(), |index| {
-        let reason = match baseline[index] {
-            Call::Work { .. } => LimitRefusal::Work,
-            Call::Allocate(_) => LimitRefusal::Storage,
-        };
+        let reason = refusal_of(baseline[index]);
         synchronous_case(
             |m| {
                 support::refuse(m, support::pipeline::Refusal::For(index, reason));
@@ -205,10 +213,7 @@ fn text_semantics_use_literal_composition_reordering_and_hangul_oracles() {
             &format!("literal text encode of {source:?}"),
             baseline.len(),
             |index| {
-                let reason = match baseline[index] {
-                    Call::Work { .. } => LimitRefusal::Work,
-                    Call::Allocate(_) => LimitRefusal::Storage,
-                };
+                let reason = refusal_of(baseline[index]);
                 synchronous_case(
                     |m| {
                         support::refuse(m, support::pipeline::Refusal::For(index, reason));

@@ -139,11 +139,13 @@ authority-quantum-is-allowance	tests/data/controls/authority-quantum-is-allowanc
 authority-share-unclamped	tests/data/controls/authority-share-unclamped.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::no_ceiling_is_raised_by_a_builder_or_a_share	-	failed	unwrap_err()` on an `Ok` value
 # The cleanup admission seam (policy.rs `Authority::reclaim`, `Limits::admit`;
 # reclamation.rs `Cleanup`'s `traverse`), one plant each: cleanup held to the
-# foreground's lifetime ceiling; the deadline refusing cleanup; and the
-# cleanup capability admitting its units as the policy's foreground work.
+# foreground's lifetime ceiling; the deadline refusing cleanup; the cleanup
+# capability admitting its units as the policy's foreground work; and the
+# history storing a cleanup unit as foreground work.
 cleanup-lifetime-gated	tests/data/controls/cleanup-lifetime-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the lifetime allowance
 cleanup-deadline-gated	tests/data/controls/cleanup-deadline-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the deadline
 cleanup-charged-foreground	tests/data/controls/cleanup-charged-foreground.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_unit_under_the_cleanup_capability_is_charged_as_cleanup	-	failed	cleanup was charged to the foreground
+history-reclaim-as-work	tests/data/controls/history-reclaim-as-work.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::the_history_names_each_units_account	-	failed	a cleanup unit was recorded as foreground work
 # Shared governance (governance.rs), one plant each: the operation's plan
 # committed before the group decides; the group's admitting flag taken
 # whatever holds it; a permit's drop leaving the group's live total held; a

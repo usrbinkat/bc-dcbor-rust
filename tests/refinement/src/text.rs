@@ -4,7 +4,8 @@
 //! An identity is `FAMILY.SEQUENCE`. An observation is its publishing
 //! family, its performer (a policy's number, or `-` for none) and its event:
 //!
-//! - `work V B ANSWER`, `allocate N ANSWER`; an answer is `admitted`,
+//! - `work V B ANSWER`, `reclaim V B ANSWER` (a cleanup unit), `allocate N
+//!   ANSWER`; an answer is `admitted`,
 //!   `granted ID` or `refused REASON`, then `injected` when injected; a
 //!   reason is `turn`, `quantum-too-small`, `work`, `requested`, `storage`,
 //!   `too-large`, `contended`, `deadline`, `cancelled`, `scheduled N` or
@@ -167,6 +168,7 @@ fn settled_text(settled: &Settled) -> String {
 fn call_text(call: Call) -> String {
     match call {
         Call::Work { values, bytes } => format!("work {values} {bytes}"),
+        Call::Reclaim { values, bytes } => format!("reclaim {values} {bytes}"),
         Call::Allocate(bytes) => format!("allocate {bytes}"),
     }
 }
@@ -500,6 +502,10 @@ impl<'t> Words<'t> {
             "work" => {
                 let (values, bytes) = (self.number("values")?, self.number("bytes")?);
                 Event::Call(Call::Work { values, bytes }, self.answer()?)
+            }
+            "reclaim" => {
+                let (values, bytes) = (self.number("values")?, self.number("bytes")?);
+                Event::Call(Call::Reclaim { values, bytes }, self.answer()?)
             }
             "allocate" => {
                 let bytes = self.number("bytes")?;

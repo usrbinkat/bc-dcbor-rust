@@ -403,7 +403,7 @@ pub(crate) fn admits_its_production_representation() {
     let admitted = m.admitted_calls();
     let mut allocations = admitted.iter().filter_map(|call| match call {
         Call::Allocate(bytes) => Some(*bytes),
-        Call::Work { .. } => None,
+        Call::Work { .. } | Call::Reclaim { .. } => None,
     });
     let mut findings = Findings::new();
     findings.equal(

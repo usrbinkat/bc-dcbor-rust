@@ -7,7 +7,7 @@
 //!
 //! | tag | event        | words 1..                                                        |
 //! |-----|--------------|------------------------------------------------------------------|
-//! | 1   | call         | kind (1 work, 2 allocate), values, bytes, answer, a, b             |
+//! | 1   | call         | kind (1 work, 2 allocate, 3 reclaim), values, bytes, answer, a, b |
 //! | 2   | admit        | values, bytes, obligation (0 none), held values, held bytes, id(2), acquisition(2) |
 //! | 3   | spend        | obligation, values, bytes, id(2), acquisition(2), permit(2)       |
 //! | 4   | forfeit      | as spend, then rule                                               |
@@ -168,6 +168,7 @@ pub(super) fn encode(event: Event) -> Option<[u64; WORDS]> {
             let (kind, values, bytes) = match call {
                 Call::Work { values, bytes } => (1, values, bytes),
                 Call::Allocate(bytes) => (2, 0, bytes),
+                Call::Reclaim { values, bytes } => (3, values, bytes),
             };
             let (outcome, a, b) = match answer {
                 Answer::Admitted => (1, 0, 0),
@@ -316,6 +317,10 @@ pub(super) fn decode(words: &[u64; WORDS]) -> Option<Event> {
                     bytes: words[3],
                 },
                 2 if words[2] == 0 => Call::Allocate(words[3]),
+                3 => Call::Reclaim {
+                    values: words[2],
+                    bytes: words[3],
+                },
                 _ => return None,
             };
             let answer = match words[4] {

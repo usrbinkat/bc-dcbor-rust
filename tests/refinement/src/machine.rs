@@ -522,7 +522,9 @@ impl Machine {
             return Err(Rule::AllocateInCleanup);
         }
         match (call, answer) {
-            (Call::Work { values, bytes }, Answer::Admitted) => {
+            // A foreground and a cleanup unit alike: the admission that
+            // follows is the unit's own, whichever account it is charged to.
+            (Call::Work { values, bytes } | Call::Reclaim { values, bytes }, Answer::Admitted) => {
                 self.refusal = None;
                 if let Performer::Policy(policy) = by {
                     self.admitting.insert(policy, WriteWork::new(values, bytes));

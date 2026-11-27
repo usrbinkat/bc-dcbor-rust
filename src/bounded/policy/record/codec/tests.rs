@@ -30,6 +30,23 @@ fn every_event() -> Vec<Event> {
             Answer::Admitted,
         ),
         Event::Call(
+            Call::Reclaim {
+                values: 1,
+                bytes: u64::MAX,
+            },
+            Answer::Admitted,
+        ),
+        Event::Call(
+            Call::Reclaim {
+                values: 2,
+                bytes: 0,
+            },
+            Answer::Refused {
+                refusal: LimitRefusal::Turn,
+                injected: false,
+            },
+        ),
+        Event::Call(
             Call::Allocate(u64::MAX),
             Answer::Granted(id(1, u64::MAX - 1)),
         ),
@@ -203,6 +220,13 @@ fn words_naming_no_observation_are_refused() {
     let mut unknown_refusal = refused;
     unknown_refusal[4] = 3 + 12;
     cases.push(("unknown refusal", unknown_refusal));
+    // The first call kind past the last one `encode` writes (3, reclaim).
+    let mut unknown_call = refused;
+    unknown_call[1] = 4;
+    cases.push(("unknown call kind", unknown_call));
+    let mut allocation_values = refused;
+    allocation_values[2] = 1;
+    cases.push(("values of an allocation", allocation_values));
     let mut refusal_argument = refused;
     refusal_argument[5] = 1;
     cases.push(("argument of a refusal that takes none", refusal_argument));

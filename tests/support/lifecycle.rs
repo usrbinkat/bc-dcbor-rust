@@ -36,9 +36,9 @@ use dcbor::bounded::decode::construction::{
 };
 use dcbor::bounded::encoding::{OwnedEmitStep, OwnedWriter};
 use dcbor::bounded::{
-    Admission, Answer, BoundedError, BoundedResult, Call, Capacity, Class, Custodial, CustodySink,
-    Event, Failure, Hold, Identity, LimitRefusal, Limits, Observed, Performer, PermitsObserved,
-    Releasing, Resumable, Step, TURN, WriteWork,
+    Answer, BoundedError, BoundedResult, Call, Capacity, Class, Custodial, CustodySink, Event,
+    Failure, Hold, Identity, LimitRefusal, Limits, Observed, Performer, PermitsObserved, Releasing,
+    Resumable, Step, TURN, WriteWork,
 };
 use dcbor_refinement as refinement;
 
@@ -4444,7 +4444,7 @@ fn construction_under<T: InPlace<Limits>>(
                                 .into_iter()
                                 .filter_map(|call| match call {
                                     Call::Allocate(bytes) => Some(bytes),
-                                    Call::Work { .. } => None,
+                                    Call::Work { .. } | Call::Reclaim { .. } => None,
                                 })
                                 .collect();
                             let (used, requested, peak) =
@@ -5809,27 +5809,21 @@ impl<T, E: Debug, R: Labelled> From<&Stopped<T, E, R>> for Finding {
 /// quantum ([`LimitRefusal::QuantumTooSmall`], the accounting core's own
 /// classification), no turn can ever admit it and the operation is stalled
 /// ([`Stopped::Stalled`]), returned at once rather than after every turn of
-/// the bound is spent retrying it. The position is read only when
-/// `observed`.
+/// the bound is spent retrying it, whether a foreground or a cleanup unit.
+/// The position is read only when `observed`.
 fn stalled<T, E, O: Resumable<Limits>>(
     m: &Limits,
     operation: &mut O,
     observed: bool,
 ) -> Option<Stopped<T, E>> {
-    match m.trace().last() {
-        Some(Admission {
-            index,
-            call: Call::Work { values, bytes },
-            result: Err(LimitRefusal::QuantumTooSmall),
-            ..
-        }) => Some(Stopped::Stalled {
-            call: index,
-            values,
-            bytes,
-            position: observed.then(|| rendered(operation)),
-        }),
-        _ => None,
-    }
+    let admission = m.trace().last()?;
+    let work = admission.call.work()?;
+    (admission.result == Err(LimitRefusal::QuantumTooSmall)).then(|| Stopped::Stalled {
+        call: admission.index,
+        values: work.values,
+        bytes: work.bytes,
+        position: observed.then(|| rendered(operation)),
+    })
 }
 
 /// Whether a fresh turn can satisfy a refused turn's `error`: a refusal the
@@ -5857,10 +5851,9 @@ pub fn ordinary_exhaustion<E: Failure<Refusal = LimitRefusal>>(m: &Limits, error
         return false;
     };
     assert_eq!(index + 1, m.attempts(), "refusal witness is stale");
-    let Call::Work { values, bytes } = m.calls()[index] else {
-        panic!("ordinary work refusal did not concern work");
+    let Some(requested) = m.calls()[index].work() else {
+        panic!("ordinary work refusal did not concern a work or cleanup unit");
     };
-    let requested = WriteWork::new(values, bytes);
     assert!(TURN.covers(&requested), "unit exceeds a fresh quantum");
     assert!(
         !m.remaining().covers(&requested),
@@ -6528,7 +6521,7 @@ impl RefusalRun {
                     events.push((call, true));
                 } else {
                     assert_eq!(reason, LimitRefusal::Turn, "unexpected ordinary refusal");
-                    assert!(matches!(call, Call::Work { .. }));
+                    assert!(call.work().is_some(), "a spent turn refused {call:?}");
                 }
             } else {
                 admitted.push(call);
