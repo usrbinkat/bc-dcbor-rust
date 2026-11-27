@@ -666,12 +666,13 @@ classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	n
 # cancellation classes each cleanup position too, so a reclaiming stage's
 # plant is met there. Whether an operation is cancelling is no field of
 # its class: a stop cancels it before its cleanup, which runs alike either
-# way, so no plant of it could merge boundaries whose cleanups differ.
+# way, so no plant of it could merge boundaries whose cleanups differ. Nor
+# is whether an input task still holds its scope reference: its cleanup
+# admits the unit ending it either way (input.rs `release_scope`).
 classes-operation-allocated-unread	tests/data/controls/classes-operation-allocated-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-prefix-unread	tests/data/controls/classes-operation-prefix-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-finished-unread	tests/data/controls/classes-operation-finished-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-outstanding-unread	tests/data/controls/classes-operation-outstanding-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
-classes-input-scope-unread	tests/data/controls/classes-input-scope-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-input-record-unread	tests/data/controls/classes-input-record-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-parse-record-unread	tests/data/controls/classes-parse-record-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-parse-parser-unread	tests/data/controls/classes-parse-parser-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
@@ -705,14 +706,16 @@ classes-preparation-cursors-unread	tests/data/controls/classes-preparation-curso
 classes-preparation-entries-unread	tests/data/controls/classes-preparation-entries-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 classes-preparation-merge-unread	tests/data/controls/classes-preparation-merge-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
 classes-preparation-bitmap-unread	tests/data/controls/classes-preparation-bitmap-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	nested_tree_values_retain_custody_at_every_pipeline_boundary	-	failed	the class merges states of different custody
-classes-text-stage-unread	tests/data/controls/classes-text-stage-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-text-scratch-unread	tests/data/controls/classes-text-scratch-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-text-chars-unread	tests/data/controls/classes-text-chars-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-arena-completes-unread	tests/data/controls/classes-arena-completes-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-arena-relocating-unread	tests/data/controls/classes-arena-relocating-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 classes-arena-elements-unread	tests/data/controls/classes-arena-elements-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_interleavings	retiring_each_preparation_boundary_preserves_other_operations	-	failed	the class merges states of different custody
 # The text continuation's class read through the parse's normalizer
-# (parse.rs, `ParseDetail::class`), the same plants as above.
+# (parse.rs, `ParseDetail::class`), the same plants as above. The stage's
+# plant runs here alone: it varies only within the continuation's own
+# cleanup, which an interleaving's live boundaries never reach and the
+# matrix classes at each cleanup position.
 classes-text-stage-unread-parse	tests/data/controls/classes-text-stage-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-text-scratch-unread-parse	tests/data/controls/classes-text-scratch-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-text-chars-unread-parse	tests/data/controls/classes-text-chars-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody

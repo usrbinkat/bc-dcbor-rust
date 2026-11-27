@@ -259,15 +259,16 @@ where
     }
 }
 
-/// What an input copy's cleanup admits from its detail: whether the task
-/// holds its scope reference, ended in one unit, and its record's byte
+/// What an input copy's cleanup admits from its detail: its record's byte
 /// buffer by the buffer's own reduction. The bytes copied so far are not
 /// read: the copy's cleanup drops the buffer whole whatever it holds, which
-/// the buffer's reduction states.
+/// the buffer's reduction states. Nor is whether the task still holds its
+/// scope reference: its cleanup admits the one unit that ends it whether or
+/// not it is held ([`release_scope`]), and the task gives it up only in the
+/// step that finishes the operation, which the operation's class reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub struct InputClass<C> {
-    pub scope: bool,
     pub record: Option<C>,
 }
 
@@ -280,7 +281,6 @@ impl super::operation::Position<InputDetail<BufferObservation>> {
         self.operation_class(
             self.units(),
             InputClass {
-                scope: self.detail.scope,
                 record: self.detail.record.map(|record| record.class()),
             },
         )

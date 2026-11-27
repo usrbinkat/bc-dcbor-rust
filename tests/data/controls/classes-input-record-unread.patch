@@ -1,11 +1,9 @@
 --- src/bounded/decode/construction/input.rs
 +++ src/bounded/decode/construction/input.rs
-@@ -281,7 +281,7 @@
+@@ -282,5 +282,5 @@
              self.units(),
              InputClass {
-                 scope: self.detail.scope,
 -                record: self.detail.record.map(|record| record.class()),
 +                record: self.detail.record.map(|record| record.class()).filter(|_| false),
              },
          )
-     }
