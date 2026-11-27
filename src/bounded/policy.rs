@@ -2632,6 +2632,13 @@ mod tests {
             m.traverse(2, 0).unwrap();
             let before = (m.used(), m.remaining());
             assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
+            // Each refusal's totals are read before the next admission, which
+            // a committed total would otherwise refuse for another reason.
+            assert_eq!(
+                (m.used(), m.remaining()),
+                before,
+                "a refused unit committed"
+            );
             assert_eq!(
                 m.traverse(TURN.values + 1, 0),
                 Err(LimitRefusal::QuantumTooSmall)
