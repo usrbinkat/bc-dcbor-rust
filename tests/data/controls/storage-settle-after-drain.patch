@@ -1,32 +1,32 @@
 --- src/bounded/decode/storage.rs
 +++ src/bounded/decode/storage.rs
-@@ -1159,15 +1159,25 @@
+@@ -1170,15 +1170,25 @@
          &mut self,
-         a: &mut A,
+         cleanup: &mut Cleanup<'_, A>,
      ) -> BoundedResult<bool, A> {
--        self.enter_cleanup(a.performer());
+-        self.enter_cleanup(cleanup.performer());
          let (next, result) = match mem::replace(&mut self.state, Self::EMPTY) {
 -            // A staging block never acquired holds nothing once its
 -            // admissions are settled: the arena's own cleanup follows.
              State::Settled {
                  arena,
 -                growth: growth @ (Growth::Idle | Growth::Staging),
--            } => Self::reclaim_settled(arena, growth, a),
+-            } => Self::reclaim_settled(arena, growth, cleanup),
 +                growth: Growth::Idle,
-+            } => Self::reclaim_settled(arena, Growth::Idle, a),
++            } => Self::reclaim_settled(arena, Growth::Idle, cleanup),
 +            State::Settled {
 +                arena,
 +                growth: Growth::Staging,
 +            } => {
-+                let (next, result) = Self::reclaim_settled(arena, Growth::Staging, a);
++                let (next, result) = Self::reclaim_settled(arena, Growth::Staging, cleanup);
 +                if result.is_ok() {
-+                    self.enter_cleanup(a.performer());
++                    self.enter_cleanup(cleanup.performer());
 +                }
 +                (next, result)
 +            }
              State::Settled { arena, growth } => {
 +                if let Growth::Staged(_) = &growth {
-+                    self.enter_cleanup(a.performer());
++                    self.enter_cleanup(cleanup.performer());
 +                }
                  Self::release_growth(growth);
                  (

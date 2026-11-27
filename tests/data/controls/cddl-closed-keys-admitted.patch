@@ -1,6 +1,6 @@
 --- src/cddl.rs
 +++ src/cddl.rs
-@@ -184,9 +184,10 @@
+@@ -188,7 +188,8 @@
              format!("{occurrence}{}: {}", member.key, member.value)
          })
          .collect();
@@ -10,5 +10,3 @@
          entries.push("* any => any".to_string());
      }
      if entries.is_empty() {
-         "{ }".to_string()
-     } else {

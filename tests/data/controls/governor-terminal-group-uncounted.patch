@@ -1,0 +1,10 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -219,6 +219,5 @@
+         Group::saturate(&self.terminal_values, work.values);
+         Group::saturate(&self.terminal_bytes, work.bytes);
+-        Group::saturate(&self.group.cleanup_values, work.values);
+-        Group::saturate(&self.group.cleanup_bytes, work.bytes);
++        // Planted: a terminal policy's cleanup uncounted on its group.
+     }
+ }

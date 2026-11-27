@@ -17,7 +17,10 @@
 //! is therefore decided against committed totals alone: classification is
 //! deterministic. Cleanup ([`Releasing::reclaim`]) never takes the flag: it
 //! is never refused for either level's lifetime ceilings, and the group
-//! counts it apart with a checked atomic addition.
+//! counts it apart with a checked atomic addition. A terminal policy
+//! ([`super::TerminalAllocator`]) admits every unit as cleanup of its
+//! permit's operation and group, each count a saturating atomic addition,
+//! so a scope drained after its scheduler has gone is still counted.
 //!
 //! Before the core is consulted, a foreground admission is held to the
 //! operation's standing: a cancellation of the operation or of its whole
@@ -56,7 +59,7 @@ struct Group {
     /// Cumulative requested bytes granted: written only under `admitting`.
     requested: AtomicU64,
     /// Cleanup work admitted, values and bytes: never gated, each a checked
-    /// atomic addition.
+    /// atomic addition, or a saturating one for a terminal policy's.
     cleanup_values: AtomicU64,
     cleanup_bytes: AtomicU64,
     /// Live requested bytes, raised only under `admitting`, lowered by any
@@ -145,45 +148,78 @@ impl Group {
         }
     }
 
-    /// Reserve `bytes` of live capacity under `ceiling` in `live`, its peak
-    /// in `peak`; [`LimitRefusal::Storage`], nothing reserved, when the
-    /// capacity held now leaves no room.
-    fn reserve(
-        live: &AtomicU64,
-        peak: &AtomicU64,
-        ceiling: u64,
-        bytes: u64,
-    ) -> Result<(), LimitRefusal> {
+    /// `amount` added to `total`, saturating at `u64::MAX` rather than
+    /// refusing: how a terminal policy counts, which must admit every unit.
+    /// Lock-free and allocation-free: a failed exchange means another
+    /// addition to `total` completed.
+    fn saturate(total: &AtomicU64, amount: u64) {
+        let mut current = total.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(amount);
+            match total.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Reserve `bytes` of live capacity under `ceiling` in `live`, the live
+    /// total it reached returned; [`LimitRefusal::Storage`], nothing
+    /// reserved, when the capacity held now leaves no room. The peak is the
+    /// caller's to raise, once every level has granted the allocation.
+    fn reserve(live: &AtomicU64, ceiling: u64, bytes: u64) -> Result<u64, LimitRefusal> {
         let mut current = live.load(Ordering::Acquire);
-        let next = loop {
+        loop {
             let next = current
                 .checked_add(bytes)
                 .filter(|next| *next <= ceiling)
                 .ok_or(LimitRefusal::Storage)?;
             match live.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break next,
+                Ok(_) => return Ok(next),
                 Err(actual) => current = actual,
             }
-        };
-        peak.fetch_max(next, Ordering::AcqRel);
-        Ok(())
+        }
     }
 }
 
 /// The counters one operation's permits share: its live storage, its
-/// cancellation, and the group it belongs to.
+/// cancellation, the cleanup its terminal policies admitted, and the group
+/// it belongs to.
 struct Operation {
     group: Arc<Group>,
     live: AtomicU64,
     peak: AtomicU64,
     /// This operation cancelled: set once, never cleared.
     cancelled: AtomicBool,
+    /// Cleanup admitted by terminal policies minted from this operation's
+    /// permits, values and bytes, each saturating: the operation's own
+    /// budget counts the rest of its cleanup.
+    terminal_values: AtomicU64,
+    terminal_bytes: AtomicU64,
 }
 
 impl Operation {
     /// Whether this operation, or its whole group, was cancelled.
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || self.group.cancelled.load(Ordering::Acquire)
+    }
+
+    /// The cleanup its terminal policies admitted.
+    fn terminal(&self) -> WriteWork {
+        WriteWork::new(
+            self.terminal_values.load(Ordering::Acquire),
+            self.terminal_bytes.load(Ordering::Acquire),
+        )
+    }
+
+    /// Count `work`, admitted by a terminal policy, as cleanup of this
+    /// operation and of its group: never refused, each quantity a
+    /// saturating addition, allocation-free and non-unwinding.
+    fn count_terminal(&self, work: WriteWork) {
+        Group::saturate(&self.terminal_values, work.values);
+        Group::saturate(&self.terminal_bytes, work.bytes);
+        Group::saturate(&self.group.cleanup_values, work.values);
+        Group::saturate(&self.group.cleanup_bytes, work.bytes);
     }
 }
 
@@ -277,6 +313,8 @@ impl Governor {
                 live: AtomicU64::new(0),
                 peak: AtomicU64::new(0),
                 cancelled: AtomicBool::new(false),
+                terminal_values: AtomicU64::new(0),
+                terminal_bytes: AtomicU64::new(0),
             }),
             #[cfg(feature = "std")]
             deadline: None,
@@ -347,7 +385,8 @@ pub struct OperationBudget {
     #[cfg(feature = "std")]
     deadline: Option<std::time::Instant>,
     /// A terminal policy ([`super::TerminalAllocator`]): every admission
-    /// admitted uncounted, every request refused.
+    /// admitted and counted as cleanup of the permit's operation and group
+    /// ([`Operation::count_terminal`]), every request refused.
     terminal: bool,
 }
 
@@ -456,14 +495,25 @@ impl OperationBudget {
         }
     }
 
-    /// Every unit this operation admitted, foreground and cleanup.
+    /// Every unit this operation admitted, foreground and cleanup, the
+    /// cleanup of terminal policies minted from its permits included. Each
+    /// total is bounded by the operation's work, so the sum saturates only
+    /// past `u64`, which no bounded operation reaches.
     pub fn used(&self) -> WriteWork {
-        self.authority.used()
+        Self::with_terminal(self.authority.used(), self.operation.terminal())
     }
 
-    /// The part of [`Self::used`] admitted as cleanup.
+    /// The part of [`Self::used`] admitted as cleanup, by this budget and
+    /// by terminal policies minted from its permits.
     pub fn cleanup_used(&self) -> WriteWork {
-        self.authority.cleanup()
+        Self::with_terminal(self.authority.cleanup(), self.operation.terminal())
+    }
+
+    fn with_terminal(own: WriteWork, terminal: WriteWork) -> WriteWork {
+        WriteWork::new(
+            own.values.saturating_add(terminal.values),
+            own.bytes.saturating_add(terminal.bytes),
+        )
     }
 
     /// The foreground work this operation still admits on its own
@@ -508,11 +558,12 @@ impl Budget for OperationBudget {
     /// Held to the operation's standing ([`Self::standing`]), planned on its
     /// core, committed on the group, then on the operation.
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
+        let work = WriteWork::new(values, bytes);
         if self.terminal {
+            self.operation.count_terminal(work);
             return Ok(());
         }
         self.standing()?;
-        let work = WriteWork::new(values, bytes);
         let planned = self.authority.plan_work(work)?;
         self.admit(planned, |group| group.work(work))
     }
@@ -564,10 +615,11 @@ impl Releasing for OperationBudget {
     /// never refused for either level's lifetime ceilings, a cancellation
     /// or the deadline, nor contended.
     fn reclaim(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
+        let work = WriteWork::new(values, bytes);
         if self.terminal {
+            self.operation.count_terminal(work);
             return Ok(());
         }
-        let work = WriteWork::new(values, bytes);
         let planned = self.authority.plan_reclaim(work)?;
         self.admit(planned, |group| group.reclaim(work))
     }
@@ -586,7 +638,8 @@ impl Allocator for OperationBudget {
     /// group's whole live ceiling and requested ceiling, the operation's
     /// live capacity, and the group's live capacity, a refusal of the last
     /// returning the operation's reservation: every check before any
-    /// commitment, so a refusal commits nothing at either level.
+    /// commitment, so a refusal commits nothing at either level, neither
+    /// level's peak included, raised only once both have granted.
     fn allocate(&mut self, bytes: u64) -> Result<GovernedPermit, LimitRefusal> {
         if self.terminal {
             return Err(LimitRefusal::Storage);
@@ -605,16 +658,17 @@ impl Allocator for OperationBudget {
             .checked_add(bytes)
             .filter(|total| *total <= group.ceilings.requested)
             .ok_or(LimitRefusal::Requested)?;
-        Group::reserve(
-            &operation.live,
-            &operation.peak,
-            self.authority.ceilings().live,
-            bytes,
-        )?;
-        if let Err(refusal) = Group::reserve(&group.live, &group.peak, group.ceilings.live, bytes) {
-            operation.live.fetch_sub(bytes, Ordering::AcqRel);
-            return Err(refusal);
-        }
+        let operation_live =
+            Group::reserve(&operation.live, self.authority.ceilings().live, bytes)?;
+        let group_live = match Group::reserve(&group.live, group.ceilings.live, bytes) {
+            Ok(live) => live,
+            Err(refusal) => {
+                operation.live.fetch_sub(bytes, Ordering::AcqRel);
+                return Err(refusal);
+            }
+        };
+        operation.peak.fetch_max(operation_live, Ordering::AcqRel);
+        group.peak.fetch_max(group_live, Ordering::AcqRel);
         group.requested.store(group_requested, Ordering::Release);
         self.authority.granted(requested);
         Ok(GovernedPermit {
@@ -627,8 +681,9 @@ impl Allocator for OperationBudget {
 // SAFETY: terminal: constructing this policy only clones an existing Arc and
 // builds an authority of constants, allocating nothing and never unwinding,
 // and its fields' drops are allocation-free and non-unwinding. traverse: a
-// terminal policy's `traverse` and `reclaim` return at once, admitting
-// every unit uncounted, allocation-free and non-unwinding. allocate: a
+// terminal policy's `traverse` and `reclaim` always succeed, counting each
+// unit by four saturating atomic additions (`Operation::count_terminal`),
+// lock-free, allocation-free and non-unwinding. allocate: a
 // terminal policy refuses every request, allocating nothing. borrow: the
 // policy holds its own clone of the permit's counters, never a reference to
 // `permit`.
@@ -789,6 +844,11 @@ mod tests {
             0,
             "a group refusal kept the operation's reservation"
         );
+        assert_eq!(
+            (second.peak_bytes(), governor.peak_bytes()),
+            (0, 6),
+            "a group refusal raised a peak"
+        );
         let other = second.allocate(2).unwrap();
         assert_eq!((governor.live_bytes(), governor.peak_bytes()), (8, 8));
         assert_eq!((first.live_bytes(), second.live_bytes()), (6, 2));
@@ -850,20 +910,23 @@ mod tests {
         assert_eq!(operation.reclaim(1, 0), Err(LimitRefusal::Turn));
     }
 
-    /// A terminal policy minted from a permit admits every unit uncounted,
-    /// refuses every request, and releases into the same totals.
+    /// A terminal policy minted from a permit admits every unit, its group's
+    /// work spent and its operation cancelled, counting each as cleanup of
+    /// the permit's operation and group, never as foreground; it refuses
+    /// every request, and its permit releases into the same totals.
     #[test]
     #[expect(
         clippy::disallowed_methods,
         reason = "the governor's axioms are driven by direct admissions"
     )]
-    fn a_terminal_policy_admits_uncounted_and_allocates_nothing() {
+    fn a_terminal_policy_counts_its_cleanup_and_allocates_nothing() {
         let governor = Governor::new(work(0));
         let mut operation = governor.operation(Ceilings::UNLIMITED);
         let permit = operation.allocate(4).unwrap();
+        operation.cancellation().cancel();
         let mut terminal = OperationBudget::terminal(&permit);
-        assert_eq!(terminal.traverse(1, 0), Ok(()));
-        assert_eq!(terminal.reclaim(1, 0), Ok(()));
+        assert_eq!(terminal.traverse(1, 2), Ok(()));
+        assert_eq!(terminal.reclaim(3, 4), Ok(()));
         assert_eq!(
             terminal
                 .allocate(1)
@@ -871,9 +934,25 @@ mod tests {
                 .unwrap_err(),
             LimitRefusal::Storage
         );
-        assert_eq!(governor.used(), WriteWork::default());
+        let cleanup = WriteWork::new(4, 6);
+        assert_eq!(
+            governor.cleanup_used(),
+            cleanup,
+            "terminal cleanup went uncounted on the group"
+        );
+        assert_eq!(
+            operation.cleanup_used(),
+            cleanup,
+            "terminal cleanup went uncounted on the operation"
+        );
+        assert_eq!((governor.used(), operation.used()), (cleanup, cleanup));
+        assert_eq!(
+            governor.remaining(),
+            WriteWork::new(0, u64::MAX),
+            "terminal cleanup was charged to the group's foreground"
+        );
         drop((terminal, permit));
-        assert_eq!(governor.live_bytes(), 0);
+        assert_eq!((governor.live_bytes(), operation.live_bytes()), (0, 0));
     }
 
     /// The whole chain under a governed operation: a typed decode admitted

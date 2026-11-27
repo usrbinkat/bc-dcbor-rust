@@ -1,6 +1,6 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -377,7 +377,8 @@
+@@ -546,8 +546,9 @@
          planned: Planned,
          group: impl FnOnce(&Group) -> Result<(), LimitRefusal>,
      ) -> Result<(), LimitRefusal> {
@@ -10,3 +10,4 @@
 +        group(&self.operation.group)?;
          Ok(())
      }
+ }

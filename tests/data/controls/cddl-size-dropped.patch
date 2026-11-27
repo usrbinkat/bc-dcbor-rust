@@ -1,7 +1,6 @@
 --- src/fixed_bytes.rs
 +++ src/fixed_bytes.rs
-@@ -144,6 +144,7 @@
- /// 3.8.1), the set every decoder of the type accepts.
+@@ -145,5 +145,6 @@
  impl<const N: usize> crate::cddl::Cddl for FixedBytes<N> {
      fn cddl(_: &mut crate::cddl::Rules) -> String {
 -        format!("bstr .size {N}")

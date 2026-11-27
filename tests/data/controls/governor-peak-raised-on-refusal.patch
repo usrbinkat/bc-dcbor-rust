@@ -1,0 +1,11 @@
+--- src/bounded/governance.rs
++++ src/bounded/governance.rs
+@@ -660,6 +660,8 @@
+             .ok_or(LimitRefusal::Requested)?;
+         let operation_live =
+             Group::reserve(&operation.live, self.authority.ceilings().live, bytes)?;
++        // Planted: the operation's peak raised before the group grants.
++        operation.peak.fetch_max(operation_live, Ordering::AcqRel);
+         let group_live = match Group::reserve(&group.live, group.ceilings.live, bytes) {
+             Ok(live) => live,
+             Err(refusal) => {

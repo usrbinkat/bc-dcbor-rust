@@ -1,7 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -234,4 +234,5 @@
-         self.foreground()
+@@ -244,3 +244,4 @@
              .checked_then(work)
 -            .filter(|foreground| self.ceilings.work.covers(foreground))
 +            // Planted: a running turn admits past the lifetime allowance.

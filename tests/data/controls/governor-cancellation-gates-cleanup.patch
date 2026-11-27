@@ -1,10 +1,11 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -567,5 +567,7 @@
-         if self.terminal {
+@@ -620,6 +620,8 @@
+             self.operation.count_terminal(work);
              return Ok(());
          }
 +        // Planted: cleanup held to the operation's standing.
 +        self.standing()?;
-         let work = WriteWork::new(values, bytes);
          let planned = self.authority.plan_reclaim(work)?;
+         self.admit(planned, |group| group.reclaim(work))
+     }

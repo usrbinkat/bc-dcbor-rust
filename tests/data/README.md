@@ -1585,12 +1585,6 @@ The schema controls plant defects of what a type declares of the wire it accepts
   copying the first `N` bytes. The symbolic decoder still refuses it:
   `a_fixed_byte_string_is_certified_its_transitions_legal_and_within_its_cost` must fail at the
   empty type with "FixedBytes<0> was built from".
-- `ascii-rule-widened.patch` makes the ASCII rule admit U+0080 (`ascii_text.rs`, `first_non_ascii`):
-  `the_ascii_range_is_exactly_below_u_0080` must fail with "U+0080 was accepted as ASCII".
-- `ascii-wire-normalizing.patch` declares an ASCII text's wire profile strict
-  (`in_place/checked.rs`, `AsciiText::WIRE`), so a text the quick check leaves unproven is
-  normalized and reaches the rule: `an_ascii_text_is_decoded_under_quick_checks_alone` must fail
-  with "an ASCII text's parse normalized an unproven text".
 
 The accounting controls plant defects of the accounting core's axioms (`src/bounded/policy.rs`,
 `Authority`), of its cleanup admission seam, and of the shared governance built on it
@@ -1628,9 +1622,18 @@ or `bounded::governance::tests`:
 - `governor-storage-refusal-kept.patch` keeps the operation's live reservation when the group
   refuses the request: the same test must fail with "a group refusal kept the operation's
   reservation".
+- `governor-peak-raised-on-refusal.patch` raises the operation's peak when its live reservation is
+  made, before the group grants the request (`OperationBudget::allocate`): the same test must fail
+  with "a group refusal raised a peak".
 - `governor-cleanup-gated.patch` holds the group's cleanup count to its lifetime work ceiling
   (`Group::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with "cleanup was
   refused for a lifetime ceiling".
+- `governor-terminal-group-uncounted.patch` admits a terminal policy's units without counting them
+  on the group (`Operation::count_terminal`):
+  `a_terminal_policy_counts_its_cleanup_and_allocates_nothing` must fail with "terminal cleanup went
+  uncounted on the group".
+- `governor-terminal-operation-uncounted.patch` admits them without counting them on the operation:
+  the same test must fail with "terminal cleanup went uncounted on the operation".
 - `governor-group-cancellation-unobserved.patch` reads only the operation's own cancellation
   (`Operation::cancelled`): `a_cancellation_is_sticky_and_spares_cleanup` must fail with "a group
   cancellation was not observed".
@@ -1645,7 +1648,9 @@ or `bounded::governance::tests`:
 - `ascii-wire-normalizing.patch` declares an ASCII text's wire profile strict
   (`in_place/checked.rs`, `InPlace::WIRE`), so a text the quick check cannot prove is normalized and
   reaches the binding: `an_ascii_text_decodes_quick_only` must fail with "an unproven text reached
-  an ASCII text's binding".
+  an ASCII text's binding". Under its own control, `ascii-wire-normalizing-parse`, the same diff is
+  observed at the parse: `an_ascii_text_is_decoded_under_quick_checks_alone` must fail with "an
+  ASCII text's parse normalized an unproven text".
 - `authority-share-unclamped.patch` leaves a share's live ceiling above its family's:
   `no_ceiling_is_raised_by_a_builder_or_a_share` must fail when a request beyond the family's whole
   ceiling is granted, "unwrap_err()`on an`Ok` value".
