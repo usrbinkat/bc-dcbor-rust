@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "cddl"
 version = "0.10.7"
-source = "git+https://github.com/usrbinkat/cddl.git?rev=08e45a74b6bfe104af6af15fabb3b1133ed7edd0#08e45a74b6bfe104af6af15fabb3b1133ed7edd0"
+source = "git+https://github.com/usrbinkat/cddl.git?rev=1e2d11a33c7ae5355ab57209495ff950414b41e6#1e2d11a33c7ae5355ab57209495ff950414b41e6"
 dependencies = [
  "abnf_to_pest",
  "base16",
@@ -230,7 +230,6 @@ dependencies = [
  "pest_stack_guard",
  "pest_vm",
  "regex",
- "regex-syntax",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

@@ -19,9 +19,10 @@ dcbor = { path = "../..", default-features = false, features = ["std", "derive"]
 # The independent oracle: an RFC 8610 implementation validating CBOR bytes
 # against CDDL text (`validate_cbor_from_slice`). Pinned by revision, the
 # identity: usrbinkat/cddl branch fix/cbor-range-bytes-and-foreign-tags at
-# 08e45a7, anweiss/cddl main c4c8d29 plus seven commits (the fourth and fifth
-# change the fork's own tests only; the sixth pins pest 2.9.6). Three correct
-# the validator where upstream admits items the RFCs refuse:
+# 1e2d11a, anweiss/cddl main c4c8d29 plus nine commits (the fourth, fifth and
+# ninth change the fork's own tests only; the sixth pins pest 2.9.6). Four
+# correct the validator where upstream admits items the RFCs refuse, or
+# refuses items they admit:
 # - a byte string matched against an integer range by its length without
 #   `.size` (RFC 8610, Sections 2.2.2.1 and 3.8.1);
 # - any tag other than 0, 1, 33 or a bignum tag satisfying every prelude type
@@ -31,7 +32,11 @@ dcbor = { path = "../..", default-features = false, features = ["std", "derive"]
 #   holding a match. XSD regular expressions are implicitly anchored (RFC 8610,
 #   Section 3.8.3; XML Schema Part 2, Appendix F) and an `.abnf` controller is
 #   one element matched by the whole target (RFC 9165, Section 3), so a rule
-#   such as `tstr .regexp "[\u0000-\u007F]*"` denotes exactly the ASCII texts.
+#   such as `tstr .regexp "[\u0000-\u007F]*"` denotes exactly the ASCII texts;
+# - the eighth: `.regexp` read by the Appendix F grammar alone (another
+#   dialect's constructs refused, `^`/`$` ordinary characters), and a map key
+#   type constrained by a control (`tstr .regexp "a" => uint`) matched against
+#   each key rather than against the map.
 # Each feature enabled, and why:
 # - std: the validator module exists only under it (src/lib.rs), and without
 #   it the build script refuses unless a no_std parser is generated
@@ -46,7 +51,7 @@ dcbor = { path = "../..", default-features = false, features = ["std", "derive"]
 #   validator under no feature gate (src/validator/mod.rs).
 # Not enabled: csv-validate, freezer, ast-comments, ast-parent, each gating
 # modules or variants outside the CBOR path; `.regexp` needs none of them.
-cddl = { git = "https://github.com/usrbinkat/cddl.git", rev = "08e45a74b6bfe104af6af15fabb3b1133ed7edd0", default-features = false, features = ["std", "cbor", "json", "additional-controls", "ast-span"] }
+cddl = { git = "https://github.com/usrbinkat/cddl.git", rev = "1e2d11a33c7ae5355ab57209495ff950414b41e6", default-features = false, features = ["std", "cbor", "json", "additional-controls", "ast-span"] }
 
 [lints]
 workspace = true
