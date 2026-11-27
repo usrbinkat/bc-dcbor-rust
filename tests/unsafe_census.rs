@@ -3921,8 +3921,12 @@ fn thread_names(census: &Census) -> Vec<(String, String)> {
 /// and the storage counters every reservation and shared policy holds
 /// (`Counters`, `policy.rs`; a `Limits` itself is one operation's, never
 /// shared: `share` builds a fresh one over the same counters), with the
-/// family's credit ledgers inside them (`Ledgers`). FF-13's premise that no
-/// per-worker identity enters the protocol is checked over exactly these.
+/// family's credit ledgers inside them (`Ledgers`), each total a `Count`;
+/// and a governed group's and operation's counters (`Group`, `Operation`,
+/// `governance.rs`), which every permit, cancellation and terminal policy of
+/// them shares (an `OperationBudget` itself is one operation's). FF-13's
+/// premise that no per-worker identity enters the protocol is checked over
+/// exactly these.
 const PROTOCOL: &[(&str, &str)] = &[
     (
         "src/bounded/decode/construction/reclamation.rs",
@@ -3935,6 +3939,9 @@ const PROTOCOL: &[(&str, &str)] = &[
     ),
     ("src/bounded/policy.rs", "Counters"),
     ("src/bounded/policy.rs", "Ledgers"),
+    ("src/bounded/policy.rs", "Count"),
+    ("src/bounded/governance.rs", "Group"),
+    ("src/bounded/governance.rs", "Operation"),
 ];
 
 /// A record's dispatch, written once by its acquisition before the record is
@@ -3953,17 +3960,25 @@ const FAMILY_ALIASES: &[&str] = &[
 
 /// Fields written only before their holder is shared, then only read, each
 /// by type and field: the release observer, which `observe_releases` sets
-/// through `Arc::get_mut`, refused once the counters are shared; and the
-/// recording family, installed by `Limits::recorded` before `Arc::new`.
-const CONFIGURED: &[(&str, &str)] = &[("Counters", "release_observer"), ("Counters", "recording")];
+/// through `Arc::get_mut`, refused once the counters are shared; the
+/// recording family, installed by `Limits::recorded` before `Arc::new`; a
+/// governed group's ceilings, fixed by `Governor::new`; and an operation's
+/// group, the `Arc` it is made over by `Governor::operation`.
+const CONFIGURED: &[(&str, &str)] = &[
+    ("Counters", "release_observer"),
+    ("Counters", "recording"),
+    ("Group", "ceilings"),
+    ("Operation", "group"),
+];
 
-/// Arrays of the family's primitives indexed by a fixed enumeration, never by
-/// a worker, each by type and field: the boundary valuations reached, one
-/// bitmask per `Predicate` (`Predicate::COUNT` of them), which any thread
-/// only ORs into; and the credit ledgers A, C and F, one total per quantity
-/// (values, bytes), which any thread advances by checked compare-exchange
-/// (`Ledgers::record`). An array is otherwise refused: indexed by a worker,
-/// it would carry the worker's identity into the protocol.
+/// Arrays of the family's primitives, or of a protocol type, indexed by a
+/// fixed enumeration, never by a worker, each by type and field: the
+/// boundary valuations reached, one bitmask per `Predicate`
+/// (`Predicate::COUNT` of them), which any thread only ORs into; and the
+/// credit ledgers A, C and F, one `Count` per quantity (values, bytes),
+/// which any thread advances by one wait-free addition (`Ledgers::record`,
+/// `Count::add`). An array is otherwise refused: indexed by a worker, it
+/// would carry the worker's identity into the protocol.
 const ENUMERATED: &[(&str, &str)] = &[
     ("Counters", "reached"),
     ("Ledgers", "admitted"),
@@ -4017,13 +4032,16 @@ fn protocol_state(root: &Path, protocol: &[(&str, &str)]) -> Vec<String> {
                 _ => None,
             };
             let configured = CONFIGURED.contains(&(*name, field_name.as_str()));
-            // An enumerated array holds the family's primitives alone.
+            // An enumerated array holds the family's primitives, or protocol
+            // state, alone.
             let enumerated = ENUMERATED.contains(&(*name, field_name.as_str()))
                 && matches!(&field.ty, syn::Type::Array(array)
                 if matches!(&*array.elem, syn::Type::Path(element)
                     if element.path.segments.first().is_some_and(|segment| {
-                        FAMILY_ALIASES.contains(&segment.ident.to_string().as_str())
-                            || segment.ident == "S"
+                        let segment = segment.ident.to_string();
+                        FAMILY_ALIASES.contains(&segment.as_str())
+                            || segment == "S"
+                            || names.contains(&segment.as_str())
                     })));
             let allowed = configured
                 || enumerated

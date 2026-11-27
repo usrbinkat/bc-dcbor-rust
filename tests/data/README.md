@@ -1628,9 +1628,9 @@ or `bounded::governance::tests`:
 - `governor-peak-raised-on-refusal.patch` raises the operation's peak when its live reservation is
   made, before the group grants the request (`OperationBudget::allocate`): the same test must fail
   with "a group refusal raised a peak".
-- `governor-cleanup-gated.patch` holds the group's cleanup count to its lifetime work ceiling
-  (`Group::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with "cleanup was
-  refused for a lifetime ceiling".
+- `governor-cleanup-gated.patch` holds the group's cleanup commit to its lifetime work ceiling
+  (`OperationBudget::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with
+  "cleanup was refused for a lifetime ceiling".
 - `governor-terminal-group-uncounted.patch` admits a terminal policy's units without counting them
   on the group (`Operation::count_terminal`):
   `a_terminal_policy_counts_its_cleanup_and_allocates_nothing` must fail with "terminal cleanup went

@@ -17,7 +17,7 @@ mod proofs;
 pub mod record;
 use crate::bounded::decode::construction::TypedPosition;
 use crate::bounded::decode::construction::reclamation::AbortOnUnwind;
-use crate::sync::{AtomicU64, Ordering};
+use crate::sync::{AtomicBool, AtomicU64, Ordering};
 use alloc::{sync::Arc, vec::Vec};
 use record::{Recording, Session};
 
@@ -583,18 +583,19 @@ struct Counters {
 /// A counter family's credit ledgers: A, C and F in values and bytes, and
 /// the violation flag, each a family atomic, so a terminal policy minted from
 /// a permit's counters records into the ledger its originating policy reads.
-/// Every quantity is updated by its own checked compare-exchange, the values
-/// and bytes of each of A, C and F one at a time, not together: one that does
-/// not fit is left unchanged, while the other quantities of the same event
-/// may have advanced, and the sticky violation flag is set, so the ledger is
-/// no longer claimed conserved ([`Credits::conserved_with`] is false).
-/// Allocation-free and non-unwinding, so cleanup and terminal steps record.
-/// Conservation is read only at quiescence.
+/// Every quantity is a [`Count`], updated by its own wait-free addition, the
+/// values and bytes of each of A, C and F one at a time, not together: one
+/// that does not fit reads `u64::MAX` from then on, while the other
+/// quantities of the same event may have advanced, and the sticky violation
+/// flag is set, so the ledger is no longer claimed conserved
+/// ([`Credits::conserved_with`] is false). Allocation-free, non-unwinding
+/// and of a fixed number of instructions, so cleanup and terminal steps
+/// record. Conservation is read only at quiescence.
 #[derive(Debug, Default)]
 struct Ledgers {
-    admitted: [AtomicU64; 2],
-    consumed: [AtomicU64; 2],
-    forfeited: [AtomicU64; 2],
+    admitted: [Count; 2],
+    consumed: [Count; 2],
+    forfeited: [Count; 2],
     violated: AtomicU64,
 }
 
@@ -603,7 +604,7 @@ impl Ledgers {
     /// admission adds its work to A and its unheld part to C; a spend adds
     /// to C; a forfeit adds to F. An admission holding more than it
     /// admitted sets the violation flag and changes nothing else. A quantity
-    /// that does not fit is left unchanged and sets the flag, while the
+    /// that does not fit saturates ([`Count`]) and sets the flag, while the
     /// event's other quantities and ledgers may have advanced.
     fn record(&self, credit: Credit) {
         let none = WriteWork::new(0, 0);
@@ -632,30 +633,13 @@ impl Ledgers {
         }
     }
 
-    /// `work` added to a ledger, its values and its bytes each by its own
-    /// checked compare-exchange: a quantity that does not fit is left
-    /// unchanged while the other may have advanced. False when either did
-    /// not fit.
-    fn add(ledger: &[AtomicU64; 2], work: WriteWork) -> bool {
-        let values = Self::add_one(&ledger[0], work.values);
-        let bytes = Self::add_one(&ledger[1], work.bytes);
+    /// `work` added to a ledger, its values and its bytes each a [`Count`]:
+    /// a quantity that does not fit saturates while the other may have
+    /// advanced. False when either did not fit.
+    fn add(ledger: &[Count; 2], work: WriteWork) -> bool {
+        let values = ledger[0].add(work.values);
+        let bytes = ledger[1].add(work.bytes);
         values && bytes
-    }
-
-    fn add_one(ledger: &AtomicU64, amount: u64) -> bool {
-        if amount == 0 {
-            return true;
-        }
-        let mut current = ledger.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(amount) else {
-                return false;
-            };
-            match ledger.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
     }
 
     fn violate(&self) {
@@ -664,17 +648,66 @@ impl Ledgers {
 
     /// The ledgers now, as a snapshot.
     fn snapshot(&self) -> Credits {
-        let read = |ledger: &[AtomicU64; 2]| {
-            WriteWork::new(
-                ledger[0].load(Ordering::Acquire),
-                ledger[1].load(Ordering::Acquire),
-            )
-        };
+        let read = |ledger: &[Count; 2]| WriteWork::new(ledger[0].get(), ledger[1].get());
         Credits {
             admitted: read(&self.admitted),
             consumed: read(&self.consumed),
             forfeited: read(&self.forfeited),
             violated: self.violated.load(Ordering::Acquire) != 0,
+        }
+    }
+}
+
+/// A total only ever raised, by any thread: the one counter of every
+/// ledger and every governed cleanup total. Each addition is one
+/// `fetch_add`, wait-free, a fixed number of instructions whatever other
+/// threads do, allocation-free and non-unwinding, so a terminal policy's
+/// admissions may count with it ([`super::TerminalAllocator`],
+/// *traverse*). Whether the sum fit in `u64` is decided from the value the
+/// addition returned; the one addition that does not fit sets the sticky
+/// `overflowed` flag, and the total reads `u64::MAX` from then on: once
+/// that flag is seen it never reads below what was counted. Exact while it
+/// has not overflowed.
+pub(crate) struct Count {
+    total: AtomicU64,
+    overflowed: AtomicBool,
+}
+
+impl Default for Count {
+    fn default() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl core::fmt::Debug for Count {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl Count {
+    /// Add `amount`: whether the sum fit in `u64`.
+    pub(crate) fn add(&self, amount: u64) -> bool {
+        let fits = self
+            .total
+            .fetch_add(amount, Ordering::AcqRel)
+            .checked_add(amount)
+            .is_some();
+        if !fits {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        fits
+    }
+
+    /// The total, `u64::MAX` once a sum did not fit.
+    pub(crate) fn get(&self) -> u64 {
+        if self.overflowed.load(Ordering::Acquire) {
+            u64::MAX
+        } else {
+            self.total.load(Ordering::Acquire)
         }
     }
 }
@@ -1864,8 +1897,8 @@ impl Budget for Limits {
     }
 
     /// Recorded into the family's shared ledgers (`Ledgers::record`), in
-    /// every mode, the terminal one included: checked compare-exchange
-    /// updates of the family atomics; and, in a recorded family, published
+    /// every mode, the terminal one included: wait-free updates of the
+    /// family's totals ([`Count`]); and, in a recorded family, published
     /// into its session. Both allocate nothing and do not unwind.
     fn admitted(&mut self, work: WriteWork) {
         let credit = Credit::Admit { work, held: None };
@@ -2034,7 +2067,8 @@ impl Origin for Family {
 // through `traverse` and `reclaim` alike, bypass the policy's limits and
 // counters and never refuse work; recording a
 // boundary is one relaxed `fetch_or` on the shared counters, a credit event
-// checked compare-exchange updates and a `fetch_or` on the same counters, and
+// wait-free `fetch_add` updates (`Count`) and a `fetch_or` on the same
+// counters, and
 // publishing an observation into a recorded family's session claims a
 // preallocated slot and stores its words (`record`), all allocation-free and
 // non-unwinding, a failed update or an exhausted session setting a flag

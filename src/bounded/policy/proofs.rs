@@ -6,7 +6,7 @@
 //! [`Ledgers`] accumulates quantities and detects arithmetic failure; it
 //! does not authorize settlement (a lone spend of one value leaves A = 0,
 //! C = 1, unviolated). Its reference ([`Model`]) is stated from its
-//! documentation (`Ledgers`, `policy.rs:190-195`), never computed by calling
+//! documentation (`Ledgers`, `Count`), never computed by calling
 //! it, in `u128`, where no sum of at most [`EVENTS`] `u64` quantities
 //! overflows:
 //!
@@ -14,9 +14,13 @@
 //!   to C; a forfeit adds to F;
 //! - an admission holding more than it admitted, in either quantity,
 //!   changes nothing and sets the violation;
-//! - each component of each ledger is added by its own checked add: one
-//!   that would exceed `u64::MAX` is left unchanged and sets the violation,
-//!   while the event's other components still advance (not all-or-nothing);
+//! - each component of each ledger is added by its own wait-free addition
+//!   (`Count`): one that would exceed `u64::MAX` saturates there, reading
+//!   `u64::MAX` from then on, and sets the violation, while the event's
+//!   other components still advance (not all-or-nothing). Saturation, not
+//!   an unchanged component, is what one `fetch_add` can keep: holding the
+//!   component unchanged needs a retry loop, which no terminal admission may
+//!   take (`TerminalAllocator`, *traverse*);
 //! - the violation is sticky.
 //!
 //! Domain: every sequence of at most [`EVENTS`] events, each of any kind and
@@ -54,11 +58,11 @@
 //! `Rule::UnknownObligation`) and one exceeding its remaining work (`:384-388`,
 //! `Rule::Overdrawn`).
 //!
-//! Each component's update is a compare-exchange loop (`Ledgers::add_one`,
-//! policy.rs:254-268); on one thread its first exchange succeeds, so it runs
-//! once; the ledger harnesses' event loops and their arrays' construction
-//! run at most [`EVENTS`] = 4 times: the longest, 4, and its exit,
-//! `kani::unwind(5)`; the conservation step has no loop of its own. One
+//! Each component's update is one `fetch_add` and at most one flag store
+//! (`Count::add`), no loop; the ledger harnesses' event loops and their
+//! arrays' construction run at most [`EVENTS`] = 4 times: the longest, 4,
+//! and its exit, `kani::unwind(5)`; the conservation step has no loop of its
+//! own. One
 //! thread: nothing here is about interleavings, which are the concurrency
 //! gate's. Status: written and unverified until
 //! the gate runs them. Compiled only under `cfg(kani)`.
@@ -123,15 +127,14 @@ struct Model {
 }
 
 impl Model {
-    /// `work` added to `ledger`, each component by its own checked add.
+    /// `work` added to `ledger`, each component saturating at `u64::MAX`.
     fn add(ledger: &mut [u128; 2], violated: &mut bool, work: WriteWork) {
         for (component, amount) in ledger.iter_mut().zip([work.values, work.bytes]) {
             let next = *component + u128::from(amount);
             if next > MAX {
                 *violated = true;
-            } else {
-                *component = next;
             }
+            *component = next.min(MAX);
         }
     }
 
@@ -351,16 +354,20 @@ fn conserved(credits: &Credits, held: Held) -> bool {
     credits.violated || balanced(credits, held)
 }
 
-/// A family's ledgers in any state: every component any `u64`, the
-/// violation flag any word (set when nonzero, `Ledgers::snapshot`). Built
-/// from the ledgers' own fields, so no production constructor is widened
-/// for the proof.
+/// A family's ledgers in any state: every component any `u64` and either
+/// overflow state (`Count`), the violation flag any word (set when nonzero,
+/// `Ledgers::snapshot`). Built from the ledgers' own fields, so no
+/// production constructor is widened for the proof.
 fn any_ledgers() -> Ledgers {
     let atomic = || crate::sync::AtomicU64::new(kani::any());
+    let count = || super::Count {
+        total: atomic(),
+        overflowed: crate::sync::AtomicBool::new(kani::any()),
+    };
     Ledgers {
-        admitted: [atomic(), atomic()],
-        consumed: [atomic(), atomic()],
-        forfeited: [atomic(), atomic()],
+        admitted: [count(), count()],
+        consumed: [count(), count()],
+        forfeited: [count(), count()],
         violated: atomic(),
     }
 }
@@ -429,10 +436,9 @@ fn a_fresh_family_is_conserved_with_nothing_held() {
 /// every unviolated family, at any length: no bound on the events is part
 /// of the theorem.
 ///
-/// Its loops are only each component's compare-exchange (`Ledgers::add_one`),
-/// whose first exchange succeeds on one thread, so its backedge is never
-/// taken; `kani::unwind(5)` is its siblings' bound, its unwinding assertions
-/// checking that no loop the run reaches takes more.
+/// It reaches no loop: each component's update is one `fetch_add`
+/// (`Count::add`); `kani::unwind(5)` is its siblings' bound, its unwinding
+/// assertions checking that no loop the run reaches takes more.
 #[kani::proof]
 #[kani::unwind(5)]
 fn every_legal_transition_preserves_conservation() {

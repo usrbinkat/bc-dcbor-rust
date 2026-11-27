@@ -1,8 +1,10 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -125,2 +125,5 @@
-     fn reclaim(&self, work: WriteWork) -> Result<(), LimitRefusal> {
-+        // Planted: cleanup held to the group's lifetime ceiling.
-+        let used = self.foreground().checked_then(work).ok_or(LimitRefusal::Work)?;
-+        if !self.ceilings.work.covers(&used) { return Err(LimitRefusal::Work); }
-         if !Self::add(&self.cleanup_values, work.values) {
+@@ -586,4 +586,7 @@
+         let planned = self.authority.plan_reclaim(work)?;
+         self.admit(planned, |group| {
++            // Planted: cleanup held to the group's lifetime ceiling.
++            let used = group.foreground().checked_then(work).ok_or(LimitRefusal::Work)?;
++            if !group.ceilings.work.covers(&used) { return Err(LimitRefusal::Work); }
+             group.reclaim(work);
+             Ok(())

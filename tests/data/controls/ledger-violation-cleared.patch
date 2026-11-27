@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -269,7 +269,10 @@
+@@ -630,7 +630,10 @@
          ];
          if fitted.contains(&false) {
              self.violate();
@@ -10,5 +10,5 @@
 +            self.violated.store(0, Ordering::Release);
 +        }
      }
-
-     /// `work` added to a ledger, its values and its bytes each by its own
+ 
+     /// `work` added to a ledger, its values and its bytes each a [`Count`]:

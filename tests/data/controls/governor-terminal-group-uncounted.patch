@@ -1,10 +1,9 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -219,6 +219,5 @@
-         Group::saturate(&self.terminal_values, work.values);
-         Group::saturate(&self.terminal_bytes, work.bytes);
--        Group::saturate(&self.group.cleanup_values, work.values);
--        Group::saturate(&self.group.cleanup_bytes, work.bytes);
+@@ -183,5 +183,5 @@
+     fn count_terminal(&self, work: WriteWork) {
+         count(&self.terminal_values, &self.terminal_bytes, work);
+-        self.group.reclaim(work);
 +        // Planted: a terminal policy's cleanup uncounted on its group.
      }
  }
