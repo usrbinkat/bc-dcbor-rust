@@ -962,6 +962,7 @@ mod tests {
     #[test]
     fn a_typed_decode_runs_under_a_governed_operation() {
         use crate::bounded::decode::decode_typed;
+        use alloc::string::String;
         let governor = Governor::new(Ceilings::UNLIMITED);
         let mut operation = governor.operation(Ceilings::UNLIMITED);
         // A one-call decode is stepped by no scheduler.

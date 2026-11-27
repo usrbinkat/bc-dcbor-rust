@@ -5992,11 +5992,14 @@ where
                 if cancel && m.injected_refusals() > injected_before {
                     return Ok(None);
                 }
-                if !retryable(m, &error, injected) {
-                    return Err(Stopped::Operation(error));
-                }
+                // A unit beyond the quantum is retryable by no turn: its
+                // stall is named before the refusal is returned as the
+                // operation's.
                 if let Some(stall) = stalled(m, operation, observed) {
                     return Err(stall);
+                }
+                if !retryable(m, &error, injected) {
+                    return Err(Stopped::Operation(error));
                 }
             }
             Err(error) => return Err(Stopped::Operation(error)),
@@ -6201,13 +6204,13 @@ where
                 Ok(Step::Finished) => unreachable!("finished cleanup was probed"),
                 Ok(Step::Complete(output)) => return Err(Stopped::Published(output)),
                 Err(error) if error.refused() => {
-                    if !retryable(m, &error, injected) {
-                        return Err(Stopped::Operation(error));
-                    }
                     if lost(m, at).is_none()
                         && let Some(stall) = stalled(m, operation, observed)
                     {
                         return Err(stall);
+                    }
+                    if !retryable(m, &error, injected) {
+                        return Err(Stopped::Operation(error));
                     }
                 }
                 Err(error) => return Err(Stopped::Operation(error)),
@@ -6306,14 +6309,17 @@ where
             Ok(Step::Complete(output)) => return Err(Stopped::Published(output)),
             Ok(Step::Finished) => return Err(Stopped::Finished),
             Err(error) if error.refused() => {
+                if error.class() == Class::Refused(&LimitRefusal::QuantumTooSmall)
+                    && reason != LimitRefusal::QuantumTooSmall
+                    && let Some(stall) = stalled(m, operation, true)
+                {
+                    return Err(stall);
+                }
                 if matches!(schedule, TurnSchedule::Fresh)
                     && error.class() == Class::Refused(&LimitRefusal::Turn)
                     && reason != LimitRefusal::Turn
                     && m.injected_refusals() == 0
                 {
-                    if let Some(stall) = stalled(m, operation, true) {
-                        return Err(stall);
-                    }
                     continue;
                 }
                 assert_eq!(error.class(), Class::Refused(&reason));
@@ -8136,7 +8142,7 @@ mod tests {
                         |m, _| {
                             ordinary.push(ordinary_exhaustion(
                                 m,
-                                &BoundedError::Refused(LimitRefusal::Work),
+                                &BoundedError::Refused(LimitRefusal::Turn),
                             ));
                         },
                         |_| (),
@@ -8151,7 +8157,7 @@ mod tests {
                         assert_eq!(
                             m.refused_calls(),
                             [
-                                (1, LimitRefusal::Work, false),
+                                (1, LimitRefusal::Turn, false),
                                 (3, LimitRefusal::Work, true)
                             ]
                         );
