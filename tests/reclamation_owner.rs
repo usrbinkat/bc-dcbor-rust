@@ -134,6 +134,112 @@ fn an_operation_reports_the_scope_count_and_a_closing_scope_reports_closed() {
     });
 }
 
+/// The operation's part of a class (`OperationClass`) on scopes holding a
+/// record besides the operation's own, which no single pipeline reaches: a
+/// parse whose record is allocated, its prefix still empty, has the detail
+/// of one not yet allocated (`Parsed::detail` reads only the held input
+/// until its prefix completes), so whether its record is allocated is the
+/// one fact separating them, while the allocated one's cleanup also
+/// releases its record. Each member's scope holds the same number of
+/// records, its queue drained: an unallocated parse beside another live
+/// input, and an allocated one whose other input was dropped and drained.
+/// A third member, the allocated parse beside the live input, holds one
+/// record more and cleans up as the second does: the scope's other records
+/// are no part of the operation's cleanup, nor of its class.
+#[test]
+fn an_operation_class_separates_its_record_from_the_scopes_other_records() {
+    use dcbor::bounded::decode::construction::{DocumentDecoder, OwnedInitialized};
+    type Copied = <ByteString as Reclaim<Limits>>::State;
+    static WIRE: [u8; 3] = [0x82, 0x01, 0x02];
+    static OTHER: [u8; 1] = [0x00];
+    /// Calls any loop of a member takes at most.
+    const CALLS: usize = 256;
+    fn copied(
+        owner: &DecodeOwner<'static, Limits>,
+        a: &mut Limits,
+        wire: &'static [u8],
+    ) -> OwnedInitialized<'static, ByteString, Limits> {
+        let mut copy = owner.copy_input(wire);
+        for _ in 0..CALLS {
+            if let Step::Complete(input) = copy.step(a).expect("an unlimited copy") {
+                return input;
+            }
+        }
+        panic!("the copy did not publish");
+    }
+    let member = |allocated: bool, other_live: bool| {
+        let what = format!("a parse, allocated {allocated}, another input live {other_live}");
+        let mut a = Limits::unlimited();
+        let mut owner = DecodeOwner::<'static, Limits>::new();
+        owner.initialize_step(&mut a).expect("the scope");
+        let input = copied(&owner, &mut a, &WIRE);
+        let mut other = Some(copied(&owner, &mut a, &OTHER));
+        let mut decoder = DocumentDecoder::parse(input, Options::normalizing(8));
+        if allocated {
+            assert!(
+                matches!(decoder.step(&mut a), Ok(Step::Progress)),
+                "{what}: the record's allocation"
+            );
+        }
+        if !other_live {
+            let held = owner.outstanding();
+            drop(other.take());
+            for _ in 0..CALLS {
+                if owner.outstanding() < held {
+                    break;
+                }
+                owner.step(&mut a).expect("an unlimited drain");
+            }
+            assert_eq!(owner.outstanding(), held - 1, "{what}: the drain");
+        }
+        let position = decoder.position();
+        assert_eq!(position.allocated, allocated, "{what}");
+        assert_eq!(position.initialized, 0, "{what}: a prefix written");
+        let class = position.class::<Copied>();
+        decoder.cancel();
+        let (attempts, live) = (a.attempts(), a.live_bytes());
+        let mut finished = false;
+        for _ in 0..CALLS {
+            if matches!(
+                decoder.step(&mut a).expect("an unlimited cleanup"),
+                Step::Finished
+            ) {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "{what}: the cleanup did not finish");
+        let cleanup = (a.attempts() - attempts, live - a.live_bytes());
+        drop((decoder, other));
+        let mut done = false;
+        for _ in 0..CALLS {
+            if owner.shutdown_step(&mut a).expect("an unlimited shutdown") == Reclaimed::Done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "{what}: the scope did not shut down");
+        assert_eq!(a.live_bytes(), 0, "{what}: storage kept");
+        (what, position, class, cleanup)
+    };
+    let unallocated = member(false, true);
+    let allocated = member(true, false);
+    let beside = member(true, true);
+    assert_eq!(
+        (unallocated.1.outstanding, unallocated.1.queue),
+        (allocated.1.outstanding, allocated.1.queue),
+        "the scopes of the first two members differ"
+    );
+    assert_ne!(
+        unallocated.3, allocated.3,
+        "the allocated record's cleanup is the unallocated one's"
+    );
+    support::agree(
+        "an operation beside the scope's other records",
+        [unallocated, allocated, beside].map(|(what, _, class, cleanup)| (what, class, cleanup)),
+    );
+}
+
 /// A built tree's cleanup never takes more calls than its state declares,
 /// and the declaration falls by at least one with every call: it is the
 /// most calls cleanup can still take, so no phase may declare more than the

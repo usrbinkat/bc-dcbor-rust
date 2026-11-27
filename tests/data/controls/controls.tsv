@@ -668,11 +668,16 @@ classes-windows-unread	tests/data/controls/classes-windows-unread.patch	native	n
 # its class: a stop cancels it before its cleanup, which runs alike either
 # way, so no plant of it could merge boundaries whose cleanups differ. Nor
 # is whether an input task still holds its scope reference: its cleanup
-# admits the unit ending it either way (input.rs `release_scope`).
-classes-operation-allocated-unread	tests/data/controls/classes-operation-allocated-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
+# admits the unit ending it either way (input.rs `release_scope`); nor how
+# many records the scope holds, of which only the queued ones, which the
+# queue's own field counts, are any part of the operation's cleanup. A
+# pipeline's operation record is the only record its scope allocates while
+# it is unallocated, so whether it is allocated is run where another live
+# record makes it the one separating fact (reclamation_owner.rs,
+# `an_operation_class_separates_its_record_from_the_scopes_other_records`).
+classes-operation-allocated-unread	tests/data/controls/classes-operation-allocated-unread.patch	native	nightly	dcbor	all	fast	reclamation_owner	an_operation_class_separates_its_record_from_the_scopes_other_records	-	failed	the class merges states of different custody
 classes-operation-prefix-unread	tests/data/controls/classes-operation-prefix-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-operation-finished-unread	tests/data/controls/classes-operation-finished-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
-classes-operation-outstanding-unread	tests/data/controls/classes-operation-outstanding-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-input-record-unread	tests/data/controls/classes-input-record-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-parse-record-unread	tests/data/controls/classes-parse-record-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody
 classes-parse-parser-unread	tests/data/controls/classes-parse-parser-unread.patch	native	nightly	dcbor	all	exhaustive	owned_pipeline_matrix	text_survives_every_admission_physical_failure_and_stop	-	failed	the class merges states of different custody

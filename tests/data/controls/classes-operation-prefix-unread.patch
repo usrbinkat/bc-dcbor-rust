@@ -1,11 +1,11 @@
 --- src/bounded/decode/construction/operation.rs
 +++ src/bounded/decode/construction/operation.rs
-@@ -307,7 +307,7 @@
+@@ -308,7 +308,7 @@
          OperationClass {
              queue: self.queue,
              allocated: self.allocated,
 -            prefix,
 +            prefix: prefix.min(PrefixClass::Units(0)),
              finished: self.finished,
-             outstanding: self.outstanding,
              task,
+         }
