@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -225,7 +225,8 @@
+@@ -305,7 +305,8 @@
          let Some(turn) = self.turn else {
              return Ok(None);
          };

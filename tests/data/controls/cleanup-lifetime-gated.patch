@@ -1,11 +1,7 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -250,4 +250,8 @@
+@@ -282,2 +282,4 @@
      pub(crate) fn plan_reclaim(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
-         let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
 +        // Planted: cleanup held to the foreground's lifetime ceiling.
-+        if !self.ceilings.work.covers(&used) {
-+            return Err(LimitRefusal::Work);
-+        }
-         let cleanup = self.cleanup.checked_then(work).ok_or(LimitRefusal::Work)?;
++        self.ceilings.foreground_after(self.foreground, work)?;
          let turn = self.turn_after(work)?;

@@ -1588,9 +1588,15 @@ The schema controls plant defects of what a type declares of the wire it accepts
 
 The accounting controls plant defects of the accounting core's axioms (`src/bounded/policy.rs`,
 `Authority`), of its cleanup admission seam, and of the shared governance built on it
-(`src/bounded/governance.rs`), each detected by its own test in `bounded::policy::tests::authority`
-or `bounded::governance::tests`:
+(`src/bounded/governance.rs`). Shared obligations run for both policies in
+`bounded::policy::conformance`; policy-specific witnesses remain in
+`bounded::policy::tests::authority` and `bounded::governance::tests`. The
+[conformance contract](../../docs/policy-conformance.md) describes the adapters and coverage. The
+registry names each exact instantiated test:
 
+- `authority-cleanup-total-refuses.patch` restores checked cleanup addition in
+  `Authority::plan_reclaim`. Both policies' `cleanup_never_refuses_for_its_own_total` must fail with
+  "a cleanup unit was refused for its total".
 - `authority-turn-raises-lifetime.patch` lets a running turn admit past the lifetime allowance
   (`Authority::plan_work` skips `Ceilings::foreground_after`), the conflation of a turn with the
   lifetime ceiling the core removes: `turns_never_raise_lifetime_authorization` must fail with
@@ -1606,12 +1612,13 @@ or `bounded::governance::tests`:
   session grants its permit record (`Limits::admit`), so a grant refused `Unrecorded` keeps the
   capacity and raises the peak: `an_unrecorded_grant_keeps_nothing_it_reserved` must fail with "an
   unrecorded grant kept what it reserved".
-- `cleanup-lifetime-gated.patch` holds a cleanup admission (`Authority::reclaim`) to the
+- `cleanup-lifetime-gated.patch` holds a cleanup admission (`Authority::plan_reclaim`) to the
   foreground's lifetime work ceiling, so cleanup cannot complete once the foreground is spent:
   `cleanup_is_never_refused_for_the_foreground` must fail with "cleanup was refused for the lifetime
   allowance".
 - `cleanup-deadline-gated.patch` lets the deadline refuse cleanup as it refuses the foreground
-  (`Limits::admit`): the same test must fail with "cleanup was refused for the deadline".
+  (`Limits::admit`): `cleanup_is_never_refused_for_the_simulated_deadline` must fail with "cleanup
+  was refused for the deadline".
 - `cleanup-charged-foreground.patch` makes the cleanup capability (`Cleanup`, `reclamation.rs`)
   admit its units as the policy's foreground work:
   `a_unit_under_the_cleanup_capability_is_charged_as_cleanup` must fail with "cleanup was charged to
@@ -1629,12 +1636,12 @@ or `bounded::governance::tests`:
   live storage (`GovernedPermit::drop`): `live_storage_is_held_at_both_levels` must fail with "left:
   (8, 0)".
 - `governor-storage-refusal-kept.patch` never returns a pending reservation (`Reserved::drop`, the
-  one storage implementation, `policy.rs`), so the operation's reservation is kept when the group
-  refuses the request: the same test must fail with "a group refusal kept the operation's
-  reservation".
+  one storage implementation, `policy.rs`). Both policies' `a_later_refusal_returns_the_reservation`
+  must fail with "a later refusal kept the reservation": recording refuses the Limits grant, and
+  group capacity refuses the governed grant.
 - `governor-peak-raised-on-refusal.patch` raises the peak when a reservation is made
-  (`Storage::reserve`), before every level grants the request: the same test must fail with "a group
-  refusal raised a peak".
+  (`Storage::reserve`), before every level grants the request: both instantiations of the same
+  late-refusal test must fail with "a later refusal raised a peak".
 - `governor-cleanup-gated.patch` holds the group's cleanup commit to its lifetime work ceiling
   (`OperationBudget::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with
   "cleanup was refused for a lifetime ceiling".

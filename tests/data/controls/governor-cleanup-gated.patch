@@ -1,6 +1,6 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -586,4 +586,7 @@
+@@ -563,4 +563,7 @@
          let planned = self.authority.plan_reclaim(work)?;
          self.admit(planned, |group| {
 +            // Planted: cleanup held to the group's lifetime ceiling.

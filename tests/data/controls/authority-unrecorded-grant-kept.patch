@@ -1,13 +1,13 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -1914,4 +1914,6 @@
+@@ -1913,4 +1913,6 @@
                      .storage
                      .reserve(self.authority.ceilings.live, bytes)?;
 +                // Planted: the reservation kept before the session grants a record.
 +                reserved.keep();
                  let granted = match &self.counters.recording {
                      None => None,
-@@ -1923,5 +1925,4 @@
+@@ -1922,5 +1924,4 @@
                      }
                  };
 -                reserved.keep();

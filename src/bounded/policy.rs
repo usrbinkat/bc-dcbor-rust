@@ -10,6 +10,8 @@ use super::{
     Acquisition, Allocator, Budget, Credit, Effect, Forfeit, Hold, Identity, Origin, Owner,
     Performer, Settled, WriteWork,
 };
+#[cfg(test)]
+mod conformance;
 /// Kani harnesses of credit conservation (register item 4): compiled only by
 /// `cargo kani`.
 #[cfg(kani)]
@@ -176,7 +178,7 @@ impl Ceilings {
 /// core's alone, so no caller can commit totals the core did not compute.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Planned {
-    used: WriteWork,
+    foreground: WriteWork,
     cleanup: WriteWork,
     turn: Option<Turn>,
 }
@@ -216,14 +218,15 @@ struct Turn {
 ///   ([`Self::reclaim`]): it returns what an operation holds, so it is
 ///   accounted apart from foreground work and no lifetime ceiling gates
 ///   it; the quantum and the turn bound it as they bound every unit.
+/// - Cleanup's account saturates; no cleanup unit is refused for arithmetic.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Authority {
     ceilings: Ceilings,
     quantum: WriteWork,
-    /// Every admitted unit's work, foreground and cleanup.
-    used: WriteWork,
-    /// The part of [`Self::used`] admitted as cleanup: never more than it,
-    /// both raised together by every cleanup admission.
+    /// Foreground work admitted: what the lifetime work ceiling counts.
+    foreground: WriteWork,
+    /// Cleanup work admitted, saturating independently in each quantity:
+    /// never refused for its own arithmetic or a lifetime ceiling.
     cleanup: WriteWork,
     requested: u64,
     turn: Option<Turn>,
@@ -236,22 +239,11 @@ impl Authority {
         Self {
             ceilings,
             quantum,
-            used: WriteWork::new(0, 0),
+            foreground: WriteWork::new(0, 0),
             cleanup: WriteWork::new(0, 0),
             requested: 0,
             turn: None,
         }
-    }
-
-    /// The foreground work admitted: every unit's, less cleanup's. Every
-    /// cleanup admission raises both totals together ([`Self::reclaim`]),
-    /// so the difference never saturates; the policy ships, so it never
-    /// panics.
-    fn foreground(&self) -> WriteWork {
-        WriteWork::new(
-            self.used.values.saturating_sub(self.cleanup.values),
-            self.used.bytes.saturating_sub(self.cleanup.bytes),
-        )
     }
 
     /// Admit `work` as foreground, or refuse it with nothing committed
@@ -274,11 +266,10 @@ impl Authority {
     /// committing nothing: the lifetime ceiling over the foreground's total,
     /// then the turn ([`Self::turn_after`]).
     pub(crate) fn plan_work(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
-        let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
-        self.ceilings.foreground_after(self.foreground(), work)?;
+        let foreground = self.ceilings.foreground_after(self.foreground, work)?;
         let turn = self.turn_after(work)?;
         Ok(Planned {
-            used,
+            foreground,
             cleanup: self.cleanup,
             turn,
         })
@@ -286,15 +277,13 @@ impl Authority {
 
     /// The totals and turn a cleanup admission of `work` reaches,
     /// committing nothing: no lifetime ceiling, only the turn
-    /// ([`Self::turn_after`]). The totals' one refusal of their own is a sum
-    /// beyond `u64`, which no bounded operation reaches.
+    /// ([`Self::turn_after`]). Cleanup's account saturates independently in
+    /// each quantity; its arithmetic never refuses an admission.
     pub(crate) fn plan_reclaim(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
-        let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
-        let cleanup = self.cleanup.checked_then(work).ok_or(LimitRefusal::Work)?;
         let turn = self.turn_after(work)?;
         Ok(Planned {
-            used,
-            cleanup,
+            foreground: self.foreground,
+            cleanup: saturating_then(self.cleanup, work),
             turn,
         })
     }
@@ -304,7 +293,7 @@ impl Authority {
     /// caller commits a plan in the same call that made it, before any other
     /// admission, so no plan is ever committed over another.
     pub(crate) fn commit(&mut self, planned: Planned) {
-        self.used = planned.used;
+        self.foreground = planned.foreground;
         self.cleanup = planned.cleanup;
         self.turn = planned.turn;
     }
@@ -348,9 +337,10 @@ impl Authority {
         self.ceilings
     }
 
-    /// Every admitted unit's work, foreground and cleanup.
+    /// Every admitted unit's work, foreground and cleanup, saturating in
+    /// each quantity when their sum exceeds `u64`.
     pub(crate) const fn used(&self) -> WriteWork {
-        self.used
+        saturating_then(self.foreground, self.cleanup)
     }
 
     /// The part of [`Self::used`] admitted as cleanup.
@@ -390,7 +380,7 @@ impl Authority {
     /// instrument's restart ([`Limits::measure`]), so a run measures only
     /// what follows it. No production authority calls it.
     fn restart(&mut self) {
-        self.used = WriteWork::new(0, 0);
+        self.foreground = WriteWork::new(0, 0);
         self.cleanup = WriteWork::new(0, 0);
         self.requested = 0;
     }
@@ -398,7 +388,7 @@ impl Authority {
     /// The foreground work still admissible now: the lifetime allowance's
     /// remainder, within the turn's when one is running.
     pub(crate) fn remaining(&self) -> WriteWork {
-        let foreground = self.foreground();
+        let foreground = self.foreground;
         let lifetime = WriteWork::new(
             self.ceilings.work.values.saturating_sub(foreground.values),
             self.ceilings.work.bytes.saturating_sub(foreground.bytes),
@@ -415,6 +405,15 @@ impl Authority {
             ),
         }
     }
+}
+
+/// Two accounts summed for reporting, saturating independently in each
+/// quantity. Foreground authorization never reads this lossy total.
+const fn saturating_then(left: WriteWork, right: WriteWork) -> WriteWork {
+    WriteWork::new(
+        left.values.saturating_add(right.values),
+        left.bytes.saturating_add(right.bytes),
+    )
 }
 
 /// Why a policy's history cannot be read ([`Limits::history`]).
@@ -1632,13 +1631,13 @@ impl Limits {
 
     /// Cumulative admitted work, foreground and cleanup.
     pub fn used(&self) -> WriteWork {
-        self.authority.used
+        self.authority.used()
     }
 
     /// The part of [`Self::used`] admitted as cleanup
     /// ([`super::Releasing::reclaim`]), which no lifetime ceiling counts.
     pub fn cleanup_used(&self) -> WriteWork {
-        self.authority.cleanup
+        self.authority.cleanup()
     }
 
     /// Requested capacities currently held by live reservations.
@@ -1974,7 +1973,7 @@ impl Limits {
             index: self.attempts - 1,
             call,
             result,
-            work: self.authority.used,
+            work: self.authority.used(),
             storage: (self.live_bytes(), self.peak_bytes()),
             position: None,
         });
@@ -2725,100 +2724,6 @@ mod tests {
         use super::*;
         use crate::bounded::Releasing;
 
-        const ONE: WriteWork = WriteWork::new(1, 0);
-
-        /// Lifetime authorization never increases: a policy of five values
-        /// stepped one quantum at a time admits exactly five, every later
-        /// turn refusing the lifetime allowance ([`LimitRefusal::Work`],
-        /// which stops), never the turn's; the turns' own usage is all that
-        /// a turn resets, and the remainder of a quantity the policy leaves
-        /// unlimited is the turn's.
-        #[test]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the policy's axioms are driven by direct admissions"
-        )]
-        fn turns_never_raise_lifetime_authorization() {
-            let mut m = Limits::new(5, u64::MAX, u64::MAX);
-            let mut admitted = 0;
-            for _ in 0..10 {
-                m.turn();
-                while m.traverse(1, 0).is_ok() {
-                    admitted += 1;
-                }
-            }
-            assert_eq!(admitted, 5, "turns raised the lifetime allowance");
-            assert_eq!(m.used(), WriteWork::new(5, 0));
-            m.turn();
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
-            // Each quantity's remainder is its own: the values are spent for
-            // good, the bytes the policy leaves unlimited are the turn's, and
-            // exactly that remainder is admissible.
-            assert_eq!(m.remaining(), WriteWork::new(0, TURN.bytes));
-            m.traverse(0, TURN.bytes).unwrap();
-            assert_eq!(m.remaining(), WriteWork::new(0, 0));
-            assert_eq!(LimitRefusal::Work.recovery(), Recovery::Stop);
-        }
-
-        /// A refused admission commits nothing: work refused for its turn,
-        /// for its quantum and for the lifetime allowance leaves the totals
-        /// as they were; a request refused for the requested ceiling, for
-        /// the whole live ceiling and for live capacity leaves the requested
-        /// total, live and peak bytes as they were.
-        #[test]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the policy's axioms are driven by direct admissions"
-        )]
-        fn a_refused_admission_commits_nothing() {
-            // Ten values in all: the turn's and the quantum's refusals come
-            // well within the lifetime allowance, its own refusal last.
-            let mut m = Limits::new(10, u64::MAX, 8).requesting_at_most(10);
-            m.turn_with(WriteWork::new(2, 64));
-            m.traverse(2, 0).unwrap();
-            let before = (m.used(), m.remaining());
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
-            // Each refusal's totals are read before the next admission, which
-            // a committed total would otherwise refuse for another reason.
-            assert_eq!(
-                (m.used(), m.remaining()),
-                before,
-                "a refused unit committed"
-            );
-            assert_eq!(
-                m.traverse(TURN.values + 1, 0),
-                Err(LimitRefusal::QuantumTooSmall)
-            );
-            assert_eq!(
-                (m.used(), m.remaining()),
-                before,
-                "a refused unit committed"
-            );
-            for _ in 0..2 {
-                m.turn();
-                m.traverse(TURN.values, 0).unwrap();
-            }
-            m.turn();
-            assert_eq!(m.traverse(TURN.values, 0), Err(LimitRefusal::Work));
-            assert_eq!(
-                m.used(),
-                WriteWork::new(2 + 2 * TURN.values, 0),
-                "a refused unit committed"
-            );
-            let held = m.allocate(6).unwrap();
-            let before = (m.requested_bytes(), m.live_bytes(), m.peak_bytes());
-            assert_eq!(m.allocate(9).unwrap_err(), LimitRefusal::TooLarge);
-            assert_eq!(m.allocate(3).unwrap_err(), LimitRefusal::Storage);
-            assert_eq!(m.allocate(5).unwrap_err(), LimitRefusal::Requested);
-            assert_eq!(
-                (m.requested_bytes(), m.live_bytes(), m.peak_bytes()),
-                before,
-                "a refused request committed"
-            );
-            drop(held);
-            assert_eq!(m.live_bytes(), 0);
-        }
-
         /// A recorded grant its session has no permit record for is refused
         /// [`LimitRefusal::Unrecorded`] after its live capacity was reserved
         /// ([`Storage::reserve`]): the reservation is returned, never kept,
@@ -2848,55 +2753,6 @@ mod tests {
             assert_eq!(m.live_bytes(), 0);
             drop(m);
             assert_eq!(session.finish().err(), Some(record::Incomplete::Exhausted));
-        }
-
-        /// The quantum bounds a unit in every turn, the allowance what one
-        /// turn admits: a unit beyond the quantum is impossible
-        /// ([`LimitRefusal::QuantumTooSmall`], which stops) whatever the
-        /// turn grants; one within the quantum and beyond what the turn
-        /// still allows waits ([`LimitRefusal::Turn`], the next turn), a
-        /// turn granting nothing included; a grant beyond the quantum is
-        /// held to it.
-        #[test]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the policy's axioms are driven by direct admissions"
-        )]
-        fn the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn() {
-            let mut m = Limits::turns();
-            assert_eq!(
-                m.traverse(TURN.values + 1, 0),
-                Err(LimitRefusal::QuantumTooSmall)
-            );
-            assert_eq!(LimitRefusal::QuantumTooSmall.recovery(), Recovery::Stop);
-            m.turn_with(WriteWork::new(0, 0));
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
-            assert_eq!(LimitRefusal::Turn.recovery(), Recovery::NextTurn);
-            m.turn_with(ONE);
-            m.traverse(1, 0).unwrap();
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
-            m.turn_with(WriteWork::new(u64::MAX, u64::MAX));
-            assert_eq!(m.remaining(), TURN, "a grant beyond the quantum");
-            m.exhaust();
-            assert_eq!(m.remaining(), WriteWork::new(0, 0));
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
-            m.open();
-            m.traverse(TURN.values + 1, 0).unwrap();
-        }
-
-        /// Refusal precedence is fixed: an exhausted lifetime allowance is
-        /// named before the turn's, and before an impossible unit.
-        #[test]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the policy's axioms are driven by direct admissions"
-        )]
-        fn lifetime_exhaustion_precedes_the_turn_and_the_quantum() {
-            let mut m = Limits::new(1, u64::MAX, u64::MAX);
-            m.turn_with(ONE);
-            m.traverse(1, 0).unwrap();
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
-            assert_eq!(m.traverse(TURN.values + 1, 0), Err(LimitRefusal::Work));
         }
 
         /// A requested-bytes ceiling is only ever lowered, and a share's
@@ -2949,17 +2805,14 @@ mod tests {
             }
         }
 
-        /// Cleanup completes whatever the foreground's state: with the
-        /// lifetime work allowance spent, and again past the deadline, a
-        /// cleanup admission is admitted where a foreground one is refused,
-        /// accounted apart ([`Limits::cleanup_used`]) and never taken from
-        /// the foreground's remainder.
+        /// The instrument's simulated expiry refuses foreground work but
+        /// never cleanup.
         #[test]
         #[expect(
             clippy::disallowed_methods,
             reason = "the policy's axioms are driven by direct admissions"
         )]
-        fn cleanup_is_never_refused_for_the_foreground() {
+        fn cleanup_is_never_refused_for_the_simulated_deadline() {
             let mut m = Limits::new(1, u64::MAX, u64::MAX);
             m.traverse(1, 0).unwrap();
             assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Work));
@@ -2982,51 +2835,6 @@ mod tests {
                 WriteWork::new(0, u64::MAX),
                 "cleanup was taken from the foreground's remainder"
             );
-        }
-
-        /// Cleanup is scheduled as every unit is: a unit beyond the quantum
-        /// is impossible, and cleanup spends the running turn's allowance,
-        /// the one turn it shares with foreground work, so a spent turn
-        /// refuses both for the next.
-        #[test]
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the policy's axioms are driven by direct admissions"
-        )]
-        fn cleanup_spends_the_turn_and_is_held_to_the_quantum() {
-            let mut m = Limits::turns();
-            assert_eq!(
-                m.reclaim(TURN.values + 1, 0),
-                Err(LimitRefusal::QuantumTooSmall)
-            );
-            m.turn_with(ONE);
-            m.reclaim(1, 0).unwrap();
-            assert_eq!(m.reclaim(1, 0), Err(LimitRefusal::Turn));
-            assert_eq!(m.traverse(1, 0), Err(LimitRefusal::Turn));
-            m.turn_with(ONE);
-            m.traverse(1, 0).unwrap();
-            assert_eq!(m.reclaim(1, 0), Err(LimitRefusal::Turn));
-            assert_eq!(m.cleanup_used(), ONE);
-            assert_eq!(m.used(), WriteWork::new(2, 0));
-        }
-
-        /// A unit admitted through the cleanup capability is the policy's
-        /// cleanup: under a policy of no foreground work at all it is
-        /// admitted, through the route, and charged to the cleanup account;
-        /// a foreground unit beside it is refused.
-        #[test]
-        fn a_unit_under_the_cleanup_capability_is_charged_as_cleanup() {
-            use crate::bounded::decode::construction::reclamation::Cleanup;
-            use crate::bounded::{Caller, Unit};
-            let unit = Unit::new(Caller, 1, 8);
-            let mut m = Limits::new(0, 0, u64::MAX);
-            assert!(
-                unit.admit(&mut Cleanup::new(&mut m)).is_ok(),
-                "cleanup was charged to the foreground"
-            );
-            assert_eq!(m.cleanup_used(), WriteWork::new(1, 8));
-            assert!(unit.admit(&mut m).is_err());
-            assert_eq!(m.used(), m.cleanup_used());
         }
 
         /// The history names the account each unit was charged to: a

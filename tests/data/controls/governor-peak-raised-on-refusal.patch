@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -781,4 +781,6 @@
+@@ -780,4 +780,6 @@
              ) {
                  Ok(_) => {
 +                    // Planted: the peak raised when reserved, before every level grants.

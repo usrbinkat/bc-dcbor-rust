@@ -133,9 +133,13 @@ typed-decode-profile-ignored	tests/data/controls/typed-decode-profile-ignored.pa
 # allowance taken for the quantum, so a turn granting nothing refuses an
 # admissible unit as impossible; and a share's live ceiling left above its
 # family's.
-authority-turn-raises-lifetime	tests/data/controls/authority-turn-raises-lifetime.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::turns_never_raise_lifetime_authorization	-	failed	turns raised the lifetime allowance
-authority-refusal-commits	tests/data/controls/authority-refusal-commits.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_refused_admission_commits_nothing	-	failed	a refused unit committed
-authority-quantum-is-allowance	tests/data/controls/authority-quantum-is-allowance.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn	-	failed	left: Err(QuantumTooSmall)
+authority-cleanup-total-refuses	tests/data/controls/authority-cleanup-total-refuses.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_cleanup_never_refuses_for_its_own_total	-	failed	a cleanup unit was refused for its total
+authority-cleanup-total-refuses-governed	tests/data/controls/authority-cleanup-total-refuses.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_cleanup_never_refuses_for_its_own_total	-	failed	a cleanup unit was refused for its total
+authority-turn-raises-lifetime	tests/data/controls/authority-turn-raises-lifetime.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_turns_never_raise_lifetime_authorization	-	failed	turns raised the lifetime allowance
+authority-turn-raises-lifetime-governed	tests/data/controls/authority-turn-raises-lifetime.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_turns_never_raise_lifetime_authorization	-	failed	turns raised the lifetime allowance
+authority-refusal-commits	tests/data/controls/authority-refusal-commits.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_a_refused_admission_commits_nothing	-	failed	a refused unit committed
+authority-quantum-is-allowance	tests/data/controls/authority-quantum-is-allowance.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn	-	failed	left: Err(QuantumTooSmall)
+authority-quantum-is-allowance-governed	tests/data/controls/authority-quantum-is-allowance.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn	-	failed	left: Err(QuantumTooSmall)
 authority-share-unclamped	tests/data/controls/authority-share-unclamped.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::no_ceiling_is_raised_by_a_builder_or_a_share	-	failed	unwrap_err()` on an `Ok` value
 authority-unrecorded-grant-kept	tests/data/controls/authority-unrecorded-grant-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::an_unrecorded_grant_keeps_nothing_it_reserved	-	failed	an unrecorded grant kept what it reserved
 # The cleanup admission seam (policy.rs `Authority::reclaim`, `Limits::admit`;
@@ -143,9 +147,11 @@ authority-unrecorded-grant-kept	tests/data/controls/authority-unrecorded-grant-k
 # foreground's lifetime ceiling; the deadline refusing cleanup; the cleanup
 # capability admitting its units as the policy's foreground work; and the
 # history storing a cleanup unit as foreground work.
-cleanup-lifetime-gated	tests/data/controls/cleanup-lifetime-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the lifetime allowance
-cleanup-deadline-gated	tests/data/controls/cleanup-deadline-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the deadline
-cleanup-charged-foreground	tests/data/controls/cleanup-charged-foreground.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_unit_under_the_cleanup_capability_is_charged_as_cleanup	-	failed	cleanup was charged to the foreground
+cleanup-lifetime-gated	tests/data/controls/cleanup-lifetime-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the lifetime allowance
+cleanup-lifetime-gated-governed	tests/data/controls/cleanup-lifetime-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_cleanup_is_never_refused_for_the_foreground	-	failed	cleanup was refused for the lifetime allowance
+cleanup-deadline-gated	tests/data/controls/cleanup-deadline-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::cleanup_is_never_refused_for_the_simulated_deadline	-	failed	cleanup was refused for the deadline
+cleanup-charged-foreground	tests/data/controls/cleanup-charged-foreground.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_a_unit_under_the_cleanup_capability_is_charged_as_cleanup	-	failed	cleanup was charged to the foreground
+cleanup-charged-foreground-governed	tests/data/controls/cleanup-charged-foreground.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_a_unit_under_the_cleanup_capability_is_charged_as_cleanup	-	failed	cleanup was charged to the foreground
 history-reclaim-as-work	tests/data/controls/history-reclaim-as-work.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::the_history_names_each_units_account	-	failed	a cleanup unit was recorded as foreground work
 # Shared governance (governance.rs), one plant each: the operation's plan
 # committed before the group decides; the group's admitting flag taken
@@ -157,8 +163,10 @@ history-reclaim-as-work	tests/data/controls/history-reclaim-as-work.patch	native
 governor-operation-commits-first	tests/data/controls/governor-operation-commits-first.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::the_group_work_ceiling_is_aggregate	-	failed	a refused unit committed
 governor-flag-ignored	tests/data/controls/governor-flag-ignored.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_contended_group_admission_commits_nothing	-	failed	left: Ok(())
 governor-permit-group-unreleased	tests/data/controls/governor-permit-group-unreleased.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::live_storage_is_held_at_both_levels	-	failed	left: (8, 0)
-governor-storage-refusal-kept	tests/data/controls/governor-storage-refusal-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::live_storage_is_held_at_both_levels	-	failed	a group refusal kept the operation's reservation
-governor-peak-raised-on-refusal	tests/data/controls/governor-peak-raised-on-refusal.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::live_storage_is_held_at_both_levels	-	failed	a group refusal raised a peak
+governor-storage-refusal-kept	tests/data/controls/governor-storage-refusal-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_a_later_refusal_returns_the_reservation	-	failed	a later refusal kept the reservation
+governor-storage-refusal-kept-limits	tests/data/controls/governor-storage-refusal-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_a_later_refusal_returns_the_reservation	-	failed	a later refusal kept the reservation
+governor-peak-raised-on-refusal	tests/data/controls/governor-peak-raised-on-refusal.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::governed_a_later_refusal_returns_the_reservation	-	failed	a later refusal raised a peak
+governor-peak-raised-on-refusal-limits	tests/data/controls/governor-peak-raised-on-refusal.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::conformance::limits_a_later_refusal_returns_the_reservation	-	failed	a later refusal raised a peak
 governor-cleanup-gated	tests/data/controls/governor-cleanup-gated.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::cleanup_is_never_refused_for_either_ceiling	-	failed	cleanup was refused for a lifetime ceiling
 governor-terminal-group-uncounted	tests/data/controls/governor-terminal-group-uncounted.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_terminal_policy_counts_its_cleanup_and_allocates_nothing	-	failed	terminal cleanup went uncounted on the group
 governor-terminal-operation-uncounted	tests/data/controls/governor-terminal-operation-uncounted.patch	native	nightly	dcbor	all	fast	lib	bounded::governance::tests::a_terminal_policy_counts_its_cleanup_and_allocates_nothing	-	failed	terminal cleanup went uncounted on the operation

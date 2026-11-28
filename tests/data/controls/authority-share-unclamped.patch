@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -1165,7 +1165,8 @@
+@@ -1407,7 +1407,8 @@
      pub fn share_within(&self, ceilings: Ceilings) -> Self {
          let mut shared = Self::with_counters(
              Ceilings {

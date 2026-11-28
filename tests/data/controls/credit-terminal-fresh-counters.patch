@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -2045,7 +2045,9 @@
+@@ -2187,7 +2187,9 @@
  // clone of the permit's counters, never a reference to `permit`.
  unsafe impl super::TerminalAllocator for Limits {
      fn terminal(permit: &Reservation) -> Self {

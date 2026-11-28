@@ -1,10 +1,12 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -277,3 +277,6 @@
-         let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
--        self.ceilings.foreground_after(self.foreground(), work)?;
+@@ -268,3 +268,8 @@
+     pub(crate) fn plan_work(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
+-        let foreground = self.ceilings.foreground_after(self.foreground, work)?;
 +        // Planted: a running turn admits past the lifetime allowance.
-+        if self.turn.is_none() {
-+            self.ceilings.foreground_after(self.foreground(), work)?;
-+        }
++        let foreground = if self.turn.is_some() {
++            self.foreground.checked_then(work).ok_or(LimitRefusal::Work)?
++        } else {
++            self.ceilings.foreground_after(self.foreground, work)?
++        };
          let turn = self.turn_after(work)?;

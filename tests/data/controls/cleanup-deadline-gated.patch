@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -1708,5 +1708,6 @@
+@@ -1868,5 +1868,6 @@
          let now = self.clock;
          self.clock = self.clock.saturating_add(1);
 -        if call.is_foreground() && self.expiry.is_some_and(|expiry| now >= expiry) {

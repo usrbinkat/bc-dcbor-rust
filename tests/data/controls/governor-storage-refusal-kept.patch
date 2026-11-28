@@ -1,6 +1,6 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -837,5 +837,6 @@
+@@ -836,5 +836,6 @@
      /// what [`Storage::reserve`] added, allocation-free and non-unwinding.
      fn drop(&mut self) {
 -        self.storage.live.fetch_sub(self.bytes, Ordering::AcqRel);

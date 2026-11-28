@@ -1,0 +1,7 @@
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -285,3 +285,3 @@
+             foreground: self.foreground,
+-            cleanup: saturating_then(self.cleanup, work),
++            cleanup: self.cleanup.checked_then(work).ok_or(LimitRefusal::Work)?,
+             turn,

@@ -257,6 +257,16 @@ fn every_budget_family_has_one_fixture_entry_and_one_launch_identity() {
 /// other recording records into the default or its measured budget.
 const SIZED: &[(&str, &str, usize)] = &[
     ("src/bounded/policy/record.rs", "DEFAULT", 1),
+    (
+        "src/bounded/policy.rs",
+        "an_unrecorded_grant_keeps_nothing_it_reserved",
+        1,
+    ),
+    (
+        "src/bounded/policy/conformance.rs",
+        "reservation_pressure",
+        1,
+    ),
     ("tests/support/lifecycle.rs", "measured", 1),
     ("tests/support/budgets.rs", "MEASURING", 1),
     (
