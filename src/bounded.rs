@@ -1195,8 +1195,8 @@ pub(crate) fn reserved<A: Allocator, T>(
 /// One held obligation, the one custody of held credit every holder keeps:
 /// its originating family's capability, the identity its admission minted,
 /// its kind and the work it still holds. Its settlements are this type's
-/// alone: a partial spend ([`Self::consume`]), the remainder spent
-/// ([`Self::spend`]) or forfeited ([`Self::forfeit`]), each recorded into
+/// alone: a partial spend (`Self::consume`), the remainder spent
+/// (`Self::spend`) or forfeited (`Self::forfeit`), each recorded into
 /// its origin. Dropped unsettled, it forfeits what it still holds
 /// ([`Forfeit::Cancelled`]) into its origin: allocation-free and
 /// non-unwinding, so no holder's drop or terminal path leaves credit held
@@ -2070,7 +2070,7 @@ impl<T, P> Owned<T, P> {
     /// Make room for `additional` more elements, each growth an acquisition
     /// of `owner`, the custody that holds this vector. The owner is the
     /// custody's, not the vector's own: storing it here would take the
-    /// vector past one write extent ([`write_extent`]).
+    /// vector past one write extent (`write_extent`).
     pub fn reserve<A: Allocator<Permit = P>>(
         &mut self,
         additional: usize,

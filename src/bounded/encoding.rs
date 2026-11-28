@@ -49,7 +49,7 @@ mod proofs;
 /// An unordered map yields its entries one per instruction
 /// ([`Instruction::Entry`]), or hands the engine a cursor
 /// ([`Instruction::Entries`]) or, for a hash table, the table itself
-/// ([`Instruction::Buckets`]), whose buckets only the engine inspects, each
+/// (`Instruction::Buckets`), whose buckets only the engine inspects, each
 /// window of controls admitted first.
 /// References and representation must remain stable for the preparation borrow.
 /// Implementing this safe trait does not authorize transferring retained
@@ -1383,7 +1383,7 @@ impl<'a, P, O: Origin> Preparation<'a, P, O> {
     /// preparation refers to nothing, so the source it borrowed may be
     /// released while the preparation is still observed ([`Planned`]).
     /// The public entry: the cleanup capability minted over `a`
-    /// ([`reclamation::with_cleanup`]), then [`Self::reclaim_under`].
+    /// (`reclamation::with_cleanup`), then `Self::reclaim_under`.
     pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,
@@ -2173,7 +2173,7 @@ pub struct Shape {
     /// it makes: every `End` and omitted field included, each inspecting at
     /// most a head.
     pub instructions: u64,
-    /// The hash tables it enumerates ([`Instruction::Buckets`]).
+    /// The hash tables it enumerates (`Instruction::Buckets`).
     pub bucket_tables: u64,
     /// Their buckets, all together: every control admitted once.
     pub buckets: u64,
@@ -2958,7 +2958,7 @@ const INSPECTED: Rate<PreparationPlace> = Rate::new(PreparationPlace::Instructio
 const UNIT_VALUES: u64 = TURN.values;
 
 /// The bucket controls one window of a hash table's enumeration admits
-/// ([`buckets::BucketCursor`]): a quantum, the last window of a table
+/// (`buckets::BucketCursor`): a quantum, the last window of a table
 /// shorter. Windows are index-aligned.
 pub const BUCKET_WINDOW: usize = decode::construction::stable::QUANTUM;
 
@@ -3533,7 +3533,7 @@ where
 /// This preparation's custody ([`CustodySink`]): its own group, under the
 /// owner its bucket windows are acquisitions of (`None` until its first
 /// window makes it), holding each open window's acquisition bound
-/// ([`window_bindings`]) and its obligation ([`window_obligations`]); inside
+/// (`window_bindings`) and its obligation (`window_obligations`); inside
 /// it, each independently owning component's group, in field order: its six
 /// arenas ([`Storage::observe_custody`]), its dynamic engine's three, its
 /// text continuation's ([`TextContinuation::observe_custody`]), and, while
@@ -3572,7 +3572,7 @@ impl<P, O: Origin> Custodial<P> for Preparation<'_, P, O> {
 impl<P, O: Origin> Drop for Preparation<'_, P, O> {
     /// A preparation dropped with a window open is its windows' destruction:
     /// each window's credit forfeited and its acquisition ended, with no
-    /// policy performing it ([`forfeit_windows`]), before the arenas drop.
+    /// policy performing it (`forfeit_windows`), before the arenas drop.
     fn drop(&mut self) {
         let malformed = windows_malformed(&self.windows, self.cursors.len());
         forfeit_windows(&mut self.windows, Performer::None, Forfeit::Cancelled);
@@ -3718,7 +3718,7 @@ impl<P> RetiringPrepared<P> {
     /// Release one of the plan's allocations and its permit, a release its
     /// growth paid for; once none is held, the call admits the completion it
     /// reports as `Done`, under the cleanup capability minted over `a`
-    /// ([`reclamation::with_cleanup`]): admitted as cleanup, never as
+    /// (`reclamation::with_cleanup`): admitted as cleanup, never as
     /// foreground work.
     pub fn reclaim_step<A: Allocator<Permit = P>>(
         &mut self,
@@ -4050,7 +4050,7 @@ unsafe impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
     /// holder has open ([`CustodySink`]): the source value's, behind its
     /// handle once the record holds it, under the owner its own record
     /// carries (its [`Custodial`] traversal); and, once initialization
-    /// completes and while the record holds it ([`holds_preparation`]), the
+    /// completes and while the record holds it (`holds_preparation`), the
     /// preparation's (its [`Custodial`] traversal). The preparation's
     /// prefix before that is resource-free, so it owns nothing; once dropped
     /// it holds nothing. Read-only; whole exactly when every part's
@@ -4339,7 +4339,7 @@ where
     /// acquisition. Nothing to settle.
     fn settle(&mut self, _: Performer) {}
 
-    /// The record's observation ([`Planned::detail`]), the source the task
+    /// The record's observation (`Planned::detail`), the source the task
     /// still holds observed while the record's source field is unwritten.
     fn detail(&mut self, record: Observed<'_, 's, Self, A>) -> Self::Detail {
         let held = self.source.as_mut().map(TypedValue::detail);

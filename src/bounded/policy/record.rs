@@ -351,7 +351,7 @@ fn at(index: u64) -> usize {
     }
 }
 
-/// A recording session ([`self`]): made before the run, with its capacity,
+/// A recording session: made before the run, with its capacity,
 /// and held by its recorder alone until [`Self::finish`]. Not `Clone`: one
 /// handle, the one [`Self::finish`] consumes.
 pub struct Session {
@@ -409,7 +409,7 @@ impl Session {
     }
 
     /// Every observation of the session, in slot order, once nothing else
-    /// holds it ([`self`]): refused while a family, permit, held obligation
+    /// holds its store: refused while a family, permit, held obligation
     /// or owner of the session lives, when the session is invalid, or when
     /// a claimed slot was never completed.
     pub fn finish(self) -> Result<Vec<Observed>, Incomplete> {

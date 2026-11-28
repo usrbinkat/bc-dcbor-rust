@@ -283,7 +283,7 @@ impl<'c, O: Origin> BucketCursor<'c, O> {
     }
 
     /// The obligation this cursor's custody holds, if any: its window's, a
-    /// nonzero remainder reported once ([`window_obligation`]). A fragment,
+    /// nonzero remainder reported once (`window_obligation`). A fragment,
     /// never a complete observation: emitted only inside the group its
     /// holder has open as `begin(Some(owner.id()))` of the very [`Owner`]
     /// the holder stores and passes to [`Self::step`], the owner every
@@ -321,7 +321,7 @@ impl<'c, O: Origin> BucketCursor<'c, O> {
     /// the performing budget ([`Budget::performer`]):
     /// [`Forfeit::EnumerationComplete`] when its map's declared count was
     /// reached, [`Forfeit::Cancelled`] when an error or cleanup ends it; the
-    /// window's acquisition then ended ([`super::close_window`]). Admits nothing;
+    /// window's acquisition then ended (`super::close_window`). Admits nothing;
     /// later calls return [`BucketStep::Finished`].
     pub fn end(&mut self, by: Performer, rule: Forfeit) {
         close_window(self.window, self.acquisition, Some(rule), by);
@@ -340,7 +340,7 @@ impl<'c, O: Origin> BucketCursor<'c, O> {
     /// A window's controls are one acquisition of `owner`, the custody that
     /// holds the cursor: its identity minted ([`Budget::acquisition`]),
     /// then the call's value and the controls admitted, the controls held
-    /// ([`Rate::admit_held`]); a refused admission keeps the acquisition
+    /// (`Rate::admit_held`); a refused admission keeps the acquisition
     /// for the retry without holding credit. A call within a window admits its
     /// value alone and mints nothing.
     pub fn step<'a, B: Budget<Origin = O>>(

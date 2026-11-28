@@ -28,12 +28,12 @@ use crate::bounded::{
 /// so a place a binding keeps within the value stays valid across steps.
 ///
 /// The driver keeps the value's construction's pending acquisition credit
-/// ([`Pending`]) beside the session, outside the value, and supplies it to
+/// beside the session, outside the value, and supplies it to
 /// every step's root context. Its owner is made by the first acquisition
-/// entry, under whatever budget performs it ([`Pending::deferred`]), and
+/// entry, under whatever budget performs it, and
 /// every later entry is validated against it. Cleanup's first step, and
-/// dropping the driver, settle that credit explicitly by origin
-/// ([`Pending::settle_all`]). Dropping the driver runs no other cleanup:
+/// dropping the driver, settle that credit explicitly by origin.
+/// Dropping the driver runs no other cleanup:
 /// whatever the value holds is reclaimed only by [`Self::reclaim_step`] to
 /// `Done`.
 pub struct Standalone<'d, 'a, 'v, T: InPlace<A>, A: Allocator> {
@@ -57,8 +57,7 @@ impl<'d, 'a, 'v, T: InPlace<A>, A: Allocator> Standalone<'d, 'a, 'v, T, A> {
     /// whatever it holds, the session starts unbound, and no credit is
     /// pending.
     /// A root declaring a dispatch depth past the limit fails to compile here
-    /// (E0080), as a scope record's allocation does
-    /// ([`super::reclamation::admitted_depth`]).
+    /// (E0080), as a scope record's allocation does.
     pub fn new(document: &'d Document<'a, A::Permit>, value: &'v mut MaybeUninit<T>) -> Self {
         const { super::reclamation::admitted_depth::<T, A>() };
         Self {
@@ -111,8 +110,8 @@ impl<'d, 'a, 'v, T: InPlace<A>, A: Allocator> Standalone<'d, 'a, 'v, T, A> {
     }
 
     /// One unit of cleanup ([`in_place::reclaim`]), under the cleanup
-    /// capability minted here over `a` ([`super::reclamation::Cleanup`],
-    /// through [`super::reclamation::with_cleanup`]), the driver's cleanup
+    /// capability minted here over `a` ([`super::reclamation::Cleanup`]),
+    /// the driver's cleanup
     /// dispatch. The pending credit is settled first, by origin, under this
     /// step's performer: the first cleanup step is cleanup's entry and
     /// settles it; every later one, and a retry of a refused one, finds it
@@ -209,7 +208,7 @@ impl<T: InPlace<A>, A: Allocator> Resumable<A> for Standalone<'_, '_, '_, T, A> 
 /// stores (`None` before its first acquisition entry made it, when it holds
 /// nothing), every acquisition of the value bound under it: the pending's
 /// bound acquisition and held obligations, as its own group, the one report
-/// of whether an acquisition is bound ([`Pending::observe_custody`]), and the
+/// of whether an acquisition is bound, and the
 /// value's permits ([`in_place::observe_permits`], whose independently
 /// owning parts nest their own groups). The session's state holds no
 /// obligation. Read-only; the completeness of every part, combined.

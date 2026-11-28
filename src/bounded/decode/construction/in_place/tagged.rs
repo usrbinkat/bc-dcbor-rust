@@ -85,7 +85,7 @@ const fn contract<U, P>() -> stable::Contract<Meta<U>, Meta<U>, P> {
 
 /// The construction state of a tagged value whose untagged payload's state
 /// is `U`, with permits of `P`: its metadata, once installed, and the ticket
-/// of that installation's acquisition while it is pending ([`Ticket`]), whose
+/// of that installation's acquisition while it is pending, whose
 /// credit is the operation's. Only the tagged engine reads or changes it.
 pub struct State<U, P> {
     meta: Option<Installed<Meta<U>, P>>,

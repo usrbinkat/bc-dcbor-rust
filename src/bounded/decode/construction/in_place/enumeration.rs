@@ -143,7 +143,7 @@ const fn contract<V, P>() -> stable::Contract<Meta<V>, Meta<V>, P> {
 
 /// The construction state of an enum whose payloads' states are `V`, with
 /// permits of `P`: its metadata, once installed; the ticket of that
-/// installation's acquisition while it is pending ([`Ticket`]), whose credit
+/// installation's acquisition while it is pending, whose credit
 /// is the operation's; and the variant index the selection has reached. Only
 /// the enum engine reads or changes it.
 pub struct State<V, P> {

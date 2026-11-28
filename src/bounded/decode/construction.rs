@@ -44,7 +44,7 @@ pub use reclamation::{
 
 /// One construction step's whole input: the document, the node it builds
 /// from, the slot of the value it builds, and the construction's pending
-/// acquisition ([`stable::Pending`]), held together. Fields are private and
+/// acquisition, held together. Fields are private and
 /// nothing public takes a document, a slot and a pending acquisition apart:
 /// a root context is minted only by the engine (`Self::root`, from the
 /// document and the pending acquisition the operation owns, or the

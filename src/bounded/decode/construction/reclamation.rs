@@ -996,7 +996,7 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// overhead to the maximum child's bound, using saturating arithmetic.
     /// The default is valid only for leaf bindings with no child dispatch.
     /// Understating this bound violates the unsafe implementation contract.
-    /// A root past [`MAX_DISPATCH_DEPTH`] fails to compile ([`admitted_depth`]);
+    /// A root past [`MAX_DISPATCH_DEPTH`] fails to compile (`admitted_depth`);
     /// an understated declaration is refused at run time at the dispatch
     /// that exceeds it (`Depth`): construction is refused
     /// [`BoundedError::PlanMismatch`], nothing changed; a stepped cleanup is
@@ -1050,7 +1050,7 @@ pub unsafe trait Reclaim<A: Allocator>: Sized {
     /// allocations, its child records' blocks, and every live child's own.
     /// A binding opens no group of its own: the root holding it brackets
     /// these permits in its owner's group, since every acquisition a binding
-    /// makes is bound under that root's pending ([`stable::Pending`]). A
+    /// makes is bound under that root's pending (`stable::Pending`). A
     /// binding holds no obligation (its credit is the root pending's) and
     /// reports none; a state that holds an independently owning custody of
     /// its own (an arena with its own pending) reports that custody as a
@@ -1235,7 +1235,7 @@ enum Front {
 }
 
 /// The scope queue's drain state, what its next steps read
-/// ([`Reclaimer::step`]): the remaining declared calls of the record whose
+/// (`Reclaimer::step`): the remaining declared calls of the record whose
 /// cleanup is active, if one is; the records queued behind it; and whether
 /// the next removal's unit is admitted and retained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1245,7 +1245,7 @@ pub struct QueuePosition {
     pub removal_admitted: bool,
 }
 
-/// An observation of a scope queue ([`Reclaimer::queue_position`]): none
+/// An observation of a scope queue (`Reclaimer::queue_position`): none
 /// when the operation holds no scope reference, contended when another
 /// caller was stepping the queue, else its drain state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

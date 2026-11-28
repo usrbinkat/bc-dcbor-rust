@@ -262,7 +262,7 @@ pub const fn unit(bytes: usize) -> ResourceBound {
 /// admission ([`admit`]).
 const ADMITTED: Scan<Caller> = Scan::new(Caller, 1);
 
-/// Admit one unit of one value and `bytes` bytes ([`ADMITTED`]): how a
+/// Admit one unit of one value and `bytes` bytes: how a
 /// binding outside this crate admits the work it reports, through the one
 /// route, so its admission is observed ([`crate::bounded::Credit::Admit`])
 /// as every engine admission is. Any budget: a construction step's policy,

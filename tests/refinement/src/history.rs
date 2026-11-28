@@ -251,7 +251,7 @@ impl History {
 
     /// The same replay and exact divergence rules as [`crate::settled`],
     /// each checkpoint reconstructed in one working snapshot as the replay
-    /// reaches it and lent to the check ([`Replay`]), never copied.
+    /// reaches it and lent to the check (`Replay`), never copied.
     pub fn settled(&self, observed: &[crate::Observed]) -> Result<(), crate::Divergence> {
         crate::machine::settled_with(observed, &mut Replay::new(&self.deltas))
     }

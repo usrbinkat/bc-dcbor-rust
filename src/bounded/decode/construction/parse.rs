@@ -917,7 +917,7 @@ impl<'s, I: DecodeInput<A>, A: Allocator> OwnedDocument<'s, I, A> {
         self.record.scope()
     }
 
-    /// The document's record observed ([`Parsed::detail`]): what a holder
+    /// The document's record observed: what a holder
     /// stepping its cleanup (a construction's record or task) reads of it.
     /// `&mut self` excludes every view of the document meanwhile; nothing is
     /// changed, admitted or allocated.
@@ -942,7 +942,7 @@ impl<I: DecodeInput<A>, A: Allocator> Custodial<A::Permit> for OwnedDocument<'_,
 /// parse ([`cursor::retained_decode_bound`]), the parser's release and its
 /// last cleanup unit included; the arena's transfer, its storage's parts
 /// then its owner's identity, one unit each
-/// ([`DocumentArena::transfer_work`]);
+/// (`DocumentArena::transfer_work`);
 /// publication; and the record's own cleanup: its transition, the arena's
 /// two parts and the input slot emptied by [`OwnedDocument::into_input`] or
 /// by the record's initialization. The input is held by the record but

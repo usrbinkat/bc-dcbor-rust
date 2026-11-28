@@ -233,10 +233,10 @@ pub unsafe trait Task<'s, A: Allocator>: Sized {
 /// Allocation-free observation of an operation: whether its record is
 /// allocated and how much of its prefix is written; whether it is cancelling
 /// or finished; how many records its scope holds and its scope queue's drain
-/// state, which the queue's steps read ([`ScopeRef::queue_position`]); and
+/// state, which the queue's steps read; and
 /// its task's detail. Where its record's acquisition stands is not observed:
 /// cleanup cancels the acquisition at every stage without admitting
-/// anything ([`Acquisition::cancel_into`]), so no stage changes what its
+/// anything, so no stage changes what its
 /// cleanup admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position<D> {
@@ -273,7 +273,7 @@ pub enum PrefixClass {
 /// cancels it before its cleanup, which runs alike from either
 /// ([`Operation::cancel`], [`Operation::step`]), and its drop reads nothing
 /// of it. Nor is where the record's acquisition stands: every cleanup step
-/// cancels it first, admitting nothing ([`Acquisition::cancel_into`]).
+/// cancels it first, admitting nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub struct OperationClass<C> {
@@ -394,7 +394,7 @@ impl<'s, K: Task<'s, A>, A: TerminalAllocator> Operation<'s, K, A> {
 /// acquisition token's (the record's write and release held toward a block
 /// not yet granted, under the token's owner); its record, once allocated
 /// (the block and the value's custody under the owner the record stores);
-/// and the task's outside the record ([`Task::observe_custody`]). Read-only;
+/// and the task's outside the record. Read-only;
 /// the completeness of every part, combined.
 impl<'s, K: Task<'s, A>, A: TerminalAllocator> Custodial<A::Permit> for Operation<'s, K, A> {
     fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {

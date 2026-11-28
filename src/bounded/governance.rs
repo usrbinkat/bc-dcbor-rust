@@ -3,14 +3,13 @@
 //! ([`OperationBudget`]) under its own ceilings, quantum and turns.
 //!
 //! One accounting core decides every admission: the operation's
-//! [`Authority`] plans it (its ceilings, its quantum, its turn and the fixed
+//! accounting authority plans it (its ceilings, its quantum, its turn and the fixed
 //! refusal precedence), the group commits it against the group's ceilings,
 //! and only then does the operation commit its plan. So a refusal at either
 //! level commits nothing at either level, and no second implementation of
-//! the core exists. The group's checks are the core's own
-//! ([`Ceilings::foreground_after`], [`Ceilings::requested_after`]), and
-//! each level's live storage is the one implementation of it
-//! ([`Storage`]): both levels reserve, and both keep only once both have
+//! the core exists. The group's foreground and request checks are the core's own,
+//! and each level's live storage uses the same implementation:
+//! both levels reserve, and both keep only once both have
 //! granted.
 //!
 //! The group's foreground admissions are nonblocking: one admission checks
@@ -21,8 +20,8 @@
 //! is therefore decided against committed totals alone: classification is
 //! deterministic. Cleanup ([`Releasing::reclaim`]) never takes the flag: it
 //! is never refused for either level's lifetime ceilings, and the group
-//! counts it apart, never refusing, each quantity one wait-free addition
-//! ([`Count`]). A terminal policy ([`super::TerminalAllocator`]) admits every
+//! counts it apart, never refusing, each quantity one wait-free addition.
+//! A terminal policy ([`super::TerminalAllocator`]) admits every
 //! unit as cleanup of its permit's operation and group, counted the same
 //! way, so a scope drained after its scheduler has gone is still counted.
 //!
@@ -30,7 +29,7 @@
 //! operation's standing: a cancellation of the operation or of its whole
 //! group ([`Cancellation`]), sticky, refuses it [`LimitRefusal::Cancelled`];
 //! then, under `std`, the operation's monotonic deadline
-//! ([`OperationBudget::deadline`]) refuses it [`LimitRefusal::Deadline`].
+//! (`OperationBudget::deadline`) refuses it [`LimitRefusal::Deadline`].
 //! Both stop the operation; neither refuses its cleanup, which returns what
 //! the operation holds.
 //!
@@ -315,8 +314,8 @@ impl Governor {
 }
 
 /// One operation's budget within its group ([`Governor::operation`]): its
-/// own ceilings, quantum and turns, decided by the accounting core
-/// ([`Authority`]), each admission then committed against the group's
+/// own ceilings, quantum and turns, decided by the accounting core,
+/// each admission then committed against the group's
 /// ceilings. Used by one operation at a time; its permits may move to and be
 /// released on other threads.
 pub struct OperationBudget {
@@ -352,7 +351,7 @@ impl GovernedPermit {
 }
 
 impl Drop for GovernedPermit {
-    /// One release from each level's storage ([`Storage::release`]),
+    /// One release from each level's storage,
     /// allocation-free. Each was raised by these bytes, kept, before the
     /// permit existed ([`OperationBudget::allocate`]), and a permit's bytes
     /// never change, so neither release panics.
@@ -495,7 +494,7 @@ impl OperationBudget {
 impl Budget for OperationBudget {
     type Refusal = LimitRefusal;
 
-    /// Held to the operation's standing ([`Self::standing`]), planned on its
+    /// Held to the operation's cancellation and deadline, planned on its
     /// core, committed on the group, then on the operation.
     fn traverse(&mut self, values: u64, bytes: u64) -> Result<(), LimitRefusal> {
         let work = WriteWork::new(values, bytes);
@@ -575,11 +574,11 @@ impl Releasing for OperationBudget {
 }
 
 impl Allocator for OperationBudget {
-    /// The operation's standing ([`OperationBudget::standing`]), then its
+    /// The operation's cancellation and deadline, then its
     /// request checked by its core (its whole live ceiling, then its
     /// requested ceiling), then, holding the group's flag, the group's
-    /// ([`Ceilings::requested_after`]), then the operation's live capacity
-    /// and the group's ([`Storage::reserve`]): every check before any
+    /// request ceilings, then the operation's live capacity
+    /// and the group's: every check before any
     /// commitment, and each pending reservation returned by any later
     /// refusal, so a refusal commits nothing at either level. Both
     /// reservations are kept, each level's peak raised, only once both

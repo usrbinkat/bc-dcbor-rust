@@ -293,7 +293,7 @@ fn custody_text(custody: &Custody) -> String {
     text
 }
 
-/// A run's three recorded columns, each canonical ([`canonical`]): its
+/// A run's three recorded columns, each canonical (`canonical`): its
 /// observations, separated by `; `; its marks in boundary order, separated
 /// by `; `; its end.
 pub fn render_run(run: &Run) -> (String, String, String) {

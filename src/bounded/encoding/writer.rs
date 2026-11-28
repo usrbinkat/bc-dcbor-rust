@@ -545,7 +545,7 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> OwnedWriter<'s, I, T, A
     }
 
     /// The emission's progress and its plan record observed
-    /// ([`Planned::detail`]): the record's source is read through its
+    /// (`Planned::detail`): the record's source is read through its
     /// exclusive custody, its cleanup being the record's. `&mut self`
     /// excludes every borrowed chunk meanwhile; nothing is changed, admitted
     /// or allocated.

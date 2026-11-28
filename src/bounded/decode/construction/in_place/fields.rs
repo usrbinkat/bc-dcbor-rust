@@ -130,7 +130,7 @@ const fn contract<F, P>() -> stable::Contract<Meta<F, P>, Meta<F, P>, P> {
 
 /// The construction state of a field map whose fields' states are `F`, with
 /// permits of `P`: its metadata, once installed; the ticket of that
-/// installation's acquisition while it is pending ([`Ticket`]), whose credit
+/// installation's acquisition while it is pending, whose credit
 /// is the operation's; its phase; and the fields completed, in key order.
 /// Only the field engine reads or changes it; outside code can only start
 /// one.

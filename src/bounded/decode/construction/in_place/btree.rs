@@ -326,7 +326,7 @@ pub enum TreeObservation<K, V> {
 /// value's observations: the phase; each arena's execution observation, its
 /// physical stage and counts (the two index arenas, the nodes, the entry
 /// records; [`StoragePosition`], the admissions an arena's growth holds
-/// reported by its own custody traversal in [`permits_tree`], never here);
+/// reported by its own custody traversal in `permits_tree`, never here);
 /// the entries the map holds and
 /// the tree's height; a node allocated with its permit before it enters the
 /// node arena; the sort, planning and slot progress that fix every following

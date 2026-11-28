@@ -132,7 +132,7 @@ pub struct StringDecoder<'a, P, O: Origin> {
 /// A decode dropped with its acquisition still bound is that acquisition's
 /// destruction: the release it holds forfeited into its origin, then the
 /// acquisition ended, both with no policy performing them
-/// ([`StringDecoder::cancel_acquisition`]). Allocation-free, non-unwinding.
+/// (`StringDecoder::cancel_acquisition`). Allocation-free, non-unwinding.
 impl<P, O: Origin> Drop for StringDecoder<'_, P, O> {
     fn drop(&mut self) {
         self.cancel_acquisition(Performer::None);

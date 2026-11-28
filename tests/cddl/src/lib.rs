@@ -19,7 +19,7 @@
 //!
 //! # The value classes the domain reaches
 //!
-//! Every replacement [`kinds`] makes, so every class below at every map
+//! Every replacement `kinds` makes, so every class below at every map
 //! value and array element of every sample, and one level down:
 //!
 //! - both simple values dCBOR admits besides `null` (`false` via the

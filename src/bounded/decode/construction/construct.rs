@@ -458,7 +458,7 @@ unsafe impl<I: DecodeInput<A>, T: InPlace<A>, A: Allocator> Reclaim<A>
 /// cleanups are the record's, so their states, not only their presence, are
 /// observed. Whether an acquisition of the value's construction is bound is
 /// the record's custody's to report ([`CustodySink::bound`], from
-/// [`Pending::observe_custody`]), not its progress's.
+/// `Pending::observe_custody`), not its progress's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConstructDetail<N, O> {
     pub phase: Option<ConstructPhase>,
@@ -735,7 +735,7 @@ impl<'s, I: DecodeInput<A>, T: InPlace<A>, A: Allocator> TypedValue<'s, I, T, A>
         )
     }
 
-    /// The value's record observed ([`Constructed::detail`]): what a holder
+    /// The value's record observed: what a holder
     /// stepping its cleanup (an owned preparation's record or task) reads of
     /// it. `&mut self` excludes every reader of the value meanwhile; nothing
     /// is changed, admitted or allocated.

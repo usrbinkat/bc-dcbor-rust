@@ -76,9 +76,9 @@ enum State<T, P> {
 /// and solely owns those obligations, each settling into the family that
 /// admitted it; `holder` is the ticket of the acquisition under way. The
 /// pending's owner is the arena's: the arena is made with no budget, so its
-/// pending starts with its owner uninitialized ([`Pending::deferred`]), and
+/// pending starts with its owner uninitialized (`Pending::deferred`), and
 /// its first acquisition entry, under whatever budget performs it, ordinary
-/// or recording, makes the owner once ([`Pending::bind`]). An initialized
+/// or recording, makes the owner once (`Pending::bind`). An initialized
 /// owner is never replaced, even an ordinary one under a later recording
 /// budget: that pairing is refused at the entry
 /// ([`Budget::validate_owner`]), never adopted. Whether the owner is
@@ -139,7 +139,7 @@ pub struct StoragePosition {
 /// An arena's position as a holder that steps its cleanup only while it is
 /// unreleased reads it ([`Storage::held_position`]): its own position, and
 /// whether it holds no element, allocation, reservation or growth under way
-/// ([`Storage::is_released`]). A settled empty arena whose staging block's
+/// (`Storage::is_released`). A settled empty arena whose staging block's
 /// acquisition is under way is `Settled` but not released: its cleanup's
 /// entry settles that acquisition's credit. That acquisition is pending
 /// custody, which a refused step leaves admitted, so whether it is under way
@@ -165,7 +165,7 @@ impl Default for StoragePosition {
 
 /// How an arena's cleanup disposes of its settled elements: one admitted
 /// unit each ([`Storage::reclaim_step`], elements that drop), or all of them
-/// in one unit ([`Storage::reclaim_copy_step`], plain data).
+/// in one unit (`Storage::reclaim_copy_step`, plain data).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ElementCleanup {
     Dropped,
@@ -176,13 +176,13 @@ pub enum ElementCleanup {
 /// class admit the same units in the same order, stepped to their end.
 ///
 /// Read from the cleanup ([`Storage::reclaim_step`],
-/// [`Storage::reclaim_copy_step`]): a growth's block and allocation are
+/// `Storage::reclaim_copy_step`): a growth's block and allocation are
 /// released, and the pending custody settled, admitting nothing, so its
 /// stage and permits change no admission; a relocation, interrupted or
 /// complete, drains each element in a unit of its own, then resets in one
 /// admitted write; a settled arena drains each dropping element, or
 /// discards its plain data in one unit, then admits its completing
-/// transition. Whether it is released ([`Storage::is_released`]) changes
+/// transition. Whether it is released (`Storage::is_released`) changes
 /// nothing here: a released arena admits that transition as an empty one
 /// holding its allocation does. A holder that steps an arena only while it
 /// is not released reads that fact itself, in its own class.
@@ -206,7 +206,7 @@ pub enum Elements {
 }
 
 /// What a holder that steps an arena's cleanup only while the arena is not
-/// released ([`Storage::is_released`]) admits for it: its own class, and
+/// released (`Storage::is_released`) admits for it: its own class, and
 /// whether its completing transition is admitted. The arena is released as
 /// soon as its last allocation is: a relocation's reset leaves the empty
 /// arena, and a settled arena holding an allocation releases it in a unit
@@ -676,7 +676,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     /// owner (`None` while deferred, before the arena's first acquisition),
     /// the owner every one of its acquisitions names ([`CustodySink`]): the
     /// pending custody's own group, the one place a growth's credit is held
-    /// ([`Pending`], never inferred from the growth's stage), nested inside;
+    /// (`Pending`, never inferred from the growth's stage), nested inside;
     /// then each permit the arena physically owns, once each: the settled
     /// allocation's, a staged, ready or relocating growth's block's and its
     /// grown allocation's, a relocation's old allocation's, and a vacated
@@ -825,7 +825,7 @@ impl<T, P, O: Origin> Storage<T, P, O> {
 
     /// The settled arena, readable and writable in place; or, while its
     /// elements are relocating, one admitted unit of the relocation
-    /// ([`Self::relocate_step`]) and `None`. A growth staged beside a
+    /// (`Self::relocate_step`) and `None`. A growth staged beside a
     /// settled arena leaves it readable, and is never resumed here: only
     /// [`Self::reserve_step`] grows. So settling acquires nothing, and is
     /// bound on [`Releasing`]: cleanup steps it through its capability
@@ -1153,8 +1153,8 @@ impl<T, P, O: Origin> Storage<T, P, O> {
     /// changes nothing, so every later call settles nothing again.
     ///
     /// The public entry: the cleanup capability minted over `a`
-    /// ([`with_cleanup`]), so every unit is admitted as cleanup
-    /// ([`Releasing::reclaim`]), then [`Self::reclaim_under`].
+    /// (`with_cleanup`), so every unit is admitted as cleanup
+    /// ([`Releasing::reclaim`]), then `Self::reclaim_under`.
     pub fn reclaim_step<A: Allocator<Permit = P, Origin = O>>(
         &mut self,
         a: &mut A,

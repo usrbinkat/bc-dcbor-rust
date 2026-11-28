@@ -264,7 +264,7 @@ where
 /// read: the copy's cleanup drops the buffer whole whatever it holds, which
 /// the buffer's reduction states. Nor is whether the task still holds its
 /// scope reference: its cleanup admits the one unit that ends it whether or
-/// not it is held ([`release_scope`]), and the task gives it up only in the
+/// not it is held, and the task gives it up only in the
 /// step that finishes the operation, which the operation's class reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]

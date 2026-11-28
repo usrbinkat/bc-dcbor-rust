@@ -28,7 +28,7 @@ pub const TURN: WriteWork = WriteWork::new(3, 64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Why an admission was refused: the one refusal of the accounting core
-/// ([`Authority`]), each variant naming the allowance it exhausted, and
+/// (`Authority`), each variant naming the allowance it exhausted, and
 /// [`Self::recovery`] the one classification of what a caller does next.
 pub enum LimitRefusal {
     /// The current turn's quantum is spent; its lifetime allowance is not.
@@ -61,7 +61,7 @@ pub enum LimitRefusal {
     /// The fault schedule refused the call with this index.
     Scheduled(usize),
     /// A recorded family's session has no permit record left for the grant
-    /// ([`record`]): the run is no evidence, and nothing was granted.
+    /// ([`Session`]): the run is no evidence, and nothing was granted.
     Unrecorded,
 }
 
@@ -847,7 +847,7 @@ impl Drop for Reserved<'_> {
 /// its family's counters, and `word`, read by the family's mode, which is
 /// fixed while the family can issue or hold permits. An ordinary family's
 /// `word` is the full-width requested bytes. A recorded family's is the
-/// index of the permit's record in its session ([`record`]), which holds
+/// index of the permit's record in its session ([`Session`]), which holds
 /// its bytes, its identity and its lifecycle; the family is the counters'.
 pub struct Reservation {
     counters: Arc<Counters>,
@@ -905,7 +905,7 @@ pub enum TransferRefusal {
     /// The merged size does not fit in `u64`.
     Overflow,
     /// A recorded family's session has no permit record left for the
-    /// split's child ([`record`]).
+    /// split's child ([`Session`]).
     Unrecorded,
 }
 
@@ -1061,7 +1061,7 @@ impl Reservation {
 /// evidence claim may read them that way.
 ///
 /// A quantity whose update does not fit in `u64` saturates, reading
-/// `u64::MAX` from then on ([`Count`]), while the event's other quantities
+/// `u64::MAX` from then on, while the event's other quantities
 /// and ledgers may have advanced, and an admission
 /// reporting more held than it admitted changes no ledger; both set
 /// [`Self::violated`], sticky, so the ledgers are no longer claimed
@@ -1257,7 +1257,7 @@ impl core::fmt::Debug for AdmissionTrace {
 }
 
 /// The measurement and fault-injection instrument over the accounting core
-/// ([`Authority`]): its ceilings, totals and turns are the core's, and what
+/// (`Authority`): its ceilings, totals and turns are the core's, and what
 /// this type adds is the instrument's alone (the fault schedule, the
 /// admission clock, measurement restarts, the trace and the recording). The
 /// policy is used by one operation at a time; its reservations may move to
@@ -1347,7 +1347,7 @@ impl Limits {
         }
     }
 
-    /// A new family recorded in `session` ([`record`]), with the limits of
+    /// A new family recorded in `session` ([`Session`]), with the limits of
     /// [`Self::new`]: its permits are the session's records, and every
     /// observation of it, its shares and its terminal policies is published
     /// into the session's one order. The mode is a fact of the family's
@@ -1708,10 +1708,10 @@ impl Limits {
 
     /// This policy's own calls since construction or the last
     /// [`Self::measure`], each with its answer, as its recorded family's
-    /// session holds them, the one record of them ([`record`]); refused,
+    /// session holds them, the one record of them ([`Session`]); refused,
     /// naming why, for a family that records nothing or a session that
     /// cannot report them. Never panics, never an empty or short history:
-    /// the one read of a policy's history, which [`Self::view`] asserts.
+    /// the one read of a policy's history, which `Self::view` asserts.
     pub fn history(&self) -> Result<Vec<(Call, Answer)>, Unreadable> {
         let recording = self
             .counters
@@ -1775,7 +1775,7 @@ impl Limits {
     }
 
     /// Refused calls: index among this policy's calls, reason, and whether
-    /// the fault schedule injected it ([`Self::view`]).
+    /// the fault schedule injected it (`Self::view`).
     pub fn refused_calls(&self) -> Vec<(usize, LimitRefusal, bool)> {
         self.view()
             .into_iter()
@@ -1797,13 +1797,13 @@ impl Limits {
         self.clock
     }
 
-    /// Attempted calls ([`Self::view`]: panics on an unrecorded family).
+    /// Attempted calls (`Self::view`: panics on an unrecorded family).
     pub fn calls(&self) -> Vec<Call> {
         self.view().into_iter().map(|(call, _)| call).collect()
     }
 
     /// Admitted calls: admitted work and granted allocations
-    /// ([`Self::view`]). Named apart from the admission observation
+    /// (`Self::view`). Named apart from the admission observation
     /// [`Budget::admitted`], which a `&mut Limits` receiver would otherwise
     /// resolve to first.
     pub fn admitted_calls(&self) -> Vec<Call> {
@@ -2008,7 +2008,7 @@ impl Budget for Limits {
 
     /// Recorded into the family's shared ledgers (`Ledgers::record`), in
     /// every mode, the terminal one included: wait-free updates of the
-    /// family's totals ([`Count`]); and, in a recorded family, published
+    /// family's totals (`Count`); and, in a recorded family, published
     /// into its session. Both allocate nothing and do not unwind.
     fn admitted(&mut self, work: WriteWork) {
         let credit = Credit::Admit { work, held: None };
@@ -2196,7 +2196,7 @@ unsafe impl super::TerminalAllocator for Limits {
 impl super::Releasing for Limits {
     type Permit = Reservation;
 
-    /// The cleanup account ([`Authority::reclaim`]): attempted, clocked,
+    /// The cleanup account (`Authority::reclaim`): attempted, clocked,
     /// traced and published as every call is, and refused by the fault
     /// schedule as every call is, the instrument's alone; never by the
     /// deadline or the lifetime work ceiling.
@@ -2215,7 +2215,7 @@ impl super::Releasing for Limits {
 }
 
 impl Allocator for Limits {
-    /// The one admission ([`Self::admit_traced`]) grants or refuses; a
+    /// The one admission (`Self::admit_traced`) grants or refuses; a
     /// recorded grant arrives with its committed record and identity. The
     /// owning permit is made at once, before the allocation observer runs,
     /// so an observer that unwinds drops a permit that releases what was

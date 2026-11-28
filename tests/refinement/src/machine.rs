@@ -1088,7 +1088,7 @@ fn replay(
     Ok(machine)
 }
 
-/// Check `run` against the machine ([`replay`] with its checkpoints,
+/// Check `run` against the machine (`replay` with its checkpoints,
 /// cleanup and publication), then its end against what the run reached.
 /// Accepted, or the first divergence.
 pub fn check(run: &Run) -> Result<(), Divergence> {
@@ -1120,7 +1120,7 @@ pub fn evidence(run: &Run) -> Result<Evidence, Divergence> {
 
 /// A finished session's whole stream and the custody `checkpoints` its
 /// runner took, through the same transitions and the same rules as
-/// [`check`] ([`replay`]): admission correspondence; every permit given
+/// [`check`] (`replay`): admission correspondence; every permit given
 /// paid for, given its observed outcome, and released exactly once or
 /// merged away; every obligation settled; every identity, family and link
 /// consistent; and each checkpoint's custody the state its boundary

@@ -835,21 +835,21 @@ impl<A: Allocator> Drop for ScopeRef<'_, A> {
 /// The token is the custody of the credit used to obtain its record, which
 /// therefore stays outside the record it acquires: its admissions toward a
 /// record not yet granted are held in its own pending credit
-/// ([`Pending`]), each obligation keeping the origin and identity its
+/// (`Pending`), each obligation keeping the origin and identity its
 /// admission gave it, so a write admitted under one family and a release,
 /// after a refused request, under another each settle into their own
 /// family, under one acquisition identity. Its owner is made by its first
-/// acquisition entry ([`Pending::deferred`]), every later entry validated
+/// acquisition entry (`Pending::deferred`), every later entry validated
 /// against it. Cancelled ([`Self::cancel`]) or dropped holding credit, the
 /// token settles it explicitly by origin, [`crate::bounded::Forfeit::Cancelled`];
 /// its grant and its cancel leave nothing held and the token unbound, ready
 /// for reuse.
 ///
-/// Between a record's two acquisition stages ([`ScopeRef::allocate_step`])
+/// Between a record's two acquisition stages (`ScopeRef::allocate_step`)
 /// the token also holds the granted block, its head written and its owner
 /// not yet: the block is the acquisition's, reported in the token's group,
 /// and a cancel or drop then frees it without reading its owner
-/// ([`Reclaimer::release_unowned`]), a release its acquisition paid for.
+/// (`Reclaimer::release_unowned`), a release its acquisition paid for.
 pub struct Acquisition<'s, T: Reclaim<A>, A: TerminalAllocator> {
     scope: Option<ScopeRef<'s, A>>,
     pending: Pending<A::Origin>,
@@ -893,7 +893,7 @@ impl<T: Reclaim<A>, A: TerminalAllocator> Acquisition<'_, T, A> {
     }
 
     /// The credit this token holds toward a record not yet granted: its
-    /// pending's ([`Pending::held_credit`]), the token's one holder of
+    /// pending's (`Pending::held_credit`), the token's one holder of
     /// obligations. Allocation-free. `None` when the sum does not fit.
     pub fn held_credit(&self) -> Option<WriteWork> {
         self.pending.held_credit()
@@ -901,12 +901,12 @@ impl<T: Reclaim<A>, A: TerminalAllocator> Acquisition<'_, T, A> {
 
     /// The owner this token's acquisitions are bound under, the owner every
     /// record it acquires stores, once its first acquisition entry made it
-    /// ([`Pending::deferred`]); `None` before. A custom binding acquires its
+    /// (`Pending::deferred`); `None` before. A custom binding acquires its
     /// payload's storage under it ([`crate::bounded::Owned::reserve`]), so
     /// the record's group, which reports the payload's permits under the
     /// record's owner ([`Reclaim::observe_permits`]), reports them under the
     /// owner that acquired them: the association the crate's own bindings
-    /// make through the operation's acquisition custody ([`Self::pending`]).
+    /// make through the operation's acquisition custody (`Self::pending`).
     /// Read-only, minting nothing.
     pub fn owner(&self) -> Option<&crate::bounded::Owner> {
         self.pending.owner_ref()
@@ -945,7 +945,7 @@ impl<T: Reclaim<A>, A: TerminalAllocator> Acquisition<'_, T, A> {
     /// reuse, bound to no scope, so a later cancel or drop settles nothing
     /// again. Nothing is admitted and nothing can refuse.
     /// An outermost frame: its scope reference released here
-    /// ([`with_worklist`]).
+    /// (`with_worklist`).
     pub fn cancel(&mut self, by: Performer) {
         with_worklist(|worklist| self.cancel_into(by, worklist));
     }
@@ -966,7 +966,7 @@ impl<T: Reclaim<A>, A: TerminalAllocator> Acquisition<'_, T, A> {
 /// The token's custody, one group under the owner its pending stores (`None`
 /// before its first entry made it, when it holds nothing): its pending's
 /// obligations toward a record not yet granted, as the pending's own group
-/// ([`Pending::observe_custody`]), and, between the record's two stages, the
+/// (`Pending::observe_custody`), and, between the record's two stages, the
 /// granted block's permit. Read-only.
 impl<T: Reclaim<A>, A: TerminalAllocator> Custodial<A::Permit> for Acquisition<'_, T, A> {
     fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
@@ -1023,11 +1023,11 @@ impl<T: Reclaim<A>, A: TerminalAllocator> Default for Acquisition<'_, T, A> {
 ///
 /// Admissions a refused initialization holds toward a scope block not yet
 /// granted are held credit ([`Self::held_credit`]), in the authority's own
-/// pending credit ([`Pending`]), outside the block it acquires: each
+/// pending credit (`Pending`), outside the block it acquires: each
 /// obligation keeps the origin and identity its admission gave it, so a
 /// write admitted under one family and a release, on a retry, under another
 /// each settle into their own family. Its owner is made by its first
-/// initialization entry ([`Pending::deferred`]), every later entry validated
+/// initialization entry (`Pending::deferred`), every later entry validated
 /// against it. Shut down ([`Self::shutdown_step`]) or dropped holding
 /// credit, the authority settles it explicitly by origin,
 /// [`crate::bounded::Forfeit::Cancelled`].
@@ -1099,7 +1099,7 @@ impl<'s, A: TerminalAllocator> DecodeOwner<'s, A> {
 
     /// Admit and allocate the scope's queue and reference count, then admit
     /// its terminal dispatch write. The block's admissions are held in the
-    /// authority's pending credit with their origins ([`stable::acquire`]),
+    /// authority's pending credit with their origins (`stable::acquire`),
     /// every entry, a retry included, validated against its owner. A refusal
     /// retains what was admitted for the next call. Once `Ok`, later calls
     /// do nothing and return `Ok`. A closed authority refuses with
@@ -1202,7 +1202,7 @@ impl<'s, A: TerminalAllocator> DecodeOwner<'s, A> {
     /// The credit the authority holds toward a scope block not yet granted
     /// ([`crate::bounded::Obligation`]), held across a refused
     /// initialization and spent by the retry's grant, or forfeited by
-    /// [`Self::shutdown_step`]: its pending's ([`Pending::held_credit`]),
+    /// [`Self::shutdown_step`]: its pending's (`Pending::held_credit`),
     /// the authority's one holder of obligations; the scope's records'
     /// credit is their acquisitions'. `None` when the sum does not fit.
     pub fn held_credit(&self) -> Option<WriteWork> {
@@ -1284,7 +1284,7 @@ impl<'s, A: TerminalAllocator> DecodeOwner<'s, A> {
     /// ([`ScopePosition::removal_admitted`]); the call that removes the
     /// record spends it and reports `Progress` without admitting.
     /// An outermost frame: the scope releases the step defers are performed
-    /// before it returns ([`with_worklist`]).
+    /// before it returns (`with_worklist`).
     pub fn step(&self, a: &mut A) -> BoundedResult<Reclaimed, A> {
         match &self.scope {
             Some(block) => with_worklist(|worklist| scope(block).owner.step(a, worklist)),
@@ -1332,10 +1332,10 @@ impl<'s, A: TerminalAllocator> DecodeOwner<'s, A> {
 /// owner its pending stores (`None` before its first initialization entry
 /// made it, when it holds nothing), its pending's obligations toward a scope
 /// block not yet granted as the pending's own group
-/// ([`Pending::observe_custody`]) and the scope block's permit; then, once
+/// (`Pending::observe_custody`) and the scope block's permit; then, once
 /// the scope is ready, every record its queue holds, active and queued, each
 /// a group under the owner of the acquisition that allocated it
-/// ([`Reclaimer::observe_custody`]). Records still held by their handles are
+/// (`Reclaimer::observe_custody`). Records still held by their handles are
 /// their handles' to report. `Contended` when another caller is stepping the
 /// queue: its records were not walked, and the observation is not whole.
 /// The traversal reads the authority only (its pending credit, the block's
@@ -1498,7 +1498,7 @@ impl<'s, T: Reclaim<A>, A: Allocator> OwnedRecord<'s, T, A> {
 
 /// The record's custody, one group under the owner its entry stores, the
 /// owner of the acquisition that allocated it: its block's permit and its
-/// payload's custody ([`Record::observe_custody`]), the same observation the
+/// payload's custody (`Record::observe_custody`), the same observation the
 /// queue makes of it once retired. Read-only.
 impl<T: Reclaim<A>, A: Allocator> Custodial<A::Permit> for OwnedRecord<'_, T, A> {
     fn observe_custody(&mut self, sink: &mut dyn CustodySink<A::Permit>) -> PermitsObserved {
