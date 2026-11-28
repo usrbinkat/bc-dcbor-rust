@@ -227,7 +227,7 @@ impl<T: Custodial<Permit>> Custodial<Permit> for Reclaiming<T> {
 impl<T: Custodial<Permit>, W: pipeline::Physical> Holding<'_, '_, Reclaiming<T>, W> {
     /// Finish operation-local cleanup, checkpointing the complete holding
     /// stack, `observe` given the surviving handle exclusively after each
-    /// turn, as every cleanup observer is ([`reclaim_by`]).
+    /// turn, as every cleanup observer is (`reclaim_by`).
     pub fn reclaim(
         &mut self,
         policy: PolicyId,

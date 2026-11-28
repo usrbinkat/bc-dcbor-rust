@@ -37,7 +37,7 @@ const WORKLOAD: &str = "DCBOR_GATE_WORKLOAD";
 pub struct Workload(std::ffi::OsString);
 
 impl Workload {
-    /// The launcher the gate running this tool exported ([`WORKLOAD`]);
+    /// The launcher the gate running this tool exported (`WORKLOAD`);
     /// refused when no gate defined its confinement.
     pub fn exported() -> Result<Self, String> {
         std::env::var_os(WORKLOAD).map(Self).ok_or_else(|| {
@@ -60,7 +60,7 @@ impl Workload {
     }
 
     /// The launcher itself, for a measuring parent outside the workload's
-    /// scope that runs it as its command ([`run_once`]).
+    /// scope that runs it as its command (`run_once`).
     pub fn launcher(&self) -> &OsStr {
         &self.0
     }
@@ -150,7 +150,7 @@ fn build_report(stdout: &[u8], stderr: &[u8]) -> String {
 /// it is a target of: the working directory and `CARGO_MANIFEST_DIR` cargo
 /// runs it with, which a test locating its own package reads (trybuild's
 /// `cargo::manifest_dir`, then `cargo metadata` in that directory). The gate
-/// runs every test binary as cargo would ([`run_once`]), so a test that
+/// runs every test binary as cargo would (`run_once`), so a test that
 /// reads its package's directory reads the copy's, never the caller's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestExecutable {
@@ -192,7 +192,7 @@ pub fn flags(checker: Checker) -> String {
 
 /// Build `checker`'s test binaries of `root`, in release with every
 /// feature, in its own target directory (each cfg rebuilds the library),
-/// logging its diagnostics to `log` ([`build_report`]): the executable of
+/// logging its diagnostics to `log` (`build_report`): the executable of
 /// each target holding models ([`dcbor_model_bounds::targets`]). A build
 /// that fails returns its log's contents.
 pub fn build(
@@ -260,7 +260,7 @@ pub fn build(
 /// Build the test target `target` (`lib`, or an integration test binary) of
 /// `package` in `root`, with `features` (`all`, a comma-separated list, or
 /// none for the package's defaults), into `target_dir`, logging the build's
-/// diagnostics to `log` ([`build_report`]: the compiler's own messages,
+/// diagnostics to `log` (`build_report`: the compiler's own messages,
 /// which a refused build's judgement reads, then cargo's standard error).
 /// Its test executable ([`crate::reach::executable`]),
 /// or, when the build failed, its log: a compiler refusal is what a run
@@ -307,7 +307,7 @@ pub fn build_target(
 }
 
 /// One run of `test` alone in `executable` (`--exact`, one thread, output
-/// uncaptured), in its package as cargo runs it ([`run_once`]), its
+/// uncaptured), in its package as cargo runs it (`run_once`), its
 /// environment `environment` beside the controlled one and `TERM=dumb`,
 /// logged to `log`: its termination and its log's text.
 pub fn run_test(
@@ -488,7 +488,7 @@ impl KaniRun<'_> {
 
 /// The one `cargo kani` invocation of the validated run `run`, consumed:
 /// the proof suite's evidence run, one calibration execution, or one control
-/// side ([`kani`]). Its termination and its log's text.
+/// side (`kani`). Its termination and its log's text.
 pub fn execute_kani(run: KaniRun<'_>) -> Result<(Termination, String), String> {
     kani(&run)
 }
@@ -510,7 +510,7 @@ pub fn kani_launcher() -> Result<PathBuf, String> {
 }
 
 /// A record of the gate's, `bytes` at the new file `path`, durable as every
-/// run's evidence is ([`create_evidence`]).
+/// run's evidence is (`create_evidence`).
 pub fn record(path: &Path, bytes: &[u8]) -> Result<(), String> {
     create_evidence(path, bytes)
 }

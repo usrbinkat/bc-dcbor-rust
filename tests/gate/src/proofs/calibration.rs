@@ -149,7 +149,7 @@ pub struct CalibrationRequest<'a> {
 /// What a calibration runs under, each at the boundary that consumes it: the
 /// workload launcher its Kani runs are confined by, the settling policy, the
 /// system's load readings, its clocks, and the writer of its last record
-/// (`calibration.json`, [`crate::process::create_evidence`] in operation).
+/// (`calibration.json`, `crate::process::create_evidence` in operation).
 pub struct Runtime<'a> {
     pub workload: &'a crate::process::Workload,
     pub settling: &'a SettlingPolicy,
@@ -159,7 +159,7 @@ pub struct Runtime<'a> {
 }
 
 /// A writer of one new record: the path and its bytes, refused when it
-/// cannot be created and made durable ([`crate::process::create_evidence`]).
+/// cannot be created and made durable (`crate::process::create_evidence`).
 pub type RecordWriter<'a> = dyn Fn(&Path, &[u8]) -> Result<(), String> + 'a;
 
 /// A calibration ([`calibration`]) under the system's load, its clocks and
@@ -183,7 +183,7 @@ pub fn calibrate(request: CalibrationRequest<'_>) -> Result<Schedule, String> {
 /// A calibration: the checkout's workload lock acquired
 /// ([`WorkloadLock::acquire`]) and held until its last record is written, so
 /// no other gate workload starts before the calibration has ended; its
-/// schedule built by [`schedule`]; then the schedule attempted as its last
+/// schedule built by `schedule`; then the schedule attempted as its last
 /// record (`calibration.json`) whatever failed, a failure to write it joining
 /// the calibration's faults. The schedule when nothing failed, complete or
 /// not; otherwise every fault, the record kept naming them.

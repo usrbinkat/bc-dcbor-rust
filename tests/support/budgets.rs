@@ -14,9 +14,9 @@
 //! finished once every fixture it declares has been ([`Budgets::finish`]),
 //! which a family dropped unfinished refuses. Under
 //! [`RECORD`] naming this selection's record, every fixture runs at the
-//! fixed bootstrap capacity ([`MEASURING`]) and the finished family is
+//! fixed bootstrap capacity (`MEASURING`) and the finished family is
 //! published whole; otherwise every fixture runs at the capacity its record
-//! states ([`crate::measured`]). A record absent from the build is refused
+//! states (`crate::measured`). A record absent from the build is refused
 //! outside its own recording run.
 use crate::{Capacity, Observed, RecordedRun};
 use dcbor_record::{self as record, budgets::Counts};
@@ -338,7 +338,7 @@ mod tests {
     /// default ([`crate::CAPACITY`]) finishes under the record of its own
     /// measurement, and is refused, its session exhausted, under a record
     /// within the default. A capacity taken from anywhere but the record
-    /// (the default, or the bootstrap's [`MEASURING`]) fails one of the two.
+    /// (the default, or the bootstrap's `MEASURING`) fails one of the two.
     #[test]
     fn a_fixture_runs_at_the_capacity_its_record_states() {
         fn outgrowing(run: &mut RecordedRun) -> Result<(), crate::Finding> {

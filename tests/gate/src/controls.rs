@@ -588,7 +588,7 @@ fn checked_alone(report: &str, harness: &str, outcome: Outcome) -> bool {
 
 /// Whether a run of `control` with its diff applied refused it by its own
 /// rule: the planned outcome; for a run of one test, natively or under
-/// Miri, that test alone ([`alone`]) unless the planned outcome is a refused
+/// Miri, that test alone (`alone`) unless the planned outcome is a refused
 /// build; and the pattern in that run's own report, or in its fixture's
 /// block. Every other run is a fault naming why.
 pub fn judge(control: &Control, outcome: Outcome, report: &str) -> Result<(), String> {
@@ -735,7 +735,7 @@ pub struct BaselineReceipt {
 /// digest of the predictions it is held to, the copy and the build
 /// directory, the copy's source state and each path's digest
 /// ([`crate::proofs::SourceState::digests`]), for a baseline the complete
-/// state its copy must become with the diff applied ([`planted_state`]), the
+/// state its copy must become with the diff applied (`planted_state`), the
 /// source transition the side was validated for, the baseline a red or
 /// green side cites, and the
 /// calibration's artifact beside the transfer that explains why a copy's
@@ -762,7 +762,7 @@ pub struct AuthorizationRecord {
 
 /// A control side's validated authorization ([`AuthorizationRecord`]):
 /// made only here, by the control runner's validation of the side
-/// ([`authorize`]), so no run is a control side without it.
+/// (`authorize`), so no run is a control side without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authorization {
     record: AuthorizationRecord,

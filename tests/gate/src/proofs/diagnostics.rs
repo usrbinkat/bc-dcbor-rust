@@ -771,7 +771,7 @@ fn discovery_identity(evidence: &Path) -> Result<super::RunIdentity, String> {
 
 /// Diagnose `harness` (its source file `harness_file`, relative to the
 /// package, as CBMC records it) from the discovery evidence `evidence`,
-/// under `focus`, in a new directory under `root` ([`diagnosis_directory`]),
+/// under `focus`, in a new directory under `root` (`diagnosis_directory`),
 /// its steps run by `workload`: its identity, then the property inventory;
 /// one verdict per harness and unwinding assertion, a failed one traced;
 /// the reachability checks together; the formula's steps and byte

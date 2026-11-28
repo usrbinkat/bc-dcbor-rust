@@ -175,7 +175,7 @@
 //!   reach index OUT BASE...
 //!                   the reach map of the run in OUT, published as
 //!                   OUT/reach.json, and its verdict (`reach::index`)
-//!   costs check|record ROOT [RESUME]
+//!   costs check|record ROOT \[RESUME\]
 //!                   the matrix cost evidence of the repository ROOT,
 //!                   checked or recorded, reusing the completed run RESUME;
 //!                   TMPDIR is where its logs are made, DCBOR_COST_BASELINE

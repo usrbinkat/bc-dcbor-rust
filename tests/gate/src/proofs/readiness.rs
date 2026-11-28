@@ -308,7 +308,7 @@ fn settled_at(policy: &SettlingPolicy, observations: &[Settled]) -> Result<Optio
 /// The settling of the system under `policy` ([`SettlingPolicy::validate`]
 /// first): readings from `sample`, each timed by `clocks`, the policy's
 /// interval waited between them, until the readings settle
-/// ([`settled_at`], the one evaluation), or `limit` have been read, or a
+/// (`settled_at`, the one evaluation), or `limit` have been read, or a
 /// reading cannot be taken or does not hold. Every reading taken, and
 /// whether it settled.
 pub fn settle(
@@ -448,7 +448,7 @@ impl Readiness {
     /// and of `commit` when given; the workload lock recorded, acquired
     /// before the first reading; its policy valid
     /// ([`SettlingPolicy::validate`]); and its readings settled by the one
-    /// evaluation ([`settled_at`]) at its last reading, within its limit.
+    /// evaluation (`settled_at`) at its last reading, within its limit.
     /// Refused naming the first that does not hold: a receipt that only says
     /// it is ready establishes nothing.
     pub fn validate(&self, commit: Option<&str>) -> Result<(), String> {

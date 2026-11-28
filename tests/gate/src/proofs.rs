@@ -795,7 +795,7 @@ fn limit(hierarchy: &Path, path: &str, parent: Option<&str>, name: &str) -> Limi
 }
 
 /// The limits of the control group `workload` and of every ancestor through
-/// the root `/`, innermost first ([`ancestry`]), read from the cgroup
+/// the root `/`, innermost first (`ancestry`), read from the cgroup
 /// hierarchy mounted at `hierarchy` (`/sys/fs/cgroup`), each file as
 /// [`LimitObservation`] states it.
 pub fn limits(hierarchy: &Path, workload: &str) -> Vec<Level> {
@@ -874,8 +874,8 @@ impl EnvironmentRecord {
     /// is, whether it was just observed or read back from evidence: a
     /// non-blank processor model; an affinity and an effective cpuset that
     /// are non-empty CPU lists; a hierarchy that is exactly one group's
-    /// ancestry through `/` ([`ancestry`]); and at every level each limit a
-    /// value valid for its file ([`limit_valid`]) or an absence with its
+    /// ancestry through `/` (`ancestry`); and at every level each limit a
+    /// value valid for its file (`limit_valid`) or an absence with its
     /// reason, none unavailable. Refused naming the first fact that is not.
     pub fn establish(&self) -> Result<EstablishedEnvironment, String> {
         let fault = |what: String| Err(format!("the environment is not established: {what}"));
@@ -1028,7 +1028,7 @@ pub(crate) fn now() -> Result<Instant, String> {
 
 /// A run's identity, written into its evidence before it launches: a fresh
 /// identifier (`/proc/sys/kernel/random/uuid`), its purpose and the digest of
-/// the document it was given (kept beside it, [`RunPurpose::document`]), the
+/// the documents it was given (kept beside it, [`RunPurpose::documents`]), the
 /// digest of the source state of the copy it ran ([`tree_digest`]; the commit
 /// the copy was archived from is its script's record, `commit.txt`), the
 /// build's arguments, the loop-bound policy's digest, and its start, seconds
@@ -1049,7 +1049,7 @@ pub struct RunIdentityRecord {
 
 impl RunIdentityRecord {
     /// This record validated ([`RunIdentity`]): of [`RUNTIME_VERSION`], its
-    /// identifier a run identifier ([`run_identifier`]), its purpose one a
+    /// identifier a run identifier (`run_identifier`), its purpose one a
     /// run has, its revision, source state and policy SHA-256 digests, its
     /// build named, its start's nanoseconds below a second.
     pub fn validate(self) -> Result<RunIdentity, String> {
@@ -1174,7 +1174,7 @@ fn tree_record(stream: &mut Vec<u8>, path: &[u8], kind: u8, metadata: &[u8], pay
 }
 
 /// The digest of a tree's source state from each path's own digest
-/// ([`SourceState::digests`]), in byte order of the paths: [`TREE_DOMAIN`],
+/// ([`SourceState::digests`]), in byte order of the paths: `TREE_DOMAIN`,
 /// then one record (`e`) per path carrying its digest. What a run retains
 /// (`sources.json`) recomputes its identity's source state by, and what
 /// [`SourceState::digest`] is.
@@ -1861,7 +1861,7 @@ fn ceiling_milliseconds(duration: std::time::Duration) -> Option<u64> {
 /// calibration references, its predicted milliseconds and why its
 /// calibration applies (`transfer`). No key appears twice at any depth and
 /// none is unknown. Each reference is an adopted run whose raw records
-/// establish a verified execution of that harness ([`calibration_sample`]);
+/// establish a verified execution of that harness ([`eligible_sample`]);
 /// a harness's samples are of distinct runs and share one artifact, and
 /// every sample of the document shares one verifier, the document's build
 /// and policy, and its environment. The prediction is recomputed from the
@@ -2651,9 +2651,9 @@ fn preserved_artifact(
 /// What a discovery run's evidence under `directory` (its
 /// `--loop-bounds-evidence`) must hold, its own judgement: for every harness
 /// `discovery` selects, a directory of the driver's, its preserved
-/// instrumented binary ([`preserved_artifact`]) and a loop discovery of that
+/// instrumented binary (`preserved_artifact`) and a loop discovery of that
 /// binary that exited successfully and holds one valid inventory
-/// ([`discovered`], the one validator of a discovery, which every other run's
+/// (`discovered`, the one validator of a discovery, which every other run's
 /// reconciliation applies too). A discovery's solver is stopped at its
 /// deadline ([`DISCOVERY_MILLISECONDS`]), so its report, its termination, its
 /// solver records and its function scope are no part of it. Each harness's
@@ -2834,7 +2834,7 @@ pub(crate) fn sha256_text(text: &str) -> bool {
 /// CBMC (a `VERIFICATION:-` line), under `directory` (the run's
 /// `--loop-bounds-evidence`): its launch attempt (`solver.attempt`,
 /// `spawning\n`), the solver command it was spawned as (`solver.arguments`,
-/// [`command_record`]), the executables that ran (`solver.identity`, the
+/// `command_record`), the executables that ran (`solver.identity`, the
 /// driver's and the solver's path and SHA-256, the command's program the
 /// solver), and the instrumented binary it ran on, preserved before
 /// anything read it (`artifact.out`, recorded in `artifact.json` with its
@@ -2852,7 +2852,7 @@ pub(crate) fn sha256_text(text: &str) -> bool {
 /// not repeated: only the correspondence between the policy given, the
 /// resolution recorded and the command spawned is checked.
 ///
-/// Every harness's loop discovery is validated ([`discovered`]) before the
+/// Every harness's loop discovery is validated (`discovered`) before the
 /// function-scoped selectors it owes are derived from its inventory.
 pub fn check_execution_evidence(
     directory: &Path,

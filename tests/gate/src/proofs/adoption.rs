@@ -283,7 +283,7 @@ fn accept(
 /// `evidence` (a run's `LOG.evidence`, its log beside it as `LOG`) into the
 /// tree at `root`, under [`CALIBRATION`]`/RUN`, its log as `kani.log` and its
 /// evidence as `evidence/`, every instrumented binary left out, and accept it
-/// ([`adopt_with`] with `fsync(2)`).
+/// (`adopt_with` with `fsync(2)`).
 pub fn adopt(evidence: &Path, root: &Path) -> Result<PathBuf, Adoption> {
     adopt_with(evidence, root, &synchronized)
 }

@@ -51,7 +51,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// Where one recorded run's time went ([`recorded_evidence`]), by the stages
+/// Where one recorded run's time went (`recorded_evidence`), by the stages
 /// of the one recorded-run pipeline. Wall-clock diagnostics of where a run's
 /// cost lies: no check, budget receipt or qualification decision reads them.
 ///
@@ -62,17 +62,17 @@ use std::time::{Duration, Instant};
 ///   - `body`: the fixture's body, every production step with its turn and
 ///     contract checks and its checkpoints;
 ///     - `collect` (`collections` of them): each custody traversal
-///       collected ([`collected`]), every checkpoint's and every
+///       collected (`collected`), every checkpoint's and every
 ///       retirement's;
 ///     - `push` (`checkpoints` of them): each checkpoint stored
-///       ([`refinement::History::push`], in [`capture_collected`]);
-///   - `finalization`: the run's one ending ([`concluded`]), its policies'
+///       ([`refinement::History::push`], in `capture_collected`);
+///   - `finalization`: the run's one ending (`concluded`), its policies'
 ///     destruction included;
 ///     - `correspondence`: each policy's history read against its counters
-///       ([`correspondence`]);
+///       (`correspondence`);
 ///     - `finish`: the session finished ([`dcbor::bounded::Session::finish`]);
 ///     - `refine`: the stream and every checkpoint replayed through the
-///       refinement machine ([`refine`]);
+///       refinement machine (`refine`);
 ///     - `storage`: the checkpoints' storage bound
 ///       ([`refinement::History::storage`]);
 ///   - `inspect`: the fixture's evidence inspections
@@ -416,11 +416,11 @@ fn located(observed: &[Observed], divergence: refinement::Divergence) -> String 
 /// storage-form words (a `dcbor` unit test handing its session's stream to
 /// this crate, which links its own build of `dcbor`:
 /// `Observed::to_words`), read back whole and refined by the one
-/// finalization's checker ([`refine`], no checkpoints): the verdict as
+/// finalization's checker (`refine`, no checkpoints): the verdict as
 /// data, never a panic, so a caller holding findings of its own reports
 /// them beside it (`construction::findings` in `dcbor`). Err names the
 /// index of words that are no observation, or the divergence and the
-/// observation it was found at, as [`enforce`] names them.
+/// observation it was found at, as `enforce` names them.
 pub fn refinement_of_words(words: &[[u64; dcbor::bounded::OBSERVED_WORDS]]) -> Result<(), String> {
     let mut observed = Vec::with_capacity(words.len());
     for (index, words) in words.iter().enumerate() {
@@ -567,7 +567,7 @@ pub struct Counted {
 }
 
 /// The one comparison of a policy's recorded history with its own counters
-/// ([`correspondence`], and `construction::findings` in `dcbor` through
+/// (`correspondence`, and `construction::findings` in `dcbor` through
 /// plain counts): every attempt recorded, every refusal, every attempt
 /// either admitted or refused, every injection. Err names the first
 /// quantity that disagrees.
@@ -690,7 +690,7 @@ where
 
 impl<'s, O: Resumable<Limits>> Worked<DecodeOwner<'s, Limits>, O> {
     /// Initialize the worker's own scope under its policy share `m` by the
-    /// one initialization schedule ([`initialize_by`]); any stop is the
+    /// one initialization schedule (`initialize_by`); any stop is the
     /// worker's finding, returned through its join.
     pub fn initialize(&mut self, m: &mut Limits) -> Result<(), Finding> {
         initialize_by(
@@ -968,7 +968,7 @@ impl<T: Custodial<Permit>, W: pipeline::Physical> Holding<'_, '_, T, W> {
 
     /// Hand the custody of `output`, which the held value published, over
     /// from its publisher: the held value retired now as `retirement`
-    /// ([`retired`]), observed beside `output` and its surroundings, inside
+    /// (`retired`), observed beside `output` and its surroundings, inside
     /// the holding's physical window; then `output` held as `published` for
     /// `consume`. The output outlives its publisher. After the hand-over the
     /// held value is gone: this holding reports no custody of it, and a
@@ -1337,8 +1337,8 @@ pub enum Stepped<E, R> {
 }
 
 /// The holding scope's execution: the held value is an operation, driven by
-/// the one execution schedule ([`drive_controlled`]) and the one cleanup schedule
-/// ([`wound_by`]), each turn inside the holding's physical window, the
+/// the one execution schedule (`drive_controlled`) and the one cleanup schedule
+/// (`wound_by`), each turn inside the holding's physical window, the
 /// complete holding stack checkpointed after every turn whose recording is
 /// still evidence: the surroundings, the operation, and the turn's output.
 impl<T, W> Holding<'_, '_, T, W>
@@ -1502,7 +1502,7 @@ where
     /// checkpointed. An attempt that was not refused, a prepaid release
     /// included (the boundary had no admission to refuse), or a lost
     /// recording is the stop, any output it published held and retired as a
-    /// published handle first ([`Self::halted`]).
+    /// published handle first (`Self::halted`).
     pub fn refused(
         &mut self,
         policy: PolicyId,
@@ -1543,7 +1543,7 @@ where
 
     /// One fresh checked turn of the held operation under `policy` for a
     /// fixture's own schedule (a handwritten loop over the operation's own
-    /// steps), the `at`-th of it: the shared turn ([`turn_in`]) inside the
+    /// steps), the `at`-th of it: the shared turn (`turn_in`) inside the
     /// holding's physical window, its contract checked through its position;
     /// then, while the recording is still evidence, the holding stack
     /// checkpointed beside the turn's output and `observe` reading the
@@ -1553,7 +1553,7 @@ where
     /// `consume`. The operation's own error, a refusal included, is returned
     /// for the fixture to classify; a lost recording, a contract violation
     /// and a failed terminal probe are the stop, any output it carries held
-    /// first ([`Self::halted`]).
+    /// first (`Self::halted`).
     pub fn step<R>(
         &mut self,
         policy: PolicyId,
@@ -1735,7 +1735,7 @@ where
     }
 
     /// Drive the held operation's own cleanup to `Finished` under `policy`
-    /// within `turns` ([`wound_by`]), each turn inside the holding's physical
+    /// within `turns` (`wound_by`), each turn inside the holding's physical
     /// window, the holding stack checkpointed after each. Finished, the
     /// operation holds nothing and retires as [`Retirement::Exhausted`]. A
     /// publication cleanup admits none of is a stop, its output held and
@@ -2053,7 +2053,7 @@ impl<T: Custodial<Permit> + Send> Holding<'_, '_, CustodyBatch<T>, pipeline::Unw
     /// Retire the held batch now, as the holding declared it, every member
     /// destroyed on a worker thread of its own, the workers released
     /// together so the destructions race, each joined before the custody
-    /// after the retirement is observed ([`retired_by`]): one retirement,
+    /// after the retirement is observed (`retired_by`): one retirement,
     /// checkpointed and checked against its rule as any other. A worker's
     /// panic is the destruction's, kept as the run's defect. The holding then
     /// holds nothing.
@@ -2175,7 +2175,7 @@ pub type Reached<R, E> = Result<Result<R, E>, Finding>;
 pub type DecodeFailure = dcbor::bounded::decode::DecodeError<LimitRefusal>;
 
 /// The held scope's shared operations: its initialization and its drain by
-/// the one scope drivers ([`initialize`], [`drain`]), and every input and
+/// the one scope drivers ([`Self::initialize`], [`Self::drain`]), and every input and
 /// decode made in it, each a nested holding of its own, so a fixture
 /// supplies only its wire, its options, its policy and its assertions.
 impl<'s, W: pipeline::Physical> Holding<'_, '_, DecodeOwner<'s, Limits>, W> {
@@ -2281,7 +2281,7 @@ impl<'s, D: Scope<'s>, W: pipeline::Physical> Holding<'_, '_, D, W> {
     /// One fresh checked turn of a step of the held scope under `policy` for
     /// a fixture's own schedule, the `at`-th of it ([`scope_checked`]), the
     /// step inside the holding's physical window; then the recording's
-    /// integrity read ([`scope_turn`]) and the holding stack checkpointed.
+    /// integrity read (`scope_turn`) and the holding stack checkpointed.
     /// The step's outcome as the scope returned it, for the fixture to
     /// classify; a lost recording is the run's finding, that outcome kept in
     /// it ([`Stopped::Lost`]).
@@ -2503,7 +2503,7 @@ where
     W: pipeline::Physical,
 {
     /// A record of `T` acquired in `scope` under `policy` by the held
-    /// acquisition ([`acquire_by`]), each turn inside the holding's physical
+    /// acquisition (`acquire_by`), each turn inside the holding's physical
     /// window and the holding stack checkpointed after it, the acquired
     /// record beside the acquisition; the record held for `body` and retired
     /// as a published handle once it returns. Any stop is the run's finding,
@@ -2896,7 +2896,7 @@ fn capture(
 /// One stored checkpoint, named by its place among the run's checkpoints:
 /// the place the refinement machine names a divergence at
 /// ([`refinement::At::Checkpoint`]). Only the checkpoint operation mints
-/// one, for the checkpoint it stored ([`capture_collected`]); a capture that
+/// one, for the checkpoint it stored (`capture_collected`); a capture that
 /// stores nothing names none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointId(usize);
@@ -2951,7 +2951,7 @@ fn capture_collected(
 }
 
 /// The custody one production traversal reports (`observe`, a custody's
-/// `observe_custody`), collected by owner ([`Collector`]): every group
+/// `observe_custody`), collected by owner (`Collector`): every group
 /// properly nested and closed, every item inside a group of a stored owner,
 /// every identity once, and the traversal whole. Contention refuses the
 /// whole capture, whatever was emitted before it.
@@ -3513,7 +3513,7 @@ impl RecordedRun {
     }
 
     /// A new policy of this run, `capacity` live bytes, the admission
-    /// oracle's ([`recorded_policy`]).
+    /// oracle's (`recorded_policy`).
     pub fn policy(&mut self, capacity: u64) -> PolicyId {
         self.adopt(recorded_policy(&self.session, capacity, false))
     }
@@ -3525,7 +3525,7 @@ impl RecordedRun {
 
     /// A new policy of this run, `capacity` live bytes, that also reports
     /// each admitted allocation to the heap observer
-    /// ([`recorded_policy`]): for a fixture that witnesses physical
+    /// (`recorded_policy`): for a fixture that witnesses physical
     /// storage.
     pub fn observed_policy(&mut self, capacity: u64) -> PolicyId {
         self.adopt(recorded_policy(&self.session, capacity, true))
@@ -3587,7 +3587,7 @@ impl RecordedRun {
     /// ([`dcbor::bounded::Session::boundary`]): replayed with the session's
     /// observations before it and compared at finalization. The observation
     /// is collected whole first ([`collect`]); one that is no observation
-    /// is the run's defect, kept without unwinding ([`capture`]): no
+    /// is the run's defect, kept without unwinding (`capture`): no
     /// checkpoint, partial or whole, is stored, and the run fails at its
     /// finalization naming it.
     pub fn checkpoint(
@@ -3633,18 +3633,18 @@ impl RecordedRun {
 /// returned once the body dropped every operation, owner and output it
 /// held, so nothing it held outlives it. Then, in order:
 /// each policy's counters are checked against its recorded history, every
-/// finding kept as detached data ([`correspondence`]); the policies are
+/// finding kept as detached data (`correspondence`); the policies are
 /// dropped; the session is finished, refused naming why when anything that
 /// can publish into it still lives (an operation, owner, permit or output
 /// `body` kept), and its whole stream and every checkpoint go through the
-/// refinement machine ([`finalize`]); and the fixture's own readings run. No
+/// refinement machine (`finalize`); and the fixture's own readings run. No
 /// step is optional, and none runs in a destructor: a fixture that panics
 /// has already failed. A body that returned a finding, a fixture that
 /// recorded a defect ([`RecordedRun::defect`]) instead of panicking, and a
 /// policy whose history disagrees with its counters, reach finalization
 /// too: no later mandatory check can skip it. The run then fails naming
 /// every finding, every correspondence finding and what the recording
-/// finished as ([`describe`]); acceptance stays strict, any finding alone
+/// finished as (`describe`); acceptance stays strict, any finding alone
 /// failing the run.
 pub fn recorded_run<R>(body: impl FnOnce(&mut RecordedRun) -> Result<R, Finding>) -> R {
     recorded_run_with(CAPACITY, ExpectedVerdict::Accepted, body)
@@ -4117,10 +4117,10 @@ impl<T> Custodial<Permit> for Destination<T> {
 /// do not change. The state is observed after every build step and every
 /// cleanup unit ([`Custody`]), and the construction's custody, its one
 /// grouped production traversal (`Standalone::observe_custody`), is
-/// checkpointed at the session boundary there too ([`capture`]), from the
+/// checkpointed at the session boundary there too (`capture`), from the
 /// initial state on: the refinement machine compares each with the custody
 /// the observations before it reach, owner by owner, at finalization
-/// ([`settled`]). A refused build step, after any number of attempts, must
+/// (`settled`). A refused build step, after any number of attempts, must
 /// leave the observation unchanged and is no transition: what it admitted is
 /// the pending custody the checkpoint reports. A cleanup unit whose only
 /// attempt was refused must leave the observation unchanged, and no refusal
@@ -5050,7 +5050,7 @@ fn quantum_checked<R: Outcome>(
 }
 
 /// One step of `operation` under the policy's current allowance, checked
-/// against the [`Resumable`] contract ([`contract_checked`]), a violation
+/// against the [`Resumable`] contract (`contract_checked`), a violation
 /// the fixture's panic.
 pub fn contracted<O: Resumable<Limits>>(m: &mut Limits, operation: &mut O) -> StepOf<O>
 where
@@ -5462,7 +5462,7 @@ where
 /// its caller owns its destruction; whatever a turn moved out of the
 /// operation (a published output) comes back inside the stop, for the
 /// caller to own and drop before its run finalizes. `R` is the driver's
-/// production outcome of one turn ([`Turned`]), a [`Resumable`] step's by
+/// production outcome of one turn (`Turned`), a [`Resumable`] step's by
 /// default.
 ///
 /// Owning stops cannot be consumed as detached findings:
@@ -5479,9 +5479,9 @@ where
 /// ```
 pub enum Stopped<T, E, R = Result<Step<T>, E>> {
     /// The operation's own error, as the operation returned it: terminal, or
-    /// a refusal no fresh turn satisfies ([`retryable`]).
+    /// a refusal no fresh turn satisfies (`retryable`).
     Operation(E),
-    /// The run's recording became no evidence at a turn ([`lost`]); that
+    /// The run's recording became no evidence at a turn (`lost`); that
     /// turn's outcome is kept whole beside it.
     Lost(Lost, R),
     /// The operation published where its schedule admits no publication: a
@@ -5491,9 +5491,9 @@ pub enum Stopped<T, E, R = Result<Step<T>, E>> {
     /// publication or a failure.
     Finished,
     /// A refused unit of work wider than a turn's quantum: no turn can ever
-    /// admit it, so the operation is stalled ([`stalled`]). The refused call,
+    /// admit it, so the operation is stalled (`stalled`). The refused call,
     /// its unit, and the operation's position, rendered from the held
-    /// operation at the stall ([`rendered`]) where the driver reads
+    /// operation at the stall (`rendered`) where the driver reads
     /// positions.
     Stalled {
         call: usize,
@@ -5687,7 +5687,7 @@ impl<T, E: Debug, R: Labelled> Debug for Stopped<T, E, R> {
 }
 
 /// A finding a recorded run carries to its finalization as detached data
-/// ([`recorded_run`], [`concluded`]): what a fixture's body returns, or
+/// ([`recorded_run`], `concluded`): what a fixture's body returns, or
 /// records, once it released what it held. A driver's stop becomes one at
 /// the holding after it retires publication custody; the recording's loss keeps the recorder's
 /// snapshot ([`Lost`]), with diagnostics rendered before custody retires.
@@ -5700,7 +5700,7 @@ pub enum Finding {
     /// operation's error where its caller required success, a publication or
     /// `Finished` its schedule admits none of, a stall, or the bound spent.
     Driver(String),
-    /// A defect the fixture or the run's checkpointing found ([`capture`],
+    /// A defect the fixture or the run's checkpointing found (`capture`,
     /// [`RecordedRun::defect`]).
     Defect(String),
 }
@@ -6445,7 +6445,7 @@ impl RefusalRun {
 
     /// The run of `m`, a recorded policy, read from its session: its calls
     /// since construction or its last `measure`, each answered, against its
-    /// own counters ([`corresponds`]), every work call within a turn. A
+    /// own counters (`corresponds`), every work call within a turn. A
     /// policy that records nothing has no history to read, and the read
     /// panics ([`Limits::calls`]); so does an invalid session. The whole
     /// run's evidence, every family's observations, is the session's, read
@@ -6463,7 +6463,7 @@ impl RefusalRun {
 
     /// The run's history is the session's: `observed`, the run's finished
     /// evidence ([`RecordedRun::inspect_evidence`]), holds the run's calls among the calls the
-    /// run's policy `by` performed ([`Budget::performer`]), followed by
+    /// run's policy `by` performed ([`dcbor::bounded::Budget::performer`]), followed by
     /// exactly `followed` more (a drain the run's policy made after the run
     /// was read: its `calls().len()` then, less the run's), each answered as
     /// the run read it: refused at exactly the run's refusal indices, with
@@ -6888,7 +6888,7 @@ fn emitted<I: DecodeInput<Limits>, T: InPlace<Limits>, W: pipeline::Physical>(
 
 /// An emission turn's outcome as its stop keeps it ([`Stopped::Lost`]),
 /// detached at that turn while its chunk's borrow of the writer was still
-/// valid ([`emission_turn`]): the exact production step rendered by its own
+/// valid (`emission_turn`): the exact production step rendered by its own
 /// `Debug` (`Progress`, `Chunk` with its bytes, `Complete` and `Finished`
 /// each themselves), the emission's error kept typed, and every byte the
 /// emission consumed, the turn's chunk once among them. Diagnostic
@@ -10491,7 +10491,7 @@ pub mod pipeline {
     /// figures as absent, never as zero.
     pub trait Physical: Sized {
         /// The run's policy, recorded in `session`: the admission oracle's
-        /// with what this witness adds to it ([`super::recorded_policy`]).
+        /// with what this witness adds to it (`super::recorded_policy`).
         fn policy(session: &Recording) -> Limits;
         /// The witness of a run failing physical request `fail_at`, unarmed.
         fn begin(fail_at: Option<usize>) -> Self;
@@ -10509,7 +10509,7 @@ pub mod pipeline {
     }
 
     /// The heap guard: the observed policy reports each admitted allocation
-    /// ([`super::recorded_policy`]), and an armed observation matches each
+    /// (`super::recorded_policy`), and an armed observation matches each
     /// physical request against one.
     impl Physical for heap::Observation {
         fn policy(session: &Recording) -> Limits {

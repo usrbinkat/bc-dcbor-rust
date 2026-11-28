@@ -763,7 +763,7 @@ fn becomes(
 /// (`Storage::reserve_step`, `settle_step`, `Spare::push`), from `before`
 /// to `after`, over its execution observation ([`StoragePosition`]), each
 /// transition naming every field it changes and every other held equal
-/// ([`becomes`]):
+/// (`becomes`):
 ///
 /// - a free slot of a settled arena filled: one more element, within the
 ///   reserved capacity;
@@ -854,7 +854,7 @@ pub fn storage_build(before: &StoragePosition, after: &StoragePosition) -> bool 
 /// `reclaim_copy_step`, or a newest element popped from a settled arena),
 /// from `before` to `after`, over its execution observation
 /// ([`StoragePosition`]), each transition naming every field it changes and
-/// every other held equal ([`becomes`]):
+/// every other held equal (`becomes`):
 ///
 /// - a settled element drained, or plain data cleared at once;
 /// - an empty settled arena's allocation and permit released, which
