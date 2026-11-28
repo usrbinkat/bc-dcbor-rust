@@ -1,8 +1,10 @@
 --- src/bounded/policy.rs
 +++ src/bounded/policy.rs
-@@ -244,3 +244,4 @@
-             .checked_then(work)
--            .filter(|foreground| self.ceilings.work.covers(foreground))
-+            // Planted: a running turn admits past the lifetime allowance.
-+            .filter(|foreground| self.turn.is_some() || self.ceilings.work.covers(foreground))
-             .ok_or(LimitRefusal::Work)?;
+@@ -277,3 +277,6 @@
+         let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
+-        self.ceilings.foreground_after(self.foreground(), work)?;
++        // Planted: a running turn admits past the lifetime allowance.
++        if self.turn.is_none() {
++            self.ceilings.foreground_after(self.foreground(), work)?;
++        }
+         let turn = self.turn_after(work)?;

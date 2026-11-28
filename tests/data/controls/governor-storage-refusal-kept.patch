@@ -1,9 +1,10 @@
---- src/bounded/governance.rs
-+++ src/bounded/governance.rs
-@@ -664,5 +664,5 @@
-             Ok(live) => live,
-             Err(refusal) => {
--                operation.live.fetch_sub(bytes, Ordering::AcqRel);
-+                // Planted: the operation's reservation kept on a group refusal.
-                 return Err(refusal);
-             }
+--- src/bounded/policy.rs
++++ src/bounded/policy.rs
+@@ -837,5 +837,6 @@
+     /// what [`Storage::reserve`] added, allocation-free and non-unwinding.
+     fn drop(&mut self) {
+-        self.storage.live.fetch_sub(self.bytes, Ordering::AcqRel);
++        // Planted: a reservation not kept is never returned.
++        let _ = (self.storage, self.bytes);
+     }
+ }

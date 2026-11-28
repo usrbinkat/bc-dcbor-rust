@@ -1591,9 +1591,10 @@ The accounting controls plant defects of the accounting core's axioms (`src/boun
 (`src/bounded/governance.rs`), each detected by its own test in `bounded::policy::tests::authority`
 or `bounded::governance::tests`:
 
-- `authority-turn-raises-lifetime.patch` lets a running turn admit past the lifetime allowance, the
-  conflation of a turn with the lifetime ceiling the core removes:
-  `turns_never_raise_lifetime_authorization` must fail with "turns raised the lifetime allowance".
+- `authority-turn-raises-lifetime.patch` lets a running turn admit past the lifetime allowance
+  (`Authority::plan_work` skips `Ceilings::foreground_after`), the conflation of a turn with the
+  lifetime ceiling the core removes: `turns_never_raise_lifetime_authorization` must fail with
+  "turns raised the lifetime allowance".
 - `authority-refusal-commits.patch` commits the lifetime total before the plan's checks
   (`Authority::work`), so a unit the turn refuses is counted: `a_refused_admission_commits_nothing`
   must fail with "a refused unit committed".
@@ -1601,6 +1602,10 @@ or `bounded::governance::tests`:
   granting nothing refuses an admissible unit as impossible instead of deferring it:
   `the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn` must fail with "left:
   Err(QuantumTooSmall)".
+- `authority-unrecorded-grant-kept.patch` keeps a recorded grant's live reservation before the
+  session grants its permit record (`Limits::admit`), so a grant refused `Unrecorded` keeps the
+  capacity and raises the peak: `an_unrecorded_grant_keeps_nothing_it_reserved` must fail with "an
+  unrecorded grant kept what it reserved".
 - `cleanup-lifetime-gated.patch` holds a cleanup admission (`Authority::reclaim`) to the
   foreground's lifetime work ceiling, so cleanup cannot complete once the foreground is spent:
   `cleanup_is_never_refused_for_the_foreground` must fail with "cleanup was refused for the lifetime
@@ -1621,13 +1626,15 @@ or `bounded::governance::tests`:
   (`Group::admitting`), so a contended admission is admitted:
   `a_contended_group_admission_commits_nothing` must fail with "left: Ok(())".
 - `governor-permit-group-unreleased.patch` drops a governed permit without releasing the group's
-  live total: `live_storage_is_held_at_both_levels` must fail with "left: (8, 0)".
-- `governor-storage-refusal-kept.patch` keeps the operation's live reservation when the group
+  live storage (`GovernedPermit::drop`): `live_storage_is_held_at_both_levels` must fail with "left:
+  (8, 0)".
+- `governor-storage-refusal-kept.patch` never returns a pending reservation (`Reserved::drop`, the
+  one storage implementation, `policy.rs`), so the operation's reservation is kept when the group
   refuses the request: the same test must fail with "a group refusal kept the operation's
   reservation".
-- `governor-peak-raised-on-refusal.patch` raises the operation's peak when its live reservation is
-  made, before the group grants the request (`OperationBudget::allocate`): the same test must fail
-  with "a group refusal raised a peak".
+- `governor-peak-raised-on-refusal.patch` raises the peak when a reservation is made
+  (`Storage::reserve`), before every level grants the request: the same test must fail with "a group
+  refusal raised a peak".
 - `governor-cleanup-gated.patch` holds the group's cleanup commit to its lifetime work ceiling
   (`OperationBudget::reclaim`): `cleanup_is_never_refused_for_either_ceiling` must fail with
   "cleanup was refused for a lifetime ceiling".

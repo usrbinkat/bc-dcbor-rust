@@ -1,12 +1,9 @@
 --- src/bounded/governance.rs
 +++ src/bounded/governance.rs
-@@ -292,8 +292,5 @@
+@@ -359,5 +359,5 @@
      fn drop(&mut self) {
-         self.operation.live.fetch_sub(self.bytes, Ordering::AcqRel);
--        self.operation
--            .group
--            .live
--            .fetch_sub(self.bytes, Ordering::AcqRel);
+         self.operation.storage.release(self.bytes);
+-        self.operation.group.storage.release(self.bytes);
 +        // Planted: the group's live total never released.
      }
  }

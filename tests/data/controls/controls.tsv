@@ -137,6 +137,7 @@ authority-turn-raises-lifetime	tests/data/controls/authority-turn-raises-lifetim
 authority-refusal-commits	tests/data/controls/authority-refusal-commits.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::a_refused_admission_commits_nothing	-	failed	a refused unit committed
 authority-quantum-is-allowance	tests/data/controls/authority-quantum-is-allowance.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::the_quantum_bounds_a_unit_and_the_allowance_bounds_a_turn	-	failed	left: Err(QuantumTooSmall)
 authority-share-unclamped	tests/data/controls/authority-share-unclamped.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::no_ceiling_is_raised_by_a_builder_or_a_share	-	failed	unwrap_err()` on an `Ok` value
+authority-unrecorded-grant-kept	tests/data/controls/authority-unrecorded-grant-kept.patch	native	nightly	dcbor	all	fast	lib	bounded::policy::tests::authority::an_unrecorded_grant_keeps_nothing_it_reserved	-	failed	an unrecorded grant kept what it reserved
 # The cleanup admission seam (policy.rs `Authority::reclaim`, `Limits::admit`;
 # reclamation.rs `Cleanup`'s `traverse`), one plant each: cleanup held to the
 # foreground's lifetime ceiling; the deadline refusing cleanup; the cleanup

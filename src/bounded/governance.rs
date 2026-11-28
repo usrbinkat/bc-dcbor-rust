@@ -7,7 +7,11 @@
 //! refusal precedence), the group commits it against the group's ceilings,
 //! and only then does the operation commit its plan. So a refusal at either
 //! level commits nothing at either level, and no second implementation of
-//! the core exists.
+//! the core exists. The group's checks are the core's own
+//! ([`Ceilings::foreground_after`], [`Ceilings::requested_after`]), and
+//! each level's live storage is the one implementation of it
+//! ([`Storage`]): both levels reserve, and both keep only once both have
+//! granted.
 //!
 //! The group's foreground admissions are nonblocking: one admission checks
 //! and commits the group's totals at a time, holding the group's admitting
@@ -39,7 +43,7 @@
 extern crate alloc;
 use alloc::sync::Arc;
 
-use super::policy::{Authority, Ceilings, Count, LimitRefusal, Planned, TURN};
+use super::policy::{Authority, Ceilings, Count, LimitRefusal, Planned, Storage, TURN};
 use super::{
     Acquisition, Allocator, Budget, Effect, Hold, Identity, Owner, Performer, RecordStage,
     Releasing, WriteWork,
@@ -62,10 +66,9 @@ struct Group {
     /// terminal policy's: never gated and never refused ([`Count`]).
     cleanup_values: Count,
     cleanup_bytes: Count,
-    /// Live requested bytes, raised only under `admitting`, lowered by any
-    /// permit's drop.
-    live: AtomicU64,
-    peak: AtomicU64,
+    /// Live requested bytes of every operation's permits, reserved only
+    /// under `admitting`, released by any permit's drop.
+    storage: Storage,
     /// Every operation of the group cancelled: set once, never cleared.
     cancelled: AtomicBool,
 }
@@ -113,11 +116,7 @@ impl Group {
     /// refuse it with nothing committed.
     fn work(&self, work: WriteWork) -> Result<(), LimitRefusal> {
         let _admitting = self.admitting()?;
-        let used = self
-            .foreground()
-            .checked_then(work)
-            .filter(|used| self.ceilings.work.covers(used))
-            .ok_or(LimitRefusal::Work)?;
+        let used = self.ceilings.foreground_after(self.foreground(), work)?;
         self.values.store(used.values, Ordering::Release);
         self.bytes.store(used.bytes, Ordering::Release);
         Ok(())
@@ -129,24 +128,6 @@ impl Group {
     fn reclaim(&self, work: WriteWork) {
         count(&self.cleanup_values, &self.cleanup_bytes, work);
     }
-
-    /// Reserve `bytes` of live capacity under `ceiling` in `live`, the live
-    /// total it reached returned; [`LimitRefusal::Storage`], nothing
-    /// reserved, when the capacity held now leaves no room. The peak is the
-    /// caller's to raise, once every level has granted the allocation.
-    fn reserve(live: &AtomicU64, ceiling: u64, bytes: u64) -> Result<u64, LimitRefusal> {
-        let mut current = live.load(Ordering::Acquire);
-        loop {
-            let next = current
-                .checked_add(bytes)
-                .filter(|next| *next <= ceiling)
-                .ok_or(LimitRefusal::Storage)?;
-            match live.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Ok(next),
-                Err(actual) => current = actual,
-            }
-        }
-    }
 }
 
 /// The counters one operation's permits share: its live storage, its
@@ -154,8 +135,8 @@ impl Group {
 /// it belongs to.
 struct Operation {
     group: Arc<Group>,
-    live: AtomicU64,
-    peak: AtomicU64,
+    /// Live requested bytes of this operation's permits ([`Storage`]).
+    storage: Storage,
     /// This operation cancelled: set once, never cleared.
     cancelled: AtomicBool,
     /// Cleanup admitted by terminal policies minted from this operation's
@@ -244,8 +225,7 @@ impl Governor {
                 requested: AtomicU64::new(0),
                 cleanup_values: Count::default(),
                 cleanup_bytes: Count::default(),
-                live: AtomicU64::new(0),
-                peak: AtomicU64::new(0),
+                storage: Storage::default(),
                 cancelled: AtomicBool::new(false),
             }),
         }
@@ -273,8 +253,7 @@ impl Governor {
             authority,
             operation: Arc::new(Operation {
                 group: self.group.clone(),
-                live: AtomicU64::new(0),
-                peak: AtomicU64::new(0),
+                storage: Storage::default(),
                 cancelled: AtomicBool::new(false),
                 terminal_values: Count::default(),
                 terminal_bytes: Count::default(),
@@ -326,12 +305,12 @@ impl Governor {
 
     /// The bytes every live permit of the group holds.
     pub fn live_bytes(&self) -> u64 {
-        self.group.live.load(Ordering::Acquire)
+        self.group.storage.live()
     }
 
     /// The most bytes the group's permits held at once.
     pub fn peak_bytes(&self) -> u64 {
-        self.group.peak.load(Ordering::Acquire)
+        self.group.storage.peak()
     }
 }
 
@@ -373,15 +352,13 @@ impl GovernedPermit {
 }
 
 impl Drop for GovernedPermit {
-    /// Each total was raised by these bytes before the permit existed
-    /// ([`OperationBudget::allocate`]), so neither subtraction wraps: one
-    /// atomic subtraction each, allocation-free and non-unwinding.
+    /// One release from each level's storage ([`Storage::release`]),
+    /// allocation-free. Each was raised by these bytes, kept, before the
+    /// permit existed ([`OperationBudget::allocate`]), and a permit's bytes
+    /// never change, so neither release panics.
     fn drop(&mut self) {
-        self.operation.live.fetch_sub(self.bytes, Ordering::AcqRel);
-        self.operation
-            .group
-            .live
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.operation.storage.release(self.bytes);
+        self.operation.group.storage.release(self.bytes);
     }
 }
 
@@ -493,12 +470,12 @@ impl OperationBudget {
 
     /// The bytes this operation's live permits hold.
     pub fn live_bytes(&self) -> u64 {
-        self.operation.live.load(Ordering::Acquire)
+        self.operation.storage.live()
     }
 
     /// The most bytes this operation's permits held at once.
     pub fn peak_bytes(&self) -> u64 {
-        self.operation.peak.load(Ordering::Acquire)
+        self.operation.storage.peak()
     }
 
     /// `planned`, the operation's own plan, committed once the group has
@@ -600,12 +577,13 @@ impl Releasing for OperationBudget {
 impl Allocator for OperationBudget {
     /// The operation's standing ([`OperationBudget::standing`]), then its
     /// request checked by its core (its whole live ceiling, then its
-    /// requested ceiling), then, holding the group's flag, the
-    /// group's whole live ceiling and requested ceiling, the operation's
-    /// live capacity, and the group's live capacity, a refusal of the last
-    /// returning the operation's reservation: every check before any
-    /// commitment, so a refusal commits nothing at either level, neither
-    /// level's peak included, raised only once both have granted.
+    /// requested ceiling), then, holding the group's flag, the group's
+    /// ([`Ceilings::requested_after`]), then the operation's live capacity
+    /// and the group's ([`Storage::reserve`]): every check before any
+    /// commitment, and each pending reservation returned by any later
+    /// refusal, so a refusal commits nothing at either level. Both
+    /// reservations are kept, each level's peak raised, only once both
+    /// levels have granted.
     fn allocate(&mut self, bytes: u64) -> Result<GovernedPermit, LimitRefusal> {
         if self.terminal {
             return Err(LimitRefusal::Storage);
@@ -615,26 +593,15 @@ impl Allocator for OperationBudget {
         let operation = &self.operation;
         let group = &operation.group;
         let _admitting = group.admitting()?;
-        if bytes > group.ceilings.live {
-            return Err(LimitRefusal::TooLarge);
-        }
         let group_requested = group
-            .requested
-            .load(Ordering::Acquire)
-            .checked_add(bytes)
-            .filter(|total| *total <= group.ceilings.requested)
-            .ok_or(LimitRefusal::Requested)?;
-        let operation_live =
-            Group::reserve(&operation.live, self.authority.ceilings().live, bytes)?;
-        let group_live = match Group::reserve(&group.live, group.ceilings.live, bytes) {
-            Ok(live) => live,
-            Err(refusal) => {
-                operation.live.fetch_sub(bytes, Ordering::AcqRel);
-                return Err(refusal);
-            }
-        };
-        operation.peak.fetch_max(operation_live, Ordering::AcqRel);
-        group.peak.fetch_max(group_live, Ordering::AcqRel);
+            .ceilings
+            .requested_after(group.requested.load(Ordering::Acquire), bytes)?;
+        let operation_reserved = operation
+            .storage
+            .reserve(self.authority.ceilings().live, bytes)?;
+        let group_reserved = group.storage.reserve(group.ceilings.live, bytes)?;
+        operation_reserved.keep();
+        group_reserved.keep();
         group.requested.store(group_requested, Ordering::Release);
         self.authority.granted(requested);
         Ok(GovernedPermit {

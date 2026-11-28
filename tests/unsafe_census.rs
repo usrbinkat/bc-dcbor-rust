@@ -3921,8 +3921,10 @@ fn thread_names(census: &Census) -> Vec<(String, String)> {
 /// and the storage counters every reservation and shared policy holds
 /// (`Counters`, `policy.rs`; a `Limits` itself is one operation's, never
 /// shared: `share` builds a fresh one over the same counters), with the
-/// family's credit ledgers inside them (`Ledgers`), each total a `Count`;
-/// and a governed group's and operation's counters (`Group`, `Operation`,
+/// family's credit ledgers inside them (`Ledgers`), each total a `Count`,
+/// and their live storage (`Storage`), which a governed group and
+/// operation hold too; and a governed group's and operation's counters
+/// (`Group`, `Operation`,
 /// `governance.rs`), which every permit, cancellation and terminal policy of
 /// them shares (an `OperationBudget` itself is one operation's). FF-13's
 /// premise that no per-worker identity enters the protocol is checked over
@@ -3940,6 +3942,7 @@ const PROTOCOL: &[(&str, &str)] = &[
     ("src/bounded/policy.rs", "Counters"),
     ("src/bounded/policy.rs", "Ledgers"),
     ("src/bounded/policy.rs", "Count"),
+    ("src/bounded/policy.rs", "Storage"),
     ("src/bounded/governance.rs", "Group"),
     ("src/bounded/governance.rs", "Operation"),
 ];

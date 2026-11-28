@@ -136,6 +136,39 @@ impl Ceilings {
         requested: u64::MAX,
         live: u64::MAX,
     };
+
+    /// The foreground total once `work` is admitted beside `foreground`,
+    /// or [`LimitRefusal::Work`] when it passes the work ceiling or `u64`:
+    /// the one lifetime check of foreground work, an operation's
+    /// ([`Authority::plan_work`]) and a governed group's alike. Commits
+    /// nothing.
+    pub(crate) fn foreground_after(
+        &self,
+        foreground: WriteWork,
+        work: WriteWork,
+    ) -> Result<WriteWork, LimitRefusal> {
+        foreground
+            .checked_then(work)
+            .filter(|after| self.work.covers(after))
+            .ok_or(LimitRefusal::Work)
+    }
+
+    /// The cumulative requested total once a request of `bytes` is granted
+    /// beside `requested`: [`LimitRefusal::TooLarge`] when the request
+    /// passes the whole live ceiling, which no release makes room for, then
+    /// [`LimitRefusal::Requested`] when the total passes the requested
+    /// ceiling or `u64`. The one check of a request against its ceilings,
+    /// an operation's ([`Authority::request`]) and a governed group's
+    /// alike; live capacity is [`Storage::reserve`]'s. Commits nothing.
+    pub(crate) fn requested_after(&self, requested: u64, bytes: u64) -> Result<u64, LimitRefusal> {
+        if bytes > self.live {
+            return Err(LimitRefusal::TooLarge);
+        }
+        requested
+            .checked_add(bytes)
+            .filter(|total| *total <= self.requested)
+            .ok_or(LimitRefusal::Requested)
+    }
 }
 
 /// An admission an [`Authority`] checked and has not committed: the totals
@@ -159,9 +192,11 @@ struct Turn {
 /// The accounting core: the one owner of an authority's ceilings, its
 /// committed lifetime totals, its turn, and the order in which an admission
 /// is checked. Every policy admits through [`Self::work`],
-/// [`Self::reclaim`] and [`Self::request`]; the live counter is the
-/// family's ([`Counters`]), reserved by [`Self::request`]'s caller in one
-/// atomic update after every other check has passed.
+/// [`Self::reclaim`] and [`Self::request`]; live capacity is shared
+/// ([`Storage`]: a family's, a governed operation's and group's), reserved
+/// by [`Self::request`]'s caller in one atomic check-and-increment after
+/// every other check has passed, its peak raised only once every level has
+/// granted.
 ///
 /// Its axioms, each held by this type's shape:
 ///
@@ -240,10 +275,7 @@ impl Authority {
     /// then the turn ([`Self::turn_after`]).
     pub(crate) fn plan_work(&self, work: WriteWork) -> Result<Planned, LimitRefusal> {
         let used = self.used.checked_then(work).ok_or(LimitRefusal::Work)?;
-        self.foreground()
-            .checked_then(work)
-            .filter(|foreground| self.ceilings.work.covers(foreground))
-            .ok_or(LimitRefusal::Work)?;
+        self.ceilings.foreground_after(self.foreground(), work)?;
         let turn = self.turn_after(work)?;
         Ok(Planned {
             used,
@@ -298,17 +330,12 @@ impl Authority {
         }))
     }
 
-    /// Check a request of `bytes` against the requested and live ceilings,
-    /// committing nothing: the cumulative requested total it reaches, for
-    /// [`Self::granted`] once the live capacity is reserved.
+    /// Check a request of `bytes` against the requested and live ceilings
+    /// ([`Ceilings::requested_after`]), committing nothing: the cumulative
+    /// requested total it reaches, for [`Self::granted`] once the live
+    /// capacity is reserved.
     pub(crate) fn request(&self, bytes: u64) -> Result<u64, LimitRefusal> {
-        if bytes > self.ceilings.live {
-            return Err(LimitRefusal::TooLarge);
-        }
-        self.requested
-            .checked_add(bytes)
-            .filter(|total| *total <= self.ceilings.requested)
-            .ok_or(LimitRefusal::Requested)
+        self.ceilings.requested_after(self.requested, bytes)
     }
 
     /// Commit a granted request's cumulative total ([`Self::request`]).
@@ -552,8 +579,7 @@ pub enum RecordStage {
 impl core::fmt::Debug for Counters {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Counters")
-            .field("live", &self.live)
-            .field("peak", &self.peak)
+            .field("storage", &self.storage)
             .field("recorded", &self.recording.is_some())
             .finish_non_exhaustive()
     }
@@ -561,8 +587,8 @@ impl core::fmt::Debug for Counters {
 
 #[derive(Default)]
 struct Counters {
-    live: AtomicU64,
-    peak: AtomicU64,
+    /// The family's live storage, every share's and permit's.
+    storage: Storage,
     release_observer: Option<fn(u64)>,
     /// The family's part of its recording session, fixed when the family is
     /// made ([`Limits::recorded`]): `None` for an ordinary family, whose
@@ -712,6 +738,108 @@ impl Count {
     }
 }
 
+/// Live requested storage that every holder of one capacity shares: the
+/// bytes its permits hold now and the most they held at once. The one
+/// implementation of live storage, a [`Limits`] family's ([`Counters`])
+/// and a governed operation's and group's alike. A request reserves its
+/// bytes by one check-and-increment against a ceiling ([`Self::reserve`]),
+/// which returns a pending reservation ([`Reserved`]): kept
+/// ([`Reserved::keep`]), the peak is raised to the live total it reached;
+/// dropped, as by any later refusal at this level or another, its bytes are
+/// returned and the peak is as it was. So no refused request moves the
+/// peak or keeps capacity, whatever check refuses it. A permit's drop
+/// releases its bytes ([`Self::release`]).
+///
+/// The reservation is a compare-exchange retry loop, lock-free and not
+/// wait-free: it is a foreground admission, refusable and retried, which a
+/// terminal policy never makes ([`super::TerminalAllocator`], *allocate*).
+/// An unconditional `fetch_add` undone on refusal would show a concurrent
+/// request bytes past the ceiling that no grant holds, refusing it for
+/// capacity that is free.
+#[derive(Debug, Default)]
+pub(crate) struct Storage {
+    live: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl Storage {
+    /// Reserve `bytes` within `ceiling` beside the bytes held now, pending
+    /// until kept; [`LimitRefusal::Storage`], nothing reserved, when they
+    /// do not fit.
+    pub(crate) fn reserve(&self, ceiling: u64, bytes: u64) -> Result<Reserved<'_>, LimitRefusal> {
+        let mut current = self.live.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .filter(|next| *next <= ceiling)
+                .ok_or(LimitRefusal::Storage)?;
+            match self.live.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(Reserved {
+                        storage: self,
+                        bytes,
+                        live: next,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Release `bytes` a kept reservation holds: one atomic subtraction,
+    /// allocation-free. Panics on a release of bytes not held, which only a
+    /// permit released twice makes.
+    pub(crate) fn release(&self, bytes: u64) {
+        let previous = self.live.fetch_sub(bytes, Ordering::AcqRel);
+        assert!(previous >= bytes, "reservation released twice");
+    }
+
+    /// The bytes held now.
+    pub(crate) fn live(&self) -> u64 {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The most bytes held at once by kept reservations.
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+/// A reservation of [`Storage::reserve`] not yet kept: its bytes count as
+/// live, so no concurrent request takes them, and the peak is unchanged.
+/// Dropped, its bytes are returned; kept, they belong to the permit the
+/// caller makes.
+#[must_use = "a reservation dropped is returned"]
+pub(crate) struct Reserved<'s> {
+    storage: &'s Storage,
+    bytes: u64,
+    /// The live total this reservation reached.
+    live: u64,
+}
+
+impl Reserved<'_> {
+    /// Keep the reservation, once every level has granted the request: the
+    /// peak raised to the live total it reached. Its bytes are released
+    /// from then on by the permit that holds them ([`Storage::release`]).
+    pub(crate) fn keep(self) {
+        self.storage.peak.fetch_max(self.live, Ordering::AcqRel);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Reserved<'_> {
+    /// A reservation not kept returns its bytes: one atomic subtraction of
+    /// what [`Storage::reserve`] added, allocation-free and non-unwinding.
+    fn drop(&mut self) {
+        self.storage.live.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// Storage admission released when its owning allocation is released. A
 /// reservation may be released on any thread; release is one atomic
 /// subtraction, allocates nothing, and panics on a release it never admitted.
@@ -745,8 +873,7 @@ impl Drop for Reservation {
             return;
         }
         let bytes = self.bytes();
-        let previous = self.counters.live.fetch_sub(bytes, Ordering::AcqRel);
-        assert!(previous >= bytes, "reservation released twice");
+        self.counters.storage.release(bytes);
         if let Some(recording) = recording {
             recording.released(self.word);
             recording.publish(
@@ -934,8 +1061,9 @@ impl Reservation {
 /// ledgers do not report how much work has physically executed, and no
 /// evidence claim may read them that way.
 ///
-/// A quantity whose update does not fit in `u64` is left unchanged while the
-/// event's other quantities and ledgers may have advanced, and an admission
+/// A quantity whose update does not fit in `u64` saturates, reading
+/// `u64::MAX` from then on ([`Count`]), while the event's other quantities
+/// and ledgers may have advanced, and an admission
 /// reporting more held than it admitted changes no ledger; both set
 /// [`Self::violated`], sticky, so the ledgers are no longer claimed
 /// conserved. The policy ships, so it never panics.
@@ -1515,12 +1643,12 @@ impl Limits {
 
     /// Requested capacities currently held by live reservations.
     pub fn live_bytes(&self) -> u64 {
-        self.counters.live.load(Ordering::Acquire)
+        self.counters.storage.live()
     }
 
     /// The most live bytes held at once.
     pub fn peak_bytes(&self) -> u64 {
-        self.counters.peak.load(Ordering::Acquire)
+        self.counters.storage.peak()
     }
 
     /// Every boundary valuation reached by the policies over this storage,
@@ -1778,40 +1906,23 @@ impl Limits {
                     return Err(LimitRefusal::Scheduled(index));
                 }
                 let requested = self.authority.request(bytes)?;
-                // Shared policies can admit concurrently. Check capacity and
-                // reserve it in one atomic update, retrying against the latest
-                // total when another admission or release wins the race.
-                let ceiling = self.authority.ceilings.live;
-                let mut previous = self.counters.live.load(Ordering::Acquire);
-                let live = loop {
-                    let next = previous
-                        .checked_add(bytes)
-                        .filter(|next| *next <= ceiling)
-                        .ok_or(LimitRefusal::Storage)?;
-                    match self.counters.live.compare_exchange_weak(
-                        previous,
-                        next,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break next,
-                        Err(current) => previous = current,
-                    }
-                };
+                // Shared policies can admit concurrently: the family's
+                // storage reserves the capacity in one atomic
+                // check-and-increment, returned if the session refuses.
+                let reserved = self
+                    .counters
+                    .storage
+                    .reserve(self.authority.ceilings.live, bytes)?;
                 let granted = match &self.counters.recording {
                     None => None,
-                    Some(recording) => match recording.reserve(bytes) {
-                        Some((record, id)) => {
-                            recording.commit(record);
-                            Some((record, id))
-                        }
-                        None => {
-                            self.counters.live.fetch_sub(bytes, Ordering::AcqRel);
-                            return Err(LimitRefusal::Unrecorded);
-                        }
-                    },
+                    Some(recording) => {
+                        let (record, id) =
+                            recording.reserve(bytes).ok_or(LimitRefusal::Unrecorded)?;
+                        recording.commit(record);
+                        Some((record, id))
+                    }
                 };
-                self.counters.peak.fetch_max(live, Ordering::AcqRel);
+                reserved.keep();
                 self.authority.granted(requested);
                 Ok(granted)
             }
@@ -2444,10 +2555,11 @@ mod tests {
             drop(permit);
         }
 
-        /// An update that does not fit, and an admission holding more than
-        /// it admitted, change no ledger and set the violation, which
-        /// conservation then refuses; sums, deltas and the conservation
-        /// check refuse what does not fit, at `u64::MAX`.
+        /// An update that does not fit saturates its ledger at `u64::MAX`,
+        /// and an admission holding more than it admitted changes no
+        /// ledger; both set the violation, which conservation then refuses;
+        /// sums, deltas and the conservation check refuse what does not
+        /// fit, at `u64::MAX`.
         #[test]
         fn every_ledger_sum_is_checked_at_u64_max() {
             let full = WriteWork::new(u64::MAX, u64::MAX);
@@ -2705,6 +2817,37 @@ mod tests {
             );
             drop(held);
             assert_eq!(m.live_bytes(), 0);
+        }
+
+        /// A recorded grant its session has no permit record for is refused
+        /// [`LimitRefusal::Unrecorded`] after its live capacity was reserved
+        /// ([`Storage::reserve`]): the reservation is returned, never kept,
+        /// so live, peak and requested bytes are as they were, and the
+        /// session is no evidence.
+        #[test]
+        fn an_unrecorded_grant_keeps_nothing_it_reserved() {
+            use crate::bounded::{Capacity, Session};
+            let session = Session::new(Capacity {
+                permits: 1,
+                events: Capacity::DEFAULT.events,
+            });
+            let mut m = Limits::recorded(u64::MAX, u64::MAX, 8, &session);
+            let held = m.allocate(2).expect("the session's one permit record");
+            let before = (m.live_bytes(), m.peak_bytes(), m.requested_bytes());
+            assert_eq!(before, (2, 2, 2));
+            assert_eq!(
+                m.allocate(4).map(|permit| permit.bytes()).unwrap_err(),
+                LimitRefusal::Unrecorded
+            );
+            assert_eq!(
+                (m.live_bytes(), m.peak_bytes(), m.requested_bytes()),
+                before,
+                "an unrecorded grant kept what it reserved"
+            );
+            drop(held);
+            assert_eq!(m.live_bytes(), 0);
+            drop(m);
+            assert_eq!(session.finish().err(), Some(record::Incomplete::Exhausted));
         }
 
         /// The quantum bounds a unit in every turn, the allowance what one
